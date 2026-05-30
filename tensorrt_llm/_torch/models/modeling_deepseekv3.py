@@ -1274,6 +1274,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         assert (
             quant_config.quant_algo
             is not QuantAlgo.MIXED_PRECISION), "MIXED_PRECISION is ambiguous"
+        self.has_gated_norm = bool(getattr(config, "gated_norm", False))
 
         self.allreduce = None
         self.moe_allreduce = None
@@ -1344,6 +1345,27 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.next_layer_layernorm: RMSNorm = None
+        if self.has_gated_norm:
+            rank = int(getattr(config, "gated_norm_rank", 16))
+            self.input_gated_norm_down = nn.Linear(config.hidden_size,
+                                                   rank,
+                                                   bias=False,
+                                                   dtype=config.torch_dtype)
+            self.input_gated_norm_up = nn.Linear(rank,
+                                                 config.hidden_size,
+                                                 bias=False,
+                                                 dtype=config.torch_dtype)
+            self.post_attention_gated_norm_down = nn.Linear(
+                config.hidden_size, rank, bias=False, dtype=config.torch_dtype)
+            self.post_attention_gated_norm_up = nn.Linear(
+                rank, config.hidden_size, bias=False, dtype=config.torch_dtype)
+            self.fusion_config.PRE_MOE_FUSION = False
+            self.fusion_config.PRE_MLP_FUSION = False
+        else:
+            self.input_gated_norm_down = None
+            self.input_gated_norm_up = None
+            self.post_attention_gated_norm_down = None
+            self.post_attention_gated_norm_up = None
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -1398,6 +1420,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 mlp_tp_size = tp
         return mlp_tp_size
 
+    def _maybe_apply_gated_norm(self, hidden_states: torch.Tensor,
+                                gate_down: Optional[nn.Linear],
+                                gate_up: Optional[nn.Linear]) -> torch.Tensor:
+        if gate_down is None or gate_up is None:
+            return hidden_states
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        hidden_dtype = flat.dtype
+        gate = torch.matmul(flat.float(), gate_down.weight.float().t())
+        gate = torch.nn.functional.silu(gate).to(gate_up.weight.dtype)
+        gate = torch.matmul(gate, gate_up.weight.t())
+        gate = torch.sigmoid(gate).to(hidden_dtype)
+        return (flat * gate).reshape(hidden_states.shape)
+
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -1410,6 +1445,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self._maybe_apply_gated_norm(
+            hidden_states, self.input_gated_norm_down,
+            self.input_gated_norm_up)
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1478,6 +1516,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+        hidden_states = self._maybe_apply_gated_norm(
+            hidden_states, self.post_attention_gated_norm_down,
+            self.post_attention_gated_norm_up)
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1556,6 +1597,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # We need to add twoshot allreduce here to avoid modifying MLA logic
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+        hidden_states = self._maybe_apply_gated_norm(
+            hidden_states, self.post_attention_gated_norm_down,
+            self.post_attention_gated_norm_up)
 
         hidden_states = self.mlp(
             hidden_states,
@@ -1822,7 +1866,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # at the end of __init__.
         if model_config.mapping.has_cp_helix():
             print(
-                f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
+                "[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
             # Repurpose KVP ranks to TP while keeping other details the same.
@@ -1885,7 +1929,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
             print(
-                f"[DeepseekV3ForCausalLM::__init__] Restoring original mapping."
+                "[DeepseekV3ForCausalLM::__init__] Restoring original mapping."
             )
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp

@@ -1415,6 +1415,20 @@ class MLA(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
+        self.gate_proj = None
+        if getattr(config.pretrained_config, "attention_output_gate", False):
+            self.gate_proj = Linear(
+                self.hidden_size,
+                self.num_key_value_heads * self.v_head_dim,
+                bias=False,
+                dtype=dtype,
+                mapping=mapping_o,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                quant_config=None,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                gather_output=False,
+                use_custom_cublas_mm=True)
+
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
                 return 1.0
@@ -2934,6 +2948,10 @@ class MLA(nn.Module):
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
+
+        if self.gate_proj is not None:
+            gate = self.gate_proj(hidden_states)
+            attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

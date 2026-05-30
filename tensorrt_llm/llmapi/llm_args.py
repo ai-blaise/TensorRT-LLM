@@ -306,12 +306,26 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for DeepSeek Sparse Attention."""
     algorithm: Literal["dsa"] = "dsa"
+    indexer_mode: Literal["vanilla", "indexcache", "indexcache-hisa"] = Field(
+        default="vanilla",
+        description=
+        "DSA indexer execution mode. `indexcache-hisa` requires the FP4 "
+        "indexer K cache and layers HISA selection on top of IndexCache.",
+    )
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
     index_head_dim: Optional[int] = Field(
         default=None, description="The dimension of the indexer heads.")
     index_topk: Optional[int] = Field(default=None,
                                       description="The topk for the indexer.")
+    index_topk_freq: Optional[int] = Field(
+        default=None,
+        description=
+        "Frequency for OP-compatible IndexCache TopK reuse when no explicit "
+        "pattern is provided.")
+    index_topk_pattern: Optional[str] = Field(
+        default=None,
+        description="Per-layer F/S IndexCache TopK reuse pattern.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
     skip_indexer_for_short_seqs: bool = Field(
@@ -352,6 +366,23 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
         "per-token footprint from 132 B to 68 B.",
     )
+    enable_nvfp4_hisa: bool = Field(
+        default=False,
+        description=
+        "Enable the Blaise NVFP4 IndexCache+HISA selector contract. This is "
+        "only valid with indexer_mode='indexcache-hisa' and indexer_k_dtype='fp4'."
+    )
+    hisa_block_size: int = Field(default=128,
+                                 description="HISA candidate block size.")
+    hisa_block_topk: int = Field(
+        default=64, description="Number of candidate blocks selected by HISA.")
+    hisa_compression_ratio: float = Field(
+        default=4.0, description="Target HISA block compression ratio.")
+    hisa_min_seq_len: int = Field(
+        default=65536,
+        description="Minimum sequence length before HISA selection is used.")
+    hisa_execution_mode: Literal["auto", "optimized", "reference"] = Field(
+        default="optimized", description="HISA selector implementation mode.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -380,6 +411,33 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                         f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
                         f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
                         f"for non-Blackwell GPUs.")
+        if self.index_topk_freq is not None and self.index_topk_freq < 1:
+            raise ValueError("index_topk_freq must be at least 1.")
+        if self.index_topk_pattern is not None:
+            self.index_topk_pattern = self.index_topk_pattern.upper()
+            if any(role not in ("F", "S")
+                   for role in self.index_topk_pattern):
+                raise ValueError(
+                    "index_topk_pattern may only contain 'F' and 'S'.")
+            if self.index_topk_pattern[0] != "F":
+                raise ValueError(
+                    "index_topk_pattern must keep layer 0 as 'F'.")
+        if self.indexer_mode == "indexcache-hisa" or self.enable_nvfp4_hisa:
+            if self.indexer_mode != "indexcache-hisa":
+                raise ValueError(
+                    "enable_nvfp4_hisa requires indexer_mode='indexcache-hisa'."
+                )
+            if self.indexer_k_dtype != "fp4":
+                raise ValueError(
+                    "indexcache-hisa requires indexer_k_dtype='fp4'.")
+            if self.hisa_block_size <= 0:
+                raise ValueError("hisa_block_size must be positive.")
+            if self.hisa_block_topk <= 0:
+                raise ValueError("hisa_block_topk must be positive.")
+            if self.hisa_compression_ratio < 0:
+                raise ValueError("hisa_compression_ratio must be non-negative.")
+            if self.hisa_min_seq_len <= 0:
+                raise ValueError("hisa_min_seq_len must be positive.")
         return self
 
     def supports_backend(self, backend: str) -> bool:

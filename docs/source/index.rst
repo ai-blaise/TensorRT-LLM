@@ -34,6 +34,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Models
 
    models/supported-models.md
+   models/blaise-deepseek-v32.md
    models/visual-generation.md
    models/adding-new-model.md
 

@@ -40,6 +40,88 @@ if TYPE_CHECKING:
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
 
+def _as_dict(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        return value
+    if value is not None and hasattr(value, "to_dict"):
+        return value.to_dict()
+    return None
+
+
+def _get_quantization_config(pretrained_config: transformers.PretrainedConfig
+                             ) -> Optional[Dict[str, Any]]:
+    return _as_dict(getattr(pretrained_config, "quantization_config", None))
+
+
+def _is_nvfp4_indexer_method(method: Optional[str]) -> bool:
+    return method in {
+        "nvfp4",
+        "nvfp4_e2m1_ue8m0",
+        "fp4",
+        "fp4_e2m1_ue8m0",
+    }
+
+
+def _get_blaise_indexer_overrides(
+        pretrained_config: transformers.PretrainedConfig) -> Dict[str, Any]:
+    quant_config = _get_quantization_config(pretrained_config)
+    if quant_config is None:
+        return {}
+
+    indexer_quant = _as_dict(quant_config.get("indexer_quantization"))
+    if indexer_quant is None:
+        return {}
+
+    overrides: Dict[str, Any] = {}
+    method = indexer_quant.get("quant_method")
+    if _is_nvfp4_indexer_method(method):
+        overrides["indexer_k_dtype"] = "fp4"
+
+    indexcache = _as_dict(indexer_quant.get("indexcache"))
+    if indexcache is not None and indexcache.get("enabled", False):
+        overrides["indexer_mode"] = "indexcache"
+        freq = indexcache.get("freq", indexcache.get("index_topk_freq"))
+        if freq is not None:
+            overrides["index_topk_freq"] = int(freq)
+        pattern = indexcache.get("pattern",
+                                 indexcache.get("index_topk_pattern"))
+        if pattern is not None:
+            overrides["index_topk_pattern"] = str(pattern).upper()
+
+    hisa = _as_dict(indexer_quant.get("hisa"))
+    if hisa is not None and bool(hisa.get("enabled", False)):
+        mode = str(hisa.get("mode", "indexcache-hisa"))
+        if mode != "indexcache-hisa":
+            raise ValueError(
+                "Blaise NVFP4 HISA model-card dispatch requires "
+                "hisa.mode='indexcache-hisa'.")
+        overrides["indexer_mode"] = mode
+        overrides["indexer_k_dtype"] = "fp4"
+        overrides["enable_nvfp4_hisa"] = True
+        if "block_size" in hisa:
+            overrides["hisa_block_size"] = int(hisa["block_size"])
+        if "block_topk" in hisa:
+            overrides["hisa_block_topk"] = int(hisa["block_topk"])
+        if "compression_ratio" in hisa:
+            overrides["hisa_compression_ratio"] = float(
+                hisa["compression_ratio"])
+        if "min_seq_len" in hisa:
+            overrides["hisa_min_seq_len"] = int(hisa["min_seq_len"])
+        if "execution_mode" in hisa:
+            overrides["hisa_execution_mode"] = str(hisa["execution_mode"])
+
+    return overrides
+
+
+def _is_deepseek_dsa_config(
+        pretrained_config: transformers.PretrainedConfig) -> bool:
+    architectures = getattr(pretrained_config, "architectures", []) or []
+    return (architectures[0] in [
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    ] if architectures else False) or hasattr(pretrained_config, "index_topk")
+
+
 def _unified_kv_pool_includes_mamba(
         is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
     """Whether the KV cache pool will include mamba layers for a hybrid model.
@@ -575,14 +657,15 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[0] in [
-                        "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
-                ]:
+                if _is_deepseek_dsa_config(pretrained_config):
+                    pretrained_config.model_type = "deepseek_v32"
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     indexer_rope_interleave = getattr(
                         pretrained_config, 'indexer_rope_interleave', False)
                     if sparse_attention_config:
+                        model_overrides = _get_blaise_indexer_overrides(
+                            pretrained_config)
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
@@ -593,22 +676,101 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+                        indexer_mode = sparse_attention_config.indexer_mode
+                        index_topk_freq = sparse_attention_config.index_topk_freq
+                        index_topk_pattern = sparse_attention_config.index_topk_pattern
+                        enable_nvfp4_hisa = sparse_attention_config.enable_nvfp4_hisa
+                        hisa_block_size = sparse_attention_config.hisa_block_size
+                        hisa_block_topk = sparse_attention_config.hisa_block_topk
+                        hisa_compression_ratio = sparse_attention_config.hisa_compression_ratio
+                        hisa_min_seq_len = sparse_attention_config.hisa_min_seq_len
+                        hisa_execution_mode = sparse_attention_config.hisa_execution_mode
+                        if indexer_mode == "vanilla" and model_overrides.get(
+                                "indexer_mode") in ("indexcache",
+                                                    "indexcache-hisa"):
+                            indexer_mode = model_overrides["indexer_mode"]
+                            indexer_k_dtype = model_overrides.get(
+                                "indexer_k_dtype", indexer_k_dtype)
+                            enable_nvfp4_hisa = model_overrides.get(
+                                "enable_nvfp4_hisa", enable_nvfp4_hisa)
+                            if index_topk_freq is None:
+                                index_topk_freq = model_overrides.get(
+                                    "index_topk_freq")
+                            if index_topk_pattern is None:
+                                index_topk_pattern = model_overrides.get(
+                                    "index_topk_pattern")
+                            hisa_block_size = model_overrides.get(
+                                "hisa_block_size", hisa_block_size)
+                            hisa_block_topk = model_overrides.get(
+                                "hisa_block_topk", hisa_block_topk)
+                            hisa_compression_ratio = model_overrides.get(
+                                "hisa_compression_ratio",
+                                hisa_compression_ratio)
+                            hisa_min_seq_len = model_overrides.get(
+                                "hisa_min_seq_len", hisa_min_seq_len)
+                            hisa_execution_mode = model_overrides.get(
+                                "hisa_execution_mode", hisa_execution_mode)
                     else:
+                        model_overrides = _get_blaise_indexer_overrides(
+                            pretrained_config)
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
-                        use_cute_dsl_topk = False
-                        use_cute_dsl_paged_mqa_logits = False
+                        use_cute_dsl_topk = bool(model_overrides)
+                        use_cute_dsl_paged_mqa_logits = bool(model_overrides)
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
-                        indexer_k_dtype = "fp8"
+                        indexer_k_dtype = model_overrides.get(
+                            "indexer_k_dtype", "fp8")
+                        indexer_mode = model_overrides.get(
+                            "indexer_mode", "vanilla")
+                        index_topk_freq = model_overrides.get(
+                            "index_topk_freq")
+                        index_topk_pattern = model_overrides.get(
+                            "index_topk_pattern")
+                        enable_nvfp4_hisa = model_overrides.get(
+                            "enable_nvfp4_hisa", False)
+                        hisa_block_size = model_overrides.get(
+                            "hisa_block_size", 128)
+                        hisa_block_topk = model_overrides.get(
+                            "hisa_block_topk", 64)
+                        hisa_compression_ratio = model_overrides.get(
+                            "hisa_compression_ratio", 4.0)
+                        hisa_min_seq_len = model_overrides.get(
+                            "hisa_min_seq_len", 65536)
+                        hisa_execution_mode = model_overrides.get(
+                            "hisa_execution_mode", "optimized")
+                    for key, value in {
+                            "dsa_indexer_mode": indexer_mode,
+                            "nsa_indexer_mode": indexer_mode,
+                            "index_topk_freq": index_topk_freq,
+                            "index_topk_pattern": index_topk_pattern,
+                            "enable_dsa_nvfp4_hisa": enable_nvfp4_hisa,
+                            "enable_nsa_nvfp4_hisa": enable_nvfp4_hisa,
+                            "hisa_block_size": hisa_block_size,
+                            "hisa_block_topk": hisa_block_topk,
+                            "hisa_compression_ratio": hisa_compression_ratio,
+                            "hisa_min_seq_len": hisa_min_seq_len,
+                            "hisa_execution_mode": hisa_execution_mode,
+                    }.items():
+                        if value is not None:
+                            setattr(pretrained_config, key, value)
+                    if (index_topk_pattern is not None and len(
+                            index_topk_pattern) !=
+                            pretrained_config.num_hidden_layers):
+                        raise ValueError(
+                            "DSA IndexCache pattern length must match "
+                            "num_hidden_layers.")
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+                            indexer_mode=indexer_mode,
                             index_n_heads=index_n_heads,
                             index_head_dim=index_head_dim,
                             index_topk=index_topk,
+                            index_topk_freq=index_topk_freq,
+                            index_topk_pattern=index_topk_pattern,
                             indexer_max_chunk_size=indexer_max_chunk_size,
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
@@ -618,7 +780,13 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
-                            indexer_k_dtype=indexer_k_dtype)
+                            indexer_k_dtype=indexer_k_dtype,
+                            enable_nvfp4_hisa=enable_nvfp4_hisa,
+                            hisa_block_size=hisa_block_size,
+                            hisa_block_topk=hisa_block_topk,
+                            hisa_compression_ratio=hisa_compression_ratio,
+                            hisa_min_seq_len=hisa_min_seq_len,
+                            hisa_execution_mode=hisa_execution_mode)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

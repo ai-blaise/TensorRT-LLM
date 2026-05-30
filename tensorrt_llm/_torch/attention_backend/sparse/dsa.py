@@ -42,6 +42,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
+    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
@@ -1387,6 +1389,25 @@ class Indexer(nn.Module):
         self.head_dim = sparse_attention_config.index_head_dim  # 128
         self.index_topk = sparse_attention_config.index_topk  # 2048
         self.layer_idx = layer_idx
+        self.indexer_mode = getattr(sparse_attention_config, "indexer_mode",
+                                    "vanilla")
+        self.index_topk_freq = getattr(sparse_attention_config,
+                                       "index_topk_freq", None)
+        self.index_topk_pattern = getattr(sparse_attention_config,
+                                          "index_topk_pattern", None)
+        self.enable_nvfp4_hisa = getattr(sparse_attention_config,
+                                         "enable_nvfp4_hisa", False)
+        self.hisa_block_size = getattr(sparse_attention_config,
+                                       "hisa_block_size", 128)
+        self.hisa_block_topk = getattr(sparse_attention_config,
+                                       "hisa_block_topk", 64)
+        self.hisa_compression_ratio = getattr(sparse_attention_config,
+                                              "hisa_compression_ratio", 4.0)
+        self.hisa_min_seq_len = getattr(sparse_attention_config,
+                                        "hisa_min_seq_len", 65536)
+        self.hisa_execution_mode = getattr(sparse_attention_config,
+                                           "hisa_execution_mode", "optimized")
+        self.skip_topk = self._should_reuse_previous_topk()
 
         self.wq_b = Linear(
             self.q_lora_rank,
@@ -1462,6 +1483,36 @@ class Indexer(nn.Module):
             # Scheme X dispatcher before any CUDA Graph capture so the host
             # attribute queries do not end up frozen into a captured graph.
             warmup_heuristic_topk_decode(top_k=self.index_topk)
+
+    def _should_reuse_previous_topk(self) -> bool:
+        if self.indexer_mode not in ("indexcache", "indexcache-hisa"):
+            return False
+        if self.index_topk_pattern:
+            role = self.index_topk_pattern[self.layer_idx %
+                                           len(self.index_topk_pattern)]
+            return role == "S"
+        freq = 1 if self.index_topk_freq is None else self.index_topk_freq
+        return max(self.layer_idx - 1, 0) % freq != 0
+
+    def _get_indexcache_topk(
+            self, metadata: DSAtrtllmAttentionMetadata,
+            num_tokens: int) -> Optional[torch.Tensor]:
+        if not self.skip_topk:
+            return None
+        cached = getattr(metadata, "_blaise_indexcache_topk", None)
+        if cached is None or cached.shape[0] < num_tokens:
+            return None
+        if cached.shape[1] != self.index_topk:
+            return None
+        return cached[:num_tokens]
+
+    def _maybe_store_indexcache_topk(
+            self, metadata: DSAtrtllmAttentionMetadata,
+            topk_indices_buffer: torch.Tensor) -> None:
+        if self.indexer_mode not in ("indexcache", "indexcache-hisa"):
+            return
+        if not self.skip_topk:
+            metadata._blaise_indexcache_topk = topk_indices_buffer
 
     def post_load_weights(self):
         """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
@@ -1927,6 +1978,11 @@ class Indexer(nn.Module):
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
             f"Unexpected quant_block_size {metadata.kv_cache_manager.quant_block_size if metadata.kv_cache_manager else 'N/A'}"
+        cached_topk = self._get_indexcache_topk(metadata,
+                                                hidden_states.shape[0])
+        if cached_topk is not None:
+            return cached_topk
+
         # Update the indexer k cache before prefill chunks gather from it.
         self._update_k_cache(k_fp8, k_scale, metadata)
 
@@ -2303,6 +2359,7 @@ class Indexer(nn.Module):
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+        self._maybe_store_indexcache_topk(metadata, topk_indices_buffer)
         return topk_indices_buffer
 
     def _weight_scale(self, weights: torch.Tensor,
