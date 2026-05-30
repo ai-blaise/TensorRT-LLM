@@ -1514,6 +1514,64 @@ class Indexer(nn.Module):
         if not self.skip_topk:
             metadata._blaise_indexcache_topk = topk_indices_buffer
 
+    def _should_use_hisa_logits(self, max_kv_len: int) -> bool:
+        if not self.enable_nvfp4_hisa:
+            return False
+        if self.indexer_mode != "indexcache-hisa":
+            return False
+        if self.hisa_execution_mode not in ("auto", "optimized", "reference"):
+            return False
+        if self.hisa_block_size * self.hisa_block_topk < self.index_topk:
+            return False
+        return max_kv_len >= self.hisa_min_seq_len
+
+    def _hisa_topk_from_logits(
+            self, logits: torch.Tensor, row_starts: torch.Tensor,
+            row_ends: torch.Tensor) -> Optional[torch.Tensor]:
+        if logits.numel() == 0:
+            return None
+        max_kv_len = int((row_ends - row_starts).max().item())
+        if not self._should_use_hisa_logits(max_kv_len):
+            return None
+
+        num_rows, num_cols = logits.shape
+        block_size = self.hisa_block_size
+        num_blocks = math.ceil(num_cols / block_size)
+        block_topk = min(self.hisa_block_topk, num_blocks)
+        topk = min(self.index_topk, num_cols)
+
+        cols = torch.arange(num_cols, device=logits.device)
+        valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
+            cols.unsqueeze(0) < row_ends.unsqueeze(1))
+        scores = logits.float().masked_fill(~valid, float("-inf"))
+
+        pad = num_blocks * block_size - num_cols
+        block_scores = F.pad(scores, (0, pad), value=float("-inf"))
+        block_scores = block_scores.reshape(num_rows, num_blocks, block_size)
+        block_scores = block_scores.amax(dim=-1)
+
+        block_ids = block_scores.topk(block_topk, dim=-1)[1]
+        block_mask = torch.zeros((num_rows, num_blocks),
+                                 device=logits.device,
+                                 dtype=torch.bool)
+        block_mask.scatter_(1, block_ids, True)
+        token_mask = block_mask.unsqueeze(-1).expand(-1, -1, block_size)
+        token_mask = token_mask.reshape(num_rows, num_blocks * block_size)
+        token_mask = token_mask[:, :num_cols]
+
+        selected = scores.masked_fill(~token_mask, float("-inf"))
+        relative = selected.topk(topk, dim=-1)[1] - row_starts.unsqueeze(1)
+        lengths = row_ends - row_starts
+        relative = relative.masked_fill(
+            (relative < 0) | (relative >= lengths.unsqueeze(1)), -1)
+
+        result = torch.full((num_rows, self.index_topk),
+                            -1,
+                            dtype=torch.int32,
+                            device=logits.device)
+        result[:, :topk] = relative.to(torch.int32)
+        return result
+
     def post_load_weights(self):
         """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
@@ -2048,7 +2106,13 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
                         chunk_q_scale,
                     )
-                    if use_custom_topk:
+                    hisa_topk = self._hisa_topk_from_logits(
+                        logits, chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
+                        chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end])
+                    if hisa_topk is not None:
+                        topk_indices_buffer[global_q_start:global_q_end, :] = \
+                            hisa_topk
+                    elif use_custom_topk:
                         torch.ops.trtllm.indexer_topk_prefill(
                             logits,
                             chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
@@ -2102,7 +2166,11 @@ class Indexer(nn.Module):
                     cu_seqlen_ke,
                     ctx_q_scale,
                 )
-                if use_custom_topk:
+                hisa_topk = self._hisa_topk_from_logits(
+                    logits, cu_seqlen_ks, cu_seqlen_ke)
+                if hisa_topk is not None:
+                    topk_indices_buffer[:num_ctx_tokens, :] = hisa_topk
+                elif use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
                         logits, cu_seqlen_ks, cu_seqlen_ke,
                         topk_indices_buffer[:num_ctx_tokens, :])
@@ -2297,7 +2365,21 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                if self.use_cute_dsl_topk and num_gen_tokens <= 256:
+                row_indices = torch.arange(num_gen_tokens,
+                                           device=logits_decode.device) // next_n
+                next_n_offset = torch.arange(num_gen_tokens,
+                                             device=logits_decode.device) % next_n
+                row_starts = torch.zeros(num_gen_tokens,
+                                         device=logits_decode.device,
+                                         dtype=gen_kv_lens_cuda.dtype)
+                row_ends = (
+                    gen_kv_lens_cuda[row_indices] - next_n + next_n_offset + 1)
+                hisa_topk = self._hisa_topk_from_logits(
+                    logits_decode, row_starts, row_ends)
+                if hisa_topk is not None:
+                    topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                        num_gen_tokens, :] = hisa_topk
+                elif self.use_cute_dsl_topk and num_gen_tokens <= 256:
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +

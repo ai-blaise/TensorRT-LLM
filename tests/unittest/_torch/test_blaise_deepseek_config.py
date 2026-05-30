@@ -73,3 +73,17 @@ def test_higgs_kv_scheme_does_not_affect_trt_indexer_overrides():
     )
 
     assert _get_blaise_indexer_overrides(pretrained_config) == {}
+
+
+def test_generic_fp4_indexer_method_is_not_treated_as_nvfp4():
+    pretrained_config = SimpleNamespace(
+        architectures=["DeepseekV3ForCausalLM"],
+        index_topk=1024,
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "fp4",
+            },
+        },
+    )
+
+    assert _get_blaise_indexer_overrides(pretrained_config) == {}

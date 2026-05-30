@@ -362,9 +362,10 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
-        "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
-        "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
-        "per-token footprint from 132 B to 68 B.",
+        "Data type used for the indexer K cache. `fp4` denotes TensorRT-LLM's "
+        "Blackwell NVFP4 E2M1/UE8M0 path; it requires SM>=100 and "
+        "index_head_dim=128, and can halve the indexer K cache per-token "
+        "footprint from 132 B to 68 B.",
     )
     enable_nvfp4_hisa: bool = Field(
         default=False,

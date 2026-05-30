@@ -57,8 +57,6 @@ def _is_nvfp4_indexer_method(method: Optional[str]) -> bool:
     return method in {
         "nvfp4",
         "nvfp4_e2m1_ue8m0",
-        "fp4",
-        "fp4_e2m1_ue8m0",
     }
 
 
