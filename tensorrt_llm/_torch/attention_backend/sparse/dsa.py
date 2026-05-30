@@ -2365,17 +2365,19 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                row_indices = torch.arange(num_gen_tokens,
-                                           device=logits_decode.device) // next_n
-                next_n_offset = torch.arange(num_gen_tokens,
-                                             device=logits_decode.device) % next_n
-                row_starts = torch.zeros(num_gen_tokens,
-                                         device=logits_decode.device,
-                                         dtype=gen_kv_lens_cuda.dtype)
-                row_ends = (
-                    gen_kv_lens_cuda[row_indices] - next_n + next_n_offset + 1)
-                hisa_topk = self._hisa_topk_from_logits(
-                    logits_decode, row_starts, row_ends)
+                hisa_topk = None
+                if logits_decode.shape[0] == num_gen_tokens:
+                    row_indices = torch.arange(
+                        num_gen_tokens, device=logits_decode.device) // next_n
+                    next_n_offset = torch.arange(
+                        num_gen_tokens, device=logits_decode.device) % next_n
+                    row_starts = torch.zeros(num_gen_tokens,
+                                             device=logits_decode.device,
+                                             dtype=gen_kv_lens_cuda.dtype)
+                    row_ends = (gen_kv_lens_cuda[row_indices] - next_n +
+                                next_n_offset + 1)
+                    hisa_topk = self._hisa_topk_from_logits(
+                        logits_decode, row_starts, row_ends)
                 if hisa_topk is not None:
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
