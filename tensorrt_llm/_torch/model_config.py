@@ -120,6 +120,21 @@ def _is_deepseek_dsa_config(
     ] if architectures else False) or hasattr(pretrained_config, "index_topk")
 
 
+def _deepseek_sparse_attention_config(**kwargs: Any
+                                      ) -> DeepSeekSparseAttentionConfig:
+    fields = getattr(DeepSeekSparseAttentionConfig, "model_fields", {})
+    known_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in fields
+    }
+    sparse_attention_config = DeepSeekSparseAttentionConfig(**known_kwargs)
+    for key, value in kwargs.items():
+        if key not in fields:
+            object.__setattr__(sparse_attention_config, key, value)
+    return sparse_attention_config
+
+
 def _unified_kv_pool_includes_mamba(
         is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
     """Whether the KV cache pool will include mamba layers for a hybrid model.
@@ -674,15 +689,28 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
-                        indexer_mode = sparse_attention_config.indexer_mode
-                        index_topk_freq = sparse_attention_config.index_topk_freq
-                        index_topk_pattern = sparse_attention_config.index_topk_pattern
-                        enable_nvfp4_hisa = sparse_attention_config.enable_nvfp4_hisa
-                        hisa_block_size = sparse_attention_config.hisa_block_size
-                        hisa_block_topk = sparse_attention_config.hisa_block_topk
-                        hisa_compression_ratio = sparse_attention_config.hisa_compression_ratio
-                        hisa_min_seq_len = sparse_attention_config.hisa_min_seq_len
-                        hisa_execution_mode = sparse_attention_config.hisa_execution_mode
+                        indexer_mode = getattr(sparse_attention_config,
+                                               "indexer_mode", "vanilla")
+                        index_topk_freq = getattr(sparse_attention_config,
+                                                  "index_topk_freq", None)
+                        index_topk_pattern = getattr(sparse_attention_config,
+                                                     "index_topk_pattern",
+                                                     None)
+                        enable_nvfp4_hisa = getattr(
+                            sparse_attention_config, "enable_nvfp4_hisa",
+                            False)
+                        hisa_block_size = getattr(sparse_attention_config,
+                                                  "hisa_block_size", 128)
+                        hisa_block_topk = getattr(sparse_attention_config,
+                                                 "hisa_block_topk", 64)
+                        hisa_compression_ratio = getattr(
+                            sparse_attention_config, "hisa_compression_ratio",
+                            4.0)
+                        hisa_min_seq_len = getattr(sparse_attention_config,
+                                                   "hisa_min_seq_len", 65536)
+                        hisa_execution_mode = getattr(
+                            sparse_attention_config, "hisa_execution_mode",
+                            "optimized")
                         if indexer_mode == "vanilla" and model_overrides.get(
                                 "indexer_mode") in ("indexcache",
                                                     "indexcache-hisa"):
@@ -762,7 +790,7 @@ class ModelConfig(Generic[TConfig]):
                             "DSA IndexCache pattern length must match "
                             "num_hidden_layers.")
                     kwargs[
-                        'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+                        'sparse_attention_config'] = _deepseek_sparse_attention_config(
                             indexer_mode=indexer_mode,
                             index_n_heads=index_n_heads,
                             index_head_dim=index_head_dim,

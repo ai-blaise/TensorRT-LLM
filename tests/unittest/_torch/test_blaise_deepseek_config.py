@@ -2,8 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import tensorrt_llm._torch.model_config as model_config
 from tensorrt_llm._torch.model_config import (
-    _get_blaise_indexer_overrides, _is_deepseek_dsa_config)
+    _deepseek_sparse_attention_config, _get_blaise_indexer_overrides,
+    _is_deepseek_dsa_config)
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 
 
@@ -87,3 +89,33 @@ def test_generic_fp4_indexer_method_is_not_treated_as_nvfp4():
     )
 
     assert _get_blaise_indexer_overrides(pretrained_config) == {}
+
+
+def test_sparse_attention_config_attaches_blaise_runtime_fields(monkeypatch):
+    class RuntimeSparseAttentionConfig:
+        model_fields = {
+            "index_head_dim": object(),
+            "index_topk": object(),
+        }
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    monkeypatch.setattr(model_config, "DeepSeekSparseAttentionConfig",
+                        RuntimeSparseAttentionConfig)
+
+    sparse_attention_config = _deepseek_sparse_attention_config(
+        index_head_dim=128,
+        index_topk=1024,
+        indexer_mode="indexcache-hisa",
+        enable_nvfp4_hisa=True,
+    )
+
+    assert sparse_attention_config.kwargs == {
+        "index_head_dim": 128,
+        "index_topk": 1024,
+    }
+    assert sparse_attention_config.indexer_mode == "indexcache-hisa"
+    assert sparse_attention_config.enable_nvfp4_hisa is True
