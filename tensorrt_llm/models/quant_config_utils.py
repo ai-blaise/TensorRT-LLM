@@ -27,12 +27,17 @@ def update_quant_config_from_compressed_tensors(
     if config_groups is None:
         raise ValueError(f"config_groups is not set in {hf_quant_config}.")
 
-    weights_quant_config = config_groups["group_0"]["weights"]
-    inputs_quant_config = config_groups["group_0"]["input_activations"]
-    weights_quant_strategy = weights_quant_config["strategy"]
-    inputs_quant_strategy = inputs_quant_config["strategy"]
+    group_0 = config_groups["group_0"]
+    weights_quant_config = group_0.get("weights")
+    inputs_quant_config = group_0.get("input_activations")
+    if weights_quant_config is None and inputs_quant_config is None:
+        raise ValueError(f"Neither weights nor input_activations is set in {hf_quant_config}.")
 
-    if weights_quant_config["num_bits"] == 8:
+    quant_source_config = weights_quant_config or inputs_quant_config
+    weights_quant_strategy = (weights_quant_config or {}).get("strategy")
+    inputs_quant_strategy = (inputs_quant_config or {}).get("strategy")
+
+    if weights_quant_config is not None and weights_quant_config["num_bits"] == 8:
         if weights_quant_strategy == "channel":
             if inputs_quant_strategy != "token":
                 raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")
@@ -54,24 +59,24 @@ def update_quant_config_from_compressed_tensors(
                 "Supported strategies: 'channel', 'block'."
             )
     elif (
-        weights_quant_config["num_bits"] == 4
-        and weights_quant_config.get("type") == "float"
-        and weights_quant_strategy == "tensor_group"
+        quant_source_config["num_bits"] == 4
+        and quant_source_config.get("type") == "float"
+        and (weights_quant_strategy or inputs_quant_strategy) == "tensor_group"
     ):
         # llm-compressor NVFP4: weights FP4 with FP8 per-group scales
         # (group_size=16), scaled by an FP32 global scale.
-        if inputs_quant_strategy != "tensor_group":
+        if inputs_quant_config is not None and inputs_quant_strategy != "tensor_group":
             raise ValueError(
                 f"Unsupported inputs_quant_strategy for NVFP4: {inputs_quant_strategy}."
             )
-        group_size = weights_quant_config["group_size"]
+        group_size = quant_source_config["group_size"]
         if group_size != 16:
             raise ValueError(f"Unsupported group_size: {group_size}. Supported: 16 for NVFP4.")
         quant_config.quant_algo = QuantAlgo.NVFP4
         quant_config.group_size = group_size
     else:
         raise ValueError(
-            f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
+            f"Unsupported quant_bits: {quant_source_config['num_bits']}. "
             "Supported: 8 (FP8) or 4 (NVFP4)."
         )
 
@@ -86,6 +91,8 @@ def update_quant_config_from_compressed_tensors(
                     f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, "
                     "conflicting with FP8 KV cache from HF quant config."
                 )
+        elif kv_cache_scheme.get("quant_method") == "higgs_dense_2bit":
+            pass
         else:
             raise ValueError(f"Unsupported kv_cache_scheme: {kv_cache_scheme}.")
 

@@ -629,6 +629,34 @@ def test_load_hf_quant_config_compressed_tensors(weights_strategy,
     assert quant_config.exclude_modules == ["lm_head"]
 
 
+def test_load_hf_quant_config_compressed_tensors_nvfp4_inputs_only_higgs_kv():
+    """Blaise DeepSeek REAP card encodes NVFP4 through input_activations."""
+    quant_config, _ = ModelConfig.load_hf_quant_config(
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "group_0": {
+                    "weights": None,
+                    "input_activations": {
+                        "num_bits": 4,
+                        "type": "float",
+                        "strategy": "tensor_group",
+                        "group_size": 16,
+                    },
+                },
+            },
+            "kv_cache_scheme": {
+                "quant_method": "higgs_dense_2bit",
+            },
+            "ignore": ["lm_head"],
+        },
+        moe_backend=None)
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert quant_config.group_size == 16
+    assert quant_config.kv_cache_quant_algo is None
+    assert quant_config.exclude_modules == ["lm_head"]
+
+
 def test_load_hf_quant_config_nvfp4_native_with_modules_to_not_convert():
     """HF nvfp4 schema: ``modules_to_not_convert`` is merged into ``exclude_modules``."""
     quant_config, _ = ModelConfig.load_hf_quant_config(
