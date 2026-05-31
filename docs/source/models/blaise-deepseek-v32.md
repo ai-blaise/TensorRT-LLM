@@ -21,8 +21,8 @@ recognized:
 | `quant_method: "nvfp4_e2m1_ue8m0"` | Selects TensorRT-LLM's Blackwell NVFP4 E2M1/UE8M0 indexer K cache. |
 | `hisa.enabled: true` | Selects the `indexcache-hisa` config contract. |
 | `hisa.block_size` | Sets `hisa_block_size`. |
-| `hisa.block_topk` | Sets `hisa_block_topk`. |
-| `hisa.compression_ratio` | Sets `hisa_compression_ratio`. |
+| `hisa.block_topk` | Sets the fixed candidate block count when `hisa.compression_ratio` is disabled. |
+| `hisa.compression_ratio` | Sets the dynamic Figure 2(b)-style HISA candidate count: `ceil(num_blocks / compression_ratio)`, lower-bounded by the number of blocks needed to contain `index_topk` tokens. |
 | `hisa.execution_mode` | Sets `hisa_execution_mode`. |
 | `indexcache.freq` / `indexcache.pattern` | Sets the OP-compatible IndexCache TopK reuse policy fields. |
 | `indexer_quantization.layersplit.enabled: true` | Enables the LayerSplit DSA KV/indexer config surface. |
@@ -57,10 +57,13 @@ frequency policy. The model loader validates explicit patterns against
 their layer mapping before enabling IndexCache reuse.
 
 The `indexcache-hisa` mode preserves the Blaise NVFP4 HISA contract and
-validates that it uses the NVFP4 indexer K cache. Its current execution target is
-TensorRT-LLM's native NVFP4 DSA path with IndexCache reuse and a HISA block
-selector over the existing indexer logits. A future CuTe/CZS HISA selector can
-replace this fallback without changing the model-card contract.
+validates that it uses the NVFP4 indexer K cache. HISA is architecturally a
+pre-Indexer block-pruning stage: score pooled block representatives, keep the
+candidate block set, and then run the original token indexer only over tokens in
+those blocks. The current TensorRT-LLM implementation still keeps a post-logits
+fallback path for validation and incremental deployment, but production
+optimization should move the HISA stage ahead of paged MQA logits so the core
+Indexer does not scan the full prefix.
 
 The first B200 HISA selector profiling pass used
 `/tmp/optrt_dsa_ikp_bench.py` inside the Dynamo TensorRT-LLM runtime pod on

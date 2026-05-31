@@ -376,9 +376,16 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     hisa_block_size: int = Field(default=128,
                                  description="HISA candidate block size.")
     hisa_block_topk: int = Field(
-        default=64, description="Number of candidate blocks selected by HISA.")
+        default=64,
+        description=
+        "Fixed number of candidate blocks selected by HISA when "
+        "hisa_compression_ratio is disabled.")
     hisa_compression_ratio: float = Field(
-        default=4.0, description="Target HISA block compression ratio.")
+        default=4.0,
+        description=
+        "Target HISA block compression ratio. A positive value selects "
+        "ceil(num_blocks / ratio) candidate blocks, lower-bounded by the "
+        "number of blocks needed to contain index_topk tokens.")
     hisa_min_seq_len: int = Field(
         default=65536,
         description="Minimum sequence length before HISA selection is used.")

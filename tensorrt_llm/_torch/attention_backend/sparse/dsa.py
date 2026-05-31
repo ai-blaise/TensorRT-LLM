@@ -1514,6 +1514,14 @@ class Indexer(nn.Module):
         if not self.skip_topk:
             metadata._blaise_indexcache_topk = topk_indices_buffer
 
+    def _hisa_block_topk(self, num_blocks: int) -> int:
+        min_blocks = math.ceil(self.index_topk / self.hisa_block_size)
+        if self.hisa_compression_ratio > 0:
+            block_topk = math.ceil(num_blocks / self.hisa_compression_ratio)
+        else:
+            block_topk = self.hisa_block_topk
+        return min(max(block_topk, min_blocks), num_blocks)
+
     def _should_use_hisa_logits(self, max_kv_len: int) -> bool:
         if not self.enable_nvfp4_hisa:
             return False
@@ -1521,7 +1529,9 @@ class Indexer(nn.Module):
             return False
         if self.hisa_execution_mode not in ("auto", "optimized", "reference"):
             return False
-        if self.hisa_block_size * self.hisa_block_topk < self.index_topk:
+        num_blocks = math.ceil(max_kv_len / self.hisa_block_size)
+        if self.hisa_block_size * self._hisa_block_topk(
+                num_blocks) < self.index_topk:
             return False
         return max_kv_len >= self.hisa_min_seq_len
 
@@ -1540,7 +1550,7 @@ class Indexer(nn.Module):
         num_rows, num_cols = logits.shape
         block_size = self.hisa_block_size
         num_blocks = math.ceil(num_cols / block_size)
-        block_topk = min(self.hisa_block_topk, num_blocks)
+        block_topk = self._hisa_block_topk(num_blocks)
         topk = min(self.index_topk, num_cols)
 
         full_rows = False
