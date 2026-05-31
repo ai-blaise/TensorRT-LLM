@@ -1409,6 +1409,7 @@ class Indexer(nn.Module):
                                            "hisa_execution_mode", "optimized")
         self._hisa_range_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
         self._hisa_full_cache: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
+        self._hisa_e2m1_cache: Dict[torch.device, torch.Tensor] = {}
         self.skip_topk = self._should_reuse_previous_topk()
 
         self.wq_b = Linear(
@@ -1549,13 +1550,195 @@ class Indexer(nn.Module):
             return False
         if self.indexer_mode != "indexcache-hisa":
             return False
-        if self.hisa_execution_mode not in ("auto", "optimized", "reference"):
+        if self.hisa_execution_mode not in ("auto", "optimized", "reference",
+                                            "preindexer_reference"):
             return False
         num_blocks = math.ceil(max_kv_len / self.hisa_block_size)
         if self.hisa_block_size * self._hisa_block_topk(
                 num_blocks) < self.index_topk:
             return False
         return max_kv_len >= self.hisa_min_seq_len
+
+    def _should_use_hisa_pre_indexer(self, max_kv_len: int) -> bool:
+        if self.hisa_execution_mode != "preindexer_reference":
+            return False
+        if not self.use_fp4:
+            return False
+        if self.hisa_block_size != 128:
+            return False
+        return self._should_use_hisa_logits(max_kv_len)
+
+    def _hisa_e2m1_values(self, device: torch.device) -> torch.Tensor:
+        values = self._hisa_e2m1_cache.get(device)
+        if values is None:
+            values = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+                                  dtype=torch.float32,
+                                  device=device)
+            self._hisa_e2m1_cache[device] = values
+        return values
+
+    def _dequantize_indexer_nvfp4(self, values: torch.Tensor,
+                                  scales: torch.Tensor) -> torch.Tensor:
+        low = values & 0x0f
+        high = (values >> 4) & 0x0f
+        codes = torch.empty((*values.shape[:-1], values.shape[-1] * 2),
+                            dtype=torch.long,
+                            device=values.device)
+        codes[..., 0::2] = low.long()
+        codes[..., 1::2] = high.long()
+        magnitudes = self._hisa_e2m1_values(values.device)[codes & 0x07]
+        signs = torch.where((codes & 0x08) != 0, -1.0, 1.0)
+        dim_ids = self._hisa_arange(codes.shape[-1], values.device)
+        scale_shifts = ((dim_ids // 32) * 8).to(torch.int32)
+        scale_exp = ((scales.to(torch.int32).unsqueeze(-1) >>
+                      scale_shifts.view(*([1] * scales.dim()), -1)) & 0xff)
+        scale = torch.pow(2.0, scale_exp.to(torch.float32) - 127.0)
+        return magnitudes * signs * scale
+
+    def _hisa_mean_pool_indexer_cache(self, k_cache: torch.Tensor,
+                                      block_table: torch.Tensor,
+                                      kv_lens: torch.Tensor,
+                                      max_blocks: int) -> torch.Tensor:
+        block_size = self.hisa_block_size
+        page_size = k_cache.shape[1]
+        num_batches = block_table.shape[0]
+        token_offsets = self._hisa_arange(block_size, k_cache.device).view(
+            1, 1, block_size)
+        block_starts = self._hisa_arange(max_blocks, k_cache.device).view(
+            1, max_blocks, 1) * block_size
+        token_indices = block_starts + token_offsets
+        token_valid = token_indices < kv_lens.view(-1, 1, 1)
+        logical_pages = torch.div(token_indices,
+                                  page_size,
+                                  rounding_mode="floor")
+        logical_pages = logical_pages.clamp_max(block_table.shape[1] - 1)
+        logical_pages = logical_pages.expand(num_batches, -1, -1)
+        physical_pages = block_table.gather(
+            1, logical_pages.reshape(num_batches, -1)).reshape(
+                num_batches, max_blocks, block_size)
+        physical_pages = physical_pages.clamp_min(0)
+        page_offsets = token_indices % page_size
+        page_offsets = page_offsets.expand(num_batches, -1, -1)
+        tokens = k_cache[physical_pages, page_offsets, 0]
+        token_values = tokens[..., :self.head_dim // 2]
+        token_scales = tokens[..., self.head_dim // 2:].contiguous().view(
+            torch.int32).view(
+            num_batches, max_blocks, block_size)
+        denom = token_valid.sum(dim=2).clamp_min(1).to(torch.float32)
+        reps = []
+        for group in range(4):
+            lo = group * 16
+            hi = lo + 16
+            decoded = self._dequantize_indexer_nvfp4(
+                token_values[..., lo:hi], token_scales)
+            decoded = decoded.masked_fill(~token_valid.unsqueeze(-1), 0.0)
+            reps.append(decoded.sum(dim=2) / denom.unsqueeze(-1))
+        return torch.cat(reps, dim=-1)
+
+    def _hisa_topk_from_nvfp4_cache(
+            self, q_values: torch.Tensor, q_scales: torch.Tensor,
+            k_cache: torch.Tensor, block_table: torch.Tensor,
+            kv_lens: torch.Tensor, weights: torch.Tensor,
+            next_n: int) -> Optional[torch.Tensor]:
+        if not q_values.is_cuda or torch.cuda.is_current_stream_capturing():
+            return None
+        max_kv_len = int(kv_lens.max().item())
+        if not self._should_use_hisa_pre_indexer(max_kv_len):
+            return None
+        if q_values.dim() != 4 or q_values.shape[-1] != self.head_dim // 2:
+            return None
+
+        num_batches = q_values.shape[0]
+        num_rows = q_values.shape[0] * q_values.shape[1]
+        max_blocks = math.ceil(max_kv_len / self.hisa_block_size)
+        block_topk = self._hisa_block_topk(max_blocks)
+        candidate_len = block_topk * self.hisa_block_size
+        topk = min(self.index_topk, candidate_len)
+
+        q_flat = q_values.reshape(num_rows, self.n_heads, self.head_dim // 2)
+        q_scale_flat = q_scales.reshape(num_rows, self.n_heads)
+        weights_flat = weights.reshape(num_rows, self.n_heads)
+        row_to_batch = torch.div(self._hisa_arange(num_rows, q_values.device),
+                                 next_n,
+                                 rounding_mode="floor")
+        row_offset = self._hisa_arange(num_rows, q_values.device) % next_n
+        prefix_lens = (kv_lens[row_to_batch] - next_n + row_offset + 1).to(
+            torch.int32)
+        if int(prefix_lens.min().item()) < self.index_topk:
+            return None
+
+        reps = self._hisa_mean_pool_indexer_cache(k_cache, block_table,
+                                                  kv_lens.to(torch.int64),
+                                                  max_blocks)
+        q_dequant = self._dequantize_indexer_nvfp4(q_flat, q_scale_flat)
+        block_scores = torch.zeros((num_rows, max_blocks),
+                                   dtype=torch.float32,
+                                   device=q_values.device)
+        reps_rows = reps.index_select(0, row_to_batch.long())
+        for group in range(4):
+            q_group = q_dequant[..., group * 32:(group + 1) * 32]
+            rep_group = reps_rows[..., group * 32:(group + 1) * 32]
+            dots = torch.matmul(q_group, rep_group.transpose(1, 2))
+            block_scores += (dots.clamp_min_(0.0) *
+                             weights_flat.unsqueeze(-1)).sum(dim=1)
+        block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
+                                 self.hisa_block_size,
+                                 rounding_mode="floor")
+        block_ids = self._hisa_arange(max_blocks, q_values.device).view(1, -1)
+        block_scores = block_scores.masked_fill(
+            block_ids >= block_counts.view(-1, 1), float("-inf"))
+        top_blocks = block_scores.topk(block_topk, dim=-1,
+                                       sorted=False).indices
+
+        offsets = self._hisa_arange(self.hisa_block_size, q_values.device)
+        candidate_indices = (top_blocks.unsqueeze(-1) *
+                             self.hisa_block_size + offsets).reshape(
+                                 num_rows, candidate_len)
+        candidate_valid = candidate_indices < prefix_lens.view(-1, 1)
+        candidate_pages = torch.div(candidate_indices,
+                                    k_cache.shape[1],
+                                    rounding_mode="floor")
+        candidate_offsets = candidate_indices % k_cache.shape[1]
+        physical_pages = block_table[row_to_batch.long()].gather(
+            1, candidate_pages.clamp_min(0))
+        candidate_cache = k_cache[physical_pages.clamp_min(0),
+                                  candidate_offsets, 0]
+        cand_values = candidate_cache[..., :self.head_dim // 2]
+        cand_scales = candidate_cache[..., self.head_dim // 2:].contiguous(
+        ).view(torch.int32).view(
+            num_rows, candidate_len)
+        candidate_scores = torch.zeros((num_rows, candidate_len),
+                                       dtype=torch.float32,
+                                       device=q_values.device)
+        for group in range(4):
+            lo = group * 16
+            hi = lo + 16
+            k_dequant = self._dequantize_indexer_nvfp4(cand_values[..., lo:hi],
+                                                       cand_scales)
+            q_group = q_dequant[..., group * 32:(group + 1) * 32]
+            dots = torch.matmul(q_group, k_dequant.transpose(1, 2))
+            candidate_scores += (dots.clamp_min_(0.0) *
+                                 weights_flat.unsqueeze(-1)).sum(dim=1)
+        candidate_scores = candidate_scores.masked_fill(~candidate_valid,
+                                                        float("-inf"))
+
+        selected = torch.empty((num_rows, topk),
+                               dtype=torch.int32,
+                               device=q_values.device)
+        selected_lengths = self._hisa_full_int32(num_rows, candidate_len,
+                                                 q_values.device)
+        torch.ops.trtllm.indexer_topk_decode(candidate_scores, selected_lengths,
+                                             selected, 1, topk)
+        topk_indices = candidate_indices.gather(1, selected.long())
+        topk_indices = topk_indices.masked_fill(
+            topk_indices >= prefix_lens.view(-1, 1), -1)
+        if topk < self.index_topk:
+            padding = torch.full((num_rows, self.index_topk - topk),
+                                 -1,
+                                 dtype=torch.int64,
+                                 device=q_values.device)
+            topk_indices = torch.cat((topk_indices, padding), dim=1)
+        return topk_indices.to(torch.int32)
 
     def _hisa_topk_from_logits(
             self, logits: torch.Tensor, row_starts: torch.Tensor,
@@ -2319,7 +2502,21 @@ class Indexer(nn.Module):
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
 
-            if self.use_cute_dsl_paged_mqa_logits:
+            pre_hisa_topk = None
+            if (use_custom_topk and self.use_fp4 and q_decode.shape[0]
+                    == num_generations and q_decode.shape[1] == next_n):
+                pre_hisa_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
+                                           num_gen_tokens, ...]
+                pre_hisa_q_scale = pre_hisa_q_scale.view(
+                    q_decode.shape[0], q_decode.shape[1], self.n_heads)
+                pre_hisa_topk = self._hisa_topk_from_nvfp4_cache(
+                    q_decode.view(torch.uint8), pre_hisa_q_scale, k_cache,
+                    block_table,
+                    metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
+                                                   num_generations],
+                    weights_decode, next_n)
+
+            if pre_hisa_topk is None and self.use_cute_dsl_paged_mqa_logits:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
                 # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
@@ -2396,7 +2593,7 @@ class Indexer(nn.Module):
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q, k_cache, weights_decode, fp8_ctx_lens,
                         fp8_block_table, fp8_schedule_meta, max_seq_len)
-            else:
+            elif pre_hisa_topk is None:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
                                          ...] if self.use_fp4 else None
@@ -2435,8 +2632,8 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                hisa_topk = None
-                if logits_decode.shape[0] == num_gen_tokens:
+                hisa_topk = pre_hisa_topk
+                if hisa_topk is None and logits_decode.shape[0] == num_gen_tokens:
                     row_indices = torch.arange(
                         num_gen_tokens, device=logits_decode.device) // next_n
                     next_n_offset = torch.arange(

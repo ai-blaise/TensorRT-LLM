@@ -166,6 +166,23 @@ columns, 0.1293 ms to 0.1255 ms for 32 rows and 131072 columns, 0.1331 ms to
 0.1589 ms to 0.1567 ms for 128 rows by 65536, and 0.1186 ms to 0.1144 ms for
 ragged 64 by 65536.
 
+The decode path also includes an explicit structural HISA reference mode,
+`hisa.execution_mode: "preindexer_reference"`, that performs the SGLang-style
+pre-Indexer flow against TensorRT-LLM's interleaved NVFP4 indexer cache:
+NVFP4-dequantized mean block representatives, compression-ratio 4:1 block
+selection, candidate-token scoring only inside selected blocks, and the existing
+TRT Indexer TopK for final token selection. This mode is not the production
+default. On the B200 runtime pod it passed a CUDA smoke for `[batch, 1024]`
+TopK output and valid bounds, but its tensorized PyTorch implementation measured
+about 3.25 to 3.46 ms on synthetic 64-head decode cells from 8192 to 32768
+tokens. That is far slower than the optimized post-logits fallback above, whose
+selector is in the roughly 0.10 to 0.16 ms range on comparable TopK=1024
+shapes. The reference mode is therefore a correctness bridge and kernelization
+target; production `auto` and `optimized` modes continue to use the faster
+post-logits fallback until the structural mean-pool, block-score, and
+candidate-score stages are replaced by fused CuTe/CZS kernels or equivalent
+TensorRT-LLM tensor-core primitives.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
