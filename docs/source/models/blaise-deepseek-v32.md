@@ -105,6 +105,14 @@ for 32 rows and 132096 columns with a 131072-token valid prefix, 0.3147 ms to
 0.2756 ms for ragged 64 by 65536, and 0.4289 ms to 0.3452 ms for 128 rows by
 65536. CUDA graph capture smoke passed.
 
+The same fallback caches the `arange` tensors used for validity masks and block
+offset expansion. On the same TopK=1024, compression-ratio=4:1 B200 harness,
+minimum times improved from 0.2806 ms to 0.2424 ms for 32 rows and 65536
+columns, 0.3281 ms to 0.2781 ms for 32 rows and 131072 columns, 0.3299 ms to
+0.2818 ms for 32 rows and 132096 columns with a 131072-token valid prefix,
+0.3114 ms to 0.2670 ms for ragged 64 by 65536, and 0.4300 ms to 0.3388 ms for
+128 rows by 65536. CUDA graph capture smoke passed.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:

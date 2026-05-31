@@ -3,7 +3,7 @@ import math
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1407,6 +1407,7 @@ class Indexer(nn.Module):
                                         "hisa_min_seq_len", 65536)
         self.hisa_execution_mode = getattr(sparse_attention_config,
                                            "hisa_execution_mode", "optimized")
+        self._hisa_range_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
         self.skip_topk = self._should_reuse_previous_topk()
 
         self.wq_b = Linear(
@@ -1522,6 +1523,14 @@ class Indexer(nn.Module):
             block_topk = self.hisa_block_topk
         return min(max(block_topk, min_blocks), num_blocks)
 
+    def _hisa_arange(self, length: int, device: torch.device) -> torch.Tensor:
+        key = (device, length)
+        value = self._hisa_range_cache.get(key)
+        if value is None:
+            value = torch.arange(length, device=device)
+            self._hisa_range_cache[key] = value
+        return value
+
     def _should_use_hisa_logits(self, max_kv_len: int) -> bool:
         if not self.enable_nvfp4_hisa:
             return False
@@ -1562,7 +1571,7 @@ class Indexer(nn.Module):
         if full_rows:
             scores = logits.float()
         else:
-            cols = torch.arange(num_cols, device=logits.device)
+            cols = self._hisa_arange(num_cols, logits.device)
             valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
                 cols.unsqueeze(0) < row_ends.unsqueeze(1))
             scores = logits.float().masked_fill(~valid, float("-inf"))
@@ -1576,7 +1585,7 @@ class Indexer(nn.Module):
         block_scores = block_scores.amax(dim=-1)
 
         block_ids = block_scores.topk(block_topk, dim=-1)[1]
-        offsets = torch.arange(block_size, device=logits.device)
+        offsets = self._hisa_arange(block_size, logits.device)
         selected_indices = (block_ids.unsqueeze(-1) * block_size +
                             offsets).reshape(num_rows, -1)
         selected_scores = padded_scores.gather(1, selected_indices)
