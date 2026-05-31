@@ -1545,7 +1545,7 @@ class Indexer(nn.Module):
             self._hisa_full_cache[key] = value
         return value
 
-    def _should_use_hisa_logits(self, max_kv_len: int) -> bool:
+    def _should_use_hisa(self, max_kv_len: int) -> bool:
         if not self.enable_nvfp4_hisa:
             return False
         if self.indexer_mode != "indexcache-hisa":
@@ -1559,14 +1559,15 @@ class Indexer(nn.Module):
             return False
         return max_kv_len >= self.hisa_min_seq_len
 
+    def _should_use_hisa_logits(self, max_kv_len: int) -> bool:
+        return False
+
     def _should_use_hisa_pre_indexer(self, max_kv_len: int) -> bool:
-        if self.hisa_execution_mode != "preindexer_reference":
-            return False
         if not self.use_fp4:
             return False
         if self.hisa_block_size != 128:
             return False
-        return self._should_use_hisa_logits(max_kv_len)
+        return self._should_use_hisa(max_kv_len)
 
     def _hisa_e2m1_values(self, device: torch.device) -> torch.Tensor:
         values = self._hisa_e2m1_cache.get(device)
@@ -1625,21 +1626,15 @@ class Indexer(nn.Module):
             torch.int32).view(
             num_batches, max_blocks, block_size)
         denom = token_valid.sum(dim=2).clamp_min(1).to(torch.float32)
-        reps = []
-        for group in range(4):
-            lo = group * 16
-            hi = lo + 16
-            decoded = self._dequantize_indexer_nvfp4(
-                token_values[..., lo:hi], token_scales)
-            decoded = decoded.masked_fill(~token_valid.unsqueeze(-1), 0.0)
-            reps.append(decoded.sum(dim=2) / denom.unsqueeze(-1))
-        return torch.cat(reps, dim=-1)
+        decoded = self._dequantize_indexer_nvfp4(token_values, token_scales)
+        decoded = decoded.masked_fill(~token_valid.unsqueeze(-1), 0.0)
+        return decoded.sum(dim=2) / denom.unsqueeze(-1)
 
     def _hisa_topk_from_nvfp4_cache(
             self, q_values: torch.Tensor, q_scales: torch.Tensor,
             k_cache: torch.Tensor, block_table: torch.Tensor,
-            kv_lens: torch.Tensor, weights: torch.Tensor,
-            next_n: int) -> Optional[torch.Tensor]:
+            kv_lens: torch.Tensor, weights: torch.Tensor, next_n: int,
+            num_sms: int) -> Optional[torch.Tensor]:
         if not q_values.is_cuda or torch.cuda.is_current_stream_capturing():
             return None
         max_kv_len = int(kv_lens.max().item())
@@ -1675,12 +1670,10 @@ class Indexer(nn.Module):
                                    dtype=torch.float32,
                                    device=q_values.device)
         reps_rows = reps.index_select(0, row_to_batch.long())
-        for group in range(4):
-            q_group = q_dequant[..., group * 32:(group + 1) * 32]
-            rep_group = reps_rows[..., group * 32:(group + 1) * 32]
-            dots = torch.matmul(q_group, rep_group.transpose(1, 2))
-            block_scores += (dots.clamp_min_(0.0) *
-                             weights_flat.unsqueeze(-1)).sum(dim=1)
+        with _tf32_matmul_enabled():
+            dots = torch.bmm(q_dequant, reps_rows.transpose(1, 2))
+        block_scores += (dots.clamp_min_(0.0) *
+                         weights_flat.unsqueeze(-1)).sum(dim=1)
         block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
                                  self.hisa_block_size,
                                  rounding_mode="floor")
@@ -1695,30 +1688,58 @@ class Indexer(nn.Module):
                              self.hisa_block_size + offsets).reshape(
                                  num_rows, candidate_len)
         candidate_valid = candidate_indices < prefix_lens.view(-1, 1)
-        candidate_pages = torch.div(candidate_indices,
-                                    k_cache.shape[1],
-                                    rounding_mode="floor")
-        candidate_offsets = candidate_indices % k_cache.shape[1]
-        physical_pages = block_table[row_to_batch.long()].gather(
-            1, candidate_pages.clamp_min(0))
-        candidate_cache = k_cache[physical_pages.clamp_min(0),
-                                  candidate_offsets, 0]
-        cand_values = candidate_cache[..., :self.head_dim // 2]
-        cand_scales = candidate_cache[..., self.head_dim // 2:].contiguous(
-        ).view(torch.int32).view(
-            num_rows, candidate_len)
-        candidate_scores = torch.zeros((num_rows, candidate_len),
-                                       dtype=torch.float32,
-                                       device=q_values.device)
-        for group in range(4):
-            lo = group * 16
-            hi = lo + 16
-            k_dequant = self._dequantize_indexer_nvfp4(cand_values[..., lo:hi],
-                                                       cand_scales)
-            q_group = q_dequant[..., group * 32:(group + 1) * 32]
-            dots = torch.matmul(q_group, k_dequant.transpose(1, 2))
-            candidate_scores += (dots.clamp_min_(0.0) *
-                                 weights_flat.unsqueeze(-1)).sum(dim=1)
+        if self.hisa_execution_mode in ("auto", "optimized"):
+            pages_per_hisa_block = self.hisa_block_size // k_cache.shape[1]
+            page_offsets = self._hisa_arange(pages_per_hisa_block,
+                                             q_values.device)
+            candidate_pages = (top_blocks.unsqueeze(-1) *
+                               pages_per_hisa_block + page_offsets).reshape(
+                                   num_rows, -1)
+            candidate_page_table = block_table[row_to_batch.long()].gather(
+                1, candidate_pages.clamp_min(0))
+            candidate_context_lens = torch.full((num_rows, 1),
+                                                candidate_len,
+                                                dtype=torch.int32,
+                                                device=q_values.device)
+            candidate_schedule = get_paged_mqa_logits_metadata(
+                candidate_context_lens, _DG_SCHEDULE_BLOCK_KV, num_sms)
+            candidate_scores = fp8_fp4_paged_mqa_logits(
+                (q_flat.reshape(num_rows, 1, self.n_heads,
+                                self.head_dim // 2).view(torch.int8),
+                 q_scale_flat.reshape(num_rows, 1, self.n_heads)),
+                k_cache,
+                weights_flat,
+                candidate_context_lens,
+                candidate_page_table,
+                candidate_schedule,
+                candidate_len,
+            )
+        else:
+            candidate_pages = torch.div(candidate_indices,
+                                        k_cache.shape[1],
+                                        rounding_mode="floor")
+            candidate_offsets = candidate_indices % k_cache.shape[1]
+            physical_pages = block_table[row_to_batch.long()].gather(
+                1, candidate_pages.clamp_min(0))
+            candidate_cache = k_cache[physical_pages.clamp_min(0),
+                                      candidate_offsets, 0]
+            cand_values = candidate_cache[..., :self.head_dim // 2]
+            cand_scales = candidate_cache[...,
+                                          self.head_dim // 2:].contiguous(
+                                          ).view(torch.int32).view(
+                                              num_rows, candidate_len)
+            candidate_scores = torch.zeros((num_rows, candidate_len),
+                                           dtype=torch.float32,
+                                           device=q_values.device)
+            for group in range(4):
+                lo = group * 16
+                hi = lo + 16
+                k_dequant = self._dequantize_indexer_nvfp4(
+                    cand_values[..., lo:hi], cand_scales)
+                q_group = q_dequant[..., group * 32:(group + 1) * 32]
+                dots = torch.matmul(q_group, k_dequant.transpose(1, 2))
+                candidate_scores += (dots.clamp_min_(0.0) *
+                                     weights_flat.unsqueeze(-1)).sum(dim=1)
         candidate_scores = candidate_scores.masked_fill(~candidate_valid,
                                                         float("-inf"))
 
@@ -2514,7 +2535,7 @@ class Indexer(nn.Module):
                     block_table,
                     metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
                                                    num_generations],
-                    weights_decode, next_n)
+                    weights_decode, next_n, metadata.num_sms)
 
             if pre_hisa_topk is None and self.use_cute_dsl_paged_mqa_logits:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),

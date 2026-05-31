@@ -23,7 +23,7 @@ recognized:
 | `hisa.block_size` | Sets `hisa_block_size`. |
 | `hisa.block_topk` | Sets the fixed candidate block count when `hisa.compression_ratio` is disabled. |
 | `hisa.compression_ratio` | Sets the dynamic Figure 2(b)-style HISA candidate count: `ceil(num_blocks / compression_ratio)`, lower-bounded by the number of blocks needed to contain `index_topk` tokens. |
-| `hisa.execution_mode` | Sets `hisa_execution_mode`. |
+| `hisa.execution_mode` | Sets `hisa_execution_mode`; `auto` and `optimized` route to pre-Indexer HISA. |
 | `indexcache.freq` / `indexcache.pattern` | Sets the OP-compatible IndexCache TopK reuse policy fields. |
 | `indexer_quantization.layersplit.enabled: true` | Enables the LayerSplit DSA KV/indexer config surface. |
 | `indexer_quantization.layersplit.layout: "interleaved"` | Maps to the `round_robin` LayerSplit owner assignment. |
@@ -57,13 +57,12 @@ frequency policy. The model loader validates explicit patterns against
 their layer mapping before enabling IndexCache reuse.
 
 The `indexcache-hisa` mode preserves the Blaise NVFP4 HISA contract and
-validates that it uses the NVFP4 indexer K cache. HISA is architecturally a
+validates that it uses the NVFP4 indexer K cache. HISA is implemented as a
 pre-Indexer block-pruning stage: score pooled block representatives, keep the
-candidate block set, and then run the original token indexer only over tokens in
-those blocks. The current TensorRT-LLM implementation still keeps a post-logits
-fallback path for validation and incremental deployment, but production
-optimization should move the HISA stage ahead of paged MQA logits so the core
-Indexer does not scan the full prefix.
+candidate block set, and then run the token indexer only over tokens in those
+blocks. The older post-logits HISA fallback is no longer a HISA execution mode;
+if the pre-Indexer path is not eligible, runtime falls back to the ordinary
+Indexer TopK rather than running a second HISA variant after full-prefix logits.
 
 The first B200 HISA selector profiling pass used
 `/tmp/optrt_dsa_ikp_bench.py` inside the Dynamo TensorRT-LLM runtime pod on
@@ -166,22 +165,26 @@ columns, 0.1293 ms to 0.1255 ms for 32 rows and 131072 columns, 0.1331 ms to
 0.1589 ms to 0.1567 ms for 128 rows by 65536, and 0.1186 ms to 0.1144 ms for
 ragged 64 by 65536.
 
-The decode path also includes an explicit structural HISA reference mode,
-`hisa.execution_mode: "preindexer_reference"`, that performs the SGLang-style
-pre-Indexer flow against TensorRT-LLM's interleaved NVFP4 indexer cache:
-NVFP4-dequantized mean block representatives, compression-ratio 4:1 block
-selection, candidate-token scoring only inside selected blocks, and the existing
-TRT Indexer TopK for final token selection. This mode is not the production
-default. On the B200 runtime pod it passed a CUDA smoke for `[batch, 1024]`
-TopK output and valid bounds, but its tensorized PyTorch implementation measured
-about 3.25 to 3.46 ms on synthetic 64-head decode cells from 8192 to 32768
-tokens. That is far slower than the optimized post-logits fallback above, whose
-selector is in the roughly 0.10 to 0.16 ms range on comparable TopK=1024
-shapes. The reference mode is therefore a correctness bridge and kernelization
-target; production `auto` and `optimized` modes continue to use the faster
-post-logits fallback until the structural mean-pool, block-score, and
-candidate-score stages are replaced by fused CuTe/CZS kernels or equivalent
-TensorRT-LLM tensor-core primitives.
+The decode path also includes `hisa.execution_mode: "reference"` for the
+SGLang-style pre-Indexer flow against TensorRT-LLM's interleaved NVFP4 indexer
+cache: NVFP4-dequantized mean block representatives, compression-ratio 4:1
+block selection, candidate-token scoring only inside selected blocks, and the
+existing TRT Indexer TopK for final token selection. `auto` and `optimized`
+use the same pre-Indexer flow but route selected-candidate scoring through
+TensorRT-LLM's FP4 paged MQA logits primitive instead of the Python dequantize
+and `torch.matmul` reference loop. Block scoring is a single TF32-enabled
+batched matmul over the full 128-dim indexer head rather than four 32-dim
+matmuls. Mean-pool dequantizes each 128-dim token vector in one pass.
+
+On the B200 runtime pod, synthetic 64-head decode cells showed the optimized
+pre-Indexer path beating the reference path across the checked shapes:
+1.3158 ms vs 2.3873 ms for batch 1 by 8192 tokens, 1.3009 ms vs 2.4715 ms for
+batch 4 by 8192 tokens, 1.2418 ms vs 2.4067 ms for batch 1 by 32768 tokens,
+and 1.3652 ms vs 2.4126 ms for batch 4 by 32768 tokens. This is a functional
+deployment path for HF configs that request `hisa.execution_mode: "optimized"`.
+The next optimization target remains the mean-pool/block-score boundary: move
+mean-pool into a persistent fused CUDA/CuTe op and quantize pooled block reps
+so block scoring can also use the FP4 MQA primitive directly.
 
 ## LayerSplit
 
