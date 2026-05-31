@@ -126,6 +126,10 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
         )
+    if spec_config.spec_dec_mode.is_smc():
+        raise NotImplementedError(
+            "SMC-SD config parsing is available, but the PyTorch runtime "
+            "worker/resource integration is not implemented yet.")
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -254,6 +258,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_sa():
         return SuffixAutomatonManager(spec_config, max_num_requests,
                                       max_seq_len)
+    if spec_dec_mode.is_smc():
+        raise NotImplementedError(
+            "SMC-SD resource management has not been wired into the PyTorch "
+            "executor yet.")
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
@@ -278,6 +286,9 @@ def get_spec_decoder(
         return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSampler(sampler_args)
+    if spec_config.spec_dec_mode.is_smc():
+        raise NotImplementedError(
+            "SMC-SD sampling is not implemented in TensorRT-LLM yet.")
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -309,6 +320,10 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
+    if spec_config.spec_dec_mode.is_smc():
+        raise NotImplementedError(
+            "SMC-SD drafting requires its dedicated particle worker; the "
+            "generic model drafter is not sufficient.")
 
     return None
 
@@ -347,6 +362,9 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelWorker(spec_config, mapping,
                                          use_separate_draft_kv_cache)
+    if spec_dec_mode.is_smc():
+        raise NotImplementedError(
+            "SMC-SD worker integration is not implemented yet.")
     return None
 
 

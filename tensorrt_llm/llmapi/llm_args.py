@@ -384,6 +384,25 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         description="Minimum sequence length before HISA selection is used.")
     hisa_execution_mode: Literal["auto", "optimized", "reference"] = Field(
         default="optimized", description="HISA selector implementation mode.")
+    layersplit_enabled: bool = Field(
+        default=False,
+        description=
+        "Enable Blaise LayerSplit owner-local DSA KV/indexer storage for "
+        "context-parallel prefill. Runtime code must compose this with the "
+        "active TP/EP/attention-DP/CP and cache-transceiver mapping.")
+    layersplit_owner_assignment: Literal["round_robin", "contiguous"] = Field(
+        default="round_robin",
+        description=
+        "How DSA layers are assigned to CP owners when LayerSplit is enabled.")
+    layersplit_transfer_backend: Literal["auto", "ucx", "nixl"] = Field(
+        default="auto",
+        description=
+        "Cache-transfer backend expected to carry LayerSplit owner-local "
+        "KV/indexer data across disaggregated context/generation workers.")
+    layersplit_all_cp_ranks_transfer: bool = Field(
+        default=True,
+        description=
+        "Require every CP rank to participate in LayerSplit cache transfer.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -439,10 +458,18 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                 raise ValueError("hisa_compression_ratio must be non-negative.")
             if self.hisa_min_seq_len <= 0:
                 raise ValueError("hisa_min_seq_len must be positive.")
+        if self.layersplit_enabled:
+            if not self.layersplit_all_cp_ranks_transfer:
+                raise ValueError(
+                    "layersplit_all_cp_ranks_transfer must remain true until "
+                    "partial-rank LayerSplit transfer is implemented.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def uses_layersplit(self) -> bool:
+        return self.layersplit_enabled
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """Whether to capture separate CUDA graphs for short and long sequences.
@@ -630,6 +657,30 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+class WarpDecodeConfig(StrictBaseModel):
+    """Blaise WarpDecode MoE fast-path policy."""
+    enabled: bool = Field(
+        default=False,
+        description=
+        "Enable the WarpDecode small-batch decode MoE fast path when runtime "
+        "shape, quantization, and parallelism guards prove it can preserve the "
+        "native DeepSeek-V3.2 B200 path semantics.")
+    max_batch_size: PositiveInt = Field(
+        default=64,
+        description="Largest decode batch size eligible for WarpDecode.")
+    policy: Literal["auto", "force", "fallback_only"] = Field(
+        default="auto",
+        description=
+        "auto uses WarpDecode only when every runtime guard passes; force turns "
+        "guard failures into errors; fallback_only records policy without "
+        "selecting the fast path.")
+    allow_parallelism_fallback: bool = Field(
+        default=True,
+        description=
+        "Allow fallback to the native MoE backend under unsupported TP, EP, "
+        "attention-DP, CP, or disaggregated-generation layouts.")
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
@@ -662,6 +713,22 @@ class MoeConfig(StrictBaseModel):
         description=
         "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
     )
+    warp_decode: Optional[WarpDecodeConfig] = Field(
+        default=None,
+        description=
+        "Optional Blaise WarpDecode overlay. This does not replace the selected "
+        "MoE backend; it constrains when a decode-only WarpDecode path may be "
+        "chosen and otherwise falls back to the configured backend.")
+
+    @model_validator(mode="after")
+    def validate_warp_decode_config(self):
+        if self.warp_decode is None or not self.warp_decode.enabled:
+            return self
+        if self.warp_decode.policy == "force" and self.warp_decode.allow_parallelism_fallback:
+            raise ValueError(
+                "warp_decode.policy='force' is incompatible with "
+                "allow_parallelism_fallback=True.")
+        return self
 
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
@@ -1855,6 +1922,57 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.DFLASH
 
 
+class SMCDecodingConfig(DecodingBaseConfig):
+    """Configuration for Blaise SMC-SD speculative decoding."""
+    decoding_type: Literal["SMC"] = "SMC"
+    gamma: PositiveInt = Field(
+        default=6,
+        description="Number of SMC-SD draft transitions per target verify step.")
+    n_particles: PositiveInt = Field(
+        default=4, description="Number of SMC particles per request.")
+    resample_threshold: NonNegativeFloat = Field(
+        default=0.5,
+        description="ESS ratio threshold below which particles are resampled.")
+    target_temperature: NonNegativeFloat = Field(
+        default=1.0, description="Target-model temperature used in SMC weights.")
+    draft_temperature: NonNegativeFloat = Field(
+        default=1.0, description="Draft-model temperature used for proposals.")
+    draft_attention_backend: Literal["auto", "triton", "fa3",
+                                     "trtllm_mha"] = Field(
+                                         default="triton",
+                                         description=
+                                         "Draft attention backend preference.")
+    draft_kv_cache_dtype: Literal["auto", "bfloat16", "fp8_e4m3",
+                                  "fp8_e5m2"] = Field(
+                                      default="auto",
+                                      description="Draft KV cache dtype.")
+
+    @model_validator(mode="after")
+    def validate_smc_config(self):
+        if self.speculative_model is None:
+            raise ValueError("speculative_model must be specified for SMC")
+        if not 0 < self.resample_threshold <= 1.0:
+            raise ValueError("resample_threshold must be in (0, 1].")
+        if self.max_draft_len is not None and self.max_draft_len != self.gamma:
+            raise ValueError("max_draft_len must match gamma for SMC.")
+        self.max_draft_len = self.gamma
+        self.max_total_draft_tokens = self.gamma + 1
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        return self.gamma + 1
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.SMC
+
+
 class AutoDecodingConfig(DecodingBaseConfig):
     """Configuration for auto speculative decoding.
 
@@ -2513,6 +2631,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
         DFlashDecodingConfig,
+        SMCDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),

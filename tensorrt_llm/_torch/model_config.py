@@ -60,6 +60,21 @@ def _is_nvfp4_indexer_method(method: Optional[str]) -> bool:
     }
 
 
+def _expand_index_topk_pattern(pattern: Any, num_hidden_layers: int) -> str:
+    pattern = str(pattern).upper()
+    invalid_roles = set(pattern) - {"F", "S"}
+    if not pattern or invalid_roles:
+        raise ValueError(
+            "DSA IndexCache pattern must contain only F/S roles.")
+    if len(pattern) == num_hidden_layers:
+        return pattern
+    repeats = (num_hidden_layers + len(pattern) - 1) // len(pattern)
+    expanded = (pattern * repeats)[:num_hidden_layers]
+    if pattern == "FSSS":
+        expanded = expanded[:-1] + "F"
+    return expanded
+
+
 def _get_blaise_indexer_overrides(
         pretrained_config: transformers.PretrainedConfig) -> Dict[str, Any]:
     quant_config = _get_quantization_config(pretrained_config)
@@ -107,6 +122,23 @@ def _get_blaise_indexer_overrides(
             overrides["hisa_min_seq_len"] = int(hisa["min_seq_len"])
         if "execution_mode" in hisa:
             overrides["hisa_execution_mode"] = str(hisa["execution_mode"])
+
+    layersplit = _as_dict(indexer_quant.get("layersplit"))
+    if layersplit is not None and bool(layersplit.get("enabled", False)):
+        overrides["layersplit_enabled"] = True
+        owner_assignment = layersplit.get("owner_assignment",
+                                          layersplit.get("layout"))
+        if owner_assignment is not None:
+            owner_assignment = str(owner_assignment)
+            if owner_assignment == "interleaved":
+                owner_assignment = "round_robin"
+            overrides["layersplit_owner_assignment"] = owner_assignment
+        if "transfer_backend" in layersplit:
+            overrides["layersplit_transfer_backend"] = str(
+                layersplit["transfer_backend"])
+        if "all_cp_ranks_transfer" in layersplit:
+            overrides["layersplit_all_cp_ranks_transfer"] = bool(
+                layersplit["all_cp_ranks_transfer"])
 
     return overrides
 
@@ -241,6 +273,7 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    warp_decode_config: Optional[Any] = None
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
@@ -711,6 +744,18 @@ class ModelConfig(Generic[TConfig]):
                         hisa_execution_mode = getattr(
                             sparse_attention_config, "hisa_execution_mode",
                             "optimized")
+                        layersplit_enabled = getattr(sparse_attention_config,
+                                                     "layersplit_enabled",
+                                                     False)
+                        layersplit_owner_assignment = getattr(
+                            sparse_attention_config,
+                            "layersplit_owner_assignment", "round_robin")
+                        layersplit_transfer_backend = getattr(
+                            sparse_attention_config,
+                            "layersplit_transfer_backend", "auto")
+                        layersplit_all_cp_ranks_transfer = getattr(
+                            sparse_attention_config,
+                            "layersplit_all_cp_ranks_transfer", True)
                         if indexer_mode == "vanilla" and model_overrides.get(
                                 "indexer_mode") in ("indexcache",
                                                     "indexcache-hisa"):
@@ -736,6 +781,18 @@ class ModelConfig(Generic[TConfig]):
                                 "hisa_min_seq_len", hisa_min_seq_len)
                             hisa_execution_mode = model_overrides.get(
                                 "hisa_execution_mode", hisa_execution_mode)
+                        if (not layersplit_enabled
+                                and model_overrides.get("layersplit_enabled")):
+                            layersplit_enabled = True
+                            layersplit_owner_assignment = model_overrides.get(
+                                "layersplit_owner_assignment",
+                                layersplit_owner_assignment)
+                            layersplit_transfer_backend = model_overrides.get(
+                                "layersplit_transfer_backend",
+                                layersplit_transfer_backend)
+                            layersplit_all_cp_ranks_transfer = model_overrides.get(
+                                "layersplit_all_cp_ranks_transfer",
+                                layersplit_all_cp_ranks_transfer)
                     else:
                         model_overrides = _get_blaise_indexer_overrides(
                             pretrained_config)
@@ -768,6 +825,14 @@ class ModelConfig(Generic[TConfig]):
                             "hisa_min_seq_len", 65536)
                         hisa_execution_mode = model_overrides.get(
                             "hisa_execution_mode", "optimized")
+                        layersplit_enabled = model_overrides.get(
+                            "layersplit_enabled", False)
+                        layersplit_owner_assignment = model_overrides.get(
+                            "layersplit_owner_assignment", "round_robin")
+                        layersplit_transfer_backend = model_overrides.get(
+                            "layersplit_transfer_backend", "auto")
+                        layersplit_all_cp_ranks_transfer = model_overrides.get(
+                            "layersplit_all_cp_ranks_transfer", True)
                     for key, value in {
                             "dsa_indexer_mode": indexer_mode,
                             "nsa_indexer_mode": indexer_mode,
@@ -780,15 +845,21 @@ class ModelConfig(Generic[TConfig]):
                             "hisa_compression_ratio": hisa_compression_ratio,
                             "hisa_min_seq_len": hisa_min_seq_len,
                             "hisa_execution_mode": hisa_execution_mode,
+                            "layersplit_enabled": layersplit_enabled,
+                            "layersplit_owner_assignment":
+                            layersplit_owner_assignment,
+                            "layersplit_transfer_backend":
+                            layersplit_transfer_backend,
+                            "layersplit_all_cp_ranks_transfer":
+                            layersplit_all_cp_ranks_transfer,
                     }.items():
                         if value is not None:
                             setattr(pretrained_config, key, value)
-                    if (index_topk_pattern is not None and len(
-                            index_topk_pattern) !=
-                            pretrained_config.num_hidden_layers):
-                        raise ValueError(
-                            "DSA IndexCache pattern length must match "
-                            "num_hidden_layers.")
+                    if index_topk_pattern is not None:
+                        index_topk_pattern = _expand_index_topk_pattern(
+                            index_topk_pattern,
+                            pretrained_config.num_hidden_layers)
+                        pretrained_config.index_topk_pattern = index_topk_pattern
                     kwargs[
                         'sparse_attention_config'] = _deepseek_sparse_attention_config(
                             indexer_mode=indexer_mode,
@@ -812,7 +883,14 @@ class ModelConfig(Generic[TConfig]):
                             hisa_block_topk=hisa_block_topk,
                             hisa_compression_ratio=hisa_compression_ratio,
                             hisa_min_seq_len=hisa_min_seq_len,
-                            hisa_execution_mode=hisa_execution_mode)
+                            hisa_execution_mode=hisa_execution_mode,
+                            layersplit_enabled=layersplit_enabled,
+                            layersplit_owner_assignment=
+                            layersplit_owner_assignment,
+                            layersplit_transfer_backend=
+                            layersplit_transfer_backend,
+                            layersplit_all_cp_ranks_transfer=
+                            layersplit_all_cp_ranks_transfer)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

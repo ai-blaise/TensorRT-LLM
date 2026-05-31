@@ -216,6 +216,7 @@ class SpeculativeDecodingMode(IntEnum):
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
     DFLASH = auto()
+    SMC = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -246,6 +247,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_dflash(self):
         return self == SpeculativeDecodingMode.DFLASH
+
+    def is_smc(self):
+        return self == SpeculativeDecodingMode.SMC
 
     def is_parallel_draft(self):
         return self.is_pard() or self.is_dflash()
@@ -299,7 +303,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model()
 
     def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
+        return (self.is_eagle3() or self.is_draft_target()
+                or self.is_mtp_eagle() or self.is_smc())
 
     def needs_kv_cache_recompute(self):
         """
@@ -319,11 +324,11 @@ class SpeculativeDecodingMode(IntEnum):
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
         ) or self.is_eagle3_one_model() or self.is_external_drafter(
-        ) or self.is_sa()
+        ) or self.is_sa() or self.is_smc()
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided() or self.is_mtp_eagle()
+        ) or self.is_user_provided() or self.is_mtp_eagle() or self.is_smc()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

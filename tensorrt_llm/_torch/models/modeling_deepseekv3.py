@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -156,6 +157,51 @@ class DeepseekV3WeightLoader:
                      weights: ConsumableWeightsDict,
                      skip_modules: List[str] = []):
 
+        def _invert_global_scale(t: torch.Tensor) -> torch.Tensor:
+            t = t.to(torch.float32)
+            out = torch.where(
+                t > 0,
+                1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
+                torch.zeros_like(t),
+            )
+            return torch.nan_to_num(out, nan=0.0, posinf=0.0,
+                                    neginf=0.0).contiguous()
+
+        def _add_compressed_tensors_nvfp4_aliases() -> None:
+            quant_config = self.model_config.get_quant_config()
+            if (quant_config is None
+                    or not quant_config.layer_quant_mode.has_nvfp4()):
+                return
+
+            aliases = {}
+            for key in weights.keys():
+                if key.endswith(".weight_packed"):
+                    value = weights[key]
+                    if not isinstance(value, torch.Tensor):
+                        value = value[...]
+                    aliases[key[:-len(".weight_packed")] +
+                            ".weight"] = value.view(
+                                fp4_utils.float4_e2m1x2)
+                elif key.endswith(".weight_global_scale"):
+                    value = weights[key]
+                    if not isinstance(value, torch.Tensor):
+                        value = value[...]
+                    aliases[key[:-len(".weight_global_scale")] +
+                            ".weight_scale_2"] = _invert_global_scale(value)
+                elif key.endswith(".input_global_scale"):
+                    value = weights[key]
+                    if not isinstance(value, torch.Tensor):
+                        value = value[...]
+                    aliases[key[:-len(".input_global_scale")] +
+                            ".input_scale"] = _invert_global_scale(value)
+
+            if aliases:
+                weights.update(
+                    {k: v
+                     for k, v in aliases.items() if k not in weights})
+
+        _add_compressed_tensors_nvfp4_aliases()
+
         def requantize_weight_with_new_scale(weight, weight_scale, old_scale_2,
                                              new_scale_2, device):
             """
@@ -217,11 +263,17 @@ class DeepseekV3WeightLoader:
         def load_kv_b_proj_and_k_b_proj_trans(module_name: str,
                                               is_scale: bool) -> torch.Tensor:
             weight_name = "weight" if not is_scale else "weight_scale_inv"
-            local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
-            local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
-            local_kv_lora_rank = kv_lora_rank if not is_scale else kv_lora_rank // 128
+            if is_scale and f"{module_name}.{weight_name}" not in weights:
+                weight_name = "weight_scale"
+            source = weights[f"{module_name}.{weight_name}"][:]
+            if is_scale and weight_name == "weight_scale_inv":
+                local_qk_nope_head_dim = qk_nope_head_dim // 128
+                local_v_head_dim = v_head_dim // 128
+            else:
+                local_qk_nope_head_dim = qk_nope_head_dim
+                local_v_head_dim = v_head_dim
 
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
+            kv_b_proj = source.unflatten(
                 0,
                 [
                     num_heads,
@@ -239,6 +291,7 @@ class DeepseekV3WeightLoader:
             local_num_heads = num_heads // weight_divisor
 
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            local_kv_lora_rank = k_nope_weight.shape[-1]
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -257,12 +310,25 @@ class DeepseekV3WeightLoader:
             local_v_head_dim = v_head_dim
             local_kv_lora_rank = kv_lora_rank
 
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
+            kv_b_proj = weights[f"{module_name}.{weight_name}"][:]
 
-            weight_name = "weight_scale_inv"
-            kv_b_proj_scale = weights[f"{module_name}.{weight_name}"][:].cuda()
-
-            kv_b_proj = weight_dequant(kv_b_proj, kv_b_proj_scale)
+            scale_inv_name = f"{module_name}.weight_scale_inv"
+            if scale_inv_name in weights:
+                kv_b_proj_scale = weights[scale_inv_name][:].cuda()
+                kv_b_proj = weight_dequant(kv_b_proj.cuda(), kv_b_proj_scale)
+            else:
+                kv_b_proj_scale = weights[f"{module_name}.weight_scale"][:]
+                kv_b_proj_scale_2 = weights[f"{module_name}.weight_scale_2"]
+                dequant_shape = (kv_b_proj.shape[0], kv_b_proj.shape[1] * 2)
+                kv_b_proj = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+                    kv_b_proj.contiguous(),
+                    kv_b_proj_scale.flatten().view(
+                        fp4_utils.float4_sf_dtype).contiguous(),
+                    kv_b_proj_scale_2,
+                    16,
+                    1,
+                    True).to(device=torch.cuda.current_device(),
+                             dtype=torch.bfloat16).reshape(dequant_shape)
             kv_b_proj = kv_b_proj.unflatten(
                 0,
                 [
@@ -379,36 +445,52 @@ class DeepseekV3WeightLoader:
                     if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
                             name)
+                        kv_b_proj_for_views = kv_b_proj
+                        k_b_proj_trans_for_views = k_b_proj_trans
                     else:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
                             name, is_scale=False)
+                        kv_b_proj_for_views = kv_b_proj
+                        k_b_proj_trans_for_views = k_b_proj_trans
+
                     module.weight.data.copy_(
                         kv_b_proj.reshape(module.weight.shape))
 
                     attn_module = all_named_modules[parent_module_name]
-                    _, v_b_proj = split_kv_b_proj(module.weight.data,
+                    if k_b_proj_trans_for_views.numel() != attn_module.k_b_proj_trans.numel():
+                        kv_b_proj_for_views, k_b_proj_trans_for_views = load_kv_b_proj_and_k_b_proj_trans_dequant(
+                            name)
+                    _, v_b_proj = split_kv_b_proj(kv_b_proj_for_views,
                                                   is_scale=False)
                     attn_module.v_b_proj = nn.Parameter(v_b_proj,
                                                         requires_grad=False)
 
                     attn_module.k_b_proj_trans.data.copy_(
-                        k_b_proj_trans.reshape(
+                        k_b_proj_trans_for_views.reshape(
                             attn_module.k_b_proj_trans.shape))
 
                     if getattr(module, "weight_scale",
                                None) is not None and not dequant_kv_b_proj:
-                        kv_b_proj_scale, k_b_proj_trans_scale = load_kv_b_proj_and_k_b_proj_trans(
-                            name, is_scale=True)
+                        if f"{name}.weight_scale_inv" in weights:
+                            kv_b_proj_scale, k_b_proj_trans_scale = load_kv_b_proj_and_k_b_proj_trans(
+                                name, is_scale=True)
+                        else:
+                            kv_b_proj_scale = weights[f"{name}.weight_scale"][:]
+                            k_b_proj_trans_scale = None
                         module.weight_scale.copy_(
                             kv_b_proj_scale.reshape(module.weight_scale.shape))
-                        attn_module.k_b_proj_trans_scale.copy_(
-                            k_b_proj_trans_scale.reshape(
-                                attn_module.k_b_proj_trans_scale.shape))
+                        if (attn_module.k_b_proj_trans_scale is not None
+                                and k_b_proj_trans_scale is not None):
+                            attn_module.k_b_proj_trans_scale.copy_(
+                                k_b_proj_trans_scale.reshape(
+                                    attn_module.k_b_proj_trans_scale.shape))
 
-                        _, v_b_proj_scale = split_kv_b_proj(
-                            module.weight_scale.data, is_scale=True)
-                        attn_module.v_b_proj_scale = nn.Parameter(
-                            v_b_proj_scale, requires_grad=False)
+                        if (attn_module.v_b_proj_scale is not None
+                                and k_b_proj_trans_scale is not None):
+                            _, v_b_proj_scale = split_kv_b_proj(
+                                module.weight_scale.data, is_scale=True)
+                            attn_module.v_b_proj_scale = nn.Parameter(
+                                v_b_proj_scale, requires_grad=False)
 
                         if attn_module.k_b_proj_trans_dequant is not None:
                             attn_module.k_b_proj_trans_dequant.data.copy_(
@@ -568,6 +650,37 @@ class DeepseekV3WeightLoader:
                         module_weights.append(
                             filter_weights('.'.join(names[:-1] + [new_name]),
                                            weights))
+                    if (names[-1] == "gate_up_proj"
+                            and self.model_config.get_quant_config(
+                            ).layer_quant_mode.has_nvfp4()
+                            and all(w.get("weight", None) is not None
+                                    and w["weight"].dtype
+                                    == fp4_utils.float4_e2m1x2
+                                    and "weight_scale_2" in w
+                                    and "weight_scale" in w
+                                    for w in module_weights)):
+                        gate_scale_2 = module_weights[0]["weight_scale_2"]
+                        up_scale_2 = module_weights[1]["weight_scale_2"]
+                        if not torch.allclose(gate_scale_2, up_scale_2):
+                            shared_weight_scale_2 = torch.maximum(
+                                gate_scale_2, up_scale_2)
+                            aligned_module_weights = []
+                            for module_weight, old_scale_2 in zip(
+                                    module_weights,
+                                    [gate_scale_2, up_scale_2]):
+                                module_weight = dict(module_weight)
+                                if old_scale_2 < shared_weight_scale_2:
+                                    weight, weight_scale = requantize_weight_with_new_scale(
+                                        module_weight["weight"][:],
+                                        module_weight["weight_scale"][:],
+                                        old_scale_2,
+                                        shared_weight_scale_2,
+                                        device=module.weight.device)
+                                    module_weight["weight"] = weight
+                                    module_weight["weight_scale"] = weight_scale
+                                module_weight["weight_scale_2"] = shared_weight_scale_2
+                                aligned_module_weights.append(module_weight)
+                            module_weights = aligned_module_weights
                     module.load_weights(weights=module_weights)
                     # Mark consumed source weights (e.g., gate_proj, up_proj)
                     if mark_consumed:
@@ -978,6 +1091,15 @@ class Deepseekv3MoE(nn.Module):
         )
 
         self.mapping = model_config.mapping
+        warp_decode_config = getattr(model_config, "warp_decode_config", None)
+        if warp_decode_config is not None and warp_decode_config.enabled:
+            msg = (
+                "WarpDecode config is enabled, but the op-trt DeepSeek-V3.2 "
+                "runtime still falls back to the native MoE backend until the "
+                "WarpDecode fast path is implemented.")
+            if warp_decode_config.policy == "force":
+                raise NotImplementedError(msg)
+            logger.warning_once(msg, key="blaise_warp_decode_not_implemented")
 
         shared_quant_config = self._get_shared_experts_quant_config(
             model_config, layer_idx)

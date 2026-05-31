@@ -1422,7 +1422,7 @@ class Indexer(nn.Module):
             self.head_dim,
             bias=False,
             dtype=torch.float32,
-            quant_config=None,
+            quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
@@ -1431,7 +1431,7 @@ class Indexer(nn.Module):
             self.n_heads,
             bias=False,
             dtype=torch.float32,
-            quant_config=None,
+            quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
 
@@ -1576,8 +1576,14 @@ class Indexer(nn.Module):
         """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
-        self._fused_wk_wp_weight = torch.cat(
-            [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
+        wk_weight = self.wk.weight.data
+        weights_proj_weight = self.weights_proj.weight.data
+        if (wk_weight.shape[-1] == self.hidden_size and
+                weights_proj_weight.shape[-1] == self.hidden_size):
+            self._fused_wk_wp_weight = torch.cat(
+                [wk_weight, weights_proj_weight], dim=0)
+        else:
+            self._fused_wk_wp_weight = None
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -2057,7 +2063,7 @@ class Indexer(nn.Module):
             (hidden_states.shape[0], self.index_topk),
             dtype=torch.int32,
             device=hidden_states.device)
-        if not use_custom_topk:
+        if not use_custom_topk or self.use_fp4:
             topk_indices_buffer[:hidden_states.shape[0]] = -1
 
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
@@ -2112,9 +2118,9 @@ class Indexer(nn.Module):
                     if hisa_topk is not None:
                         topk_indices_buffer[global_q_start:global_q_end, :] = \
                             hisa_topk
-                    elif use_custom_topk:
+                    elif use_custom_topk and not self.use_fp4:
                         torch.ops.trtllm.indexer_topk_prefill(
-                            logits,
+                            logits.contiguous(),
                             chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
                             chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
                             topk_indices_buffer[global_q_start:global_q_end, :])
@@ -2170,9 +2176,9 @@ class Indexer(nn.Module):
                     logits, cu_seqlen_ks, cu_seqlen_ke)
                 if hisa_topk is not None:
                     topk_indices_buffer[:num_ctx_tokens, :] = hisa_topk
-                elif use_custom_topk:
+                elif use_custom_topk and not self.use_fp4:
                     torch.ops.trtllm.indexer_topk_prefill(
-                        logits, cu_seqlen_ks, cu_seqlen_ke,
+                        logits.contiguous(), cu_seqlen_ks, cu_seqlen_ke,
                         topk_indices_buffer[:num_ctx_tokens, :])
                 else:
                     topk_indices = logits.topk(min(self.index_topk,
@@ -2496,18 +2502,20 @@ class Indexer(nn.Module):
         ignores it. It is returned unconditionally so the two-op CUDA graph
         split in MLA.forward_dsa_proj sees a stable signature.
         """
-        assert self._fused_wk_wp_weight is not None, \
-            "post_load_weights() must be called before forward()"
-        hidden_float = _to_float(hidden_states)
-        with _tf32_matmul_enabled():
-            # F.linear computes input @ weight.T internally; no explicit .t() needed.
-            # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
-            # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
-            # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
-            # which uses its own handle and always falls back to CUDA-core SGEMM.
-            fused_out = F.linear(hidden_float, self._fused_wk_wp_weight)
-        indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
-                                             dim=-1)
+        if self._fused_wk_wp_weight is not None:
+            hidden_float = _to_float(hidden_states)
+            with _tf32_matmul_enabled():
+                # F.linear computes input @ weight.T internally; no explicit .t() needed.
+                # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
+                # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
+                # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
+                # which uses its own handle and always falls back to CUDA-core SGEMM.
+                fused_out = F.linear(hidden_float, self._fused_wk_wp_weight)
+            indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
+                                                 dim=-1)
+        else:
+            indexer_k = self.wk(hidden_states)
+            weights = self.weights_proj(hidden_states)
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
         indexer_k = indexer_k.to(hidden_states.dtype)
 
@@ -2711,6 +2719,11 @@ class DSACacheManager(KVCacheManager):
         """Initialize cache manager with indexer K-cache pool per layer."""
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
+        if getattr(sparse_attn_config, "layersplit_enabled", False):
+            raise NotImplementedError(
+                "LayerSplit config parsing is available, but op-trt DSA cache "
+                "ownership and cache-transfer runtime integration are not "
+                "implemented yet.")
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.

@@ -25,6 +25,9 @@ recognized:
 | `hisa.compression_ratio` | Sets `hisa_compression_ratio`. |
 | `hisa.execution_mode` | Sets `hisa_execution_mode`. |
 | `indexcache.freq` / `indexcache.pattern` | Sets the OP-compatible IndexCache TopK reuse policy fields. |
+| `indexer_quantization.layersplit.enabled: true` | Enables the LayerSplit DSA KV/indexer config surface. |
+| `indexer_quantization.layersplit.layout: "interleaved"` | Maps to the `round_robin` LayerSplit owner assignment. |
+| `moe_runner_backend: "warp_decode"` | Enables the WarpDecode MoE overlay unless the operator supplied `moe_config.warp_decode`. |
 
 `hisa.mode` must be `indexcache-hisa`. Standalone HISA is rejected because the
 Blaise production path layers HISA on top of NVFP4 IndexCache.
@@ -59,6 +62,75 @@ TensorRT-LLM's native NVFP4 DSA path with IndexCache reuse and a HISA block
 selector over the existing indexer logits. A future CuTe/CZS HISA selector can
 replace this fallback without changing the model-card contract.
 
+## LayerSplit
+
+LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
+
+```python
+sparse_attention_config = {
+    "algorithm": "dsa",
+    "indexer_mode": "indexcache-hisa",
+    "indexer_k_dtype": "fp4",
+    "layersplit_enabled": True,
+    "layersplit_owner_assignment": "round_robin",
+    "layersplit_transfer_backend": "auto",
+    "layersplit_all_cp_ranks_transfer": True,
+}
+```
+
+The integration deliberately attaches LayerSplit to DSA metadata instead of to a
+standalone cache-copy flag. That keeps the contract tied to the tensors that are
+actually split: dense DSA KV and the indexer K cache. Runtime selection must
+compose with the active TP, EP/MoE EP, attention DP, CP/DWDP, and
+context/generation disaggregation mapping. Until partial-rank transfer is
+implemented, `layersplit_all_cp_ranks_transfer` must remain true.
+
+## WarpDecode
+
+WarpDecode is exposed as an MoE overlay rather than a new MoE backend:
+
+```python
+moe_config = {
+    "backend": "CUTEDSL",
+    "warp_decode": {
+        "enabled": True,
+        "max_batch_size": 64,
+        "policy": "auto",
+        "allow_parallelism_fallback": True,
+    },
+}
+```
+
+`backend` remains TensorRT-LLM's optimized DeepSeek-V3.2 B200 MoE backend.
+`warp_decode` only describes when a decode-only small-batch fast path may be
+used. In `auto` mode, unsupported shapes, quantization modes, CUDA-graph
+captures, TP/EP layouts, attention-DP groups, CP layouts, or disaggregated
+generation mappings must fall back to the native backend. `policy: "force"`
+is reserved for validation runs and turns fallback into an error.
+
+## SMC-SD
+
+SMC-SD is parsed as a PyTorch speculative decoding config:
+
+```python
+speculative_config = {
+    "decoding_type": "SMC",
+    "speculative_model": "BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+    "gamma": 6,
+    "n_particles": 4,
+    "resample_threshold": 0.5,
+    "draft_attention_backend": "triton",
+    "draft_kv_cache_dtype": "fp8_e4m3",
+}
+```
+
+The config validates the Blaise SMC-SD contract and fails explicitly if runtime
+metadata, resource-manager, drafter, sampler, or worker paths are reached before
+their implementation is complete. The runtime implementation must preserve
+separate draft/target KV ownership, CUDA-graph padding semantics, target verify
+with `gamma + 1` tokens including the bonus token, particle resampling, and
+decode-only use under disaggregated prefill/decode.
+
 ## Model semantics
 
 `attention_output_gate: true` adds the Blaise G1 attention gate under each MLA
@@ -80,7 +152,18 @@ fused gated RMSNorm path once parity is established.
 
 ## Current boundaries
 
+Dense MLA KV cache support is separate from the NVFP4 IndexCache/HISA path.
+TensorRT-LLM has general NVFP4 KV-cache plumbing, but the current DeepSeek MLA
+generation path still rejects dense FP4/NVFP4 KV. Deployments may use FP8 dense
+MLA KV as a bootstrapping fallback while NVFP4 IndexCache+HISA remains enabled,
+but that is not the production target. If dense KV precision or absorbed MLA BMM
+becomes the blocker, the expected fix is to add the missing op-trt NVFP4 MLA
+BMM/KV kernels and dispatch support rather than permanently dequantizing helper
+tensors or relying on FP8 dense KV.
+
 The implementation adapts TensorRT-LLM's native NVFP4 DSA/indexer cache
 machinery rather than wholesale-porting optimization-playground kernels. Gated
 Attention and GatedNorm are unique Blaise model semantics and are ported
-directly.
+directly. LayerSplit, WarpDecode, and SMC-SD now have explicit config surfaces
+and runtime guardrails, but their production fast paths still need the next
+implementation phase and B200 validation before deployment.

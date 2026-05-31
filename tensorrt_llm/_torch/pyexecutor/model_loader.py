@@ -69,6 +69,18 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
 
+    if pyt_kv_cache_dtype == "nvfp4":
+        pretrained_config = model_config.pretrained_config
+        model_type = getattr(pretrained_config, "model_type", "")
+        has_mla = hasattr(pretrained_config, "kv_lora_rank") and hasattr(
+            pretrained_config, "qk_rope_head_dim")
+        if model_type in ("deepseek_v3", "deepseek_v32") and has_mla:
+            raise NotImplementedError(
+                "Dense NVFP4 KV cache is not supported for DeepSeek MLA in "
+                "the current TensorRT-LLM torch path. Use fp8 dense KV; "
+                "NVFP4 IndexCache+HISA is configured separately via the "
+                "sparse attention/indexer config.")
+
     # If we're letting the checkpoint dictate the quant with auto, simply
     # return and do not modify the checkpoint.
     if pyt_kv_cache_dtype == "auto":
@@ -800,6 +812,7 @@ class ModelLoader:
             mm_encoder_only=self.llm_args.mm_encoder_only,
             attn_backend=self.llm_args.attn_backend,
             moe_backend=self.llm_args.moe_config.backend,
+            warp_decode_config=self.llm_args.moe_config.warp_decode,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
