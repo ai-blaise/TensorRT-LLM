@@ -176,15 +176,35 @@ and `torch.matmul` reference loop. Block scoring is a single TF32-enabled
 batched matmul over the full 128-dim indexer head rather than four 32-dim
 matmuls. Mean-pool dequantizes each 128-dim token vector in one pass.
 
-On the B200 runtime pod, synthetic 64-head decode cells showed the optimized
-pre-Indexer path beating the reference path across the checked shapes:
-1.3158 ms vs 2.3873 ms for batch 1 by 8192 tokens, 1.3009 ms vs 2.4715 ms for
-batch 4 by 8192 tokens, 1.2418 ms vs 2.4067 ms for batch 1 by 32768 tokens,
-and 1.3652 ms vs 2.4126 ms for batch 4 by 32768 tokens. This is a functional
-deployment path for HF configs that request `hisa.execution_mode: "optimized"`.
-The next optimization target remains the mean-pool/block-score boundary: move
-mean-pool into a persistent fused CUDA/CuTe op and quantize pooled block reps
-so block scoring can also use the FP4 MQA primitive directly.
+The NVFP4 mean-pool stage uses a fused persistent-grid CUDA kernel registered as
+`trtllm::indexer_hisa_mean_pool_nvfp4`. It decodes TensorRT-LLM's interleaved
+NVFP4 indexer cache and computes one 128-dim representative per HISA block
+without materializing per-token dequantized vectors. In the B200 runtime pod,
+the kernel matched the PyTorch dequantize-and-mean reference exactly on the
+checked synthetic cache layouts. Minimum standalone mean-pool times improved
+from 0.5138 ms to 0.0391 ms for batch 1 by 8192 tokens, 0.4547 ms to
+0.0395 ms for batch 4 by 8192 tokens, 0.4426 ms to 0.0399 ms for batch 1 by
+32768 tokens, 0.9686 ms to 0.0558 ms for batch 4 by 32768 tokens, 3.2539 ms to
+0.1934 ms for batch 16 by 32768 tokens, and 6.2905 ms to 0.3668 ms for batch
+32 by 32768 tokens.
+
+With fused mean-pool and FP4 paged-MQA candidate scoring enabled, synthetic
+64-head decode cells beat the pre-Indexer reference path across the checked
+shapes: 1.3728 ms vs 2.5933 ms for batch 1 by 8192 tokens, 1.4085 ms vs
+2.5513 ms for batch 4 by 8192 tokens, 1.3265 ms vs 2.5157 ms for batch 1 by
+32768 tokens, 1.4243 ms vs 2.5851 ms for batch 4 by 32768 tokens, 3.7609 ms vs
+4.8895 ms for batch 16 by 32768 tokens, and 6.8050 ms vs 8.8015 ms for batch
+32 by 32768 tokens. This is the deployment path for HF configs that request
+`hisa.execution_mode: "optimized"` or `auto`.
+
+Quantizing pooled block representatives and routing block scoring through the
+FP4 MQA primitive was tested but not promoted. The probe preserved score
+direction closely against TF32 `bmm` (cosine about 0.99945), but it was neutral
+or slower on most checked B200 cells: 1.04x for batch 1 by 8192 tokens, 0.91x
+for batch 4 by 8192 tokens, and about 1.00x for the 32768-token cells. Block
+scoring therefore remains a TF32 batched matmul until a fused CuTe/CZS selector
+can combine representative generation, block scoring, and selected-block
+candidate setup in one larger kernel.
 
 ## LayerSplit
 

@@ -1600,6 +1600,11 @@ class Indexer(nn.Module):
                                       block_table: torch.Tensor,
                                       kv_lens: torch.Tensor,
                                       max_blocks: int) -> torch.Tensor:
+        if (k_cache.is_cuda
+                and hasattr(torch.ops.trtllm, "indexer_hisa_mean_pool_nvfp4")):
+            return torch.ops.trtllm.indexer_hisa_mean_pool_nvfp4(
+                k_cache, block_table.contiguous(), kv_lens.to(torch.int32),
+                max_blocks)
         block_size = self.hisa_block_size
         page_size = k_cache.shape[1]
         num_batches = block_table.shape[0]

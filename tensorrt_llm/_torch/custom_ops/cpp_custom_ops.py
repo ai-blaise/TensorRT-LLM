@@ -220,6 +220,11 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::indexer_hisa_mean_pool_nvfp4")
+    def _(k_cache, block_table, kv_lens, max_blocks):
+        return k_cache.new_empty((block_table.shape[0], max_blocks, 128),
+                                 dtype=torch.float32)
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
