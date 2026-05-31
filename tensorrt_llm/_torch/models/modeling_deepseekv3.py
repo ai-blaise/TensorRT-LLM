@@ -476,6 +476,9 @@ class DeepseekV3WeightLoader:
                                 name, is_scale=True)
                         else:
                             kv_b_proj_scale = weights[f"{name}.weight_scale"][:]
+                            if not self.model_config.mapping.enable_attention_dp:
+                                kv_b_proj_scale = split_matrix_tp(
+                                    kv_b_proj_scale, tp_size, tp_rank, 0)
                             k_b_proj_trans_scale = None
                         module.weight_scale.copy_(
                             kv_b_proj_scale.reshape(module.weight_scale.shape))

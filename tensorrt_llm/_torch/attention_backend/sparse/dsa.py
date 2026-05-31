@@ -1530,7 +1530,10 @@ class Indexer(nn.Module):
             row_ends: torch.Tensor) -> Optional[torch.Tensor]:
         if logits.numel() == 0:
             return None
-        max_kv_len = int((row_ends - row_starts).max().item())
+        if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+            max_kv_len = logits.shape[1]
+        else:
+            max_kv_len = int((row_ends - row_starts).max().item())
         if not self._should_use_hisa_logits(max_kv_len):
             return None
 
