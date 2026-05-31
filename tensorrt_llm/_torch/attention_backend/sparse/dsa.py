@@ -1408,6 +1408,7 @@ class Indexer(nn.Module):
         self.hisa_execution_mode = getattr(sparse_attention_config,
                                            "hisa_execution_mode", "optimized")
         self._hisa_range_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
+        self._hisa_full_cache: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
         self.skip_topk = self._should_reuse_previous_topk()
 
         self.wq_b = Linear(
@@ -1531,6 +1532,18 @@ class Indexer(nn.Module):
             self._hisa_range_cache[key] = value
         return value
 
+    def _hisa_full_int32(self, length: int, fill: int,
+                         device: torch.device) -> torch.Tensor:
+        key = (device, length, fill)
+        value = self._hisa_full_cache.get(key)
+        if value is None:
+            value = torch.full((length, ),
+                               fill,
+                               dtype=torch.int32,
+                               device=device)
+            self._hisa_full_cache[key] = value
+        return value
+
     def _should_use_hisa_logits(self, max_kv_len: int) -> bool:
         if not self.enable_nvfp4_hisa:
             return False
@@ -1598,10 +1611,8 @@ class Indexer(nn.Module):
             selected_relative = torch.empty((num_rows, topk),
                                             dtype=torch.int32,
                                             device=logits.device)
-            selected_lengths = torch.full((num_rows, ),
-                                          selected_scores.shape[1],
-                                          dtype=torch.int32,
-                                          device=logits.device)
+            selected_lengths = self._hisa_full_int32(
+                num_rows, selected_scores.shape[1], logits.device)
             torch.ops.trtllm.indexer_topk_decode(
                 selected_scores, selected_lengths, selected_relative, 1, topk)
         else:

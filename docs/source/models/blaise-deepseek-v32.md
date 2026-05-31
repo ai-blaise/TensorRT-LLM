@@ -157,6 +157,15 @@ columns, 0.1592 ms to 0.1444 ms for 32 rows and 132096 columns with a
 131072-token valid prefix, 0.1927 ms to 0.1848 ms for 128 rows by 65536, and
 0.1382 ms to 0.1310 ms for ragged 64 by 65536.
 
+The constant selected-candidate length vector passed to the TRT TopK op is
+cached per `(device, rows, candidate_count)` just like the selector's range
+tensors. This removes a decode-hot-path allocation. The B200 harness showed
+minimum time improvements from 0.1077 ms to 0.1004 ms for 32 rows and 65536
+columns, 0.1293 ms to 0.1255 ms for 32 rows and 131072 columns, 0.1331 ms to
+0.1295 ms for 32 rows and 132096 columns with a 131072-token valid prefix,
+0.1589 ms to 0.1567 ms for 128 rows by 65536, and 0.1186 ms to 0.1144 ms for
+ragged 64 by 65536.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
