@@ -1543,10 +1543,19 @@ class Indexer(nn.Module):
         block_topk = min(self.hisa_block_topk, num_blocks)
         topk = min(self.index_topk, num_cols)
 
-        cols = torch.arange(num_cols, device=logits.device)
-        valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
-            cols.unsqueeze(0) < row_ends.unsqueeze(1))
-        scores = logits.float().masked_fill(~valid, float("-inf"))
+        full_rows = False
+        if logits.is_cuda and not torch.cuda.is_current_stream_capturing():
+            full_rows = (torch.count_nonzero(row_starts).item() == 0
+                         and torch.count_nonzero(row_ends != num_cols).item()
+                         == 0)
+
+        if full_rows:
+            scores = logits.float()
+        else:
+            cols = torch.arange(num_cols, device=logits.device)
+            valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
+                cols.unsqueeze(0) < row_ends.unsqueeze(1))
+            scores = logits.float().masked_fill(~valid, float("-inf"))
 
         pad = num_blocks * block_size - num_cols
         block_scores = F.pad(scores, (0, pad), value=float("-inf"))
@@ -1563,10 +1572,12 @@ class Indexer(nn.Module):
         token_mask = token_mask[:, :num_cols]
 
         selected = scores.masked_fill(~token_mask, float("-inf"))
-        relative = selected.topk(topk, dim=-1)[1] - row_starts.unsqueeze(1)
-        lengths = row_ends - row_starts
-        relative = relative.masked_fill(
-            (relative < 0) | (relative >= lengths.unsqueeze(1)), -1)
+        relative = selected.topk(topk, dim=-1)[1]
+        if not full_rows:
+            relative = relative - row_starts.unsqueeze(1)
+            lengths = row_ends - row_starts
+            relative = relative.masked_fill(
+                (relative < 0) | (relative >= lengths.unsqueeze(1)), -1)
 
         result = torch.full((num_rows, self.index_topk),
                             -1,
