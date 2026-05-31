@@ -1597,11 +1597,14 @@ class Indexer(nn.Module):
         selected_relative = selected_scores.topk(topk, dim=-1)[1]
         relative = selected_indices.gather(1, selected_relative)
         if not full_rows:
-            if not row_starts_are_zero:
+            if row_starts_are_zero:
+                relative = relative.masked_fill(
+                    relative >= row_ends.unsqueeze(1), -1)
+            else:
                 relative = relative - row_starts.unsqueeze(1)
-            lengths = row_ends - row_starts
-            relative = relative.masked_fill(
-                (relative < 0) | (relative >= lengths.unsqueeze(1)), -1)
+                lengths = row_ends - row_starts
+                relative = relative.masked_fill(
+                    (relative < 0) | (relative >= lengths.unsqueeze(1)), -1)
 
         result = torch.full((num_rows, self.index_topk),
                             -1,

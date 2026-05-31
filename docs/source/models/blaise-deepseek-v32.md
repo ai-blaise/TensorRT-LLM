@@ -121,6 +121,13 @@ ms for 32 rows and 131072 columns, 0.3261 ms to 0.2433 ms for 32 rows and
 132096 columns with a 131072-token valid prefix, and 0.4276 ms to 0.2829 ms for
 128 rows by 65536. CUDA graph capture smoke passed.
 
+The zero-start decode repair also skips the redundant lower-bound check in the
+final index mask. Clean B200 comparison against the zero-start incumbent showed
+0.2154 ms to 0.2011 ms for 32 rows and 65536 columns, 0.2417 ms to 0.2350 ms
+for 32 rows and 131072 columns, 0.2450 ms to 0.2393 ms for 32 rows and 132096
+columns with a 131072-token valid prefix, and 0.2889 ms to 0.2798 ms for 128
+rows by 65536. CUDA graph capture smoke passed.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
