@@ -128,6 +128,16 @@ for 32 rows and 131072 columns, 0.2450 ms to 0.2393 ms for 32 rows and 132096
 columns with a 131072-token valid prefix, and 0.2889 ms to 0.2798 ms for 128
 rows by 65536. CUDA graph capture smoke passed.
 
+The final selected-candidate top-k in that fallback is unsorted. The downstream
+sparse attention consumes the selected token set, while the stable block top-k
+still determines the candidate blocks. A B200 comparison against the sorted
+candidate incumbent preserved the selected token set for the tested deployment
+shapes and improved minimum time from 0.2091 ms to 0.1952 ms for 32 rows and
+65536 columns, 0.2528 ms to 0.2209 ms for 32 rows and 131072 columns, 0.2521
+ms to 0.2232 ms for 32 rows and 132096 columns with a 131072-token valid
+prefix, 0.3041 ms to 0.2801 ms for 128 rows by 65536, and 0.2387 ms to 0.2158
+ms for ragged 64 by 65536.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
