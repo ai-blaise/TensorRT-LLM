@@ -1589,7 +1589,7 @@ class Indexer(nn.Module):
         block_scores = padded_scores.reshape(num_rows, num_blocks, block_size)
         block_scores = block_scores.amax(dim=-1)
 
-        block_ids = block_scores.topk(block_topk, dim=-1)[1]
+        block_ids = block_scores.topk(block_topk, dim=-1, sorted=False)[1]
         offsets = self._hisa_arange(block_size, logits.device)
         selected_indices = (block_ids.unsqueeze(-1) * block_size +
                             offsets).reshape(num_rows, -1)

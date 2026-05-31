@@ -148,6 +148,15 @@ ms to 0.1856 ms for 32 rows and 132096 columns with a 131072-token valid
 prefix, 0.2954 ms to 0.2209 ms for 128 rows by 65536, and 0.2285 ms to 0.1648
 ms for ragged 64 by 65536.
 
+The HISA block top-k is also unsorted. HISA only requires the selected block set;
+for BF16 tied block scores, either tied block is a valid representative. B200
+comparison against the sorted-block, TRT-candidate-top-k incumbent preserved
+threshold correctness and improved minimum time from 0.1192 ms to 0.1127 ms for
+32 rows and 65536 columns, 0.1583 ms to 0.1424 ms for 32 rows and 131072
+columns, 0.1592 ms to 0.1444 ms for 32 rows and 132096 columns with a
+131072-token valid prefix, 0.1927 ms to 0.1848 ms for 128 rows by 65536, and
+0.1382 ms to 0.1310 ms for ragged 64 by 65536.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
