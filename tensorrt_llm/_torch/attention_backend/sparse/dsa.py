@@ -1594,8 +1594,20 @@ class Indexer(nn.Module):
         selected_indices = (block_ids.unsqueeze(-1) * block_size +
                             offsets).reshape(num_rows, -1)
         selected_scores = padded_scores.gather(1, selected_indices)
-        selected_relative = selected_scores.topk(topk, dim=-1, sorted=False)[1]
-        relative = selected_indices.gather(1, selected_relative)
+        if selected_scores.is_cuda:
+            selected_relative = torch.empty((num_rows, topk),
+                                            dtype=torch.int32,
+                                            device=logits.device)
+            selected_lengths = torch.full((num_rows, ),
+                                          selected_scores.shape[1],
+                                          dtype=torch.int32,
+                                          device=logits.device)
+            torch.ops.trtllm.indexer_topk_decode(
+                selected_scores, selected_lengths, selected_relative, 1, topk)
+        else:
+            selected_relative = selected_scores.topk(
+                topk, dim=-1, sorted=False)[1]
+        relative = selected_indices.gather(1, selected_relative.long())
         if not full_rows:
             if row_starts_are_zero:
                 relative = relative.masked_fill(

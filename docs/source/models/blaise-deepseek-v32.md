@@ -138,6 +138,16 @@ ms to 0.2232 ms for 32 rows and 132096 columns with a 131072-token valid
 prefix, 0.3041 ms to 0.2801 ms for 128 rows by 65536, and 0.2387 ms to 0.2158
 ms for ragged 64 by 65536.
 
+On CUDA, the selected-candidate top-k uses the existing TensorRT-LLM Indexer
+TopK op instead of PyTorch top-k. This keeps the stable HISA block selection and
+accepts threshold-equivalent tied candidates inside the selected blocks. B200
+comparison against the PyTorch unsorted candidate path showed threshold-correct
+results and improved minimum time from 0.2045 ms to 0.1572 ms for 32 rows and
+65536 columns, 0.2429 ms to 0.1861 ms for 32 rows and 131072 columns, 0.2433
+ms to 0.1856 ms for 32 rows and 132096 columns with a 131072-token valid
+prefix, 0.2954 ms to 0.2209 ms for 128 rows by 65536, and 0.2285 ms to 0.1648
+ms for ragged 64 by 65536.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
