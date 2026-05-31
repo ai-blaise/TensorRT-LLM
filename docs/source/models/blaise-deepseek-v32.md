@@ -95,6 +95,16 @@ smoke. Minimum times improved from 0.2813 ms to 0.1972 ms for 32 rows and
 ms to 0.2729 ms for ragged 64 by 65536, and 0.4311 ms to 0.3437 ms for 128
 rows by 65536.
 
+The TopK=1024, compression-ratio=4:1 fallback path also avoids zero-width
+padding when the logits width is already block-aligned. This keeps selected
+indices identical and removes a redundant allocation on the 65k, 131k, and
+132096-width deployment shapes. B200 minimum times for the selected-block
+fallback improved from 0.2875 ms to 0.2584 ms for 32 rows and 65536 columns,
+0.3250 ms to 0.2830 ms for 32 rows and 131072 columns, 0.3286 ms to 0.2871 ms
+for 32 rows and 132096 columns with a 131072-token valid prefix, 0.3147 ms to
+0.2756 ms for ragged 64 by 65536, and 0.4289 ms to 0.3452 ms for 128 rows by
+65536. CUDA graph capture smoke passed.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:

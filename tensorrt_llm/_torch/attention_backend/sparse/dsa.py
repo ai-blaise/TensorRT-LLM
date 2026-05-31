@@ -1568,7 +1568,10 @@ class Indexer(nn.Module):
             scores = logits.float().masked_fill(~valid, float("-inf"))
 
         pad = num_blocks * block_size - num_cols
-        padded_scores = F.pad(scores, (0, pad), value=float("-inf"))
+        if pad == 0:
+            padded_scores = scores
+        else:
+            padded_scores = F.pad(scores, (0, pad), value=float("-inf"))
         block_scores = padded_scores.reshape(num_rows, num_blocks, block_size)
         block_scores = block_scores.amax(dim=-1)
 
