@@ -1546,7 +1546,8 @@ class Indexer(nn.Module):
 
     def _hisa_topk_from_logits(
             self, logits: torch.Tensor, row_starts: torch.Tensor,
-            row_ends: torch.Tensor) -> Optional[torch.Tensor]:
+            row_ends: torch.Tensor,
+            row_starts_are_zero: bool = False) -> Optional[torch.Tensor]:
         if logits.numel() == 0:
             return None
         if logits.is_cuda and torch.cuda.is_current_stream_capturing():
@@ -1570,6 +1571,10 @@ class Indexer(nn.Module):
 
         if full_rows:
             scores = logits.float()
+        elif row_starts_are_zero:
+            cols = self._hisa_arange(num_cols, logits.device)
+            valid = cols.unsqueeze(0) < row_ends.unsqueeze(1)
+            scores = logits.float().masked_fill(~valid, float("-inf"))
         else:
             cols = self._hisa_arange(num_cols, logits.device)
             valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
@@ -1592,7 +1597,8 @@ class Indexer(nn.Module):
         selected_relative = selected_scores.topk(topk, dim=-1)[1]
         relative = selected_indices.gather(1, selected_relative)
         if not full_rows:
-            relative = relative - row_starts.unsqueeze(1)
+            if not row_starts_are_zero:
+                relative = relative - row_starts.unsqueeze(1)
             lengths = row_ends - row_starts
             relative = relative.masked_fill(
                 (relative < 0) | (relative >= lengths.unsqueeze(1)), -1)
@@ -2415,7 +2421,8 @@ class Indexer(nn.Module):
                     row_ends = (gen_kv_lens_cuda[row_indices] - next_n +
                                 next_n_offset + 1)
                     hisa_topk = self._hisa_topk_from_logits(
-                        logits_decode, row_starts, row_ends)
+                        logits_decode, row_starts, row_ends,
+                        row_starts_are_zero=True)
                 if hisa_topk is not None:
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
