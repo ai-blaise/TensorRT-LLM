@@ -62,6 +62,18 @@ TensorRT-LLM's native NVFP4 DSA path with IndexCache reuse and a HISA block
 selector over the existing indexer logits. A future CuTe/CZS HISA selector can
 replace this fallback without changing the model-card contract.
 
+The first B200 HISA selector profiling pass used
+`/tmp/optrt_dsa_ikp_bench.py` inside the Dynamo TensorRT-LLM runtime pod on
+`a4-us-002-rl9` with the c32 production profile. Nsight Systems was used as the
+available profiler on that node. For 32 rows, `next_n=1`, `index_topk=1024`,
+and 131072 columns, the full HISA PyTorch selector took 0.3106 ms minimum; the
+full-row fast path took 0.2299 ms minimum. For comparison, the CUDA C++ TopK
+path took 0.0588 ms and the CuTe DSL TopK path took 0.0440 ms on the same
+shape. The accepted change only removes redundant row masking and relative-index
+repair when all rows cover the full logits width. The remaining large gap is the
+next optimization target: replace the PyTorch HISA block selector with a fused
+CuTe/CZS selector rather than iterating further on the fallback.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
