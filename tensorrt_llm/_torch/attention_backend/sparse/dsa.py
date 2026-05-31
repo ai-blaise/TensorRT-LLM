@@ -1558,30 +1558,17 @@ class Indexer(nn.Module):
             scores = logits.float().masked_fill(~valid, float("-inf"))
 
         pad = num_blocks * block_size - num_cols
-        block_scores = F.pad(scores, (0, pad), value=float("-inf"))
-        block_scores = block_scores.reshape(num_rows, num_blocks, block_size)
+        padded_scores = F.pad(scores, (0, pad), value=float("-inf"))
+        block_scores = padded_scores.reshape(num_rows, num_blocks, block_size)
         block_scores = block_scores.amax(dim=-1)
 
         block_ids = block_scores.topk(block_topk, dim=-1)[1]
-        if full_rows and pad == 0:
-            offsets = torch.arange(block_size, device=logits.device)
-            selected_indices = (
-                block_ids.unsqueeze(-1) * block_size + offsets).reshape(
-                    num_rows, -1)
-            selected_scores = scores.gather(1, selected_indices)
-            selected_relative = selected_scores.topk(topk, dim=-1)[1]
-            relative = selected_indices.gather(1, selected_relative)
-        else:
-            block_mask = torch.zeros((num_rows, num_blocks),
-                                     device=logits.device,
-                                     dtype=torch.bool)
-            block_mask.scatter_(1, block_ids, True)
-            token_mask = block_mask.unsqueeze(-1).expand(-1, -1, block_size)
-            token_mask = token_mask.reshape(num_rows, num_blocks * block_size)
-            token_mask = token_mask[:, :num_cols]
-
-            selected = scores.masked_fill(~token_mask, float("-inf"))
-            relative = selected.topk(topk, dim=-1)[1]
+        offsets = torch.arange(block_size, device=logits.device)
+        selected_indices = (block_ids.unsqueeze(-1) * block_size +
+                            offsets).reshape(num_rows, -1)
+        selected_scores = padded_scores.gather(1, selected_indices)
+        selected_relative = selected_scores.topk(topk, dim=-1)[1]
+        relative = selected_indices.gather(1, selected_relative)
         if not full_rows:
             relative = relative - row_starts.unsqueeze(1)
             lengths = row_ends - row_starts

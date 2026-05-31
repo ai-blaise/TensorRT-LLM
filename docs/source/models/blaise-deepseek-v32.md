@@ -74,15 +74,23 @@ repair when all rows cover the full logits width. The remaining large gap is the
 next optimization target: replace the PyTorch HISA block selector with a fused
 CuTe/CZS selector rather than iterating further on the fallback.
 
-A second fallback-only optimization gathers logits from the selected HISA blocks
-before the final token TopK when rows are full-width and block-aligned. This
-keeps the same HISA block selection but avoids masking and scanning the full
-65k/131k logits width for the token TopK. On the same B200 runtime, selected
-TopK values matched the prior fallback exactly; returned indices can differ only
-for tied values where PyTorch TopK has no unique ordering. Minimum times were
-0.1883 ms to 0.1373 ms for 32 rows and 65536 columns, 0.2376 ms to 0.1439 ms
-for 32 rows and 131072 columns, 0.2205 ms to 0.1769 ms for 64 rows and 65536
-columns, and 0.2919 ms to 0.2064 ms for 128 rows and 65536 columns.
+A second optimization gathers logits from the selected HISA blocks before the
+final token TopK. This keeps the same HISA block selection but avoids masking and
+scanning the full 65k/131k logits width for the token TopK, including CUDA graph
+capture paths where host-side full-row checks are unavailable. On the same B200
+runtime, selected TopK values matched the prior fallback exactly; returned
+indices can differ only for tied values where PyTorch TopK has no unique
+ordering. Minimum times were 0.1883 ms to 0.1373 ms for 32 rows and 65536
+columns, 0.2376 ms to 0.1439 ms for 32 rows and 131072 columns, 0.2205 ms to
+0.1769 ms for 64 rows and 65536 columns, and 0.2919 ms to 0.2064 ms for 128
+rows and 65536 columns before widening the selected-block path beyond the
+full-row fallback. A follow-up audit widened the selected-block path to ragged
+rows and graph-capture-compatible execution. It matched the original HISA
+selected-value semantics on full and ragged rows and passed a CUDA graph capture
+smoke. Minimum times improved from 0.2813 ms to 0.1972 ms for 32 rows and
+65536 columns, 0.3159 ms to 0.2356 ms for 32 rows and 131072 columns, 0.3144
+ms to 0.2729 ms for ragged 64 by 65536, and 0.4311 ms to 0.3437 ms for 128
+rows by 65536.
 
 ## LayerSplit
 
