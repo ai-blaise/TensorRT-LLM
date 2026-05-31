@@ -1563,16 +1563,25 @@ class Indexer(nn.Module):
         block_scores = block_scores.amax(dim=-1)
 
         block_ids = block_scores.topk(block_topk, dim=-1)[1]
-        block_mask = torch.zeros((num_rows, num_blocks),
-                                 device=logits.device,
-                                 dtype=torch.bool)
-        block_mask.scatter_(1, block_ids, True)
-        token_mask = block_mask.unsqueeze(-1).expand(-1, -1, block_size)
-        token_mask = token_mask.reshape(num_rows, num_blocks * block_size)
-        token_mask = token_mask[:, :num_cols]
+        if full_rows and pad == 0:
+            offsets = torch.arange(block_size, device=logits.device)
+            selected_indices = (
+                block_ids.unsqueeze(-1) * block_size + offsets).reshape(
+                    num_rows, -1)
+            selected_scores = scores.gather(1, selected_indices)
+            selected_relative = selected_scores.topk(topk, dim=-1)[1]
+            relative = selected_indices.gather(1, selected_relative)
+        else:
+            block_mask = torch.zeros((num_rows, num_blocks),
+                                     device=logits.device,
+                                     dtype=torch.bool)
+            block_mask.scatter_(1, block_ids, True)
+            token_mask = block_mask.unsqueeze(-1).expand(-1, -1, block_size)
+            token_mask = token_mask.reshape(num_rows, num_blocks * block_size)
+            token_mask = token_mask[:, :num_cols]
 
-        selected = scores.masked_fill(~token_mask, float("-inf"))
-        relative = selected.topk(topk, dim=-1)[1]
+            selected = scores.masked_fill(~token_mask, float("-inf"))
+            relative = selected.topk(topk, dim=-1)[1]
         if not full_rows:
             relative = relative - row_starts.unsqueeze(1)
             lengths = row_ends - row_starts
