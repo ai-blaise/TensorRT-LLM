@@ -116,6 +116,10 @@ def main() -> int:
     for i, policy in enumerate(["round_robin", "contiguous"]):
         if not run_one(policy, 29550 + i, worker_fn="_worker_m6"):
             overall = False
+    # M8b 2-channel (indexer + KV) test, both policies
+    for i, policy in enumerate(["round_robin", "contiguous"]):
+        if not run_one(policy, 29560 + i, worker_fn="_worker_m8b"):
+            overall = False
     return 0 if overall else 1
 
 

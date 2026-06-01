@@ -742,10 +742,11 @@ def test_prefetch_records_event_on_comm_stream_and_uses_correct_owner():
     assert call.kwargs["src"] == 3
     assert call.kwargs["group"] is cp_group
     assert call.kwargs["async_op"] is True
-    # The event must have landed in _prefetched_events for layer 3 and be
-    # recorded on the comm stream.
-    assert 3 in state._prefetched_events
-    event = state._prefetched_events[3]
+    # The event must have landed in _prefetched_events for (layer=3,
+    # channel='kv') (the default channel) and be recorded on the comm
+    # stream.
+    assert (3, "kv") in state._prefetched_events
+    event = state._prefetched_events[(3, "kv")]
     assert event.recorded_on is state.comm_stream
 
 
@@ -800,8 +801,10 @@ def test_prefetch_pipeline_overlaps_consecutive_layers():
                                      payload=payload,
                                      cp_group=cp_group)
 
-    # Only layer 4's broadcast remains in flight after the loop.
-    assert list(state._prefetched_events.keys()) == [4]
+    # Only layer 4's broadcast remains in flight after the loop. Keys
+    # are (layer_idx, channel) tuples since M8b — the default channel
+    # is "kv".
+    assert list(state._prefetched_events.keys()) == [(4, "kv")]
     # Total broadcast calls: 1 (sync layer 0) + 4 prefetches (layers 1..4)
     assert fake.broadcast.call_count == 5
     # The 4 prefetches must have been async; the bootstrap was sync.
@@ -851,6 +854,157 @@ def test_per_layer_payloads_are_distinct_across_layers():
     assert p0 is not p1
     assert p0 is p0_again  # cached per layer
     assert shared is not p0  # shared path != per-layer path
-    # Both layer-0 and layer-1 payloads sit in the per-layer dict.
-    assert 0 in state._per_layer_payloads
-    assert 1 in state._per_layer_payloads
+    # Both layer-0 and layer-1 payloads sit in the per-layer dict under
+    # the default 'kv' channel (M8b key shape is (layer_idx, channel)).
+    assert (0, "kv") in state._per_layer_payloads
+    assert (1, "kv") in state._per_layer_payloads
+
+
+# ---------------------------------------------------------------------------
+# 2-phase per-layer broadcast (M8b: indexer-first + dense-KV channels)
+# ---------------------------------------------------------------------------
+
+
+def _make_state_with_two_streams(cp_size=4, cp_rank=0, policy="round_robin"):
+    """Like _make_state_with_comm_stream but also injects an
+    indexer_comm_stream so the M8b two-stream path is exercised."""
+    state = _make_state_with_comm_stream(cp_size=cp_size,
+                                         cp_rank=cp_rank,
+                                         policy=policy)
+    state.indexer_comm_stream = MagicMock(name="indexer_comm_stream")
+    return state
+
+
+def test_channel_rejects_unknown_value():
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    with pytest.raises(ValueError, match="unknown layersplit channel"):
+        state.ensure_heartbeat_payload(layer_idx=0, channel="bogus")
+    with pytest.raises(ValueError, match="unknown layersplit channel"):
+        state.prefetch_for_layer(layer_idx=0,
+                                 payload=MagicMock(),
+                                 cp_group=MagicMock(),
+                                 channel="bogus")
+    with pytest.raises(ValueError, match="unknown layersplit channel"):
+        state.wait_for_prefetched_layer(layer_idx=0, channel="bogus")
+
+
+def test_per_layer_payloads_are_distinct_per_channel():
+    import torch as _torch
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros", side_effect=lambda *a, **k: MagicMock(
+             name=f"payload-{a}-{k}")):
+        state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+        p0_kv = state.ensure_heartbeat_payload(layer_idx=0, channel="kv")
+        p0_ix = state.ensure_heartbeat_payload(layer_idx=0, channel="indexer")
+        p1_kv = state.ensure_heartbeat_payload(layer_idx=1, channel="kv")
+    # All four combinations are distinct.
+    assert p0_kv is not p0_ix
+    assert p0_kv is not p1_kv
+    assert p0_ix is not p1_kv
+    # And the dict carries the right keys.
+    assert (0, "kv") in state._per_layer_payloads
+    assert (0, "indexer") in state._per_layer_payloads
+    assert (1, "kv") in state._per_layer_payloads
+
+
+def test_prefetch_indexer_channel_uses_indexer_comm_stream():
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_two_streams(cp_size=4, cp_rank=0)
+    with _FakeM6DistContext():
+        # kv channel records on the primary comm stream
+        state.prefetch_for_layer(layer_idx=1,
+                                 payload=payload,
+                                 cp_group=cp_group,
+                                 channel="kv")
+        # indexer channel records on the indexer comm stream
+        state.prefetch_for_layer(layer_idx=1,
+                                 payload=payload,
+                                 cp_group=cp_group,
+                                 channel="indexer")
+    assert (1, "kv") in state._prefetched_events
+    assert (1, "indexer") in state._prefetched_events
+    kv_event = state._prefetched_events[(1, "kv")]
+    ix_event = state._prefetched_events[(1, "indexer")]
+    assert kv_event.recorded_on is state.comm_stream
+    assert ix_event.recorded_on is state.indexer_comm_stream
+    # The two streams must be distinct objects.
+    assert state.comm_stream is not state.indexer_comm_stream
+
+
+def test_prefetch_indexer_channel_falls_back_to_primary_stream():
+    # If indexer_comm_stream is not allocated (single-stream posture),
+    # the indexer channel runs on the primary comm_stream.
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    state.indexer_comm_stream = None  # explicit single-stream posture
+    with _FakeM6DistContext():
+        state.prefetch_for_layer(layer_idx=1,
+                                 payload=payload,
+                                 cp_group=cp_group,
+                                 channel="indexer")
+    event = state._prefetched_events[(1, "indexer")]
+    assert event.recorded_on is state.comm_stream
+
+
+def test_wait_indexer_channel_returns_false_when_only_kv_prefetched():
+    # A channel without a prefetch must NOT pop another channel's event.
+    payload = MagicMock(name="payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_two_streams(cp_size=4, cp_rank=0)
+    with _FakeM6DistContext():
+        state.prefetch_for_layer(layer_idx=3,
+                                 payload=payload,
+                                 cp_group=cp_group,
+                                 channel="kv")
+        # waiting on indexer channel for layer 3 should return False
+        assert state.wait_for_prefetched_layer(layer_idx=3,
+                                               channel="indexer") is False
+        # the kv event is still in flight
+        assert (3, "kv") in state._prefetched_events
+        # waiting on kv channel for layer 3 returns True
+        assert state.wait_for_prefetched_layer(layer_idx=3,
+                                               channel="kv") is True
+
+
+def test_two_phase_pipeline_keeps_both_channels_pipelined():
+    # Drive the 2-phase pattern by hand: at layer L we wait on both
+    # channels for L (popping their events) and prefetch both for L+1.
+    payload = MagicMock(name="payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_two_streams(cp_size=4, cp_rank=0)
+    num_layers = 4
+    with _FakeM6DistContext() as fake:
+        # Bootstrap layer 0 on both channels.
+        for ch in ("indexer", "kv"):
+            assert state.wait_for_prefetched_layer(0, channel=ch) is False
+            state.maybe_broadcast_for_layer(layer_idx=0,
+                                            payload=payload,
+                                            cp_group=cp_group,
+                                            async_op=False,
+                                            channel=ch)
+        # Prefetch layer 1 on both channels
+        for ch in ("indexer", "kv"):
+            state.prefetch_for_layer(layer_idx=1,
+                                     payload=payload,
+                                     cp_group=cp_group,
+                                     channel=ch)
+        # Pipeline 1..num_layers-1
+        for L in range(1, num_layers):
+            for ch in ("indexer", "kv"):
+                assert state.wait_for_prefetched_layer(L,
+                                                      channel=ch) is True, (L,
+                                                                            ch)
+            next_layer = L + 1
+            if next_layer < num_layers:
+                for ch in ("indexer", "kv"):
+                    state.prefetch_for_layer(layer_idx=next_layer,
+                                             payload=payload,
+                                             cp_group=cp_group,
+                                             channel=ch)
+    # No leftover events after a clean pipeline run.
+    assert state._prefetched_events == {}
+    # Total broadcast calls: 2 sync (layer 0 indexer+kv) + 2*3 prefetches
+    # (layers 1..3 on both channels)
+    assert fake.broadcast.call_count == 2 + 6

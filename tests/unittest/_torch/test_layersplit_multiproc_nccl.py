@@ -292,6 +292,180 @@ def test_real_nccl_prefetch_pipeline_publishes_owner_payload(
             f"rank {rank} failed under policy={policy}:\n{contents}")
 
 
+def _worker_m8b(rank, world_size, master_port, policy, num_layers,
+                tmpdir_path):
+    """Child-process entry point for the M8b 2-channel prefetch test.
+
+    Drives the channel-aware prefetch protocol: every layer publishes
+    both an indexer-K payload (smaller) and a dense KV payload (larger).
+    The two channels use independent comm streams + independent
+    prefetched-event dict entries; at layer L the hook waits on both
+    channels for L (popping their events) and prefetches both for L+1.
+    Verifies the receiver sees the correct content for every layer on
+    every channel.
+    """
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
+            LayerSplitRuntimeState)
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            layersplit_enabled=True,
+            layersplit_owner_assignment=policy,
+            layersplit_transfer_backend="auto",
+            layersplit_all_cp_ranks_transfer=True,
+        )
+        state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=cfg,
+            num_layers=num_layers,
+            cp_size=world_size,
+            cp_rank=rank,
+            # Force both streams on so the M8b two-stream path runs.
+            create_comm_stream=True,
+            create_indexer_comm_stream=True,
+        )
+        state.bind_cp_group(dist.group.WORLD)
+        assert state.comm_stream is not None
+        assert state.indexer_comm_stream is not None
+        assert state.comm_stream is not state.indexer_comm_stream
+
+        # Per-layer per-channel payloads. Owner stamps a channel-distinct
+        # magic value; non-owner stamps -1.
+        payloads = {}
+        for layer_idx in range(num_layers):
+            owner = state.ownership.owner_of(layer_idx)
+            for ch_idx, channel in enumerate(("indexer", "kv")):
+                p = torch.empty(4, dtype=torch.int32, device="cuda")
+                if rank == owner:
+                    # Distinct values per (layer, channel) to detect any
+                    # cross-channel aliasing.
+                    base = layer_idx * 1000 + ch_idx * 100
+                    p[:] = torch.tensor([base + i for i in range(4)],
+                                         device="cuda")
+                else:
+                    p[:] = -1
+                payloads[(layer_idx, channel)] = p
+                state._per_layer_payloads[(layer_idx, channel)] = p
+
+        errors = []
+
+        # Bootstrap layer 0 on both channels.
+        for channel in ("indexer", "kv"):
+            state.maybe_broadcast_for_layer(
+                layer_idx=0,
+                payload=payloads[(0, channel)],
+                cp_group=dist.group.WORLD,
+                async_op=False,
+                channel=channel,
+            )
+        # Prefetch layer 1 on both channels.
+        if num_layers >= 2:
+            for channel in ("indexer", "kv"):
+                state.prefetch_for_layer(
+                    layer_idx=1,
+                    payload=payloads[(1, channel)],
+                    cp_group=dist.group.WORLD,
+                    channel=channel,
+                )
+
+        # Pipeline.
+        for layer_idx in range(1, num_layers):
+            for channel in ("indexer", "kv"):
+                waited = state.wait_for_prefetched_layer(layer_idx,
+                                                         channel=channel)
+                if not waited:
+                    state.maybe_broadcast_for_layer(
+                        layer_idx=layer_idx,
+                        payload=payloads[(layer_idx, channel)],
+                        cp_group=dist.group.WORLD,
+                        async_op=False,
+                        channel=channel,
+                    )
+            next_layer = layer_idx + 1
+            if next_layer < num_layers:
+                for channel in ("indexer", "kv"):
+                    state.prefetch_for_layer(
+                        layer_idx=next_layer,
+                        payload=payloads[(next_layer, channel)],
+                        cp_group=dist.group.WORLD,
+                        channel=channel,
+                    )
+
+        torch.cuda.synchronize()
+
+        for layer_idx in range(num_layers):
+            for ch_idx, channel in enumerate(("indexer", "kv")):
+                base = layer_idx * 1000 + ch_idx * 100
+                expected = [base + i for i in range(4)]
+                got = payloads[(layer_idx, channel)].tolist()
+                if got != expected:
+                    owner = state.ownership.owner_of(layer_idx)
+                    errors.append(
+                        f"M8b layer {layer_idx} channel {channel} rank "
+                        f"{rank} owner {owner}: got {got}, expected "
+                        f"{expected}")
+
+        if state._prefetched_events:
+            errors.append(
+                f"M8b leftover prefetched events: "
+                f"{sorted(state._prefetched_events.keys())}")
+
+        result_path = os.path.join(tmpdir_path, f"rank{rank}.result")
+        with open(result_path, "w") as f:
+            if errors:
+                f.write("FAIL\n")
+                for e in errors:
+                    f.write(e + "\n")
+            else:
+                f.write(
+                    f"PASS rank={rank} layers={num_layers} channels=2 "
+                    f"streams=2\n")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not HAS_CUDA,
+                    reason="needs >=2 CUDA devices for multi-rank NCCL test")
+@pytest.mark.parametrize("policy", ["round_robin", "contiguous"])
+def test_real_nccl_two_channel_prefetch_pipeline(tmp_path, policy):
+    """End-to-end NCCL test of the M8b 2-channel (indexer + KV) prefetch
+    pipeline with independent comm streams."""
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    num_layers = 8
+    master_port = 29530 + (0 if policy == "round_robin" else 1)
+
+    mp.spawn(
+        _worker_m8b,
+        args=(world_size, master_port, policy, num_layers, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for rank in range(world_size):
+        result_path = tmp_path / f"rank{rank}.result"
+        assert result_path.exists(), f"rank {rank} produced no result file"
+        contents = result_path.read_text()
+        assert contents.startswith("PASS"), (
+            f"rank {rank} failed under policy={policy}:\n{contents}")
+
+
 if __name__ == "__main__":
     # Allow standalone invocation: python -m pytest <this file> -v
     sys.exit(pytest.main([__file__, "-v", "-s"]))

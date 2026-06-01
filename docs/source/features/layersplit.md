@@ -73,8 +73,9 @@ safe to share across decoding steps within the same model load.
 | M5        | `b06865a4`   | Per-layer broadcast scaffold: `maybe_broadcast_for_layer` + Indexer.forward hook (`payload=None`, sync-shape only). |
 | M5b       | `f6c21223`   | `cp_group_pg` resolution from `mapping`; multi-process NCCL integration test on real GPUs (NVLS-disabled to coexist with sibling NCCL tenants). |
 | M5c       | `2b3e12b3`   | Heartbeat payload (16 B per-layer broadcast) activates the real NCCL broadcast in the production hook. Surfaces CP-comm config errors at first decode step. |
-| M6        | (this commit) | Cross-layer overlap: `prefetch_for_layer(L+1)` on `comm_stream` while layer L's indexer / sparse-attn compute on the default stream. `wait_for_prefetched_layer(L)` consumes the in-flight broadcast at layer L's hook; layer 0 bootstraps via a sync broadcast. Per-layer payload tensors (instead of a single shared payload) so adjacent in-flight broadcasts never alias. (z.ai blog Fig 4(b).) Validated by CP=2 multi-proc NCCL test for both `round_robin` and `contiguous`. |
+| M6        | `37945c70`   | Cross-layer overlap: `prefetch_for_layer(L+1)` on `comm_stream` while layer L's indexer / sparse-attn compute on the default stream. `wait_for_prefetched_layer(L)` consumes the in-flight broadcast at layer L's hook; layer 0 bootstraps via a sync broadcast. Per-layer payload tensors (instead of a single shared payload) so adjacent in-flight broadcasts never alias. (z.ai blog Fig 4(b).) Validated by CP=2 multi-proc NCCL test for both `round_robin` and `contiguous`. |
 | M7        | `675c3045`   | CZS-proved stage-for-broadcast kernel scaffold + reference torch implementation; 12/12 CZS obligations proved. |
+| M8b       | (this commit) | 2-phase per-layer broadcast: indexer-K + dense KV go on independent channels (each with its own `comm_stream` by default). The indexer channel prefetches first so the small payload's NCCL kernel reaches the wire before the larger KV NCCL kernel does; the receiver waits on indexer first so the indexer compute can start as soon as the small payload lands while the KV broadcast is still in flight. `(layer_idx, channel)` keys for prefetched events + per-layer payloads. M5c sync / M6 single-channel call sites preserved as the `channel="kv"` defaults. Validated by CP=2 multi-proc NCCL test (`_worker_m8b`) for both policies — both channels independent and correct. |
 
 ## Queued work
 
@@ -137,6 +138,45 @@ can start indexer compute as soon as phase 1 lands, overlapping phase 2
 with sparse-attention compute. This is strictly stronger than M6's
 cross-layer overlap because it pipelines INSIDE a layer, not just
 across layers.
+
+### M8b 2-phase per-layer broadcast
+
+Each layer publishes two payloads on independent NCCL channels:
+
+| Channel    | Size (per token) | Why                                                                |
+|------------|------------------|---------------------------------------------------------------------|
+| `indexer`  | ~ 84 B (1 / 8 KV)| Smaller; receiver needs it before the indexer compute starts.       |
+| `kv`       | ~ 656 B          | Dense KV slice; receiver needs it before sparse-attn compute starts.|
+
+`LayerSplitRuntimeState` keeps a primary `comm_stream` (for `kv`) and an
+optional `indexer_comm_stream` (for `indexer`). When the indexer stream
+exists, the two NCCL broadcasts run on truly parallel streams and the
+small indexer broadcast doesn't queue behind the large KV broadcast. When
+the indexer stream is absent the indexer channel falls back to the primary
+stream but is still issued first, so latency-sensitive consumers still see
+it land sooner.
+
+Per-layer state keys are `(layer_idx, channel)`:
+`_per_layer_payloads`, `_prefetched_events`, every method that takes a
+`layer_idx` now also takes an optional `channel="kv"`. The M5c sync and
+M6 single-channel call sites keep their behavior because the default
+channel is `"kv"`.
+
+The DSA Indexer hook does the 2-phase pattern at every layer:
+
+```
+for ch in ("indexer", "kv"):                    # wait small first
+    if not wait_for_prefetched_layer(L, ch):
+        maybe_broadcast_for_layer(L, ..., channel=ch)   # bootstrap sync
+
+for ch in ("indexer", "kv"):                    # then prefetch L+1
+    prefetch_for_layer(L+1, ..., channel=ch)
+```
+
+This is strictly stronger than M6's single-channel overlap because each
+layer's broadcasts pipeline INSIDE the layer too — the indexer compute on
+the default stream can begin as soon as the small payload lands rather
+than waiting for the dense KV broadcast to finish.
 
 ### M6 cross-layer overlap
 

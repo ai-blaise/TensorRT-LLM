@@ -50,6 +50,18 @@ except ImportError:  # pragma: no cover - torch is always available in prod
 _VALID_POLICIES = ("round_robin", "contiguous")
 _VALID_TRANSFER_BACKENDS = ("auto", "ucx", "nixl")
 
+# LayerSplit's per-layer broadcast publishes two logically-independent
+# payloads, mirroring the z.ai "Scaling Pain" Figure 4(b) protocol:
+# - "indexer": the indexer K cache slice (small; ~1/8 dense KV size).
+#   Broadcasting this first lets the receiver start the indexer compute as
+#   soon as it lands while the larger dense KV broadcast is still in
+#   flight on a sibling stream.
+# - "kv":      the dense KV cache slice (the bulk of the bytes). Required
+#   before the sparse-attention compute reads any of layer-L's KV.
+# Single-channel callers default to ``channel="kv"`` so the M5c / M6 call
+# sites are byte-identical to their channel-aware behavior.
+_VALID_CHANNELS = ("kv", "indexer")
+
 
 @dataclass(frozen=True)
 class LayerSplitOwnership:
@@ -160,22 +172,28 @@ class LayerSplitRuntimeState:
     cp_rank: int
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
+    # M8b: optional second comm stream dedicated to the "indexer" channel
+    # so the small indexer broadcast does not queue behind the larger
+    # dense KV broadcast on the single comm stream. None falls back to
+    # the primary ``comm_stream`` (the M6 single-stream posture).
+    indexer_comm_stream: Optional[Any] = field(default=None, repr=False)
     # Backwards-compat: M5c callers ask for a single shared payload tensor
     # (one allocation reused across every layer's sync broadcast).
     _heartbeat_payload: Optional[Any] = field(default=None,
                                               repr=False,
                                               init=False)
-    # M6: per-layer payload tensors so the layer-L broadcast and the
-    # prefetched-L+1 broadcast can be in flight on the comm stream at the
-    # same time without aliasing each other's payloads. Keyed by layer_idx.
-    _per_layer_payloads: Dict[int, Any] = field(default_factory=dict,
-                                                repr=False,
-                                                init=False)
-    # M6: in-flight prefetched broadcasts; the layer-L hook consumes the
-    # event for layer L (if any) and then prefetches the L+1 event.
-    _prefetched_events: Dict[int, Any] = field(default_factory=dict,
-                                               repr=False,
-                                               init=False)
+    # M6 / M8b: per-(layer, channel) payload tensors so the layer-L
+    # broadcasts (one per channel) and the prefetched layer-L+1
+    # broadcasts can all be in flight at the same time without aliasing.
+    # Keyed by (layer_idx, channel) — kept as a single dict for clarity.
+    _per_layer_payloads: Dict[Tuple[int, str], Any] = field(
+        default_factory=dict, repr=False, init=False)
+    # M6 / M8b: in-flight prefetched broadcasts. The layer-L hook
+    # consumes the events for layer L on every channel (if any) and then
+    # prefetches the L+1 events on every channel. Keyed by
+    # (layer_idx, channel).
+    _prefetched_events: Dict[Tuple[int, str], Any] = field(
+        default_factory=dict, repr=False, init=False)
 
     def bind_cp_group(self, cp_group: Any) -> None:
         """Late-bind the CP process group resolved from ``mapping``.
@@ -189,7 +207,8 @@ class LayerSplitRuntimeState:
     def ensure_heartbeat_payload(
             self,
             layer_idx: Optional[int] = None,
-            payload_bytes: Optional[int] = None) -> Optional[Any]:
+            payload_bytes: Optional[int] = None,
+            channel: str = "kv") -> Optional[Any]:
         """Lazily allocate a CUDA tensor used as the per-layer broadcast
         payload.
 
@@ -236,6 +255,9 @@ class LayerSplitRuntimeState:
             return None
         if torch is None or not torch.cuda.is_available():
             return None
+        if channel not in _VALID_CHANNELS:
+            raise ValueError(f"unknown layersplit channel {channel!r}; "
+                             f"expected one of {_VALID_CHANNELS}")
 
         def _alloc() -> Any:
             if payload_bytes is None or payload_bytes <= 16:
@@ -245,18 +267,23 @@ class LayerSplitRuntimeState:
                                device="cuda")
 
         if layer_idx is None:
+            # Legacy shared payload (M5c sync-broadcast path). One
+            # allocation reused across every layer and channel; safe
+            # because the M5c caller never has two broadcasts in flight.
             if self._heartbeat_payload is None:
                 self._heartbeat_payload = _alloc()
             return self._heartbeat_payload
 
-        if layer_idx not in self._per_layer_payloads:
-            self._per_layer_payloads[layer_idx] = _alloc()
-        return self._per_layer_payloads[layer_idx]
+        key = (layer_idx, channel)
+        if key not in self._per_layer_payloads:
+            self._per_layer_payloads[key] = _alloc()
+        return self._per_layer_payloads[key]
 
     def prefetch_for_layer(self,
                            layer_idx: int,
                            payload: Optional[Any] = None,
-                           cp_group: Optional[Any] = None) -> bool:
+                           cp_group: Optional[Any] = None,
+                           channel: str = "kv") -> bool:
         """Kick off the per-layer broadcast on the comm stream and record
         a CUDA event so a later ``wait_for_prefetched_layer`` can have the
         default stream wait on it.
@@ -277,6 +304,9 @@ class LayerSplitRuntimeState:
             return False
         if self.cp_size <= 1 or cp_group is None or payload is None:
             return False
+        if channel not in _VALID_CHANNELS:
+            raise ValueError(f"unknown layersplit channel {channel!r}; "
+                             f"expected one of {_VALID_CHANNELS}")
         if torch is None or not torch.cuda.is_available():
             return False
         try:
@@ -287,7 +317,8 @@ class LayerSplitRuntimeState:
             return False
 
         src_rank = self.ownership.owner_of(layer_idx)
-        if self.comm_stream is None:
+        stream = self._stream_for_channel(channel)
+        if stream is None:
             # Fall back to a synchronous broadcast on the default stream;
             # there's no side stream to record an event on.
             dist.broadcast(payload,
@@ -295,17 +326,19 @@ class LayerSplitRuntimeState:
                            group=cp_group,
                            async_op=False)
             return True
-        with torch.cuda.stream(self.comm_stream):
+        with torch.cuda.stream(stream):
             dist.broadcast(payload,
                            src=src_rank,
                            group=cp_group,
                            async_op=True)
             event = torch.cuda.Event()
-            event.record(self.comm_stream)
-        self._prefetched_events[layer_idx] = event
+            event.record(stream)
+        self._prefetched_events[(layer_idx, channel)] = event
         return True
 
-    def wait_for_prefetched_layer(self, layer_idx: int) -> bool:
+    def wait_for_prefetched_layer(self,
+                                  layer_idx: int,
+                                  channel: str = "kv") -> bool:
         """Have the default (current) stream wait on the comm-stream event
         recorded by an earlier ``prefetch_for_layer(layer_idx)``.
 
@@ -314,7 +347,10 @@ class LayerSplitRuntimeState:
         prefetch was in flight for this layer (caller should fall back to
         a synchronous broadcast).
         """
-        event = self._prefetched_events.pop(layer_idx, None)
+        if channel not in _VALID_CHANNELS:
+            raise ValueError(f"unknown layersplit channel {channel!r}; "
+                             f"expected one of {_VALID_CHANNELS}")
+        event = self._prefetched_events.pop((layer_idx, channel), None)
         if event is None:
             return False
         if torch is None or not torch.cuda.is_available():
@@ -352,11 +388,19 @@ class LayerSplitRuntimeState:
             cp_size: int,
             cp_rank: int = 0,
             create_comm_stream: Optional[bool] = None,
+            create_indexer_comm_stream: Optional[bool] = None,
     ) -> "LayerSplitRuntimeState":
         """Build runtime state from a ``SparseAttentionConfig`` instance.
 
         ``create_comm_stream`` defaults to "yes if torch.cuda is available"
         so unit tests on a CPU-only host can disable it explicitly.
+
+        ``create_indexer_comm_stream`` defaults to "track create_comm_stream"
+        so production constructs both streams by default and the unit
+        tests get both streams disabled together. When True an additional
+        ``torch.cuda.Stream`` is allocated for the "indexer" channel (M8b)
+        so the small indexer broadcast doesn't queue behind the larger
+        dense KV broadcast on the primary comm stream.
         """
         enabled = bool(
             getattr(sparse_attn_config, "layersplit_enabled", False))
@@ -390,6 +434,13 @@ class LayerSplitRuntimeState:
                        if (create_comm_stream and torch is not None
                            and torch.cuda.is_available()) else None)
 
+        if create_indexer_comm_stream is None:
+            create_indexer_comm_stream = create_comm_stream
+        indexer_comm_stream = (torch.cuda.Stream()
+                               if (create_indexer_comm_stream
+                                   and torch is not None
+                                   and torch.cuda.is_available()) else None)
+
         return cls(
             enabled=True,
             ownership=ownership,
@@ -398,7 +449,16 @@ class LayerSplitRuntimeState:
             cp_size=cp_size,
             cp_rank=cp_rank,
             comm_stream=comm_stream,
+            indexer_comm_stream=indexer_comm_stream,
         )
+
+    def _stream_for_channel(self, channel: str) -> Optional[Any]:
+        """Return the comm stream dedicated to ``channel`` if any. Falls
+        back to the primary ``comm_stream`` when the indexer stream is
+        not allocated (single-stream posture)."""
+        if channel == "indexer" and self.indexer_comm_stream is not None:
+            return self.indexer_comm_stream
+        return self.comm_stream
 
     def is_owner(self, layer_idx: int) -> bool:
         if not self.enabled:
@@ -438,7 +498,8 @@ class LayerSplitRuntimeState:
             layer_idx: int,
             payload: Optional[Any] = None,
             cp_group: Optional[Any] = None,
-            async_op: bool = True) -> None:
+            async_op: bool = True,
+            channel: str = "kv") -> None:
         """Broadcast a per-layer payload from the owner CP rank to every CP
         peer, matching the z.ai "Scaling Pain" §4 LayerSplit broadcast
         protocol. Peers will receive into ``payload`` (which must already
@@ -470,6 +531,9 @@ class LayerSplitRuntimeState:
             return
         if self.cp_size <= 1:
             return
+        if channel not in _VALID_CHANNELS:
+            raise ValueError(f"unknown layersplit channel {channel!r}; "
+                             f"expected one of {_VALID_CHANNELS}")
         if cp_group is None or payload is None:
             # No group / no payload: defer to the sync-shape placeholder
             # so the consumer wait downstream still happens correctly.
@@ -485,8 +549,9 @@ class LayerSplitRuntimeState:
             return
 
         src_rank = self.ownership.owner_of(layer_idx)
-        if self.comm_stream is not None:
-            with torch.cuda.stream(self.comm_stream):
+        stream = self._stream_for_channel(channel)
+        if stream is not None:
+            with torch.cuda.stream(stream):
                 dist.broadcast(payload,
                                src=src_rank,
                                group=cp_group,
