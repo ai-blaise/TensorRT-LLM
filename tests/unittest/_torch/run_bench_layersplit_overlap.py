@@ -44,9 +44,15 @@ def run_one(num_layers: int,
             compute_us: int,
             port: int,
             warmup: int = 3,
-            measure: int = 10) -> None:
-    """Spawn the 2-rank bench for one (num_layers, payload_bytes,
-    compute_us) shape and print rank 0's report."""
+            measure: int = 10,
+            world_size: int = 2) -> None:
+    """Spawn the N-rank bench for one (num_layers, payload_bytes,
+    compute_us) shape and print rank 0's report.
+
+    ``world_size`` defaults to 2 for backwards compatibility; pass 4 to
+    drive the bench under CP=4 (the caller must have at least
+    ``world_size`` GPUs visible via ``CUDA_VISIBLE_DEVICES``).
+    """
     with tempfile.TemporaryDirectory() as td:
         shutil.copy(
             ROOT / "tests/unittest/_torch" / WORKER_FILE,
@@ -82,29 +88,34 @@ w._bench_worker(rank, int(os.environ['WORLD_SIZE']),
         result = subprocess.run(
             [
                 "python3.11", "-m", "torch.distributed.run",
-                "--nproc_per_node=2", f"--master_port={port}", driver_path,
+                f"--nproc_per_node={world_size}", f"--master_port={port}",
+                driver_path,
             ],
             capture_output=True,
             text=True,
-            timeout=240,
+            timeout=360,
         )
         if result.returncode != 0:
-            print(f"FAIL payload_bytes={payload_bytes} "
+            print(f"FAIL cp={world_size} payload_bytes={payload_bytes} "
                   f"compute_us={compute_us} returncode={result.returncode}")
             print("STDOUT (tail):", result.stdout[-1500:])
             print("STDERR (tail):", result.stderr[-1500:])
             return
         if result_path.exists():
-            print(f"\n=== payload_bytes={payload_bytes} "
+            print(f"\n=== cp={world_size} payload_bytes={payload_bytes} "
                   f"compute_us={compute_us} ===")
             print(result_path.read_text())
 
 
 def main() -> int:
-    # Default matrix: heartbeat / 1KB / 64KB / 1MB payloads, with no
-    # simulated compute and 500us of simulated compute (a representative
-    # indexer + sparse-attn per-layer cost). At 61 layers this matches
-    # the DeepSeek-V3.2 production shape.
+    # Matrix sized for DeepSeek-V3.2-REAP-345B production shapes. The
+    # heartbeat-class rows (16B - 1MB) cover the wiring + overhead
+    # regime; the realistic rows (4MB - 64MB) cover the per-layer
+    # active-KV sizes expected at long context under CP=2/CP=4 deployments
+    # (rough estimate: 8K active tokens / CP rank × 656 B / token ≈ 5 MB
+    # for V3.2, growing to ~50 MB at 128K context with cp_size=2). This
+    # is the regime where M6 / M8b overlap is supposed to actually win
+    # over M5 sync, so the bench must cover it explicitly.
     num_layers = 61
     matrix = [
         (16, 0),
@@ -115,12 +126,30 @@ def main() -> int:
         (64 * 1024, 500),
         (1024 * 1024, 0),
         (1024 * 1024, 500),
+        # Realistic per-layer active-KV sizes (M5d-full payload regime)
+        (4 * 1024 * 1024, 500),
+        (16 * 1024 * 1024, 500),
+        (64 * 1024 * 1024, 500),
     ]
-    for i, (payload_bytes, compute_us) in enumerate(matrix):
-        run_one(num_layers=num_layers,
-                payload_bytes=payload_bytes,
-                compute_us=compute_us,
-                port=29600 + i)
+
+    # Auto-detect CP size from visible devices. Run CP=2 by default; add
+    # CP=4 when 4+ GPUs are visible (matches the user's planned 2- or
+    # 4-GPU deployment shape).
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    n_visible = len([v for v in visible if v.strip()])
+    cp_sizes = [2]
+    if n_visible >= 4:
+        cp_sizes.append(4)
+
+    for cp_size in cp_sizes:
+        print(f"\n{'='*70}\n=== CP={cp_size} sweep\n{'='*70}")
+        port_base = 29600 if cp_size == 2 else 29700
+        for i, (payload_bytes, compute_us) in enumerate(matrix):
+            run_one(num_layers=num_layers,
+                    payload_bytes=payload_bytes,
+                    compute_us=compute_us,
+                    port=port_base + i,
+                    world_size=cp_size)
     return 0
 
 

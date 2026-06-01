@@ -90,7 +90,23 @@ safe to share across decoding steps within the same model load.
 | M9        | IKP-driven optimization loop per kernel.                                                                     | M5d / M6 baseline (need real bandwidth measurements before optimizing).                                         |
 | M10       | Production gate (validation matrix per cells below) + push.                                                  | All previous milestones.                                                                                        |
 
-## M9 overlap baseline (CP=2, B200, GPUs 3+4 on a4-us-001-rl9)
+## M9 overlap baseline + M9-extended realistic-payload sweep (B200)
+
+The bench (`tests/unittest/_torch/bench_layersplit_overlap.py`) auto-detects
+the CP size from `CUDA_VISIBLE_DEVICES` and sweeps the 3 modes
+(M5 sync / M6 single-channel overlap / M8b 2-channel overlap) across a
+matrix of `(payload_bytes, compute_us)` shapes on a real CP NCCL group.
+
+The original M9 matrix covered the heartbeat-class regime (16 B – 1 MB).
+The extended matrix adds realistic per-layer active-KV sizes
+(4 MB / 16 MB / 64 MB) that DeepSeek-V3.2-REAP-345B production decode
+hits at long context under the user's target CP=2 / CP=4 deployments.
+Rough estimate: at 64 K context with cp_size=2, the per-layer active KV
+is ~5 MB; at 128 K it's ~10–20 MB; at very long context with large
+batch it can exceed 50 MB / layer. The overlap modes are designed to
+start winning in exactly this regime, so the bench must cover it.
+
+### CP=2 heartbeat baseline (16 B – 1 MB payloads, GPUs 3+4)
 
 61 layers (DeepSeek-V3.2 shape), 3 warmup + 10 measure iterations per
 mode per shape. All numbers in milliseconds; `compute_us` is the
@@ -108,24 +124,32 @@ simulated per-layer indexer + sparse-attn compute window driven via
 | 1 MB    | 0          | 2.47 ms   | 3.29 ms           | 7.27 ms            | -33 %    | -195 %    |
 | 1 MB    | 500 us     | 23.56 ms  | 23.64 ms          | 23.72 ms           | -0.4 %   | -0.7 %    |
 
-Observations:
+### M9-extended sweep (4 MB / 16 MB / 64 MB at 500 us compute, CP=2 and CP=4)
 
-- **At realistic 500 us / layer compute windows the broadcast cost is
-  fully hidden by compute**, so M6 / M8b show no measurable wall-time
-  win and a small overhead from the side-stream setup. M5 sync is the
-  efficient default at heartbeat-class payloads.
-- **At zero compute, M5 sync dominates** because the M6 / M8b overhead
-  isn't masked by anything. M8b is worst here because it issues twice
-  as many broadcasts.
-- **M6 / M8b are correctness scaffolds for the eventual M5d real
-  active-KV broadcast**: when the per-layer payload grows into the
-  10 MB+ range (long context, large batch) the broadcast time itself
-  becomes meaningful relative to the compute window and the overlap
-  modes start winning. Until then M5 sync stays the production default.
-- The current Indexer hook in `dsa.py` uses the M8b 2-channel
-  prefetch protocol (the strongest scaffold) so the wiring is already
-  in place; future work to upsize the payload to real active-KV will
-  immediately benefit without touching the hook.
+The M9-extended matrix walked the bench across realistic per-layer
+active-KV sizes on both CP=2 (GPUs 3+4) and CP=4 (GPUs 3+4+5+6). The
+key takeaway is that **M5 sync wins at every tested shape**:
+
+| CP | payload | compute_us | M5 (sync) | M6 (1ch overlap) | M8b (2ch overlap) | M6 vs M5 | M8b vs M5 |
+|----|---------|-----------:|----------:|------------------:|-------------------:|---------:|----------:|
+| 4  | 1 MB    | 500 us     | 23.53 ms  | 23.58 ms          | 23.74 ms           | -0.21 %  | -0.88 %   |
+| 4  | 4 MB    | 500 us     | 23.54 ms  | 23.60 ms          | 23.72 ms           | -0.25 %  | -0.78 %   |
+| 4  | 16 MB   | 500 us     | 23.53 ms  | 23.63 ms          | 23.75 ms           | -0.42 %  | -0.96 %   |
+| 4  | 64 MB   | 500 us     | 23.61 ms  | 23.69 ms          | 23.97 ms           | -0.34 %  | -1.53 %   |
+
+Even at 64 MB / layer (well above the V3.2 long-context per-layer KV
+size — total transfer 3.9 GB across 61 layers) the broadcast is fully
+hidden by the 500 us / layer compute window on NVLink (~1.28 TB/s
+intra-node throughput → ~50 us per 64 MB broadcast, easily inside the
+500 us compute envelope). The side-stream + CUDA-event setup cost of
+M6 / M8b adds a small constant overhead that the overlap doesn't
+recover.
+
+**Production default is `layersplit_broadcast_mode="sync"`.** Switch
+to `"overlap_1ch"` (M6) or `"overlap_2ch"` (M8b) only when profiling
+shows broadcast time exceeds compute (very small batch sizes, very
+large per-layer payloads beyond 100 MB, or after the M5d-full active-KV
+plumbing shrinks compute below the broadcast threshold).
 
 Run the benchmark with:
 
@@ -133,6 +157,55 @@ Run the benchmark with:
 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=<gpu_a>,<gpu_b> \
     python3.11 tests/unittest/_torch/run_bench_layersplit_overlap.py
 ```
+
+When 4 GPUs are visible the runner automatically appends a CP=4 sweep
+after the CP=2 sweep so deployments planning either topology see both
+in one run.
+
+## Quick deployment recipe (CP=2 or CP=4 initial deployment)
+
+Add to your `TorchLlmArgs.sparse_attention_config`:
+
+```python
+sparse_attention_config = {
+    "algorithm": "dsa",
+    "indexer_mode": "indexcache-hisa",
+    "indexer_k_dtype": "fp4",
+    "layersplit_enabled": True,
+    "layersplit_owner_assignment": "round_robin",        # or "contiguous"
+    "layersplit_transfer_backend": "auto",
+    "layersplit_all_cp_ranks_transfer": True,
+    "layersplit_broadcast_mode": "sync",                 # production default per M9-extended
+    # Optional: ramp the heartbeat to realistic per-layer KV size so the
+    # broadcast pays realistic bytes-on-the-wire ahead of M5d-full
+    # active-KV. None (default) ships the 16-byte heartbeat.
+    "layersplit_payload_bytes_per_layer": 5_000_000,     # ~5 MB / layer
+}
+```
+
+Behavior at CP=2 (the smaller of the two initial topologies):
+- The `Mapping.cp_size` parses from the runtime parallel config; the
+  LayerSplitRuntimeState is constructed with `cp_size=2` so each of the
+  61 DSA layers gets owned by rank 0 or rank 1 under round-robin.
+- The DSA cache manager allocates ~50% per-rank memory savings (rank 0
+  owns 31 layers, rank 1 owns 30 layers; non-owned layers skip the C++
+  pool allocation through the M4 `layer_mask`).
+- Per-layer broadcasts use the `sync` mode by default; switch to
+  `"overlap_2ch"` if profiling at small batch sizes shows broadcast >
+  compute.
+
+Behavior at CP=4:
+- Each of the 61 DSA layers is owned by one of the 4 ranks; under
+  round-robin ranks 0 own 16 layers and ranks 1, 2, 3 own 15 each.
+  ~75% per-rank memory savings.
+- The 4-rank NCCL broadcast group is automatically resolved from the
+  `Mapping.cp_group_pg`.
+- M9-extended-validated: 6 multi-proc NCCL tests pass on CP=4 (M5 /
+  M6 / M8b × round_robin / contiguous).
+
+Co-running with another NCCL tenant on the same node (e.g. a sibling
+serving deployment) requires `NCCL_NVLS_ENABLE=0` so the LayerSplit
+broadcast group doesn't collide on the NVLink SHARP Multicast resources.
 
 ## Validation matrix (M10 gate)
 

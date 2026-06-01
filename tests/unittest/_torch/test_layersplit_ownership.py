@@ -968,6 +968,44 @@ def test_wait_indexer_channel_returns_false_when_only_kv_prefetched():
                                                channel="kv") is True
 
 
+def test_broadcast_mode_default_is_sync():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(),
+        num_layers=8,
+        cp_size=2,
+        cp_rank=0,
+        create_comm_stream=False,
+    )
+    # M9-extended bench established 'sync' as the empirical winner across
+    # every payload size tested; the runtime default must reflect that.
+    assert state.broadcast_mode == "sync"
+
+
+def test_broadcast_mode_propagates_from_sparse_config():
+    for mode in ("sync", "overlap_1ch", "overlap_2ch"):
+        state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(layersplit_broadcast_mode=mode),
+            num_layers=8,
+            cp_size=2,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+        assert state.broadcast_mode == mode
+
+
+def test_broadcast_mode_rejects_unknown_value():
+    with pytest.raises(ValueError,
+                       match="unknown layersplit_broadcast_mode"):
+        LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_broadcast_mode="async_2ch"),
+            num_layers=8,
+            cp_size=2,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+
+
 def test_payload_bytes_per_layer_propagates_from_sparse_config():
     state = LayerSplitRuntimeState.from_sparse_config(
         sparse_attn_config=_sparse_cfg(

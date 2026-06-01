@@ -3224,38 +3224,71 @@ class Indexer(nn.Module):
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
             cp_group = layersplit_state.cp_group
-            # Step 1: consume the prefetched broadcasts for this layer.
-            # Wait on indexer first (smaller / faster); kv channel is
-            # waited on next.
-            for channel in ("indexer", "kv"):
+            mode = layersplit_state.broadcast_mode
+            ownership = layersplit_state.ownership
+            if mode == "sync":
+                # M5c sync per-layer broadcast — empirically the fastest
+                # mode at every per-layer KV size measured by the M9
+                # bench because realistic compute hides the broadcast
+                # on NVLink. Single channel ('kv') so the wire profile
+                # stays one broadcast per layer per call.
+                layersplit_state.maybe_broadcast_for_layer(
+                    layer_idx=self.layer_idx,
+                    payload=layersplit_state.ensure_heartbeat_payload(
+                        layer_idx=self.layer_idx, channel="kv"),
+                    cp_group=cp_group,
+                    async_op=False,
+                    channel="kv",
+                )
+            elif mode == "overlap_1ch":
+                # M6 single-channel cross-layer prefetch: wait L (sync
+                # bootstrap if first), then prefetch L+1 on comm_stream.
                 if not layersplit_state.wait_for_prefetched_layer(
-                        self.layer_idx, channel=channel):
-                    # Bootstrap path: broadcast layer L on this channel
-                    # synchronously now so the consumer below can run.
+                        self.layer_idx, channel="kv"):
                     layersplit_state.maybe_broadcast_for_layer(
                         layer_idx=self.layer_idx,
                         payload=layersplit_state.ensure_heartbeat_payload(
-                            layer_idx=self.layer_idx, channel=channel),
+                            layer_idx=self.layer_idx, channel="kv"),
                         cp_group=cp_group,
-                        channel=channel,
+                        channel="kv",
                     )
-            # Step 2: prefetch layer L+1 on both channels so the broadcasts
-            # overlap with this layer's compute on the default stream.
-            ownership = layersplit_state.ownership
-            if ownership is not None:
-                next_layer = self.layer_idx + 1
-                if next_layer < ownership.num_layers:
-                    # Indexer first so the small payload's NCCL kernel
-                    # gets onto the wire before the larger kv payload's
-                    # NCCL kernel does.
-                    for channel in ("indexer", "kv"):
+                if ownership is not None:
+                    next_layer = self.layer_idx + 1
+                    if next_layer < ownership.num_layers:
                         layersplit_state.prefetch_for_layer(
                             layer_idx=next_layer,
                             payload=layersplit_state.ensure_heartbeat_payload(
-                                layer_idx=next_layer, channel=channel),
+                                layer_idx=next_layer, channel="kv"),
+                            cp_group=cp_group,
+                            channel="kv",
+                        )
+            else:  # overlap_2ch
+                # M8b 2-channel cross-layer prefetch (indexer-K first
+                # so its NCCL kernel reaches the wire before the larger
+                # KV NCCL kernel; receiver waits indexer first so the
+                # indexer compute can start while the KV broadcast is
+                # still in flight).
+                for channel in ("indexer", "kv"):
+                    if not layersplit_state.wait_for_prefetched_layer(
+                            self.layer_idx, channel=channel):
+                        layersplit_state.maybe_broadcast_for_layer(
+                            layer_idx=self.layer_idx,
+                            payload=layersplit_state.ensure_heartbeat_payload(
+                                layer_idx=self.layer_idx, channel=channel),
                             cp_group=cp_group,
                             channel=channel,
                         )
+                if ownership is not None:
+                    next_layer = self.layer_idx + 1
+                    if next_layer < ownership.num_layers:
+                        for channel in ("indexer", "kv"):
+                            layersplit_state.prefetch_for_layer(
+                                layer_idx=next_layer,
+                                payload=layersplit_state.ensure_heartbeat_payload(
+                                    layer_idx=next_layer, channel=channel),
+                                cp_group=cp_group,
+                                channel=channel,
+                            )
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)

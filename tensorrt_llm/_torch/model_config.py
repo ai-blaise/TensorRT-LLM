@@ -747,6 +747,9 @@ class ModelConfig(Generic[TConfig]):
                         layersplit_payload_bytes_per_layer = getattr(
                             sparse_attention_config,
                             "layersplit_payload_bytes_per_layer", None)
+                        layersplit_broadcast_mode = getattr(
+                            sparse_attention_config,
+                            "layersplit_broadcast_mode", "sync")
                         if indexer_mode == "vanilla" and model_overrides.get(
                                 "indexer_mode") in ("indexcache",
                                                     "indexcache-hisa"):
@@ -812,6 +815,7 @@ class ModelConfig(Generic[TConfig]):
                         layersplit_transfer_backend = "auto"
                         layersplit_all_cp_ranks_transfer = True
                         layersplit_payload_bytes_per_layer = None
+                        layersplit_broadcast_mode = "sync"
                     for key, value in {
                             "dsa_indexer_mode": indexer_mode,
                             "nsa_indexer_mode": indexer_mode,
@@ -833,6 +837,8 @@ class ModelConfig(Generic[TConfig]):
                             layersplit_all_cp_ranks_transfer,
                             "layersplit_payload_bytes_per_layer":
                             layersplit_payload_bytes_per_layer,
+                            "layersplit_broadcast_mode":
+                            layersplit_broadcast_mode,
                     }.items():
                         if value is not None:
                             setattr(pretrained_config, key, value)
@@ -873,7 +879,9 @@ class ModelConfig(Generic[TConfig]):
                             layersplit_all_cp_ranks_transfer=
                             layersplit_all_cp_ranks_transfer,
                             layersplit_payload_bytes_per_layer=
-                            layersplit_payload_bytes_per_layer)
+                            layersplit_payload_bytes_per_layer,
+                            layersplit_broadcast_mode=
+                            layersplit_broadcast_mode)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

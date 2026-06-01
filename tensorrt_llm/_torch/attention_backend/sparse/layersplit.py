@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - torch is always available in prod
 
 _VALID_POLICIES = ("round_robin", "contiguous")
 _VALID_TRANSFER_BACKENDS = ("auto", "ucx", "nixl")
+_VALID_BROADCAST_MODES = ("sync", "overlap_1ch", "overlap_2ch")
 
 # LayerSplit's per-layer broadcast publishes two logically-independent
 # payloads, mirroring the z.ai "Scaling Pain" Figure 4(b) protocol:
@@ -177,6 +178,13 @@ class LayerSplitRuntimeState:
     # 1_000_000 = ~1 MB / layer) and the existing M6 / M8b prefetch
     # protocol carries the payload through unchanged.
     payload_bytes_per_layer: Optional[int] = field(default=None)
+    # M9-extended-derived production default: 'sync' wins by 0-2% over
+    # 'overlap_1ch' / 'overlap_2ch' across all measured payload sizes
+    # (16 B - 64 MB / layer) at the realistic 500 us / layer compute
+    # window because the broadcast is fully hidden by compute on NVLink.
+    # 'overlap_*' modes are correctness-equivalent scaffolds the
+    # deployment can opt into when profiling shows broadcast > compute.
+    broadcast_mode: str = field(default="sync")
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
     # M8b: optional second comm stream dedicated to the "indexer" channel
@@ -455,6 +463,12 @@ class LayerSplitRuntimeState:
                 raise ValueError(
                     "layersplit_payload_bytes_per_layer must be >= 16; "
                     f"got {payload_bytes_per_layer}")
+        broadcast_mode = str(
+            getattr(sparse_attn_config, "layersplit_broadcast_mode", "sync"))
+        if broadcast_mode not in _VALID_BROADCAST_MODES:
+            raise ValueError(
+                f"unknown layersplit_broadcast_mode {broadcast_mode!r}; "
+                f"expected one of {_VALID_BROADCAST_MODES}")
 
         if create_comm_stream is None:
             create_comm_stream = (torch is not None
@@ -478,6 +492,7 @@ class LayerSplitRuntimeState:
             cp_size=cp_size,
             cp_rank=cp_rank,
             payload_bytes_per_layer=payload_bytes_per_layer,
+            broadcast_mode=broadcast_mode,
             comm_stream=comm_stream,
             indexer_comm_stream=indexer_comm_stream,
         )
