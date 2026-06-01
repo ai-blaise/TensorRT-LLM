@@ -26,8 +26,6 @@ recognized:
 | `hisa.min_seq_len` | Sets the minimum sequence length for pre-Indexer HISA; the B200 default is 32768 so 8k/16k stay on the ordinary Indexer while 32k+ can use HISA. |
 | `hisa.execution_mode` | Sets `hisa_execution_mode`; `auto` and `optimized` route to pre-Indexer HISA. |
 | `indexcache.freq` / `indexcache.pattern` | Sets the OP-compatible IndexCache TopK reuse policy fields. |
-| `indexer_quantization.layersplit.enabled: true` | Enables the LayerSplit DSA KV/indexer config surface. |
-| `indexer_quantization.layersplit.layout: "interleaved"` | Maps to the `round_robin` LayerSplit owner assignment. |
 
 `hisa.mode` must be `indexcache-hisa`. Standalone HISA is rejected because the
 Blaise production path layers HISA on top of NVFP4 IndexCache.
@@ -241,7 +239,14 @@ results back to the visible requests in the scheduled draft batch.
 
 ## LayerSplit
 
-LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:
+LayerSplit is a runtime/system feature: it configures how DSA KV and indexer
+storage are partitioned and broadcast across context-parallel ranks. It is not
+read from the HF model card and must be enabled explicitly through the
+TensorRT-LLM runtime config, mirroring the WarpDecode and SMC-SD policy that
+runtime topology features stay out of the checkpoint surface.
+
+Enable via `SparseAttentionConfig` on `LlmArgs.sparse_attention_config` or its
+`--trtllm.sparse_attention_config.*` CLI projection:
 
 ```python
 sparse_attention_config = {
@@ -249,18 +254,27 @@ sparse_attention_config = {
     "indexer_mode": "indexcache-hisa",
     "indexer_k_dtype": "fp4",
     "layersplit_enabled": True,
-    "layersplit_owner_assignment": "round_robin",
-    "layersplit_transfer_backend": "auto",
+    "layersplit_owner_assignment": "round_robin",        # or "contiguous"
+    "layersplit_transfer_backend": "auto",                # auto | ucx | nixl
     "layersplit_all_cp_ranks_transfer": True,
 }
 ```
 
-The integration deliberately attaches LayerSplit to DSA metadata instead of to a
-standalone cache-copy flag. That keeps the contract tied to the tensors that are
-actually split: dense DSA KV and the indexer K cache. Runtime selection must
-compose with the active TP, EP/MoE EP, attention DP, CP/DWDP, and
-context/generation disaggregation mapping. Until partial-rank transfer is
-implemented, `layersplit_all_cp_ranks_transfer` must remain true.
+The integration attaches LayerSplit to DSA metadata rather than to a standalone
+cache-copy flag so the contract stays tied to the tensors that are actually
+split: dense DSA KV and the indexer K cache. Runtime selection must compose with
+the active TP, EP / MoE EP, attention DP, CP / DWDP, and context/generation
+disaggregation mapping.
+
+`layersplit_all_cp_ranks_transfer` must remain `true` until partial-rank
+transfer is implemented; the `SparseAttentionConfig` validator rejects
+`layersplit_enabled=True` with `layersplit_all_cp_ranks_transfer=False` to fail
+fast at construction.
+
+Legacy note: earlier preview versions of this adapter read
+`quantization_config.indexer_quantization.layersplit.*` from the HF config.
+That side-door has been removed; HF model cards no longer enable LayerSplit and
+the keys are silently ignored. Use the runtime config above instead.
 
 ## WarpDecode
 

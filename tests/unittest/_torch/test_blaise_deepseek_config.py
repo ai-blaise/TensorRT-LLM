@@ -93,6 +93,66 @@ def test_generic_fp4_indexer_method_is_not_treated_as_nvfp4():
     assert _get_blaise_indexer_overrides(pretrained_config) == {}
 
 
+def test_layersplit_is_not_enabled_from_hf_model_card():
+    # LayerSplit is a runtime/system topology feature and must not be enabled
+    # from the HF model card. The HF parser must drop every layersplit_* key
+    # so production enablement only flows through SparseAttentionConfig.
+    pretrained_config = SimpleNamespace(
+        architectures=["DeepseekV3ForCausalLM"],
+        index_topk=1024,
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "layersplit": {
+                    "enabled": True,
+                    "layout": "interleaved",
+                    "owner_assignment": "round_robin",
+                    "transfer_backend": "ucx",
+                    "all_cp_ranks_transfer": True,
+                },
+            },
+        },
+    )
+
+    overrides = _get_blaise_indexer_overrides(pretrained_config)
+
+    assert all(not key.startswith("layersplit") for key in overrides), (
+        f"HF model card must not enable LayerSplit; leaked keys: "
+        f"{[k for k in overrides if k.startswith('layersplit')]}")
+
+
+def test_hisa_overrides_ignore_sibling_layersplit_block():
+    # When HF indexer_quantization contains both a HISA block and a LayerSplit
+    # block, only the HISA fields propagate; LayerSplit must stay runtime-only.
+    pretrained_config = SimpleNamespace(
+        architectures=["DeepseekV3ForCausalLM"],
+        index_topk=1024,
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "hisa": {
+                    "enabled": True,
+                    "mode": "indexcache-hisa",
+                    "block_size": 128,
+                    "block_topk": 64,
+                },
+                "layersplit": {
+                    "enabled": True,
+                    "owner_assignment": "contiguous",
+                },
+            },
+        },
+    )
+
+    overrides = _get_blaise_indexer_overrides(pretrained_config)
+
+    assert overrides["indexer_mode"] == "indexcache-hisa"
+    assert overrides["enable_nvfp4_hisa"] is True
+    assert overrides["hisa_block_size"] == 128
+    assert overrides["hisa_block_topk"] == 64
+    assert all(not key.startswith("layersplit") for key in overrides)
+
+
 def test_sparse_attention_config_attaches_blaise_runtime_fields(monkeypatch):
     class RuntimeSparseAttentionConfig:
         model_fields = {
