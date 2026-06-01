@@ -1212,26 +1212,20 @@ def _create_kv_cache_manager(
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
 
-    # LayerSplit (M4): when LayerSplit is enabled and CP > 1, only allocate
-    # KV / indexer pools for the layers this CP rank owns. The mask flows
-    # through the existing layer_mask plumbing into the C++ KVCacheManager
-    # / WindowBlockManager — non-owner ranks get no pool for that layer and
-    # rely on the per-layer owner broadcast (wired in M5) to receive cache
-    # tiles before each layer's attention compute. The helper returns None
-    # on the LayerSplit-off path or when CP <= 1, so existing layer_mask
-    # consumers (Gemma4 KV sharing, one-model draft KV separation) are
-    # unaffected.
-    if layer_mask is None and sparse_attn_config is not None:
-        from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
-            build_layersplit_layer_mask)
-        cp_size = getattr(mapping, "cp_size", 1) if mapping is not None else 1
-        cp_rank = getattr(mapping, "cp_rank", 0) if mapping is not None else 0
-        layer_mask = build_layersplit_layer_mask(
-            num_layers=config.num_hidden_layers,
-            sparse_attn_config=sparse_attn_config,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-        )
+    # LayerSplit (M4 / M5d): the layer_mask trimming that would have
+    # non-owner CP ranks skip layer-L pool allocation is INCOMPATIBLE
+    # with the M5d real-cache-slot broadcast — the per-layer broadcast
+    # publishes the owner's indexer_k_cache_buffers[L] tensor in place,
+    # so non-owner ranks need that tensor allocated to receive into. The
+    # build_layersplit_layer_mask helper stays in the module for future
+    # M5d-tight work (smaller recv buffer + attention-source override
+    # that lets non-owners read from a compact transient buffer instead
+    # of a pool slot) but is not invoked from production today. Every
+    # rank allocates the full DSA cache pool; the M4 per-rank memory
+    # savings are deferred until the attention-source override ships.
+    # The existing layer_mask consumers (Gemma4 KV sharing, one-model
+    # draft KV separation) are unaffected because we only skip the
+    # LayerSplit path here, not the general layer_mask plumbing.
     # Use provided num_layers if available, otherwise use config.
     # When layer_mask is set (e.g., KV sharing, LayerSplit), num_layers for
     # the cache manager must equal the number of enabled (True) layers in

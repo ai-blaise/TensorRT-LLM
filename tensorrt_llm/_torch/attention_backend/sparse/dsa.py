@@ -3190,105 +3190,41 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        # LayerSplit (M5c + M6 + M8b): the owner CP rank for layer L must
-        # publish its indexer-K and dense KV slices to peer CP ranks
-        # before any peer runs layer L's indexer / sparse attention. The
-        # protocol matches z.ai "Scaling Pain" §4 Figure 4(b):
+        # LayerSplit (M5d): the owner CP rank for layer L publishes the
+        # current contents of its indexer-K cache slot to all peer CP
+        # ranks just before the indexer reads it, in line with z.ai
+        # "Scaling Pain" §4 Figure 4(b). The payload is the live cache
+        # slot — receivers overwrite their own copy in place, so the
+        # downstream sparse_attn_indexer reads the owner's authoritative
+        # bytes via the existing get_indexer_k_cache_buffers path.
         #
-        # Two channels per layer:
-        #   "indexer": small (~1/8 KV size); peer must wait on it before
-        #              running indexer compute.
-        #   "kv":      dense KV slice; peer must wait on it before
-        #              sparse-attn compute (only used later in this
-        #              forward — not strictly required at the indexer
-        #              hook, but we wait on it here to keep the per-layer
-        #              hook position simple; M8c will split the kv wait
-        #              into the sparse-attn entry).
+        # The broadcast is synchronous on the default stream — the M9
+        # bench established that overlap modes (M6 single-channel, M8b
+        # 2-channel) only add side-stream + CUDA-event overhead at every
+        # measured payload size (16 B – 64 MB / layer) because realistic
+        # compute hides the broadcast on NVLink. Overlap-mode methods
+        # stay on the runtime state for future regimes (very small
+        # compute windows, multi-MB-and-shrinking M5e active-KV slices)
+        # but are no longer invoked from the production hook.
         #
-        # Per-layer flow:
-        #   step 1: wait on the prefetched broadcasts for layer L (one
-        #           per channel). Layer 0 has no in-flight prefetch and
-        #           bootstraps with two sync broadcasts.
-        #   step 2: prefetch layer L+1 on BOTH channels (indexer first so
-        #           the small payload starts moving while the KV broadcast
-        #           is being scheduled). If the indexer channel has its
-        #           own comm stream, both prefetches genuinely run in
-        #           parallel; otherwise they queue on the single stream
-        #           but the small indexer broadcast still completes
-        #           sooner.
-        #
-        # All paths are no-ops on the off / cp_size=1 / no-process-group
-        # / no-CUDA branches so this is safe to drop in unconditionally.
+        # All paths are no-ops on the LayerSplit-off / cp_size=1 / no
+        # process-group / no-CUDA branches so this is safe to drop in
+        # unconditionally — and it ONLY engages for DSA models because
+        # this file is the DSA attention backend (LayerSplit's only
+        # home; non-DSA models never construct a DSACacheManager).
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
-            cp_group = layersplit_state.cp_group
-            mode = layersplit_state.broadcast_mode
-            ownership = layersplit_state.ownership
-            if mode == "sync":
-                # M5c sync per-layer broadcast — empirically the fastest
-                # mode at every per-layer KV size measured by the M9
-                # bench because realistic compute hides the broadcast
-                # on NVLink. Single channel ('kv') so the wire profile
-                # stays one broadcast per layer per call.
-                layersplit_state.maybe_broadcast_for_layer(
-                    layer_idx=self.layer_idx,
-                    payload=layersplit_state.ensure_heartbeat_payload(
-                        layer_idx=self.layer_idx, channel="kv"),
-                    cp_group=cp_group,
-                    async_op=False,
-                    channel="kv",
-                )
-            elif mode == "overlap_1ch":
-                # M6 single-channel cross-layer prefetch: wait L (sync
-                # bootstrap if first), then prefetch L+1 on comm_stream.
-                if not layersplit_state.wait_for_prefetched_layer(
-                        self.layer_idx, channel="kv"):
-                    layersplit_state.maybe_broadcast_for_layer(
-                        layer_idx=self.layer_idx,
-                        payload=layersplit_state.ensure_heartbeat_payload(
-                            layer_idx=self.layer_idx, channel="kv"),
-                        cp_group=cp_group,
-                        channel="kv",
-                    )
-                if ownership is not None:
-                    next_layer = self.layer_idx + 1
-                    if next_layer < ownership.num_layers:
-                        layersplit_state.prefetch_for_layer(
-                            layer_idx=next_layer,
-                            payload=layersplit_state.ensure_heartbeat_payload(
-                                layer_idx=next_layer, channel="kv"),
-                            cp_group=cp_group,
-                            channel="kv",
-                        )
-            else:  # overlap_2ch
-                # M8b 2-channel cross-layer prefetch (indexer-K first
-                # so its NCCL kernel reaches the wire before the larger
-                # KV NCCL kernel; receiver waits indexer first so the
-                # indexer compute can start while the KV broadcast is
-                # still in flight).
-                for channel in ("indexer", "kv"):
-                    if not layersplit_state.wait_for_prefetched_layer(
-                            self.layer_idx, channel=channel):
-                        layersplit_state.maybe_broadcast_for_layer(
-                            layer_idx=self.layer_idx,
-                            payload=layersplit_state.ensure_heartbeat_payload(
-                                layer_idx=self.layer_idx, channel=channel),
-                            cp_group=cp_group,
-                            channel=channel,
-                        )
-                if ownership is not None:
-                    next_layer = self.layer_idx + 1
-                    if next_layer < ownership.num_layers:
-                        for channel in ("indexer", "kv"):
-                            layersplit_state.prefetch_for_layer(
-                                layer_idx=next_layer,
-                                payload=layersplit_state.ensure_heartbeat_payload(
-                                    layer_idx=next_layer, channel=channel),
-                                cp_group=cp_group,
-                                channel=channel,
-                            )
+            cache_slot = kv_cache_manager.get_indexer_k_cache_buffers(
+                self.layer_idx)
+            layersplit_state.maybe_broadcast_for_layer(
+                layer_idx=self.layer_idx,
+                payload=cache_slot,
+                cp_group=layersplit_state.cp_group,
+                async_op=False,
+                channel="kv",
+            )
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)

@@ -76,9 +76,11 @@ safe to share across decoding steps within the same model load.
 | M6        | `37945c70`   | Cross-layer overlap: `prefetch_for_layer(L+1)` on `comm_stream` while layer L's indexer / sparse-attn compute on the default stream. `wait_for_prefetched_layer(L)` consumes the in-flight broadcast at layer L's hook; layer 0 bootstraps via a sync broadcast. Per-layer payload tensors (instead of a single shared payload) so adjacent in-flight broadcasts never alias. (z.ai blog Fig 4(b).) Validated by CP=2 multi-proc NCCL test for both `round_robin` and `contiguous`. |
 | M7        | `675c3045`   | CZS-proved stage-for-broadcast kernel scaffold + reference torch implementation; 12/12 CZS obligations proved. |
 | M8b       | `3e3d3e99`   | 2-phase per-layer broadcast: indexer-K + dense KV go on independent channels (each with its own `comm_stream` by default). The indexer channel prefetches first so the small payload's NCCL kernel reaches the wire before the larger KV NCCL kernel does; the receiver waits on indexer first so the indexer compute can start as soon as the small payload lands while the KV broadcast is still in flight. `(layer_idx, channel)` keys for prefetched events + per-layer payloads. M5c sync / M6 single-channel call sites preserved as the `channel="kv"` defaults. Validated by CP=2 multi-proc NCCL test (`_worker_m8b`) for both policies — both channels independent and correct. |
-| M7b       | `3101945b`   | Real `@cute.jit` `stage_for_broadcast_cute_jit` body backing the production `stage_for_broadcast_cute` wrapper, with a `cute.compile`-cached launch path and a transparent torch fallback when the DSL compile pipeline isn't wired (DSLRuntimeError on dtype / tensor-conversion mismatches falls through to the torch scatter so callers never hard-fail). Validated by 8 new GPU correctness tests across `(use_fp4, num_tokens)` combinations: every shape produces a byte-exact match against `stage_for_broadcast_reference`. |
-| M9        | `1bc2ce58`   | Cross-mode overlap benchmark scaffold (`tests/unittest/_torch/bench_layersplit_overlap.py` + runner) times M5 sync / M6 single-channel / M8b 2-channel at a matrix of `(payload_bytes, compute_us)` shapes on a real CP=2 NCCL group. Establishes the production baseline for every subsequent overlap / fusion optimization. |
-| M10       | (this commit) | Production gate CP-validation extension: the multi-proc NCCL runner now auto-detects 4 visible GPUs and runs M5 / M6 / M8b at both CP=2 and CP=4 (12 tests vs the prior 6). All 12 PASS on `a4-us-001-rl9` GPUs 3,4,5,6 alongside the production sglang TP=8 deployment. CP=8 + full TP=8/EP=8/ADP exact-token validation remains queued behind a real-model deployment context (this VM's GPU 0-7 footprint is already held by the sglang deployment). |
+| M7b       | `3101945b`   | Real `@cute.jit` `stage_for_broadcast_cute_jit` body backing the production `stage_for_broadcast_cute` wrapper, with a `cute.compile`-cached launch path and a transparent torch fallback when the DSL compile pipeline isn't wired. Validated byte-exact across `(use_fp4, num_tokens)` combinations. |
+| M9        | `1bc2ce58`   | Cross-mode overlap benchmark scaffold (`tests/unittest/_torch/bench_layersplit_overlap.py` + runner) times sync / overlap_1ch / overlap_2ch broadcast modes at a matrix of `(payload_bytes, compute_us)` shapes on real CP=2 / CP=4 NCCL groups. |
+| M10       | `2d2f01e8`   | CP=4 multi-proc NCCL validation alongside CP=2 (12 tests). All PASS on `a4-us-001-rl9` GPUs 3,4,5,6 alongside the production sglang TP=8 deployment. |
+| M7c       | `845ecba0`   | Fused single-launch `@cute.kernel` body for `stage_for_broadcast` using the proven cutest TVM-FFI compile pattern (`make_fake_compact_tensor` + `cute.compile(..., options="--enable-tvm-ffi")`). |
+| M5d       | (this commit) | **The broadcast now carries the owner's real indexer-K cache slot, not a heartbeat.** The dsa.py Indexer.forward hook reads `metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)` and `dist.broadcast`s that tensor in place — receivers' cache slots are overwritten by the owner's authoritative bytes, then the downstream `sparse_attn_indexer` reads from the cache normally. Sync mode only (M9-extended bench: sync wins at every payload size up to 64 MB / layer because broadcast is hidden by compute on NVLink). Auto-engaged for DSA models (LayerSplit's only home — non-DSA models never construct a `DSACacheManager`). The M4 owner-local pool trimming is disabled (replicated allocation across CP ranks) because the broadcast publishes into receivers' pool slots, so those slots must exist. Per-rank memory savings are deferred until M5d-tight (smaller transient recv buffer + attention-source override). The `layersplit_payload_bytes_per_layer` and `layersplit_broadcast_mode` config fields are removed (the bench established the right defaults and no production deployment should configure them away). |
 
 ## Queued work
 
@@ -168,20 +170,23 @@ Add to your `TorchLlmArgs.sparse_attention_config`:
 
 ```python
 sparse_attention_config = {
-    "algorithm": "dsa",
+    "algorithm": "dsa",                                  # LayerSplit only fires for DSA
     "indexer_mode": "indexcache-hisa",
     "indexer_k_dtype": "fp4",
     "layersplit_enabled": True,
     "layersplit_owner_assignment": "round_robin",        # or "contiguous"
     "layersplit_transfer_backend": "auto",
     "layersplit_all_cp_ranks_transfer": True,
-    "layersplit_broadcast_mode": "sync",                 # production default per M9-extended
-    # Optional: ramp the heartbeat to realistic per-layer KV size so the
-    # broadcast pays realistic bytes-on-the-wire ahead of M5d-full
-    # active-KV. None (default) ships the 16-byte heartbeat.
-    "layersplit_payload_bytes_per_layer": 5_000_000,     # ~5 MB / layer
 }
 ```
+
+That's the complete LayerSplit surface — broadcast mode and payload size
+are no longer user-configurable. M5d auto-engages whenever
+`layersplit_enabled=True` on a DSA model: every layer's indexer-K cache
+slot is broadcast from the owner CP rank to the peers just before the
+indexer reads it, on the default stream, with no overlap mode required
+(M9-extended bench confirmed sync wins at every per-layer payload up to
+64 MB).
 
 Behavior at CP=2 (the smaller of the two initial topologies):
 - The `Mapping.cp_size` parses from the runtime parallel config; the

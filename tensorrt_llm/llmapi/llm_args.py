@@ -410,36 +410,6 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Require every CP rank to participate in LayerSplit cache transfer.")
-    layersplit_payload_bytes_per_layer: Optional[int] = Field(
-        default=None,
-        description=
-        "Per-layer LayerSplit broadcast payload size in bytes. None (the "
-        "default) ships the 16-byte heartbeat — sufficient to validate the "
-        "wiring + comm-stream synchronization but too small to exercise "
-        "real bandwidth. Set to a realistic per-layer KV-slice size "
-        "(e.g. 1_000_000 for a ~1 MB / layer M5d-bandwidth probe; the "
-        "production V3.2 long-context shape is multi-MB / layer) to drive "
-        "the broadcast at proportional bytes-on-the-wire through the "
-        "existing M6 cross-layer + M8b 2-channel scaffolding ahead of the "
-        "M5d-full active-KV attention-source override.")
-    layersplit_broadcast_mode: Literal["sync", "overlap_1ch",
-                                       "overlap_2ch"] = Field(
-        default="sync",
-        description=
-        "Per-layer LayerSplit broadcast dispatch mode. 'sync' (default) "
-        "issues the broadcast on the default stream and blocks before "
-        "indexer compute — the empirically-best mode at all per-layer KV "
-        "sizes measured to date (M9 bench: M5 sync beats M6 single-channel "
-        "and M8b 2-channel by 0-2% across 16 B to 64 MB payloads at the "
-        "realistic 500 us / layer compute window because the broadcast is "
-        "fully hidden by compute on NVLink). 'overlap_1ch' uses the M6 "
-        "prefetch-L+1-on-comm-stream protocol; 'overlap_2ch' uses the M8b "
-        "indexer-first + dense-KV 2-channel protocol with dual streams. "
-        "Switch away from 'sync' only when profiling evidence shows the "
-        "broadcast time exceeds the per-layer compute window (e.g. very "
-        "small batch sizes where compute drops below broadcast time, or "
-        "after the M5d-full active-KV slice shrinks compute below the "
-        "broadcast threshold).")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
