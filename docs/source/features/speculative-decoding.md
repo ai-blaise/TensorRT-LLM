@@ -197,6 +197,11 @@ the target bonus token from the selected leaf. CUDA graph capture uses the same
 hidden tree shape and pads dummy drafter rows without surfacing those rows to user
 requests.
 
+SMC-SD always requests target token probabilities for its verified draft positions,
+even when the visible user sampling strategy is greedy. The sampler also bypasses
+the generic fast-greedy shortcut so the grouped sampler materializes the target
+probabilities required for SMC particle weights.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.

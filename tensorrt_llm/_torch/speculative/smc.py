@@ -218,6 +218,9 @@ class SMCSampler(TorchSampler):
     def should_provide_draft_probs(self, request) -> bool:
         return True
 
+    def _can_use_fast_greedy_path(self, requests) -> bool:
+        return False
+
     def process_draft_tokens(
         self,
         request,

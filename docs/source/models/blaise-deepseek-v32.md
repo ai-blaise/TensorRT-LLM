@@ -302,12 +302,14 @@ speculative_config = {
 }
 ```
 
-The config validates the Blaise SMC-SD contract and fails explicitly if runtime
-metadata, resource-manager, drafter, sampler, or worker paths are reached before
-their implementation is complete. The runtime implementation must preserve
-separate draft/target KV ownership, CUDA-graph padding semantics, target verify
-with `gamma + 1` tokens including the bonus token, particle resampling, and
-decode-only use under disaggregated prefill/decode.
+The config validates the Blaise SMC-SD contract before constructing runtime
+metadata, resource-manager, drafter, sampler, or worker state. SMC-SD keeps
+separate draft/target KV ownership, CUDA-graph padding semantics, and decode-only
+use under disaggregated prefill/decode. The target verification pass covers
+`gamma * n_particles + 1` positions: every hidden particle token plus the selected
+particle leaf bonus. Greedy user sampling still requests target probabilities for
+SMC draft positions, and the SMC sampler disables the generic fast-greedy shortcut
+so those probabilities are available for particle-weight updates.
 
 ## Model semantics
 

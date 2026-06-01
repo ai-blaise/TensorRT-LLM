@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.pyexecutor.sampler import (
+    GREEDY,
+    TorchSampler,
+    _CachingRequestGrouper,
+)
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.smc import (
     build_smc_particle_choices,
@@ -230,3 +234,32 @@ def test_smc_logprob_diff_accepts_selected_token_log_probs():
     expected = torch.log(torch.tensor(0.5 / 0.25 * 0.25 / 0.5, device="cuda"))
 
     assert torch.allclose(actual, expected)
+
+
+def test_smc_greedy_requests_still_request_target_probabilities():
+    grouper = _CachingRequestGrouper(max_num_sequences=1)
+    store = grouper._store
+    store.strategies[0] = GREEDY
+    request = SimpleNamespace(
+        py_draft_tokens=[1, 2, 3],
+        py_smc_draft_token_log_probs=torch.zeros((3,), device="cuda"),
+    )
+
+    groups = grouper.group_requests_by_strategy_key(
+        [request],
+        strategy_to_key=lambda strategy: strategy,
+        pin_memory=False,
+        seq_slots=torch.tensor([0], dtype=torch.int64),
+        vocab_size=32000,
+    )
+
+    assert len(groups) == 1
+    group_key, group_value = next(iter(groups.items()))
+    assert group_key.needs_probs
+    assert group_value.speculation_needs_probs_indices.tolist() == [0]
+
+
+def test_smc_sampler_disables_fast_greedy_path():
+    sampler = object.__new__(SMCSampler)
+
+    assert not sampler._can_use_fast_greedy_path([SimpleNamespace()])

@@ -553,17 +553,26 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
         # 1) Slots pre-recorded for recompute (context-phase or beam search)
         recompute_batch_slots = store.slots_needing_recompute & active_slots
 
-        # 2) Non-greedy slots where draft-token status may have changed
-        #    (For greedy: current_has_draft is always False, matching cached, so never stale)
-        draft_check_slots = (store.non_greedy_slots & active_slots) - recompute_batch_slots
+        # 2) Active slots where draft-token status may have changed. Most greedy
+        #    speculative paths do not need target probabilities, but SMC-SD does:
+        #    its particle weights are target-vs-draft path probabilities even when
+        #    the visible sampling strategy is greedy.
+        draft_check_slots = active_slots - recompute_batch_slots
         for slot in draft_check_slots:
             batch_index = slot_to_idx[slot]
-            has_draft = bool(requests_list[batch_index].py_draft_tokens)
-            if store.speculation_needs_probs[slot] != has_draft:
+            request = requests_list[batch_index]
+            has_draft = bool(request.py_draft_tokens)
+            needs_smc_probs = getattr(
+                request, "py_smc_draft_token_log_probs", None) is not None
+            current_speculation_needs_probs = has_draft and (
+                slot in store.non_greedy_slots or needs_smc_probs)
+            if store.speculation_needs_probs[slot] != current_speculation_needs_probs:
                 # Draft-token status changed — only update the affected flags.
                 # The strategy itself doesn't depend on draft tokens (only on sampling params).
-                store.speculation_needs_probs[slot] = has_draft
-                store.needs_probs[slot] = has_draft or store.need_processed_logprobs[slot]
+                store.speculation_needs_probs[slot] = current_speculation_needs_probs
+                store.needs_probs[slot] = (
+                    current_speculation_needs_probs
+                    or store.need_processed_logprobs[slot])
 
         # 3) Full recompute for the pre-recorded slots.
         #    Every slot with a None strategy must already be in slots_needing_recompute
@@ -587,7 +596,10 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
             batch_strategies[batch_index] = strategy
 
             is_greedy = strategy == GREEDY
-            current_speculation_needs_probs = has_draft_tokens and not is_greedy
+            needs_smc_probs = getattr(
+                request, "py_smc_draft_token_log_probs", None) is not None
+            current_speculation_needs_probs = has_draft_tokens and (
+                not is_greedy or needs_smc_probs)
             store.speculation_needs_probs[slot] = current_speculation_needs_probs
             current_need_processed_logprobs = (
                 request.py_logprobs_mode == LogprobMode.PROCESSED and request.return_log_probs
