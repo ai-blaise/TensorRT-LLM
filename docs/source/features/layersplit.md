@@ -76,7 +76,8 @@ safe to share across decoding steps within the same model load.
 | M6        | `37945c70`   | Cross-layer overlap: `prefetch_for_layer(L+1)` on `comm_stream` while layer L's indexer / sparse-attn compute on the default stream. `wait_for_prefetched_layer(L)` consumes the in-flight broadcast at layer L's hook; layer 0 bootstraps via a sync broadcast. Per-layer payload tensors (instead of a single shared payload) so adjacent in-flight broadcasts never alias. (z.ai blog Fig 4(b).) Validated by CP=2 multi-proc NCCL test for both `round_robin` and `contiguous`. |
 | M7        | `675c3045`   | CZS-proved stage-for-broadcast kernel scaffold + reference torch implementation; 12/12 CZS obligations proved. |
 | M8b       | `3e3d3e99`   | 2-phase per-layer broadcast: indexer-K + dense KV go on independent channels (each with its own `comm_stream` by default). The indexer channel prefetches first so the small payload's NCCL kernel reaches the wire before the larger KV NCCL kernel does; the receiver waits on indexer first so the indexer compute can start as soon as the small payload lands while the KV broadcast is still in flight. `(layer_idx, channel)` keys for prefetched events + per-layer payloads. M5c sync / M6 single-channel call sites preserved as the `channel="kv"` defaults. Validated by CP=2 multi-proc NCCL test (`_worker_m8b`) for both policies — both channels independent and correct. |
-| M7b       | (this commit) | Real `@cute.jit` `stage_for_broadcast_cute_jit` body backing the production `stage_for_broadcast_cute` wrapper, with a `cute.compile`-cached launch path and a transparent torch fallback when the DSL compile pipeline isn't wired (DSLRuntimeError on dtype / tensor-conversion mismatches falls through to the torch scatter so callers never hard-fail). Validated by 8 new GPU correctness tests across `(use_fp4, num_tokens)` combinations: every shape produces a byte-exact match against `stage_for_broadcast_reference`. |
+| M7b       | `3101945b`   | Real `@cute.jit` `stage_for_broadcast_cute_jit` body backing the production `stage_for_broadcast_cute` wrapper, with a `cute.compile`-cached launch path and a transparent torch fallback when the DSL compile pipeline isn't wired (DSLRuntimeError on dtype / tensor-conversion mismatches falls through to the torch scatter so callers never hard-fail). Validated by 8 new GPU correctness tests across `(use_fp4, num_tokens)` combinations: every shape produces a byte-exact match against `stage_for_broadcast_reference`. |
+| M9        | (this commit) | Cross-mode overlap benchmark scaffold (`tests/unittest/_torch/bench_layersplit_overlap.py` + runner) times M5 sync / M6 single-channel / M8b 2-channel at a matrix of `(payload_bytes, compute_us)` shapes on a real CP=2 NCCL group. Establishes the production baseline for every subsequent overlap / fusion optimization. |
 
 ## Queued work
 
@@ -87,6 +88,50 @@ safe to share across decoding steps within the same model load.
 | M8 vectors | Direct NVFP4-on-the-wire broadcast; indexer-cache-first 2-phase per-layer protocol; persistent cross-layer broadcast scheduler CTA; fused HISA-block-select + LayerSplit-owner-stage; owner-aware EPLB; owner-local indexer cache compaction; UCX/NIXL fast-path for disagg-PD. | M5d for most; M5d gives the baseline against which each vector is measured. |
 | M9        | IKP-driven optimization loop per kernel.                                                                     | M5d / M6 baseline (need real bandwidth measurements before optimizing).                                         |
 | M10       | Production gate (validation matrix per cells below) + push.                                                  | All previous milestones.                                                                                        |
+
+## M9 overlap baseline (CP=2, B200, GPUs 3+4 on a4-us-001-rl9)
+
+61 layers (DeepSeek-V3.2 shape), 3 warmup + 10 measure iterations per
+mode per shape. All numbers in milliseconds; `compute_us` is the
+simulated per-layer indexer + sparse-attn compute window driven via
+`torch.cuda._sleep`.
+
+| payload | compute_us | M5 (sync) | M6 (1ch overlap) | M8b (2ch overlap) | M6 vs M5 | M8b vs M5 |
+|---------|-----------:|----------:|------------------:|-------------------:|---------:|----------:|
+| 16 B    | 0          | 2.50 ms   | 3.18 ms           | 5.37 ms            | -27 %    | -114 %    |
+| 16 B    | 500 us     | 23.51 ms  | 23.58 ms          | 24.14 ms           | -0.3 %   | -2.7 %    |
+| 1 KB    | 0          | 2.79 ms   | 3.18 ms           | 7.08 ms            | -14 %    | -154 %    |
+| 1 KB    | 500 us     | 23.51 ms  | 23.57 ms          | 23.69 ms           | -0.3 %   | -0.8 %    |
+| 64 KB   | 0          | 2.42 ms   | 3.59 ms           | 7.54 ms            | -48 %    | -212 %    |
+| 64 KB   | 500 us     | 23.50 ms  | 23.58 ms          | 23.68 ms           | -0.3 %   | -0.8 %    |
+| 1 MB    | 0          | 2.47 ms   | 3.29 ms           | 7.27 ms            | -33 %    | -195 %    |
+| 1 MB    | 500 us     | 23.56 ms  | 23.64 ms          | 23.72 ms           | -0.4 %   | -0.7 %    |
+
+Observations:
+
+- **At realistic 500 us / layer compute windows the broadcast cost is
+  fully hidden by compute**, so M6 / M8b show no measurable wall-time
+  win and a small overhead from the side-stream setup. M5 sync is the
+  efficient default at heartbeat-class payloads.
+- **At zero compute, M5 sync dominates** because the M6 / M8b overhead
+  isn't masked by anything. M8b is worst here because it issues twice
+  as many broadcasts.
+- **M6 / M8b are correctness scaffolds for the eventual M5d real
+  active-KV broadcast**: when the per-layer payload grows into the
+  10 MB+ range (long context, large batch) the broadcast time itself
+  becomes meaningful relative to the compute window and the overlap
+  modes start winning. Until then M5 sync stays the production default.
+- The current Indexer hook in `dsa.py` uses the M8b 2-channel
+  prefetch protocol (the strongest scaffold) so the wiring is already
+  in place; future work to upsize the payload to real active-KV will
+  immediately benefit without touching the hook.
+
+Run the benchmark with:
+
+```bash
+NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=<gpu_a>,<gpu_b> \
+    python3.11 tests/unittest/_torch/run_bench_layersplit_overlap.py
+```
 
 ## Validation matrix (M10 gate)
 
