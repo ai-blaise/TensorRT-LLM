@@ -225,6 +225,54 @@ def _register_fake():
         return k_cache.new_empty((block_table.shape[0], max_blocks, 128),
                                  dtype=torch.float32)
 
+    @torch.library.register_fake("trtllm::indexer_hisa_update_page_reps_nvfp4")
+    def _(k_cache, page_reps, page_counts, slot_mapping_fp8, num_tokens):
+        pass
+
+    @torch.library.register_fake(
+        "trtllm::indexer_hisa_block_reps_from_pages_nvfp4")
+    def _(page_reps, page_counts, block_table, kv_lens, max_blocks, page_size):
+        return page_reps.new_empty((block_table.shape[0], max_blocks, 128),
+                                   dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::indexer_hisa_quantize_block_reps_nvfp4")
+    def _(block_reps):
+        return (block_reps.new_empty((*block_reps.shape[:-1], 64),
+                                     dtype=torch.int8),
+                block_reps.new_empty(block_reps.shape[:-1], dtype=torch.int32))
+
+    @torch.library.register_fake(
+        "trtllm::indexer_hisa_quantized_block_reps_from_pages_nvfp4")
+    def _(page_reps, page_counts, block_table, kv_lens, max_blocks, page_size):
+        del page_counts, kv_lens, page_size
+        return (page_reps.new_empty((block_table.shape[0], max_blocks, 64),
+                                    dtype=torch.int8),
+                block_table.new_empty((block_table.shape[0], max_blocks),
+                                      dtype=torch.int32))
+
+    @torch.library.register_fake("trtllm::indexer_hisa_block_scores_nvfp4")
+    def _(q_values, q_scales, weights, block_reps, prefix_lens, block_topk,
+          next_n, block_size):
+        del q_scales, weights, prefix_lens, block_topk, next_n, block_size
+        return block_reps.new_empty((q_values.shape[0], block_reps.shape[1]),
+                                    dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::indexer_hisa_candidate_pages")
+    def _(top_blocks, block_table, next_n, pages_per_hisa_block):
+        del block_table, next_n
+        return top_blocks.new_empty(
+            (top_blocks.shape[0], top_blocks.shape[1] * pages_per_hisa_block))
+
+    @torch.library.register_fake("trtllm::indexer_hisa_mask_scores")
+    def _(candidate_scores, top_blocks, prefix_lens, block_size):
+        del candidate_scores, top_blocks, prefix_lens, block_size
+        pass
+
+    @torch.library.register_fake("trtllm::indexer_hisa_remap_selected")
+    def _(selected, top_blocks, prefix_lens, block_size, index_topk):
+        del top_blocks, prefix_lens, block_size
+        return selected.new_empty((selected.shape[0], index_topk))
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)

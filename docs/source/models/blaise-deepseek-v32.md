@@ -23,6 +23,7 @@ recognized:
 | `hisa.block_size` | Sets `hisa_block_size`. |
 | `hisa.block_topk` | Sets the fixed candidate block count when `hisa.compression_ratio` is disabled. |
 | `hisa.compression_ratio` | Sets the dynamic Figure 2(b)-style HISA candidate count: `ceil(num_blocks / compression_ratio)`, lower-bounded by the number of blocks needed to contain `index_topk` tokens. |
+| `hisa.min_seq_len` | Sets the minimum sequence length for pre-Indexer HISA; the B200 default is 32768 so 8k/16k stay on the ordinary Indexer while 32k+ can use HISA. |
 | `hisa.execution_mode` | Sets `hisa_execution_mode`; `auto` and `optimized` route to pre-Indexer HISA. |
 | `indexcache.freq` / `indexcache.pattern` | Sets the OP-compatible IndexCache TopK reuse policy fields. |
 | `indexer_quantization.layersplit.enabled: true` | Enables the LayerSplit DSA KV/indexer config surface. |
@@ -197,14 +198,20 @@ shapes: 1.3728 ms vs 2.5933 ms for batch 1 by 8192 tokens, 1.4085 ms vs
 32 by 32768 tokens. This is the deployment path for HF configs that request
 `hisa.execution_mode: "optimized"` or `auto`.
 
-Quantizing pooled block representatives and routing block scoring through the
-FP4 MQA primitive was tested but not promoted. The probe preserved score
-direction closely against TF32 `bmm` (cosine about 0.99945), but it was neutral
-or slower on most checked B200 cells: 1.04x for batch 1 by 8192 tokens, 0.91x
-for batch 4 by 8192 tokens, and about 1.00x for the 32768-token cells. Block
-scoring therefore remains a TF32 batched matmul until a fused CuTe/CZS selector
-can combine representative generation, block scoring, and selected-block
-candidate setup in one larger kernel.
+Pooled block representatives are quantized to NVFP4 and routed through the
+DeepGEMM FP4 MQA primitive for block scoring. The promoted path passes
+`max_seqlen_k=max_blocks`, which asks DeepGEMM for compressed per-row block
+logits instead of a flattened batch-wide output followed by a gather. The
+compressed output matched the gather-normalized output exactly on the B200
+probe and reduced block-score time by about 4.26x to 4.42x across 8192 through
+131072 tokens. With TopK=1024 and compression-ratio=4:1, the full score/top-k
+probe showed HISA is still a loss at 8k/16k, but becomes useful at 32k and
+improves with longer context: the 100k cell is about 1.86x faster than full
+Indexer score+top-k and the 128k cell is about 2.09x faster before counting
+the fused candidate-page, mask, and remap helper timings. The next
+optimization target remains a CuTe/CZS or TensorRT fused block-score+top-k
+selector, but the deployed block scorer is now the compressed DeepGEMM NVFP4
+tensor path rather than the TF32 fallback.
 
 ## LayerSplit
 

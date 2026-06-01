@@ -27,6 +27,7 @@ def test_blaise_nvfp4_hisa_model_card_maps_to_trt_dsa_config():
                     "block_size": 128,
                     "block_topk": 64,
                     "compression_ratio": 4.0,
+                    "min_seq_len": 32768,
                     "execution_mode": "optimized",
                 },
             },
@@ -48,6 +49,7 @@ def test_blaise_nvfp4_hisa_model_card_maps_to_trt_dsa_config():
         "hisa_block_size": 128,
         "hisa_block_topk": 64,
         "hisa_compression_ratio": 4.0,
+        "hisa_min_seq_len": 32768,
         "hisa_execution_mode": "optimized",
     }
 

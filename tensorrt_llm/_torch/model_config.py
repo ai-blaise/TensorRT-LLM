@@ -740,7 +740,7 @@ class ModelConfig(Generic[TConfig]):
                             sparse_attention_config, "hisa_compression_ratio",
                             4.0)
                         hisa_min_seq_len = getattr(sparse_attention_config,
-                                                   "hisa_min_seq_len", 65536)
+                                                   "hisa_min_seq_len", 32768)
                         hisa_execution_mode = getattr(
                             sparse_attention_config, "hisa_execution_mode",
                             "optimized")
@@ -822,7 +822,7 @@ class ModelConfig(Generic[TConfig]):
                         hisa_compression_ratio = model_overrides.get(
                             "hisa_compression_ratio", 4.0)
                         hisa_min_seq_len = model_overrides.get(
-                            "hisa_min_seq_len", 65536)
+                            "hisa_min_seq_len", 32768)
                         hisa_execution_mode = model_overrides.get(
                             "hisa_execution_mode", "optimized")
                         layersplit_enabled = model_overrides.get(

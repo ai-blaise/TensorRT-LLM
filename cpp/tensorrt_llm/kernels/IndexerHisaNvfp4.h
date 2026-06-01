@@ -29,6 +29,38 @@ void invokeIndexerHisaMeanPoolNvfp4(uint8_t const* kCache, int32_t const* blockT
     int32_t cacheDim2, int32_t cacheDim3, int64_t cacheStride0, int64_t cacheStride1, int64_t cacheStride2,
     int64_t cacheStride3, cudaStream_t stream = 0);
 
+void invokeIndexerHisaUpdatePageRepsNvfp4(uint8_t const* kCache, float* pageReps, int32_t* pageCounts,
+    int64_t const* slotMappingFp8, int32_t numTokens, int32_t cacheDim0, int32_t cacheDim1, int32_t cacheDim2,
+    int32_t cacheDim3, int64_t cacheStride0, int64_t cacheStride1, int64_t cacheStride2, int64_t cacheStride3,
+    cudaStream_t stream = 0);
+
+void invokeIndexerHisaBlockRepsFromPagesNvfp4(float const* pageReps, int32_t const* pageCounts,
+    int32_t const* blockTable, int32_t const* kvLens, float* reps, int32_t batchSize, int32_t maxBlocks,
+    int32_t pageTableStride, int32_t numPages, int32_t pageSize, cudaStream_t stream = 0);
+
+void invokeIndexerHisaQuantizeBlockRepsNvfp4(
+    float const* blockReps, int8_t* packed, int32_t* scales, int32_t totalRows, cudaStream_t stream = 0);
+
+void invokeIndexerHisaQuantizedBlockRepsFromPagesNvfp4(float const* pageReps, int32_t const* pageCounts,
+    int32_t const* blockTable, int32_t const* kvLens, int8_t* packed, int32_t* scales, int32_t batchSize,
+    int32_t maxBlocks, int32_t pageTableStride, int32_t numPages, int32_t pageSize, cudaStream_t stream = 0);
+
+void invokeIndexerHisaBlockScoresNvfp4(uint8_t const* qValues, int32_t const* qScales, float const* weights,
+    float const* blockReps, int32_t const* prefixLens, float* blockScores, int32_t numRows, int32_t numHeads,
+    int32_t maxBlocks, int32_t nextN, int32_t blockSize, int64_t qStride0, int64_t qStride1, int64_t qStride2,
+    cudaStream_t stream = 0);
+
+void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* blockTable,
+    int32_t* candidatePageTable, int32_t numRows, int32_t blockTopK, int32_t pageTableStride, int32_t nextN,
+    int32_t pagesPerHisaBlock, cudaStream_t stream = 0);
+
+void invokeIndexerHisaMaskScores(float* candidateScores, int32_t const* topBlocks, int32_t const* prefixLens,
+    int32_t numRows, int32_t blockTopK, int32_t candidateLen, int32_t blockSize, cudaStream_t stream = 0);
+
+void invokeIndexerHisaRemapSelected(int32_t const* selected, int32_t const* topBlocks, int32_t const* prefixLens,
+    int32_t* topkIndices, int32_t numRows, int32_t selectedTopK, int32_t indexTopK, int32_t blockTopK, int32_t blockSize,
+    cudaStream_t stream = 0);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

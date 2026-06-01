@@ -387,7 +387,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "ceil(num_blocks / ratio) candidate blocks, lower-bounded by the "
         "number of blocks needed to contain index_topk tokens.")
     hisa_min_seq_len: int = Field(
-        default=65536,
+        default=32768,
         description="Minimum sequence length before HISA selection is used.")
     hisa_execution_mode: Literal["auto", "optimized", "reference"] = Field(
         default="optimized", description="HISA selector implementation mode.")

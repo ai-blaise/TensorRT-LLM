@@ -31,7 +31,7 @@ if(ENABLE_UCX)
 
   target_link_libraries(${UCX_WRAPPER_TARGET}
                         PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,ucxx::ucxx>)
-  target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ucxx::ucxx ucx::ucs)
+  target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ucx::ucs)
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${CUDA_RT_LIB})
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${TORCH_LIBRARIES})
   target_link_libraries(${UCX_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES})
