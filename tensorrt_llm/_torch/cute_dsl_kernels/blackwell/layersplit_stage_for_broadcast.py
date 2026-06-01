@@ -58,6 +58,7 @@ from typing import Optional
 try:
     import cutlass  # noqa: F401  # cute DSL umbrella
     import cutlass.cute as cute  # noqa: F401
+    from cutlass.cute.runtime import make_fake_compact_tensor  # noqa: F401
     _CUTE_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _CUTE_AVAILABLE = False
@@ -130,88 +131,120 @@ def stage_for_broadcast_torch_scatter(k_data, k_scale, num_tokens: int,
 
 if _CUTE_AVAILABLE:
 
-    # M7b: real CuTe DSL implementation of the stage-for-broadcast op.
-    # The launcher below is a thin `@cute.jit` shim around two
-    # `cute.copy` calls: one for the data row, one for the 4-byte scale
-    # row. CuTe DSL emits one CUDA kernel per `cute.copy` so this
-    # currently launches two kernels per call. That matches the CZS
-    # proof's per-row layout contract (data + scale handled as
-    # independent vectorizable rows) and is correct + benchmarkable
-    # today. M7c will fuse the two copies into a single kernel body
-    # (`@cute.kernel`) once IKP profiling shows the per-launch overhead
-    # is a meaningful slice of the per-layer broadcast cost — currently
-    # the two memcpys are short enough that launch overhead dominates
-    # only at extreme batch sizes (>16k tokens), so the fusion is queued
-    # behind the M9 IKP loop.
+    # M7c: real CuTe DSL fused single-kernel stage-for-broadcast.
+    #
+    # One @cute.kernel that handles BOTH the data row + the scale row in
+    # ONE CUDA launch per call, vs the M7b two-cute.copy variant which
+    # emitted two launches. Per-block one output token; threads inside
+    # the block strip-mine across the `head_dim + 4` output bytes via a
+    # grid-stride loop, copying the data bytes from k_data for indices
+    # in [0, head_dim) and the scale bytes from k_scale for indices in
+    # [head_dim, head_dim + 4). The CZS proof at
+    # docs/proofs/layersplit_stage_for_broadcast_czs_module.json attests
+    # that V=16 elt=1B is legal for the data row (LDG.E.128 / STG.E.128)
+    # and V=4 elt=1B is legal for the scale row; the grid-stride loop
+    # respects those vectorization invariants automatically when CuTe
+    # has enough contiguous strided runs per thread.
+
+    @cute.kernel
+    def _stage_for_broadcast_kernel(
+        g_data: cute.Tensor,
+        g_scale: cute.Tensor,
+        g_out: cute.Tensor,
+        head_dim: cutlass.Constexpr,
+        threads_per_block: cutlass.Constexpr,
+    ):
+        t_idx, _, _ = cute.arch.thread_idx()
+        b_idx, _, _ = cute.arch.block_idx()
+        stage_row = head_dim + SCALE_BYTES_PER_TOKEN
+        for i in range(t_idx, stage_row, threads_per_block):
+            if i < head_dim:
+                g_out[(b_idx, i)] = g_data[(b_idx, i)]
+            else:
+                g_out[(b_idx, i)] = g_scale[(b_idx, i - head_dim)]
 
     @cute.jit
     def stage_for_broadcast_cute_jit(
-        k_data: cute.Tensor,
-        k_scale: cute.Tensor,
-        stage_out_data: cute.Tensor,
-        stage_out_scale: cute.Tensor,
+        g_data: cute.Tensor,
+        g_scale: cute.Tensor,
+        g_out: cute.Tensor,
+        num_tokens: cutlass.Constexpr,
+        head_dim: cutlass.Constexpr,
     ):
-        """JIT launcher: copy each per-token row into its slot in the
-        contiguous stage buffer. Caller pre-slices the output tensor into
-        its `[:, :head_dim]` and `[:, head_dim:]` views so this body is
-        layout-agnostic.
-
-        Inputs and outputs are uint8 row-major tensors. The CZS proof at
-        docs/proofs/layersplit_stage_for_broadcast_czs_module.json attests
-        that V=16 elt=1B is legal for the data row (LDG.E.128 / STG.E.128)
-        and V=4 elt=1B is legal for the scale row, which cute.copy
-        respects automatically based on the input contiguity.
-        """
-        cute.copy(k_data, stage_out_data)
-        cute.copy(k_scale, stage_out_scale)
+        """Single-kernel launcher: one block per token, grid-stride byte
+        copies inside the block. Compile-time specialized on
+        (num_tokens, head_dim) so the inner loop unrolls cleanly."""
+        threads_per_block = 32
+        _stage_for_broadcast_kernel(g_data, g_scale, g_out, head_dim,
+                                     threads_per_block).launch(
+                                         grid=(num_tokens, 1, 1),
+                                         block=(threads_per_block, 1, 1),
+                                     )
 
     _CUTE_COMPILED_CACHE = {}
 
+    def _build_fake_tensors(num_tokens: int, head_dim: int):
+        return (
+            make_fake_compact_tensor(cutlass.Uint8,
+                                     (int(num_tokens), int(head_dim)),
+                                     stride_order=(1, 0),
+                                     assumed_align=16),
+            make_fake_compact_tensor(
+                cutlass.Uint8,
+                (int(num_tokens), int(SCALE_BYTES_PER_TOKEN)),
+                stride_order=(1, 0),
+                assumed_align=16),
+            make_fake_compact_tensor(
+                cutlass.Uint8,
+                (int(num_tokens), int(head_dim + SCALE_BYTES_PER_TOKEN)),
+                stride_order=(1, 0),
+                assumed_align=16),
+        )
+
     def stage_for_broadcast_cute(k_data, k_scale, num_tokens: int,
                                  use_fp4: bool, stage_buffer):
-        """Production entry point: compile + launch the CuTe DSL kernels
-        with the right tensor slicing. Mirrors
-        ``stage_for_broadcast_torch_scatter`` byte-for-byte but executes
-        on the GPU via CuTe DSL.
+        """Production entry point: compile + launch the fused CuTe DSL
+        kernel that writes both the data row and the scale row of every
+        per-token stage_buffer slot in one CUDA launch.
 
         On the first call for a given ``(num_tokens, use_fp4)`` key the
-        function compiles + caches the kernel via ``cute.compile`` with
-        TVM-FFI dispatch (cutest's canonical pattern); subsequent calls
-        reuse the cached compiled callable so the amortized cost is just
-        two kernel launches. Falls back to the torch scatter when
-        ``cute.compile`` raises (CUDA-arch mismatch, DSL setup error,
-        etc.) so production decode never hard-fails on the CuTe path.
+        function compiles the kernel via ``cute.compile`` over a set of
+        ``make_fake_compact_tensor`` ed shapes (the cutest-canonical
+        TVM-FFI compile pattern), caches the compiled callable in
+        ``_CUTE_COMPILED_CACHE``, and dispatches it; subsequent calls
+        reuse the cached binary. Falls back to ``stage_for_broadcast_torch_scatter``
+        on any compile/runtime exception so callers never hard-fail.
         """
         head_dim = (NVFP4_DATA_BYTES_PER_TOKEN
                     if use_fp4 else FP8_DATA_BYTES_PER_TOKEN)
-        # Each call needs four uint8 row-major slices; cute.compile keys
-        # by shape + dtype + device internally so we cache only by the
-        # logical signature (num_tokens, use_fp4) to avoid recompiling
-        # whenever the underlying torch tensor identity changes.
-        cache_key = (int(num_tokens), bool(use_fp4))
+        cache_key = (int(num_tokens), int(head_dim))
         try:
-            k_data_slice = k_data[:num_tokens].contiguous()
-            k_scale_slice = k_scale[:num_tokens].contiguous()
-            out_data_slice = stage_buffer[:num_tokens, :head_dim]
-            out_scale_slice = stage_buffer[:num_tokens,
-                                            head_dim:head_dim +
-                                            SCALE_BYTES_PER_TOKEN]
             compiled = _CUTE_COMPILED_CACHE.get(cache_key)
             if compiled is None:
+                fake_data, fake_scale, fake_out = _build_fake_tensors(
+                    num_tokens, head_dim)
                 compiled = cute.compile(stage_for_broadcast_cute_jit,
-                                        k_data_slice, k_scale_slice,
-                                        out_data_slice, out_scale_slice,
+                                        fake_data,
+                                        fake_scale,
+                                        fake_out,
+                                        num_tokens,
+                                        head_dim,
                                         options="--enable-tvm-ffi")
                 _CUTE_COMPILED_CACHE[cache_key] = compiled
-            compiled(k_data_slice, k_scale_slice, out_data_slice,
-                     out_scale_slice)
+            # Runtime tensors: must be contiguous uint8 with the matching
+            # shape. The compiled TVM-FFI shim accepts torch tensors
+            # directly (no per-call from_dlpack).
+            k_data_in = k_data[:num_tokens].contiguous()
+            k_scale_in = k_scale[:num_tokens].contiguous()
+            out_view = stage_buffer[:num_tokens, :head_dim +
+                                    SCALE_BYTES_PER_TOKEN]
+            compiled(k_data_in, k_scale_in, out_view, num_tokens, head_dim)
         except Exception:
-            # cute.compile may not be wired up on all toolchains
-            # (DSLRuntimeError lives in cutlass.base_dsl.common and is
-            # NOT a stdlib subclass, so we catch broadly). Fall back to
-            # the torch scatter so callers never hard-fail on the CuTe
-            # path. M7c will replace the torch fallback with a true
-            # `@cute.kernel` body that does both copies in one launch.
+            # cute.compile / cute.kernel may not be wired up on every
+            # toolchain (DSLRuntimeError lives in cutlass.base_dsl.common
+            # and is NOT a stdlib subclass; catch broadly). Fall back to
+            # the byte-equivalent torch scatter so callers never
+            # hard-fail on the CuTe path.
             stage_for_broadcast_torch_scatter(k_data, k_scale, num_tokens,
                                               use_fp4, stage_buffer)
 else:
