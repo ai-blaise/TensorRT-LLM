@@ -59,6 +59,7 @@ from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .interface import MoESchedulerKind
+from .warp_decode import try_run_warp_decode
 
 __all__ = [
     "MoEScheduler",
@@ -468,15 +469,26 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
-        final_hidden_states = moe.backend.run_moe(
+        backend_kwargs = self._get_backend_kwargs(
+            router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
+        )
+        final_hidden_states = try_run_warp_decode(
+            moe,
             x=x,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,
-            **self._get_backend_kwargs(
-                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
-            ),
+            do_finalize=do_finalize,
+            all_rank_num_tokens=all_rank_num_tokens,
         )
+        if final_hidden_states is None:
+            final_hidden_states = moe.backend.run_moe(
+                x=x,
+                token_selected_experts=token_selected_slots,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf,
+                **backend_kwargs,
+            )
 
         # ========== Step 7: EPLB - Start CPU stage ==========
         moe._load_balancer_start_set_cpu_stage(is_last_call)

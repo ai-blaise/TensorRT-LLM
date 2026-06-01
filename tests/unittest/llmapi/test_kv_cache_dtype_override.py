@@ -88,6 +88,21 @@ def test_update_from_hf_quant_config_explicit_dtype_overrides(tmp_path):
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
+def test_update_from_hf_quant_config_does_not_enable_warp_decode_from_hf(tmp_path):
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        model_kwargs={
+            "quantization_config": _compressed_tensors_nvfp4_config(
+                moe_runner_backend="warp_decode",
+            ),
+        },
+    )
+    model_loader = ModelLoader(llm_args)
+
+    assert model_loader._update_from_hf_quant_config() is True
+    assert llm_args.moe_config.warp_decode is None
+
+
 def test_update_from_hf_quant_config_parses_compressed_tensors_model_kwargs(tmp_path):
     llm_args = TorchLlmArgs(
         model=str(tmp_path),

@@ -28,7 +28,6 @@ recognized:
 | `indexcache.freq` / `indexcache.pattern` | Sets the OP-compatible IndexCache TopK reuse policy fields. |
 | `indexer_quantization.layersplit.enabled: true` | Enables the LayerSplit DSA KV/indexer config surface. |
 | `indexer_quantization.layersplit.layout: "interleaved"` | Maps to the `round_robin` LayerSplit owner assignment. |
-| `moe_runner_backend: "warp_decode"` | Enables the WarpDecode MoE overlay unless the operator supplied `moe_config.warp_decode`. |
 
 `hisa.mode` must be `indexcache-hisa`. Standalone HISA is rejected because the
 Blaise production path layers HISA on top of NVFP4 IndexCache.
@@ -280,11 +279,16 @@ moe_config = {
 ```
 
 `backend` remains TensorRT-LLM's optimized DeepSeek-V3.2 B200 MoE backend.
-`warp_decode` only describes when a decode-only small-batch fast path may be
-used. In `auto` mode, unsupported shapes, quantization modes, CUDA-graph
-captures, TP/EP layouts, attention-DP groups, CP layouts, or disaggregated
-generation mappings must fall back to the native backend. `policy: "force"`
-is reserved for validation runs and turns fallback into an error.
+`warp_decode` is runtime configuration only; it is not read from the target
+model's Hugging Face config because it describes a serving-time decode policy,
+not an architecture or weight-format fact. The current op-trt hook is deliberately
+narrow: it may call the packaged WarpDecode CuTe op only for BF16, top-k=8,
+single-EP, no-communication decode shapes. The target NVFP4 production path must
+use the native backend until the NVFP4 WarpDecode kernel is ported and validated.
+In `auto` mode, unsupported shapes, quantization modes, CUDA-graph captures,
+TP/EP layouts, attention-DP groups, CP layouts, or disaggregated generation
+mappings fall back to the native backend. `policy: "force"` is reserved for
+validation runs and turns fallback into an error.
 
 ## SMC-SD
 

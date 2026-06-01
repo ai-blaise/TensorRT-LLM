@@ -1096,13 +1096,11 @@ class Deepseekv3MoE(nn.Module):
         self.mapping = model_config.mapping
         warp_decode_config = getattr(model_config, "warp_decode_config", None)
         if warp_decode_config is not None and warp_decode_config.enabled:
-            msg = (
-                "WarpDecode config is enabled, but the op-trt DeepSeek-V3.2 "
-                "runtime still falls back to the native MoE backend until the "
-                "WarpDecode fast path is implemented.")
-            if warp_decode_config.policy == "force":
-                raise NotImplementedError(msg)
-            logger.warning_once(msg, key="blaise_warp_decode_not_implemented")
+            logger.info_once(
+                "WarpDecode config is enabled; runtime guards choose the "
+                "WarpDecode fast path only for supported decode shapes.",
+                key="blaise_warp_decode_enabled",
+            )
 
         shared_quant_config = self._get_shared_experts_quant_config(
             model_config, layer_idx)
@@ -1615,6 +1613,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
+            self.mlp.experts.warp_decode_is_decode_only = (
+                attn_metadata.num_contexts == 0 and attn_metadata.num_ctx_tokens == 0)
+            self.mlp.experts.warp_decode_is_cuda_graph = attn_metadata.is_cuda_graph
+            self.mlp.experts.warp_decode_num_generation_tokens = (
+                attn_metadata.num_tokens - attn_metadata.num_ctx_tokens)
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,

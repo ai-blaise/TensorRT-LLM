@@ -40,7 +40,7 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
                        TorchLlmArgs, UserProvidedDecodingConfig,
-                       WarpDecodeConfig, _ModelFormatKind, _ModelWrapper,
+                       _ModelFormatKind, _ModelWrapper,
                        _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -448,7 +448,6 @@ class ModelLoader:
             )
 
         if hf_quant_config is not None:
-            self._apply_blaise_runtime_overlays(hf_quant_config)
             if is_modelopt_quant_config(hf_quant_config):
                 self._apply_modelopt_quant_config(
                     read_modelopt_quant_config(hf_quant_config),
@@ -501,21 +500,6 @@ class ModelLoader:
             return True
 
         return False
-
-    def _apply_blaise_runtime_overlays(self, hf_quant_config: Dict[str,
-                                                                   Any]) -> None:
-        moe_backend = hf_quant_config.get("moe_runner_backend")
-        if moe_backend != "warp_decode":
-            return
-        if self.llm_args.moe_config.warp_decode is not None:
-            logger.info(
-                "Keeping explicit moe_config.warp_decode over "
-                "quantization_config.moe_runner_backend=warp_decode.")
-            return
-        self.llm_args.moe_config.warp_decode = WarpDecodeConfig(enabled=True)
-        logger.info(
-            "Enabling WarpDecode MoE overlay from "
-            "quantization_config.moe_runner_backend=warp_decode.")
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
