@@ -173,18 +173,37 @@ class LayerSplitRuntimeState:
         """
         self.cp_group = cp_group
 
-    def ensure_heartbeat_payload(self) -> Optional[Any]:
-        """Lazily allocate a tiny CUDA tensor used as the M5c heartbeat
-        payload for the per-layer broadcast.
+    def ensure_heartbeat_payload(
+            self,
+            payload_bytes: Optional[int] = None) -> Optional[Any]:
+        """Lazily allocate a CUDA tensor used as the per-layer broadcast
+        payload.
 
-        The heartbeat is a small (4 × int32 = 16 B) tensor that the
-        production Indexer hook publishes from the owner rank every layer
-        every decode step. It exercises the NCCL broadcast path end-to-end
-        so deployments with LayerSplit on and CP > 1 actually pay (and
-        we measure) the per-layer collective cost. Once M5d plumbs the
-        real active-KV slice this hook will be replaced with the KV
-        payload; the heartbeat keeps the wiring under CI pressure in the
-        meantime.
+        ``payload_bytes=None`` (default) keeps the M5c posture: a 16-byte
+        heartbeat (4 × int32) that exercises the NCCL broadcast path end
+        to end so configuration errors surface at first decode step. The
+        16-byte payload is too small to matter for bandwidth measurement
+        but proves the wiring is correct.
+
+        ``payload_bytes > 16`` (M5d-bandwidth posture) grows the payload
+        to a realistic per-layer KV-slice size so the production decode
+        actually pays NCCL bandwidth proportional to what the M5d real
+        active-KV broadcast will pay. Used to:
+        - Measure the M6 cross-layer overlap upside ahead of M5d shipping.
+        - Stress the comm stream / cp_group at realistic sizes (e.g. 1
+          MB / layer) and surface any latent NCCL configuration issues
+          (NVSwitch contention, channel exhaustion) before M5d activates
+          the active-KV path.
+        - Provide an apples-to-apples baseline for "what would real M5d
+          cost" without yet touching the attention compute (which would
+          require exact-token CP=2 validation).
+
+        The payload is allocated as uint8 zeros for ``payload_bytes`` not
+        equal to the heartbeat size; the broadcast publishes uninitialized
+        bytes (since the receiver discards the payload in the M5d-partial
+        posture anyway). Once M5d wires the real active-KV slice the
+        payload will be a view over the cache pool rather than a separate
+        allocation.
 
         Returns None on the disabled / non-CUDA / single-CP path so the
         caller short-circuits before the broadcast call.
@@ -194,9 +213,13 @@ class LayerSplitRuntimeState:
         if torch is None or not torch.cuda.is_available():
             return None
         if self._heartbeat_payload is None:
-            self._heartbeat_payload = torch.zeros(4,
-                                                  dtype=torch.int32,
-                                                  device="cuda")
+            if payload_bytes is None or payload_bytes <= 16:
+                self._heartbeat_payload = torch.zeros(4,
+                                                      dtype=torch.int32,
+                                                      device="cuda")
+            else:
+                self._heartbeat_payload = torch.zeros(
+                    int(payload_bytes), dtype=torch.uint8, device="cuda")
         return self._heartbeat_payload
 
     @classmethod

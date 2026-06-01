@@ -531,6 +531,58 @@ def test_heartbeat_payload_returns_cached_cuda_tensor():
     assert mzeros.call_count == 1
 
 
+def test_heartbeat_default_payload_is_16_bytes_int32():
+    # The default M5c heartbeat must remain int32 × 4 = 16 B until
+    # callers explicitly opt into the larger M5d-bandwidth payload.
+    # This protects the existing wiring + bench baselines from a silent
+    # payload-size regression when the API expands.
+    state = _make_state(cp_size=4, cp_rank=0)
+    import torch as _torch
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros") as mzeros:
+        mzeros.return_value = MagicMock(spec=_torch.Tensor)
+        state.ensure_heartbeat_payload()  # payload_bytes=None
+    # zeros called with (4, dtype=int32, device='cuda')
+    args, kwargs = mzeros.call_args
+    assert args == (4, ) or kwargs.get("size") == 4 or args[0] == 4
+    assert kwargs.get("dtype") == _torch.int32
+    assert kwargs.get("device") == "cuda"
+
+
+def test_heartbeat_bandwidth_mode_allocates_uint8_block():
+    # Explicit payload_bytes > 16 (M5d-bandwidth posture): the broadcast
+    # publishes a realistic-sized payload (uint8 block) so the comm
+    # stream / NCCL channels see production-shaped traffic.
+    state = _make_state(cp_size=4, cp_rank=0)
+    import torch as _torch
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros") as mzeros:
+        mzeros.return_value = MagicMock(spec=_torch.Tensor)
+        state.ensure_heartbeat_payload(payload_bytes=1024 * 1024)  # 1 MB
+    args, kwargs = mzeros.call_args
+    assert args[0] == 1024 * 1024
+    assert kwargs.get("dtype") == _torch.uint8
+    assert kwargs.get("device") == "cuda"
+
+
+def test_heartbeat_bandwidth_size_is_cached():
+    # First-call payload_bytes wins; subsequent calls return the cached
+    # tensor regardless of payload_bytes argument. Callers that want a
+    # different size must reset the runtime state.
+    state = _make_state(cp_size=4, cp_rank=0)
+    import torch as _torch
+    fake_a = MagicMock(spec=_torch.Tensor, name="big")
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros", return_value=fake_a) as mzeros:
+        first = state.ensure_heartbeat_payload(payload_bytes=8192)
+        second = state.ensure_heartbeat_payload(payload_bytes=16)
+        third = state.ensure_heartbeat_payload(payload_bytes=2 * 1024 * 1024)
+    assert first is fake_a
+    assert second is fake_a
+    assert third is fake_a
+    assert mzeros.call_count == 1
+
+
 def test_broadcast_skipped_when_dist_not_initialized():
     payload = MagicMock()
     cp_group = MagicMock()
