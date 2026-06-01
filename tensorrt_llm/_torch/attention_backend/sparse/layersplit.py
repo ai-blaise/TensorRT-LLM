@@ -142,6 +142,14 @@ class LayerSplitRuntimeState:
       (CUDA-graph capture freezes the stream identity at capture time).
       ``None`` when LayerSplit is disabled or when CUDA is unavailable
       (CPU-only tests, doc generation).
+    - ``cp_group``: the ``torch.distributed.ProcessGroup`` for the CP
+      collective. The DSACacheManager resolves it from
+      ``mapping.cp_group_pg`` (via the device-mesh path) and stashes it
+      here so the per-layer hook does not have to re-traverse the
+      mapping on every call. ``None`` when LayerSplit is disabled,
+      when ``cp_size <= 1``, or when the mapping has not yet built the
+      process group (e.g. CPU-only unit tests, model-load smoke tests
+      before ``init_process_group``).
     """
 
     enabled: bool
@@ -151,6 +159,16 @@ class LayerSplitRuntimeState:
     cp_size: int
     cp_rank: int
     comm_stream: Optional[Any] = field(default=None, repr=False)
+    cp_group: Optional[Any] = field(default=None, repr=False)
+
+    def bind_cp_group(self, cp_group: Any) -> None:
+        """Late-bind the CP process group resolved from ``mapping``.
+
+        The DSACacheManager resolves the group eagerly at construction
+        time when possible; tests that build the runtime state directly
+        (without a mapping) can bind the group post-hoc.
+        """
+        self.cp_group = cp_group
 
     @classmethod
     def disabled(cls) -> "LayerSplitRuntimeState":

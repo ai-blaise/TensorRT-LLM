@@ -3195,9 +3195,9 @@ class Indexer(nn.Module):
         # peer CP ranks before any peer can run this layer's indexer or
         # sparse attention compute. The runtime state's broadcast is a
         # no-op on the off path, the cp_size=1 path, when no CP process
-        # group is wired through, or when no payload has been staged
-        # (M5a scaffold); M5b will pass the active-KV slice as payload and
-        # M6 will overlap the broadcast with prior-layer compute.
+        # group has been bound, or when no payload has been staged (M5b
+        # scaffold posture). M5c will pass the active-KV slice as payload
+        # and M6 will overlap the broadcast with prior-layer compute.
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
@@ -3205,7 +3205,7 @@ class Indexer(nn.Module):
             layersplit_state.maybe_broadcast_for_layer(
                 layer_idx=self.layer_idx,
                 payload=None,
-                cp_group=None,
+                cp_group=layersplit_state.cp_group,
             )
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
@@ -3378,7 +3378,8 @@ class DSACacheManager(KVCacheManager):
         self.index_head_dim = sparse_attn_config.index_head_dim
 
         # LayerSplit runtime state: owner_map + side-stream + transfer-backend
-        # selection. The state object is inert when layersplit_enabled is
+        # selection + (M5b) the CP process group used for owner -> peers
+        # broadcasts. The state object is inert when layersplit_enabled is
         # False, so the regular DSA path is unchanged in that case. The
         # ownership table sits on a separate helper so it can be unit-tested
         # without instantiating the C++ WindowBlockManager parent.
@@ -3390,16 +3391,33 @@ class DSACacheManager(KVCacheManager):
             cp_size=cp_size,
             cp_rank=cp_rank,
         )
+        if self.layersplit_state.enabled and mapping is not None:
+            # Best-effort cp_group resolution. The device-mesh path
+            # (cp_group_pg) is the canonical source, but it requires
+            # torch.distributed to be initialized and the mesh to be
+            # built. Failures here are non-fatal: the broadcast path
+            # gracefully collapses to a no-op when cp_group is None
+            # (the per-layer hook still wires through; M5c will plumb
+            # the real payload).
+            try:
+                cp_group = getattr(mapping, "cp_group_pg", None)
+            except Exception:  # pragma: no cover - defensive
+                cp_group = None
+            if cp_group is not None:
+                self.layersplit_state.bind_cp_group(cp_group)
         if self.layersplit_state.enabled:
             logger.info(
                 "LayerSplit enabled: %d layers across %d CP ranks via "
-                "policy=%s, transfer_backend=%s. Replicated-materialization "
-                "mode (M3): full DSA KV/indexer pool allocated on every rank; "
-                "owner-local allocation activates in M4.",
+                "policy=%s, transfer_backend=%s, cp_group=%s. "
+                "Replicated-materialization (M3) + owner-local alloc (M4) "
+                "+ broadcast scaffold (M5) all installed; KV payload "
+                "plumbing is M5c.",
                 num_layers,
                 cp_size,
                 self.layersplit_state.ownership.policy,
                 self.layersplit_state.transfer_backend,
+                "bound" if self.layersplit_state.cp_group is not None else
+                "unbound (broadcast collapses to noop)",
             )
 
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
