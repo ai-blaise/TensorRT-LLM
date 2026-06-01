@@ -3190,21 +3190,25 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        # LayerSplit (M5): if the deployment configured LayerSplit, the owner
-        # CP rank for this layer must publish its KV / indexer-K to the
-        # peer CP ranks before any peer can run this layer's indexer or
-        # sparse attention compute. The runtime state's broadcast is a
-        # no-op on the off path, the cp_size=1 path, when no CP process
-        # group has been bound, or when no payload has been staged (M5b
-        # scaffold posture). M5c will pass the active-KV slice as payload
-        # and M6 will overlap the broadcast with prior-layer compute.
+        # LayerSplit (M5c): if the deployment configured LayerSplit, the
+        # owner CP rank for this layer must publish its KV / indexer-K to
+        # the peer CP ranks before any peer can run this layer's indexer
+        # or sparse attention compute. Until M5d lands the active-KV
+        # slice plumbing, we publish a small heartbeat tensor every layer
+        # every decode step so the NCCL broadcast path is exercised
+        # end-to-end (proves correct wiring under CI, gives a baseline
+        # for the M6 overlap measurement, and surfaces any CP-comm
+        # configuration error during model load instead of at the moment
+        # the real KV payload starts flowing). The runtime state's
+        # broadcast is a no-op on the off path, the cp_size=1 path, when
+        # no CP process group has been bound, or when CUDA is unavailable.
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
             layersplit_state.maybe_broadcast_for_layer(
                 layer_idx=self.layer_idx,
-                payload=None,
+                payload=layersplit_state.ensure_heartbeat_payload(),
                 cp_group=layersplit_state.cp_group,
             )
 

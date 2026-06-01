@@ -501,6 +501,36 @@ def test_broadcast_uses_correct_owner_rank_contiguous():
         assert calls[1].kwargs["src"] == 7, calls[1]  # rank 7 owns 54..60
 
 
+def test_heartbeat_payload_none_on_disabled():
+    assert LayerSplitRuntimeState.disabled().ensure_heartbeat_payload() is None
+
+
+def test_heartbeat_payload_none_on_cp_size_1():
+    state = _make_state(cp_size=1, cp_rank=0)
+    assert state.ensure_heartbeat_payload() is None
+
+
+def test_heartbeat_payload_none_when_cuda_unavailable():
+    state = _make_state(cp_size=4, cp_rank=0)
+    import torch as _torch
+    with patch.object(_torch.cuda, "is_available", return_value=False):
+        assert state.ensure_heartbeat_payload() is None
+
+
+def test_heartbeat_payload_returns_cached_cuda_tensor():
+    state = _make_state(cp_size=4, cp_rank=0)
+    import torch as _torch
+    fake_tensor = MagicMock(spec=_torch.Tensor, name="heartbeat")
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros", return_value=fake_tensor) as mzeros:
+        p1 = state.ensure_heartbeat_payload()
+        p2 = state.ensure_heartbeat_payload()
+    assert p1 is fake_tensor and p2 is fake_tensor
+    # Allocation is lazy and cached — torch.zeros is invoked exactly once
+    # across both ensure_* calls.
+    assert mzeros.call_count == 1
+
+
 def test_broadcast_skipped_when_dist_not_initialized():
     payload = MagicMock()
     cp_group = MagicMock()

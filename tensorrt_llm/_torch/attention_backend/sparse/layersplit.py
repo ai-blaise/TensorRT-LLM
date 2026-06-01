@@ -160,6 +160,9 @@ class LayerSplitRuntimeState:
     cp_rank: int
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
+    _heartbeat_payload: Optional[Any] = field(default=None,
+                                              repr=False,
+                                              init=False)
 
     def bind_cp_group(self, cp_group: Any) -> None:
         """Late-bind the CP process group resolved from ``mapping``.
@@ -169,6 +172,32 @@ class LayerSplitRuntimeState:
         (without a mapping) can bind the group post-hoc.
         """
         self.cp_group = cp_group
+
+    def ensure_heartbeat_payload(self) -> Optional[Any]:
+        """Lazily allocate a tiny CUDA tensor used as the M5c heartbeat
+        payload for the per-layer broadcast.
+
+        The heartbeat is a small (4 × int32 = 16 B) tensor that the
+        production Indexer hook publishes from the owner rank every layer
+        every decode step. It exercises the NCCL broadcast path end-to-end
+        so deployments with LayerSplit on and CP > 1 actually pay (and
+        we measure) the per-layer collective cost. Once M5d plumbs the
+        real active-KV slice this hook will be replaced with the KV
+        payload; the heartbeat keeps the wiring under CI pressure in the
+        meantime.
+
+        Returns None on the disabled / non-CUDA / single-CP path so the
+        caller short-circuits before the broadcast call.
+        """
+        if not self.enabled or self.cp_size <= 1:
+            return None
+        if torch is None or not torch.cuda.is_available():
+            return None
+        if self._heartbeat_payload is None:
+            self._heartbeat_payload = torch.zeros(4,
+                                                  dtype=torch.int32,
+                                                  device="cuda")
+        return self._heartbeat_payload
 
     @classmethod
     def disabled(cls) -> "LayerSplitRuntimeState":
