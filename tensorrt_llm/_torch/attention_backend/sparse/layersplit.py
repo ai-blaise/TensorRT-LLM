@@ -170,6 +170,13 @@ class LayerSplitRuntimeState:
     all_cp_ranks_transfer: bool
     cp_size: int
     cp_rank: int
+    # M5d-config: per-layer broadcast payload size in bytes. None falls
+    # back to the 16-byte heartbeat for wiring validation; deployments
+    # that want to validate real bandwidth ahead of the M5d-full active-KV
+    # plumbing can set it to a realistic per-layer KV-slice size (e.g.
+    # 1_000_000 = ~1 MB / layer) and the existing M6 / M8b prefetch
+    # protocol carries the payload through unchanged.
+    payload_bytes_per_layer: Optional[int] = field(default=None)
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
     # M8b: optional second comm stream dedicated to the "indexer" channel
@@ -259,10 +266,22 @@ class LayerSplitRuntimeState:
             raise ValueError(f"unknown layersplit channel {channel!r}; "
                              f"expected one of {_VALID_CHANNELS}")
 
+        # If the caller did not set a payload size, fall back to the
+        # state-level default from `payload_bytes_per_layer` (M5d-config
+        # plumbing). For the indexer channel, divide by 8 to approximate
+        # the 1/8 KV-size ratio from z.ai blog §4 — the indexer-K cache
+        # is roughly an eighth of the dense KV cache.
+        effective_bytes = payload_bytes
+        if effective_bytes is None and self.payload_bytes_per_layer is not None:
+            if channel == "indexer":
+                effective_bytes = max(16, self.payload_bytes_per_layer // 8)
+            else:
+                effective_bytes = self.payload_bytes_per_layer
+
         def _alloc() -> Any:
-            if payload_bytes is None or payload_bytes <= 16:
+            if effective_bytes is None or effective_bytes <= 16:
                 return torch.zeros(4, dtype=torch.int32, device="cuda")
-            return torch.zeros(int(payload_bytes),
+            return torch.zeros(int(effective_bytes),
                                dtype=torch.uint8,
                                device="cuda")
 
@@ -427,6 +446,16 @@ class LayerSplitRuntimeState:
 
         ownership = compute_owner_assignment(num_layers, cp_size, policy)
 
+        payload_bytes_per_layer = getattr(sparse_attn_config,
+                                          "layersplit_payload_bytes_per_layer",
+                                          None)
+        if payload_bytes_per_layer is not None:
+            payload_bytes_per_layer = int(payload_bytes_per_layer)
+            if payload_bytes_per_layer < 16:
+                raise ValueError(
+                    "layersplit_payload_bytes_per_layer must be >= 16; "
+                    f"got {payload_bytes_per_layer}")
+
         if create_comm_stream is None:
             create_comm_stream = (torch is not None
                                   and torch.cuda.is_available())
@@ -448,6 +477,7 @@ class LayerSplitRuntimeState:
             all_cp_ranks_transfer=all_cp_ranks_transfer,
             cp_size=cp_size,
             cp_rank=cp_rank,
+            payload_bytes_per_layer=payload_bytes_per_layer,
             comm_stream=comm_stream,
             indexer_comm_stream=indexer_comm_stream,
         )

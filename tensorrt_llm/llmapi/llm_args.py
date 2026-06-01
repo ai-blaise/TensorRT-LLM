@@ -410,6 +410,18 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Require every CP rank to participate in LayerSplit cache transfer.")
+    layersplit_payload_bytes_per_layer: Optional[int] = Field(
+        default=None,
+        description=
+        "Per-layer LayerSplit broadcast payload size in bytes. None (the "
+        "default) ships the 16-byte heartbeat — sufficient to validate the "
+        "wiring + comm-stream synchronization but too small to exercise "
+        "real bandwidth. Set to a realistic per-layer KV-slice size "
+        "(e.g. 1_000_000 for a ~1 MB / layer M5d-bandwidth probe; the "
+        "production V3.2 long-context shape is multi-MB / layer) to drive "
+        "the broadcast at proportional bytes-on-the-wire through the "
+        "existing M6 cross-layer + M8b 2-channel scaffolding ahead of the "
+        "M5d-full active-KV attention-source override.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):

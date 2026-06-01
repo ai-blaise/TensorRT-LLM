@@ -968,6 +968,70 @@ def test_wait_indexer_channel_returns_false_when_only_kv_prefetched():
                                                channel="kv") is True
 
 
+def test_payload_bytes_per_layer_propagates_from_sparse_config():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_payload_bytes_per_layer=2_000_000),
+        num_layers=8,
+        cp_size=2,
+        cp_rank=0,
+        create_comm_stream=False,
+    )
+    assert state.enabled is True
+    assert state.payload_bytes_per_layer == 2_000_000
+
+
+def test_payload_bytes_per_layer_defaults_to_none():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(),
+        num_layers=8,
+        cp_size=2,
+        cp_rank=0,
+        create_comm_stream=False,
+    )
+    assert state.payload_bytes_per_layer is None
+
+
+def test_payload_bytes_per_layer_rejects_below_16():
+    with pytest.raises(ValueError,
+                       match="layersplit_payload_bytes_per_layer must be"):
+        LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_payload_bytes_per_layer=8),
+            num_layers=8,
+            cp_size=2,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+
+
+def test_indexer_channel_payload_is_eighth_of_kv_per_blog():
+    # Per the z.ai blog: indexer-K cache is ~1/8 the size of the dense
+    # KV cache. The state's default payload sizing should mirror that
+    # ratio so the broadcast bytes-on-the-wire match production
+    # bandwidth profile.
+    import torch as _torch
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros", side_effect=lambda *a, **k: MagicMock(
+             name=f"payload-{a}")):
+        state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_payload_bytes_per_layer=8_000_000),
+            num_layers=8,
+            cp_size=2,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+        # KV channel uses the full 8 MB
+        state.ensure_heartbeat_payload(layer_idx=0, channel="kv")
+        kv_call = _torch.zeros.call_args_list[-1]
+        assert kv_call.args[0] == 8_000_000
+        # indexer channel uses ~1/8 (i.e. 1 MB)
+        state.ensure_heartbeat_payload(layer_idx=0, channel="indexer")
+        idx_call = _torch.zeros.call_args_list[-1]
+        assert idx_call.args[0] == 1_000_000
+
+
 def test_two_phase_pipeline_keeps_both_channels_pipelined():
     # Drive the 2-phase pattern by hand: at layer L we wait on both
     # channels for L (popping their events) and prefetch both for L+1.
