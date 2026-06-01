@@ -1,5 +1,6 @@
 """Unit tests for tensorrt_llm._torch.attention_backend.sparse.layersplit."""
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -344,6 +345,177 @@ def test_layer_mask_contiguous_rank_3_owns_block():
     expected = [(24 <= layer <= 31) for layer in range(61)]
     assert mask == expected
     assert sum(mask) == 8
+
+
+# ---------------------------------------------------------------------------
+# maybe_broadcast_for_layer (M5: owner -> peers per-layer broadcast) tests
+# ---------------------------------------------------------------------------
+
+
+def _make_state(cp_size=8, cp_rank=0, policy="round_robin"):
+    return LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment=policy),
+        num_layers=61,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        create_comm_stream=False,
+    )
+
+
+def test_broadcast_noop_on_disabled_path():
+    state = LayerSplitRuntimeState.disabled()
+    # Even with a payload + group provided, the disabled path must do
+    # absolutely nothing — no broadcast call, no side effects.
+    with patch("torch.distributed.broadcast") as mock_bcast:
+        state.maybe_broadcast_for_layer(
+            layer_idx=3,
+            payload=MagicMock(),
+            cp_group=MagicMock(),
+        )
+    mock_bcast.assert_not_called()
+
+
+def test_broadcast_noop_on_cp_size_1():
+    state = _make_state(cp_size=1, cp_rank=0)
+    with patch("torch.distributed.broadcast") as mock_bcast:
+        state.maybe_broadcast_for_layer(
+            layer_idx=3,
+            payload=MagicMock(),
+            cp_group=MagicMock(),
+        )
+    mock_bcast.assert_not_called()
+
+
+def test_broadcast_noop_when_payload_or_group_missing():
+    # M5a scaffolding posture: callers stage the wiring without paying for
+    # an NCCL call. The runtime collapses to layersplit_noop_transfer.
+    state = _make_state(cp_size=4, cp_rank=0)
+    with patch("torch.distributed.broadcast") as mock_bcast:
+        state.maybe_broadcast_for_layer(layer_idx=3,
+                                        payload=None,
+                                        cp_group=MagicMock())
+        state.maybe_broadcast_for_layer(layer_idx=3,
+                                        payload=MagicMock(),
+                                        cp_group=None)
+    mock_bcast.assert_not_called()
+
+
+class _FakeDistContext:
+    """Context manager that patches torch.distributed.broadcast (and the
+    availability/initialization predicates) so unit tests can observe the
+    broadcast call without spinning up an actual process group.
+
+    Using patch.dict(sys.modules, {"torch.distributed": fake}) does not
+    work here because `import torch.distributed as dist` resolves through
+    Python's import machinery which checks the real `torch` package and
+    bypasses the sys.modules override. Patching the real attributes on
+    the real torch.distributed module is the reliable interception point.
+    """
+
+    def __init__(self, is_initialized=True):
+        self.is_initialized = is_initialized
+        self.broadcast = MagicMock(name="dist.broadcast")
+        self._patches = []
+
+    def __enter__(self):
+        import torch as _torch
+        import torch.distributed as _dist
+        self._patches = [
+            patch.object(_torch.cuda, "is_available", return_value=True),
+            patch.object(_dist, "is_available", return_value=True),
+            patch.object(_dist,
+                         "is_initialized",
+                         return_value=self.is_initialized),
+            patch.object(_dist, "broadcast", self.broadcast),
+        ]
+        for p in self._patches:
+            p.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.__exit__(*exc)
+        return False
+
+
+def test_broadcast_uses_correct_owner_rank_round_robin():
+    # round_robin policy: owner_of(layer) == layer % cp_size. Verify that
+    # the broadcast call uses src=owner regardless of which CP rank is
+    # invoking it (both owner and non-owner must call broadcast — NCCL
+    # collectives require every participant).
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    with _FakeDistContext() as fake:
+        # Owner rank 0 broadcasts layer 0
+        state0 = _make_state(cp_size=8, cp_rank=0)
+        state0.maybe_broadcast_for_layer(layer_idx=0,
+                                         payload=payload,
+                                         cp_group=cp_group,
+                                         async_op=False)
+        # Non-owner rank 5 also calls (NCCL collective) for layer 0
+        state5 = _make_state(cp_size=8, cp_rank=5)
+        state5.maybe_broadcast_for_layer(layer_idx=0,
+                                         payload=payload,
+                                         cp_group=cp_group,
+                                         async_op=False)
+        # For layer 5, owner is rank 5
+        state5.maybe_broadcast_for_layer(layer_idx=5,
+                                         payload=payload,
+                                         cp_group=cp_group,
+                                         async_op=False)
+        assert fake.broadcast.call_count == 3
+        calls = fake.broadcast.call_args_list
+        assert calls[0].kwargs["src"] == 0
+        assert calls[1].kwargs["src"] == 0
+        assert calls[2].kwargs["src"] == 5
+        for c in calls:
+            assert c.kwargs["group"] is cp_group
+
+
+def test_broadcast_uses_correct_owner_rank_contiguous():
+    payload = MagicMock()
+    cp_group = MagicMock()
+    with _FakeDistContext() as fake:
+        # cp_size=8 contiguous → ranks 0..4 own 8 layers each, ranks 5..7
+        # own 7 each. Layer 30 belongs to rank 3 (which owns 24..31).
+        state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_owner_assignment="contiguous"),
+            num_layers=61,
+            cp_size=8,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+        state.maybe_broadcast_for_layer(layer_idx=30,
+                                        payload=payload,
+                                        cp_group=cp_group,
+                                        async_op=False)
+        state.maybe_broadcast_for_layer(layer_idx=54,
+                                        payload=payload,
+                                        cp_group=cp_group,
+                                        async_op=False)
+        calls = fake.broadcast.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["src"] == 3, calls[0]
+        assert calls[1].kwargs["src"] == 7, calls[1]  # rank 7 owns 54..60
+
+
+def test_broadcast_skipped_when_dist_not_initialized():
+    payload = MagicMock()
+    cp_group = MagicMock()
+    with _FakeDistContext(is_initialized=False) as fake:
+        state = _make_state(cp_size=4, cp_rank=0)
+        state.maybe_broadcast_for_layer(layer_idx=0,
+                                        payload=payload,
+                                        cp_group=cp_group,
+                                        async_op=False)
+        fake.broadcast.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# build_layersplit_layer_mask sum-across-ranks invariant (M4 cross-check)
+# ---------------------------------------------------------------------------
 
 
 def test_layer_mask_sum_across_ranks_covers_every_layer_exactly_once():

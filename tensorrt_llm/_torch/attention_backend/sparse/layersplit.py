@@ -236,19 +236,12 @@ class LayerSplitRuntimeState:
     def layersplit_noop_transfer(self, layer_idx: int) -> None:
         """Graph-stable no-op transfer placeholder.
 
-        Mirrors the synchronization shape of a real owner-to-peers broadcast
-        without actually moving data:
-
-        - On the default stream we record an event marking "the producer of
-          layer ``layer_idx``'s KV/indexer is done".
-        - The comm stream waits on that event. M5 will additionally call
-          ``ncclBroadcast`` between record and the consumer wait; M6 will
-          start the next layer's broadcast here while the current layer's
-          attention runs on the default stream.
-
-        Calling this method on the off path or when CUDA is unavailable is
-        a no-op so the wiring is safe to drop into the model forward
-        unconditionally.
+        Records an event on the default stream and waits on the comm stream
+        — the exact synchronization shape a real owner-to-peers broadcast
+        would have, with no data movement. Used by callers that want the
+        comm-stream sync without engaging the broadcast collective (e.g.
+        the LayerSplit-off path, the cp_size=1 path, or unit tests where
+        no process group is constructed).
         """
         del layer_idx  # only used by future milestones for keying state
         if not self.enabled:
@@ -260,6 +253,70 @@ class LayerSplitRuntimeState:
         event = torch.cuda.Event()
         event.record()
         self.comm_stream.wait_event(event)
+
+    def maybe_broadcast_for_layer(
+            self,
+            layer_idx: int,
+            payload: Optional[Any] = None,
+            cp_group: Optional[Any] = None,
+            async_op: bool = True) -> None:
+        """Broadcast a per-layer payload from the owner CP rank to every CP
+        peer, matching the z.ai "Scaling Pain" §4 LayerSplit broadcast
+        protocol. Peers will receive into ``payload`` (which must already
+        be a torch tensor of the right shape on every rank); the owner's
+        tensor content is published. The broadcast runs on the dedicated
+        comm stream (created at runtime-state init) so that M6 can overlap
+        it with the indexer / sparse-attention compute on the default
+        stream.
+
+        Returns immediately as a no-op in any of these cases:
+
+        - LayerSplit is disabled.
+        - ``cp_size <= 1``: there are no peers to broadcast to.
+        - ``cp_group`` is None: the caller has not wired the CP process
+          group through yet (M5 callers may stage the hook in
+          progressively; the method must not blow up before the group is
+          available).
+        - ``payload`` is None: M5a callers pass None to exercise the
+          sync-shape (`layersplit_noop_transfer`) without paying for an
+          NCCL call. M5b passes a real KV slice tensor.
+        - ``torch.distributed`` is unavailable or the runtime is not
+          initialized (CPU-only tests, doc generation).
+
+        The owner rank for ``layer_idx`` is read from ``self.ownership``
+        — so the cache descriptor (M4), the C++ allocation mask (M4), and
+        this broadcast all agree on which rank owns the layer.
+        """
+        if not self.enabled or self.ownership is None:
+            return
+        if self.cp_size <= 1:
+            return
+        if cp_group is None or payload is None:
+            # No group / no payload: defer to the sync-shape placeholder
+            # so the consumer wait downstream still happens correctly.
+            self.layersplit_noop_transfer(layer_idx)
+            return
+        if torch is None or not torch.cuda.is_available():
+            return
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        src_rank = self.ownership.owner_of(layer_idx)
+        if self.comm_stream is not None:
+            with torch.cuda.stream(self.comm_stream):
+                dist.broadcast(payload,
+                               src=src_rank,
+                               group=cp_group,
+                               async_op=async_op)
+        else:
+            dist.broadcast(payload,
+                           src=src_rank,
+                           group=cp_group,
+                           async_op=async_op)
 
 
 def build_layersplit_layer_mask(
