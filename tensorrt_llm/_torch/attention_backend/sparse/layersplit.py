@@ -260,3 +260,47 @@ class LayerSplitRuntimeState:
         event = torch.cuda.Event()
         event.record()
         self.comm_stream.wait_event(event)
+
+
+def build_layersplit_layer_mask(
+        num_layers: int,
+        sparse_attn_config: Optional[Any],
+        cp_size: int,
+        cp_rank: int = 0) -> Optional[list]:
+    """Compute the per-layer ownership mask the KV cache manager passes to
+    the C++ ``WindowBlockManager`` so that non-owner CP ranks skip pool
+    allocation for non-owned layers (the M4 memory-savings step of the
+    LayerSplit integration).
+
+    Returns ``None`` when LayerSplit is disabled, when ``sparse_attn_config``
+    is missing the LayerSplit fields, or when ``cp_size <= 1`` — those cases
+    collapse to the regular all-layers-on-this-rank allocation path and the
+    layer_mask machinery should stay out of them. When LayerSplit is on with
+    ``cp_size > 1`` the result is a list of length ``num_layers`` where
+    ``True`` marks layers this rank owns and ``False`` marks the rest. The
+    caller (``_create_kv_cache_manager``) sums the mask to recompute
+    ``num_hidden_layers`` for the cache manager constructor; the C++ side
+    only allocates KV/indexer pools for the masked-in positions.
+
+    Composes safely with the rest of TRT-LLM:
+    - Returns ``None`` on the off path, so any other layer-mask consumer
+      (e.g. KV sharing for Gemma4 hybrid, one-model draft KV separation)
+      sees the same behavior as before.
+    - Uses the same ``compute_owner_assignment`` that drives
+      :class:`LayerSplitRuntimeState`; both code paths agree on which rank
+      owns which layer, so the cache descriptor and the runtime broadcast
+      sender will name the same owner for every layer.
+    """
+    if sparse_attn_config is None:
+        return None
+    if not bool(getattr(sparse_attn_config, "layersplit_enabled", False)):
+        return None
+    if cp_size <= 1:
+        return None
+    policy = str(
+        getattr(sparse_attn_config, "layersplit_owner_assignment",
+                "round_robin"))
+    ownership = compute_owner_assignment(num_layers=num_layers,
+                                         cp_size=cp_size,
+                                         policy=policy)
+    return [ownership.owner_of(layer) == cp_rank for layer in range(num_layers)]

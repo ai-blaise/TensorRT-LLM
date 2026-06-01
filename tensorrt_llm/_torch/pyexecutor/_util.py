@@ -1212,9 +1212,30 @@ def _create_kv_cache_manager(
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
 
+    # LayerSplit (M4): when LayerSplit is enabled and CP > 1, only allocate
+    # KV / indexer pools for the layers this CP rank owns. The mask flows
+    # through the existing layer_mask plumbing into the C++ KVCacheManager
+    # / WindowBlockManager — non-owner ranks get no pool for that layer and
+    # rely on the per-layer owner broadcast (wired in M5) to receive cache
+    # tiles before each layer's attention compute. The helper returns None
+    # on the LayerSplit-off path or when CP <= 1, so existing layer_mask
+    # consumers (Gemma4 KV sharing, one-model draft KV separation) are
+    # unaffected.
+    if layer_mask is None and sparse_attn_config is not None:
+        from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
+            build_layersplit_layer_mask)
+        cp_size = getattr(mapping, "cp_size", 1) if mapping is not None else 1
+        cp_rank = getattr(mapping, "cp_rank", 0) if mapping is not None else 0
+        layer_mask = build_layersplit_layer_mask(
+            num_layers=config.num_hidden_layers,
+            sparse_attn_config=sparse_attn_config,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
     # Use provided num_layers if available, otherwise use config.
-    # When layer_mask is set (e.g., KV sharing), num_layers for the cache
-    # manager must equal the number of enabled (True) layers in the mask.
+    # When layer_mask is set (e.g., KV sharing, LayerSplit), num_layers for
+    # the cache manager must equal the number of enabled (True) layers in
+    # the mask.
     if num_layers is not None:
         num_hidden_layers = num_layers
     elif layer_mask is not None:

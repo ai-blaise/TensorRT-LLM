@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
-    LayerSplitOwnership, LayerSplitRuntimeState, compute_owner_assignment)
+    LayerSplitOwnership, LayerSplitRuntimeState, build_layersplit_layer_mask,
+    compute_owner_assignment)
 
 
 def test_cp_size_1_collapses_all_layers_to_rank_0():
@@ -262,3 +263,112 @@ def test_runtime_state_carries_all_transfer_backends():
             create_comm_stream=False,
         )
         assert state.transfer_backend == backend
+
+
+# ---------------------------------------------------------------------------
+# build_layersplit_layer_mask (M4: owner-local cache allocation) tests
+# ---------------------------------------------------------------------------
+
+
+def test_layer_mask_none_on_disabled():
+    mask = build_layersplit_layer_mask(
+        num_layers=61,
+        sparse_attn_config=_sparse_cfg(layersplit_enabled=False),
+        cp_size=8,
+        cp_rank=0,
+    )
+    assert mask is None
+
+
+def test_layer_mask_none_when_sparse_attn_config_missing():
+    assert build_layersplit_layer_mask(num_layers=61,
+                                       sparse_attn_config=None,
+                                       cp_size=8,
+                                       cp_rank=0) is None
+
+
+def test_layer_mask_none_when_cp_size_is_1():
+    # cp_size <= 1: no reason to mask any layers because there is only one
+    # rank; the helper returns None so the caller falls back to the regular
+    # "all layers on this rank" path.
+    mask = build_layersplit_layer_mask(
+        num_layers=61,
+        sparse_attn_config=_sparse_cfg(),
+        cp_size=1,
+        cp_rank=0,
+    )
+    assert mask is None
+
+
+def test_layer_mask_round_robin_rank_0_owns_every_8th_layer():
+    mask = build_layersplit_layer_mask(
+        num_layers=61,
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment="round_robin"),
+        cp_size=8,
+        cp_rank=0,
+    )
+    assert mask is not None
+    assert len(mask) == 61
+    # Rank 0 in round-robin owns layers 0, 8, 16, 24, 32, 40, 48, 56 → 8 layers
+    expected = [(layer % 8 == 0) for layer in range(61)]
+    assert mask == expected
+    assert sum(mask) == 8
+
+
+def test_layer_mask_round_robin_rank_5_owns_layers_5_13_21_etc():
+    mask = build_layersplit_layer_mask(
+        num_layers=61,
+        sparse_attn_config=_sparse_cfg(),
+        cp_size=8,
+        cp_rank=5,
+    )
+    # Rank 5 owns layers 5, 13, 21, 29, 37, 45, 53 → 7 layers (61 % 8 = 5,
+    # so ranks 0..4 own one extra layer each)
+    expected = [((layer - 5) >= 0 and (layer - 5) % 8 == 0)
+                for layer in range(61)]
+    assert mask == expected
+    assert sum(mask) == 7
+
+
+def test_layer_mask_contiguous_rank_3_owns_block():
+    mask = build_layersplit_layer_mask(
+        num_layers=61,
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment="contiguous"),
+        cp_size=8,
+        cp_rank=3,
+    )
+    # contiguous: ranks 0..4 own 8 layers each, ranks 5..7 own 7 each. Rank
+    # 3 owns layers 24..31 inclusive.
+    expected = [(24 <= layer <= 31) for layer in range(61)]
+    assert mask == expected
+    assert sum(mask) == 8
+
+
+def test_layer_mask_sum_across_ranks_covers_every_layer_exactly_once():
+    # Critical correctness invariant for the C++ side: every layer must be
+    # owned by exactly one rank, otherwise some layers go un-allocated and
+    # the broadcast graph cannot reconstruct the full KV pool.
+    for policy in ("round_robin", "contiguous"):
+        cp_size = 8
+        num_layers = 61
+        masks = [
+            build_layersplit_layer_mask(
+                num_layers=num_layers,
+                sparse_attn_config=_sparse_cfg(
+                    layersplit_owner_assignment=policy),
+                cp_size=cp_size,
+                cp_rank=rank,
+            ) for rank in range(cp_size)
+        ]
+        for rank, mask in enumerate(masks):
+            assert mask is not None and len(mask) == num_layers, policy
+        # Each layer is True in exactly one rank's mask.
+        per_layer_owners = [
+            sum(masks[rank][layer] for rank in range(cp_size))
+            for layer in range(num_layers)
+        ]
+        assert per_layer_owners == [1] * num_layers, (policy, per_layer_owners)
+        # Total layers owned across ranks equals num_layers.
+        assert sum(sum(m) for m in masks) == num_layers, policy
