@@ -31,13 +31,20 @@ WORKER_FILE = "test_layersplit_multiproc_nccl.py"
 def run_one(policy: str,
             port: int,
             num_layers: int = 8,
-            worker_fn: str = "_worker") -> bool:
-    """Spawn a 2-rank torch.distributed.run subprocess and verify both
-    ranks reported PASS for the given owner-assignment policy.
+            worker_fn: str = "_worker",
+            world_size: int = 2) -> bool:
+    """Spawn an ``N``-rank torch.distributed.run subprocess and verify
+    every rank reported PASS for the given owner-assignment policy.
 
     ``worker_fn`` selects which entry point to invoke inside the worker
     module: ``_worker`` for the M5 sync-broadcast test, ``_worker_m6``
-    for the M6 prefetch-overlap test.
+    for the M6 prefetch-overlap test, ``_worker_m8b`` for the 2-channel
+    M8b test.
+
+    ``world_size`` defaults to 2 for backwards compatibility with the
+    CP=2 invocations; pass ``world_size=4`` to drive the M10 CP=4
+    validation. The caller is responsible for ensuring
+    ``CUDA_VISIBLE_DEVICES`` exposes at least ``world_size`` GPUs.
     """
     with tempfile.TemporaryDirectory() as td:
         # Copy the worker module into /tmp so the spawned children can
@@ -70,28 +77,30 @@ getattr(w, '{worker_fn}')(rank, int(os.environ['WORLD_SIZE']),
           int(os.environ['MASTER_PORT']),
           '{policy}', {num_layers}, '{td}')
 """
-        driver_path = f"/tmp/_ls_driver_{policy}_{worker_fn}.py"
+        driver_path = (f"/tmp/_ls_driver_{policy}_{worker_fn}_"
+                       f"cp{world_size}.py")
         with open(driver_path, "w") as f:
             f.write(driver)
 
         result = subprocess.run(
             [
                 "python3.11", "-m", "torch.distributed.run",
-                "--nproc_per_node=2", f"--master_port={port}", driver_path,
+                f"--nproc_per_node={world_size}",
+                f"--master_port={port}", driver_path,
             ],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         if result.returncode != 0:
-            print(f"FAIL fn={worker_fn} policy={policy} "
+            print(f"FAIL fn={worker_fn} policy={policy} cp={world_size} "
                   f"returncode={result.returncode}")
             print("STDOUT (tail):", result.stdout[-1500:])
             print("STDERR (tail):", result.stderr[-1500:])
             return False
 
         ok = True
-        for rank in range(2):
+        for rank in range(world_size):
             p = pathlib.Path(td) / f"rank{rank}.result"
             if not p.exists():
                 ok = False
@@ -102,24 +111,44 @@ getattr(w, '{worker_fn}')(rank, int(os.environ['WORLD_SIZE']),
                 ok = False
                 print(f"  rank{rank}: {content}")
         if ok:
-            print(f"PASS fn={worker_fn} policy={policy}")
+            print(f"PASS fn={worker_fn} policy={policy} cp={world_size}")
         return ok
 
 
 def main() -> int:
     overall = True
-    # M5 sync-broadcast test (worker_fn=_worker), both policies
-    for i, policy in enumerate(["round_robin", "contiguous"]):
-        if not run_one(policy, 29540 + i, worker_fn="_worker"):
-            overall = False
-    # M6 prefetch-overlap test (worker_fn=_worker_m6), both policies
-    for i, policy in enumerate(["round_robin", "contiguous"]):
-        if not run_one(policy, 29550 + i, worker_fn="_worker_m6"):
-            overall = False
-    # M8b 2-channel (indexer + KV) test, both policies
-    for i, policy in enumerate(["round_robin", "contiguous"]):
-        if not run_one(policy, 29560 + i, worker_fn="_worker_m8b"):
-            overall = False
+    # Resolve the world_size we can drive from the visible-devices set.
+    # Default CP=2 (the existing baseline); detect CP=4 when 4+ GPUs are
+    # visible so the M10 CP=4 validation runs automatically when the
+    # caller widens the pin (e.g. CUDA_VISIBLE_DEVICES=3,4,5,6).
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    n_visible = len([v for v in visible if v.strip()])
+    cp_sizes = [2]
+    if n_visible >= 4:
+        cp_sizes.append(4)
+    for cp_size in cp_sizes:
+        port_base = 29540 if cp_size == 2 else 29640
+        # M5 sync-broadcast test, both policies
+        for i, policy in enumerate(["round_robin", "contiguous"]):
+            if not run_one(policy,
+                           port_base + i,
+                           worker_fn="_worker",
+                           world_size=cp_size):
+                overall = False
+        # M6 prefetch-overlap test, both policies
+        for i, policy in enumerate(["round_robin", "contiguous"]):
+            if not run_one(policy,
+                           port_base + 10 + i,
+                           worker_fn="_worker_m6",
+                           world_size=cp_size):
+                overall = False
+        # M8b 2-channel test, both policies
+        for i, policy in enumerate(["round_robin", "contiguous"]):
+            if not run_one(policy,
+                           port_base + 20 + i,
+                           worker_fn="_worker_m8b",
+                           world_size=cp_size):
+                overall = False
     return 0 if overall else 1
 
 

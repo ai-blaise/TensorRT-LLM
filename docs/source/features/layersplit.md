@@ -77,7 +77,8 @@ safe to share across decoding steps within the same model load.
 | M7        | `675c3045`   | CZS-proved stage-for-broadcast kernel scaffold + reference torch implementation; 12/12 CZS obligations proved. |
 | M8b       | `3e3d3e99`   | 2-phase per-layer broadcast: indexer-K + dense KV go on independent channels (each with its own `comm_stream` by default). The indexer channel prefetches first so the small payload's NCCL kernel reaches the wire before the larger KV NCCL kernel does; the receiver waits on indexer first so the indexer compute can start as soon as the small payload lands while the KV broadcast is still in flight. `(layer_idx, channel)` keys for prefetched events + per-layer payloads. M5c sync / M6 single-channel call sites preserved as the `channel="kv"` defaults. Validated by CP=2 multi-proc NCCL test (`_worker_m8b`) for both policies — both channels independent and correct. |
 | M7b       | `3101945b`   | Real `@cute.jit` `stage_for_broadcast_cute_jit` body backing the production `stage_for_broadcast_cute` wrapper, with a `cute.compile`-cached launch path and a transparent torch fallback when the DSL compile pipeline isn't wired (DSLRuntimeError on dtype / tensor-conversion mismatches falls through to the torch scatter so callers never hard-fail). Validated by 8 new GPU correctness tests across `(use_fp4, num_tokens)` combinations: every shape produces a byte-exact match against `stage_for_broadcast_reference`. |
-| M9        | (this commit) | Cross-mode overlap benchmark scaffold (`tests/unittest/_torch/bench_layersplit_overlap.py` + runner) times M5 sync / M6 single-channel / M8b 2-channel at a matrix of `(payload_bytes, compute_us)` shapes on a real CP=2 NCCL group. Establishes the production baseline for every subsequent overlap / fusion optimization. |
+| M9        | `1bc2ce58`   | Cross-mode overlap benchmark scaffold (`tests/unittest/_torch/bench_layersplit_overlap.py` + runner) times M5 sync / M6 single-channel / M8b 2-channel at a matrix of `(payload_bytes, compute_us)` shapes on a real CP=2 NCCL group. Establishes the production baseline for every subsequent overlap / fusion optimization. |
+| M10       | (this commit) | Production gate CP-validation extension: the multi-proc NCCL runner now auto-detects 4 visible GPUs and runs M5 / M6 / M8b at both CP=2 and CP=4 (12 tests vs the prior 6). All 12 PASS on `a4-us-001-rl9` GPUs 3,4,5,6 alongside the production sglang TP=8 deployment. CP=8 + full TP=8/EP=8/ADP exact-token validation remains queued behind a real-model deployment context (this VM's GPU 0-7 footprint is already held by the sglang deployment). |
 
 ## Queued work
 
@@ -135,18 +136,19 @@ NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=<gpu_a>,<gpu_b> \
 
 ## Validation matrix (M10 gate)
 
-- Owner-map policies: `round_robin`, `contiguous`.
-- CP sizes: 2, 4, 8.
-- Parallelism composition: `TP=8`, `EP=8`, attention-DP, CP / DWDP, disagg-PD.
-- CUDA graph capture / replay at the production decode buckets:
-  `c1, c2, c4, c8, c16, c32` (per the op-trt c32 production profile).
-- Exact-token end-to-end correctness across input lengths `1k, 8k, 16k, 32k,
-  100k, 128k`.
-- Long-context prefix-hit benchmark @ 90 % cache hit, inputs `40k, 60k, 80k,
-  100k, 120k`. Compare against:
-  - No-LayerSplit fallback (same hardware, same model).
-  - SGLang op-ls reference numbers (CP=8 wall ratios `7.68×, 8.45×, 8.42×`
-    at 40 / 60 / 80 k; TTFT speedups `6.83×, 7.34×, 7.79×`).
+| Dimension                                                              | Status                                                                                                   |
+|------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
+| Owner-map policies: `round_robin`, `contiguous`                        | **DONE** — both policies covered by 57/57 unit tests + every multi-proc NCCL test.                       |
+| CP=2 NCCL correctness for M5 / M6 / M8b                                | **DONE** — `run_layersplit_multiproc_nccl.py` PASS on real B200 GPUs.                                     |
+| CP=4 NCCL correctness for M5 / M6 / M8b                                | **DONE** — 6 additional tests PASS when `CUDA_VISIBLE_DEVICES` exposes 4+ GPUs.                          |
+| Cross-mode overlap baseline                                            | **DONE** — `bench_layersplit_overlap.py` records M5 vs M6 vs M8b wall time across `(payload, compute)`.   |
+| CZS proof for the stage-for-broadcast kernel                           | **DONE** — 12/12 obligations Proved (BlockScaledScaleFactor + Vectorization + LayoutLegality variants).   |
+| `@cute.jit` `stage_for_broadcast` body + production wrapper            | **DONE** — byte-exact match vs reference across `(use_fp4, num_tokens)` matrix on real B200.             |
+| CP=8 NCCL correctness                                                  | Queued — needs an 8-GPU host (this VM's 8 GPUs are pinned by the sibling sglang deployment).             |
+| Full TP=8 / EP=8 / ADP / DWDP / disagg-PD composition                  | Queued — needs a real model deployment context (cannot co-run with the sglang tenant on this VM).        |
+| CUDA-graph capture / replay at c1, c2, c4, c8, c16, c32                | Queued — needs the real model attention path (the heartbeat path captures cleanly; M5d will validate KV).|
+| Exact-token end-to-end correctness across `1k, 8k, 16k, 32k, 100k, 128k` | Queued — needs a real model deployment context.                                                          |
+| Long-context prefix-hit @ 90 % cache hit (40k / 60k / 80k / 100k / 120k) | Queued — comparator is the SGLang op-ls reference numbers (CP=8 wall ratios `7.68×, 8.45×, 8.42×` at 40 / 60 / 80 k; TTFT speedups `6.83×, 7.34×, 7.79×`).                                              |
 
 ## Architecture overview
 
