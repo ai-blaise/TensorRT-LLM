@@ -28,9 +28,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKER_FILE = "test_layersplit_multiproc_nccl.py"
 
 
-def run_one(policy: str, port: int, num_layers: int = 8) -> bool:
+def run_one(policy: str,
+            port: int,
+            num_layers: int = 8,
+            worker_fn: str = "_worker") -> bool:
     """Spawn a 2-rank torch.distributed.run subprocess and verify both
-    ranks reported PASS for the given owner-assignment policy."""
+    ranks reported PASS for the given owner-assignment policy.
+
+    ``worker_fn`` selects which entry point to invoke inside the worker
+    module: ``_worker`` for the M5 sync-broadcast test, ``_worker_m6``
+    for the M6 prefetch-overlap test.
+    """
     with tempfile.TemporaryDirectory() as td:
         # Copy the worker module into /tmp so the spawned children can
         # import it as a top-level module ("_ls_mp_worker"), avoiding the
@@ -58,11 +66,11 @@ spec.loader.exec_module(m)
 
 import _ls_mp_worker as w
 rank = int(os.environ['RANK'])
-w._worker(rank, int(os.environ['WORLD_SIZE']),
+getattr(w, '{worker_fn}')(rank, int(os.environ['WORLD_SIZE']),
           int(os.environ['MASTER_PORT']),
           '{policy}', {num_layers}, '{td}')
 """
-        driver_path = f"/tmp/_ls_driver_{policy}.py"
+        driver_path = f"/tmp/_ls_driver_{policy}_{worker_fn}.py"
         with open(driver_path, "w") as f:
             f.write(driver)
 
@@ -76,7 +84,8 @@ w._worker(rank, int(os.environ['WORLD_SIZE']),
             timeout=120,
         )
         if result.returncode != 0:
-            print(f"FAIL policy={policy} returncode={result.returncode}")
+            print(f"FAIL fn={worker_fn} policy={policy} "
+                  f"returncode={result.returncode}")
             print("STDOUT (tail):", result.stdout[-1500:])
             print("STDERR (tail):", result.stderr[-1500:])
             return False
@@ -93,14 +102,19 @@ w._worker(rank, int(os.environ['WORLD_SIZE']),
                 ok = False
                 print(f"  rank{rank}: {content}")
         if ok:
-            print(f"PASS policy={policy}")
+            print(f"PASS fn={worker_fn} policy={policy}")
         return ok
 
 
 def main() -> int:
     overall = True
+    # M5 sync-broadcast test (worker_fn=_worker), both policies
     for i, policy in enumerate(["round_robin", "contiguous"]):
-        if not run_one(policy, 29540 + i):
+        if not run_one(policy, 29540 + i, worker_fn="_worker"):
+            overall = False
+    # M6 prefetch-overlap test (worker_fn=_worker_m6), both policies
+    for i, policy in enumerate(["round_robin", "contiguous"]):
+        if not run_one(policy, 29550 + i, worker_fn="_worker_m6"):
             overall = False
     return 0 if overall else 1
 

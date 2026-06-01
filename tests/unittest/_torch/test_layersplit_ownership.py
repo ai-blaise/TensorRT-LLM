@@ -626,3 +626,231 @@ def test_layer_mask_sum_across_ranks_covers_every_layer_exactly_once():
         assert per_layer_owners == [1] * num_layers, (policy, per_layer_owners)
         # Total layers owned across ranks equals num_layers.
         assert sum(sum(m) for m in masks) == num_layers, policy
+
+
+# ---------------------------------------------------------------------------
+# prefetch_for_layer / wait_for_prefetched_layer (M6 cross-layer overlap) tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeM6DistContext(_FakeDistContext):
+    """Variant that ALSO injects a fake comm_stream + cuda.Event so the
+    prefetch path runs without a real CUDA device.
+
+    The base _FakeDistContext patches dist.broadcast and dist availability;
+    M6 additionally needs torch.cuda.stream(...) and torch.cuda.Event() to
+    behave without an active CUDA context.
+    """
+
+    def __enter__(self):
+        super().__enter__()
+        import torch as _torch
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _fake_stream_ctx(stream):
+            yield
+
+        # Fake Event: records the comm_stream it was recorded on so the
+        # test can assert prefetch wired the right stream.
+        class _FakeEvent:
+            def __init__(self):
+                self.recorded_on = None
+
+            def record(self, stream=None):
+                self.recorded_on = stream
+
+        # Fake current_stream that swallows wait_event() calls so
+        # wait_for_prefetched_layer's `current_stream().wait_event(e)`
+        # works without a real CUDA context.
+        self.current_stream_mock = MagicMock(name="current_stream")
+        self.current_stream_mock.wait_event = MagicMock(name="wait_event")
+
+        self._extra_patches = [
+            patch.object(_torch.cuda, "stream", side_effect=_fake_stream_ctx),
+            patch.object(_torch.cuda, "Event", _FakeEvent),
+            patch.object(_torch.cuda,
+                         "current_stream",
+                         return_value=self.current_stream_mock),
+        ]
+        for p in self._extra_patches:
+            p.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._extra_patches):
+            p.__exit__(*exc)
+        return super().__exit__(*exc)
+
+
+def _make_state_with_comm_stream(cp_size=4, cp_rank=0, policy="round_robin"):
+    """Like _make_state but injects a MagicMock comm_stream so the M6
+    prefetch path uses the side-stream branch."""
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment=policy),
+        num_layers=8,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        create_comm_stream=False,
+    )
+    state.comm_stream = MagicMock(name="comm_stream")
+    return state
+
+
+def test_prefetch_noop_on_disabled_path():
+    state = LayerSplitRuntimeState.disabled()
+    with patch("torch.distributed.broadcast") as mock_bcast:
+        assert state.prefetch_for_layer(layer_idx=0,
+                                        payload=MagicMock(),
+                                        cp_group=MagicMock()) is False
+    mock_bcast.assert_not_called()
+
+
+def test_prefetch_noop_on_cp_size_1():
+    state = _make_state_with_comm_stream(cp_size=1, cp_rank=0)
+    with patch("torch.distributed.broadcast") as mock_bcast:
+        assert state.prefetch_for_layer(layer_idx=0,
+                                        payload=MagicMock(),
+                                        cp_group=MagicMock()) is False
+    mock_bcast.assert_not_called()
+
+
+def test_prefetch_noop_when_payload_or_group_missing():
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    with patch("torch.distributed.broadcast") as mock_bcast:
+        assert state.prefetch_for_layer(layer_idx=0,
+                                        payload=None,
+                                        cp_group=MagicMock()) is False
+        assert state.prefetch_for_layer(layer_idx=0,
+                                        payload=MagicMock(),
+                                        cp_group=None) is False
+    mock_bcast.assert_not_called()
+
+
+def test_prefetch_records_event_on_comm_stream_and_uses_correct_owner():
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    with _FakeM6DistContext() as fake:
+        # Layer 3 owner = 3 % 4 = 3
+        assert state.prefetch_for_layer(layer_idx=3,
+                                        payload=payload,
+                                        cp_group=cp_group) is True
+    fake.broadcast.assert_called_once()
+    call = fake.broadcast.call_args
+    assert call.kwargs["src"] == 3
+    assert call.kwargs["group"] is cp_group
+    assert call.kwargs["async_op"] is True
+    # The event must have landed in _prefetched_events for layer 3 and be
+    # recorded on the comm stream.
+    assert 3 in state._prefetched_events
+    event = state._prefetched_events[3]
+    assert event.recorded_on is state.comm_stream
+
+
+def test_wait_for_prefetched_layer_no_op_when_no_prefetch():
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    # No prefetch in flight: caller must do a sync broadcast.
+    with _FakeM6DistContext() as fake:
+        assert state.wait_for_prefetched_layer(layer_idx=0) is False
+    # current_stream().wait_event must NOT be called.
+    fake.current_stream_mock.wait_event.assert_not_called()
+
+
+def test_wait_for_prefetched_layer_consumes_event_and_signals_stream():
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    with _FakeM6DistContext() as fake:
+        state.prefetch_for_layer(layer_idx=3,
+                                 payload=payload,
+                                 cp_group=cp_group)
+        # Wait on layer 3: returns True, removes the event, signals current_stream
+        assert state.wait_for_prefetched_layer(layer_idx=3) is True
+        # Calling again returns False since the event was popped.
+        assert state.wait_for_prefetched_layer(layer_idx=3) is False
+    assert 3 not in state._prefetched_events
+    # current_stream().wait_event should have been called exactly once
+    fake.current_stream_mock.wait_event.assert_called_once()
+
+
+def test_prefetch_pipeline_overlaps_consecutive_layers():
+    # Exercise the M6 pipeline: at layer L we prefetch L+1 while computing
+    # L; at layer L+1 we consume the prefetch and prefetch L+2. After 4
+    # iterations we should have exactly one event in flight (for the next
+    # layer) and the previous events should have all been consumed.
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    with _FakeM6DistContext() as fake:
+        # Bootstrap: no prefetch for layer 0 yet, so it's a sync miss.
+        assert state.wait_for_prefetched_layer(0) is False
+        state.maybe_broadcast_for_layer(layer_idx=0,
+                                        payload=payload,
+                                        cp_group=cp_group,
+                                        async_op=False)
+        state.prefetch_for_layer(layer_idx=1,
+                                 payload=payload,
+                                 cp_group=cp_group)
+
+        for L in range(1, 4):
+            assert state.wait_for_prefetched_layer(L) is True, L
+            state.prefetch_for_layer(layer_idx=L + 1,
+                                     payload=payload,
+                                     cp_group=cp_group)
+
+    # Only layer 4's broadcast remains in flight after the loop.
+    assert list(state._prefetched_events.keys()) == [4]
+    # Total broadcast calls: 1 (sync layer 0) + 4 prefetches (layers 1..4)
+    assert fake.broadcast.call_count == 5
+    # The 4 prefetches must have been async; the bootstrap was sync.
+    async_calls = [
+        c for c in fake.broadcast.call_args_list
+        if c.kwargs.get("async_op") is True
+    ]
+    sync_calls = [
+        c for c in fake.broadcast.call_args_list
+        if c.kwargs.get("async_op") is False
+    ]
+    assert len(async_calls) == 4
+    assert len(sync_calls) == 1
+
+
+def test_clear_prefetched_events_empties_dict_without_waiting():
+    payload = MagicMock(name="kv_payload")
+    cp_group = MagicMock(name="cp_group_pg")
+    state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+    with _FakeM6DistContext():
+        state.prefetch_for_layer(layer_idx=1,
+                                 payload=payload,
+                                 cp_group=cp_group)
+        state.prefetch_for_layer(layer_idx=2,
+                                 payload=payload,
+                                 cp_group=cp_group)
+        assert len(state._prefetched_events) == 2
+        state.clear_prefetched_events()
+        assert state._prefetched_events == {}
+
+
+def test_per_layer_payloads_are_distinct_across_layers():
+    # M6 invariant: with prefetch, two consecutive layers' broadcasts can
+    # be in flight on the comm stream simultaneously. If they shared the
+    # same payload tensor the second broadcast would corrupt the first
+    # one's data. Verify ensure_heartbeat_payload returns a fresh tensor
+    # for each layer_idx.
+    import torch as _torch
+    with patch.object(_torch.cuda, "is_available", return_value=True), \
+         patch.object(_torch, "zeros", side_effect=lambda *a, **k: MagicMock(
+             name=f"payload-{a}-{k}")):
+        state = _make_state_with_comm_stream(cp_size=4, cp_rank=0)
+        p0 = state.ensure_heartbeat_payload(layer_idx=0)
+        p1 = state.ensure_heartbeat_payload(layer_idx=1)
+        p0_again = state.ensure_heartbeat_payload(layer_idx=0)
+        shared = state.ensure_heartbeat_payload()  # legacy shared path
+    assert p0 is not p1
+    assert p0 is p0_again  # cached per layer
+    assert shared is not p0  # shared path != per-layer path
+    # Both layer-0 and layer-1 payloads sit in the per-layer dict.
+    assert 0 in state._per_layer_payloads
+    assert 1 in state._per_layer_payloads

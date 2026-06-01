@@ -3190,27 +3190,54 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        # LayerSplit (M5c): if the deployment configured LayerSplit, the
-        # owner CP rank for this layer must publish its KV / indexer-K to
-        # the peer CP ranks before any peer can run this layer's indexer
-        # or sparse attention compute. Until M5d lands the active-KV
-        # slice plumbing, we publish a small heartbeat tensor every layer
-        # every decode step so the NCCL broadcast path is exercised
-        # end-to-end (proves correct wiring under CI, gives a baseline
-        # for the M6 overlap measurement, and surfaces any CP-comm
-        # configuration error during model load instead of at the moment
-        # the real KV payload starts flowing). The runtime state's
-        # broadcast is a no-op on the off path, the cp_size=1 path, when
-        # no CP process group has been bound, or when CUDA is unavailable.
+        # LayerSplit (M5c + M6): if the deployment configured LayerSplit
+        # the owner CP rank for layer L must publish its KV / indexer-K to
+        # the peer CP ranks before any peer can run layer L's indexer or
+        # sparse attention compute. M5c provided a synchronous per-layer
+        # heartbeat; M6 turns that into a prefetch protocol matching z.ai
+        # "Scaling Pain" §4 Figure 4(b):
+        #
+        #   step 1: wait on the prefetched broadcast for layer L (already
+        #           in flight on the comm stream from layer L-1's hook).
+        #           Layer 0 has no in-flight prefetch so it falls back to
+        #           a synchronous broadcast to bootstrap the pipeline.
+        #   step 2: kick off the prefetch for layer L+1 on the comm stream
+        #           — it runs in parallel with this layer's
+        #           pre_indexer_proj + sparse_attn_indexer compute on the
+        #           default stream, hiding the broadcast latency behind
+        #           the layer-L compute window.
+        #
+        # All paths are no-ops on the off / cp_size=1 / no-process-group
+        # / no-CUDA branches so this is safe to drop in unconditionally.
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
-            layersplit_state.maybe_broadcast_for_layer(
-                layer_idx=self.layer_idx,
-                payload=layersplit_state.ensure_heartbeat_payload(),
-                cp_group=layersplit_state.cp_group,
-            )
+            cp_group = layersplit_state.cp_group
+            # Step 1: consume the prefetched broadcast for this layer.
+            if not layersplit_state.wait_for_prefetched_layer(self.layer_idx):
+                # Bootstrap path (first layer of the forward, or any
+                # layer whose prefetch was skipped because of an earlier
+                # abort): broadcast layer L synchronously now so the
+                # consumer below can run.
+                layersplit_state.maybe_broadcast_for_layer(
+                    layer_idx=self.layer_idx,
+                    payload=layersplit_state.ensure_heartbeat_payload(
+                        layer_idx=self.layer_idx),
+                    cp_group=cp_group,
+                )
+            # Step 2: prefetch layer L+1 on the comm stream so it overlaps
+            # with this layer's compute. Skip if this is the last layer.
+            ownership = layersplit_state.ownership
+            if ownership is not None:
+                next_layer = self.layer_idx + 1
+                if next_layer < ownership.num_layers:
+                    layersplit_state.prefetch_for_layer(
+                        layer_idx=next_layer,
+                        payload=layersplit_state.ensure_heartbeat_payload(
+                            layer_idx=next_layer),
+                        cp_group=cp_group,
+                    )
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)

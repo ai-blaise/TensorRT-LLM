@@ -73,6 +73,7 @@ safe to share across decoding steps within the same model load.
 | M5        | `b06865a4`   | Per-layer broadcast scaffold: `maybe_broadcast_for_layer` + Indexer.forward hook (`payload=None`, sync-shape only). |
 | M5b       | `f6c21223`   | `cp_group_pg` resolution from `mapping`; multi-process NCCL integration test on real GPUs (NVLS-disabled to coexist with sibling NCCL tenants). |
 | M5c       | `2b3e12b3`   | Heartbeat payload (16 B per-layer broadcast) activates the real NCCL broadcast in the production hook. Surfaces CP-comm config errors at first decode step. |
+| M6        | (this commit) | Cross-layer overlap: `prefetch_for_layer(L+1)` on `comm_stream` while layer L's indexer / sparse-attn compute on the default stream. `wait_for_prefetched_layer(L)` consumes the in-flight broadcast at layer L's hook; layer 0 bootstraps via a sync broadcast. Per-layer payload tensors (instead of a single shared payload) so adjacent in-flight broadcasts never alias. (z.ai blog Fig 4(b).) Validated by CP=2 multi-proc NCCL test for both `round_robin` and `contiguous`. |
 | M7        | `675c3045`   | CZS-proved stage-for-broadcast kernel scaffold + reference torch implementation; 12/12 CZS obligations proved. |
 
 ## Queued work
@@ -80,7 +81,6 @@ safe to share across decoding steps within the same model load.
 | Milestone | Description                                                                                                  | Blocker                                                                                                        |
 |-----------|--------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | M5d       | Real active-KV slice broadcast: owner publishes the layer-L active blocks; non-owner attention reads from broadcast recv buffer instead of (M4-truncated) cache pool. | Attention-backend KV-source override refactor; exact-token correctness validation at CP=2.                     |
-| M6        | Cross-layer overlap: broadcast L+1 on `comm_stream` overlaps with indexer / sparse-attn compute on the default stream for layer L. (z.ai blog Fig 4(b).) | Depends on M5d real payload (heartbeat is too small for overlap to matter).                                    |
 | M7b       | Lift the stage-for-broadcast scaffold into a real `@cute.kernel @cute.jit` body; bench vs the C++ `indexer_k_cache_scatter_op` reference. | None; scaffold + CZS proof already shipped, scope is the @cute.kernel body itself.                              |
 | M8 vectors | Direct NVFP4-on-the-wire broadcast; indexer-cache-first 2-phase per-layer protocol; persistent cross-layer broadcast scheduler CTA; fused HISA-block-select + LayerSplit-owner-stage; owner-aware EPLB; owner-local indexer cache compaction; UCX/NIXL fast-path for disagg-PD. | M5d for most; M5d gives the baseline against which each vector is measured. |
 | M9        | IKP-driven optimization loop per kernel.                                                                     | M5d / M6 baseline (need real bandwidth measurements before optimizing).                                         |
@@ -137,6 +137,36 @@ can start indexer compute as soon as phase 1 lands, overlapping phase 2
 with sparse-attention compute. This is strictly stronger than M6's
 cross-layer overlap because it pipelines INSIDE a layer, not just
 across layers.
+
+### M6 cross-layer overlap
+
+At each layer L the Indexer hook on every CP rank runs:
+
+```
+1. wait_for_prefetched_layer(L)   # consume the in-flight L broadcast
+   └── False (only at L=0)        # bootstrap: sync broadcast for L now
+       maybe_broadcast_for_layer(L, payload, cp_group, async_op=False)
+
+2. prefetch_for_layer(L+1, ...)   # kick off L+1 broadcast on comm_stream
+                                  # (skipped at L = num_layers-1)
+
+3. pre_indexer_proj + sparse_attn_indexer   # default stream compute,
+                                            # overlapping with L+1 NCCL
+```
+
+Each prefetched broadcast is `dist.broadcast(..., async_op=True)` on a
+dedicated `torch.cuda.Stream` recorded as a `torch.cuda.Event`. Layer
+L+1's hook calls `current_stream().wait_event(event)` so the compute
+serializes against the broadcast at exactly the moment the payload is
+needed, with all the slack between issue and use spent in parallel.
+
+Per-layer payloads (rather than a single shared heartbeat tensor) are
+required because two broadcasts can be in flight at once: layer L's
+just-prefetched broadcast and layer L-1's still-draining wait. A shared
+tensor would corrupt one of them. `ensure_heartbeat_payload(layer_idx)`
+materializes a fresh tensor per layer; the M5c sync path still has the
+`layer_idx=None` shortcut for the shared payload to keep its diff
+minimal.
 
 ## Code layout
 

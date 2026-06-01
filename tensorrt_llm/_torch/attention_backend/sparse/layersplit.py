@@ -40,7 +40,7 @@ Edge cases the policies must handle without surprise:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 try:
     import torch
@@ -160,9 +160,22 @@ class LayerSplitRuntimeState:
     cp_rank: int
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
+    # Backwards-compat: M5c callers ask for a single shared payload tensor
+    # (one allocation reused across every layer's sync broadcast).
     _heartbeat_payload: Optional[Any] = field(default=None,
                                               repr=False,
                                               init=False)
+    # M6: per-layer payload tensors so the layer-L broadcast and the
+    # prefetched-L+1 broadcast can be in flight on the comm stream at the
+    # same time without aliasing each other's payloads. Keyed by layer_idx.
+    _per_layer_payloads: Dict[int, Any] = field(default_factory=dict,
+                                                repr=False,
+                                                init=False)
+    # M6: in-flight prefetched broadcasts; the layer-L hook consumes the
+    # event for layer L (if any) and then prefetches the L+1 event.
+    _prefetched_events: Dict[int, Any] = field(default_factory=dict,
+                                               repr=False,
+                                               init=False)
 
     def bind_cp_group(self, cp_group: Any) -> None:
         """Late-bind the CP process group resolved from ``mapping``.
@@ -175,9 +188,20 @@ class LayerSplitRuntimeState:
 
     def ensure_heartbeat_payload(
             self,
+            layer_idx: Optional[int] = None,
             payload_bytes: Optional[int] = None) -> Optional[Any]:
         """Lazily allocate a CUDA tensor used as the per-layer broadcast
         payload.
+
+        ``layer_idx=None`` (default) returns a single shared payload
+        reused across all layers — used by the M5c sync-broadcast caller
+        where layer-L's broadcast always completes before layer-L+1's
+        broadcast starts.
+
+        ``layer_idx=int`` returns a layer-specific payload tensor — used
+        by the M6 overlap caller so that the layer-L broadcast (in flight
+        on the comm stream) and the prefetched layer-L+1 broadcast (also
+        on the comm stream) do not alias each other's data.
 
         ``payload_bytes=None`` (default) keeps the M5c posture: a 16-byte
         heartbeat (4 × int32) that exercises the NCCL broadcast path end
@@ -212,15 +236,100 @@ class LayerSplitRuntimeState:
             return None
         if torch is None or not torch.cuda.is_available():
             return None
-        if self._heartbeat_payload is None:
+
+        def _alloc() -> Any:
             if payload_bytes is None or payload_bytes <= 16:
-                self._heartbeat_payload = torch.zeros(4,
-                                                      dtype=torch.int32,
-                                                      device="cuda")
-            else:
-                self._heartbeat_payload = torch.zeros(
-                    int(payload_bytes), dtype=torch.uint8, device="cuda")
-        return self._heartbeat_payload
+                return torch.zeros(4, dtype=torch.int32, device="cuda")
+            return torch.zeros(int(payload_bytes),
+                               dtype=torch.uint8,
+                               device="cuda")
+
+        if layer_idx is None:
+            if self._heartbeat_payload is None:
+                self._heartbeat_payload = _alloc()
+            return self._heartbeat_payload
+
+        if layer_idx not in self._per_layer_payloads:
+            self._per_layer_payloads[layer_idx] = _alloc()
+        return self._per_layer_payloads[layer_idx]
+
+    def prefetch_for_layer(self,
+                           layer_idx: int,
+                           payload: Optional[Any] = None,
+                           cp_group: Optional[Any] = None) -> bool:
+        """Kick off the per-layer broadcast on the comm stream and record
+        a CUDA event so a later ``wait_for_prefetched_layer`` can have the
+        default stream wait on it.
+
+        This is the M6 cross-layer overlap primitive: the indexer hook for
+        layer L issues a ``prefetch_for_layer(L+1)`` while layer L's own
+        pre-indexer projection + sparse-attention indexer runs on the
+        default stream. By the time layer L+1's hook fires, the broadcast
+        has either already finished (zero wait) or is mostly done (small
+        wait), so the cross-layer broadcast cost is amortized into the
+        layer-L compute window.
+
+        Returns True iff the broadcast was actually issued (caller may
+        skip the symmetric ``wait_for_prefetched_layer`` if False). Same
+        no-op cases as ``maybe_broadcast_for_layer``.
+        """
+        if not self.enabled or self.ownership is None:
+            return False
+        if self.cp_size <= 1 or cp_group is None or payload is None:
+            return False
+        if torch is None or not torch.cuda.is_available():
+            return False
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return False
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+
+        src_rank = self.ownership.owner_of(layer_idx)
+        if self.comm_stream is None:
+            # Fall back to a synchronous broadcast on the default stream;
+            # there's no side stream to record an event on.
+            dist.broadcast(payload,
+                           src=src_rank,
+                           group=cp_group,
+                           async_op=False)
+            return True
+        with torch.cuda.stream(self.comm_stream):
+            dist.broadcast(payload,
+                           src=src_rank,
+                           group=cp_group,
+                           async_op=True)
+            event = torch.cuda.Event()
+            event.record(self.comm_stream)
+        self._prefetched_events[layer_idx] = event
+        return True
+
+    def wait_for_prefetched_layer(self, layer_idx: int) -> bool:
+        """Have the default (current) stream wait on the comm-stream event
+        recorded by an earlier ``prefetch_for_layer(layer_idx)``.
+
+        Returns True if a prefetched event was found and waited on
+        (caller should NOT re-issue a sync broadcast); returns False if no
+        prefetch was in flight for this layer (caller should fall back to
+        a synchronous broadcast).
+        """
+        event = self._prefetched_events.pop(layer_idx, None)
+        if event is None:
+            return False
+        if torch is None or not torch.cuda.is_available():
+            return True  # nothing to wait on, but treat as handled
+        torch.cuda.current_stream().wait_event(event)
+        return True
+
+    def clear_prefetched_events(self) -> None:
+        """Drop any pending prefetched events without waiting (test/tear-down).
+
+        Used by tests and by error-recovery paths that abort a partial
+        forward; production decode steps consume every event in order via
+        ``wait_for_prefetched_layer`` so the dict empties naturally.
+        """
+        self._prefetched_events.clear()
 
     @classmethod
     def disabled(cls) -> "LayerSplitRuntimeState":
