@@ -77,6 +77,75 @@ def test_smc_resource_manager_tracks_gpu_ess_and_acceptance():
     assert torch.allclose(manager.log_weights[17][2], torch.tensor(1.25, device="cuda"))
 
 
+def _bare_smc_sampler(gamma=3, n_particles=2):
+    sampler = object.__new__(SMCSampler)
+    sampler.gamma = gamma
+    sampler.n_particles = n_particles
+    sampler.resample_threshold = 0.5
+    sampler.draft_temperature = 1.0
+    sampler.max_seq_len = 128
+    sampler._particle_token_indices = [[depth * n_particles + particle
+                                        for depth in range(gamma)]
+                                       for particle in range(n_particles)]
+    return sampler
+
+
+def test_smc_particle_logprob_diffs_score_full_paths():
+    sampler = _bare_smc_sampler(gamma=3, n_particles=2)
+    request = SimpleNamespace(
+        py_draft_tokens=[1, 2, 3, 4, 5, 6],
+        py_smc_draft_token_log_probs=torch.log(
+            torch.full((6,), 0.5, device="cuda")),
+        py_target_probs=torch.full((7, 8), 1e-4, device="cuda"),
+    )
+    request.py_target_probs[0, 2] = 0.8
+    request.py_target_probs[2, 4] = 0.7
+    request.py_target_probs[4, 6] = 0.6
+
+    diffs = sampler._compute_particle_logprob_diffs(request)
+
+    assert diffs.shape == (2,)
+    assert diffs[1] > diffs[0]
+
+
+def test_smc_sampler_advances_selected_particle_without_prefix_rejection():
+    sampler = _bare_smc_sampler(gamma=2, n_particles=2)
+    sampler.finish_if_reason = lambda *args, **kwargs: False
+    sampler._handle_stop_criteria = lambda *args, **kwargs: False
+
+    class Request:
+        py_request_id = 11
+        py_seq_slot = 0
+        py_draft_tokens = [10, 20, 11, 21]
+        py_smc_draft_token_log_probs = torch.log(
+            torch.full((4,), 0.5, device="cuda"))
+        py_target_probs = torch.full((5, 32), 1e-4, device="cuda")
+
+        def __init__(self):
+            self.tokens = []
+            self.py_num_accepted_draft_tokens_indices = []
+
+        def add_new_token(self, token, _beam_idx):
+            self.tokens.append(int(token))
+
+    request = Request()
+    request.py_target_probs[0, 20] = 0.9
+    request.py_target_probs[2, 21] = 0.8
+    new_tokens_tensor = torch.zeros((5, 1, 1), dtype=torch.int32, device="cuda")
+    new_tokens_list = [[[0]] for _ in range(5)]
+    new_tokens_list[4][0][0] = 99
+
+    accepted = sampler.process_draft_tokens(
+        request,
+        new_tokens_tensor,
+        new_tokens_list,
+        finish_reasons=new_tokens_list,
+    )
+
+    assert accepted == 2
+    assert request.py_num_accepted_draft_tokens_indices == [1, 3]
+    assert request.tokens == [20, 21, 99]
+
 def test_smc_decoder_allocates_gamma_plus_bonus_storage():
     config = _smc_config()
     args = TorchSampler.Args(

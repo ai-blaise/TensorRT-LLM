@@ -190,9 +190,12 @@ Face config: target model cards describe architecture and quantization, while
 SMC-SD selects a scheduler, draft model, draft KV cache dtype, and draft attention
 backend for a particular deployment. The PyTorch runtime records only the selected
 draft-token log probabilities needed for SMC weight updates instead of returning a
-full `[gamma * n_particles, batch, vocab]` draft-logit tensor. CUDA graph capture
-uses the same hidden tree shape and pads dummy drafter rows without surfacing those
-rows to user requests.
+full `[gamma * n_particles, batch, vocab]` draft-logit tensor. Verification scores
+complete particle paths with target-vs-draft importance ratios, advances the
+selected particle instead of truncating at the first target mismatch, and appends
+the target bonus token from the selected leaf. CUDA graph capture uses the same
+hidden tree shape and pads dummy drafter rows without surfacing those rows to user
+requests.
 
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes

@@ -233,9 +233,12 @@ TensorRT-LLM's `TRTLLM` attention backend.
 The SMC drafter keeps the particle tree internal and returns selected draft-token
 log probabilities, not full per-token draft logits. This preserves SMC log-weight
 accounting while avoiding a `gamma * n_particles * batch * vocab` output tensor in
-the static drafting loop. CUDA graph capture pads only hidden dummy drafter rows;
-`SMCModelDrafter` copies results back to the visible requests in the scheduled
-draft batch.
+the static drafting loop. The sampler then scores all full particle paths with the
+target probabilities from the tree-verify pass, selects the highest-weight
+particle under the accumulated SMC weights, emits that particle without prefix
+rejection, and uses the selected leaf's target bonus token for the next step.
+CUDA graph capture pads only hidden dummy drafter rows; `SMCModelDrafter` copies
+results back to the visible requests in the scheduled draft batch.
 
 ## LayerSplit
 

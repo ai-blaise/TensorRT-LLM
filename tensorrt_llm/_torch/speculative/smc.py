@@ -5,7 +5,8 @@ import torch
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
                                            ResourceManagerType)
-from ..pyexecutor.sampler import FinishReasonsList, TorchSampler
+from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, FinishReasonsList,
+                                  TorchSampler, add_token)
 from .interface import SpecMetadata
 from .model_drafter import ModelDrafter
 from .spec_tree_manager import SpecTreeManager
@@ -77,6 +78,7 @@ class SMCResourceManager(BaseResourceManager):
         self.log_weights: dict[int, torch.Tensor] = {}
         self.step_counts: dict[int, int] = {}
         self.accepted_lengths: dict[int, int] = {}
+        self.selected_particles: dict[int, int] = {}
         self.particle_choices = build_smc_particle_choices(
             self.gamma, self.n_particles)
         self.spec_tree_manager = SpecTreeManager(
@@ -112,12 +114,14 @@ class SMCResourceManager(BaseResourceManager):
         self.log_weights.pop(request_id, None)
         self.step_counts.pop(request_id, None)
         self.accepted_lengths.pop(request_id, None)
+        self.selected_particles.pop(request_id, None)
 
     def reset_request(self, request_id: int) -> None:
         self.log_weights[request_id] = torch.zeros(
             (self.n_particles,), dtype=torch.float32, device="cuda")
         self.step_counts[request_id] = 0
         self.accepted_lengths[request_id] = 0
+        self.selected_particles[request_id] = 0
 
     def record_acceptance(self, request_id: int, accepted_length: int) -> None:
         self._ensure_request(request_id)
@@ -131,6 +135,23 @@ class SMCResourceManager(BaseResourceManager):
         self.log_weights[request_id][particle_idx] += logprob_diff.to(
             dtype=torch.float32, device=self.log_weights[request_id].device
         )
+
+    def select_particle(
+        self, request_id: int, logprob_diffs: torch.Tensor
+    ) -> tuple[int, torch.Tensor]:
+        self._ensure_request(request_id)
+        log_weights = self.log_weights[request_id]
+        log_weights.add_(logprob_diffs.to(device=log_weights.device,
+                                          dtype=torch.float32))
+        weights = torch.softmax(log_weights, dim=0)
+        ess = torch.reciprocal(torch.sum(weights * weights))
+        selected_particle = int(torch.argmax(weights).item())
+        self.selected_particles[request_id] = selected_particle
+        if bool((ess < self.n_particles * self.resample_threshold).item()):
+            log_weights.zero_()
+            log_weights[selected_particle] = torch.log(
+                weights[selected_particle].clamp_min(1e-30))
+        return selected_particle, ess
 
     def effective_sample_size(self, request_id: int) -> torch.Tensor:
         self._ensure_request(request_id)
@@ -188,6 +209,11 @@ class SMCSampler(TorchSampler):
         self.n_particles = n_particles
         self.resample_threshold = resample_threshold
         self.draft_temperature = draft_temperature
+        self._particle_token_indices = [[depth * n_particles + particle
+                                         for depth in range(gamma)]
+                                        for particle in range(n_particles)]
+        self._particle_index_cache: dict[torch.device,
+                                         tuple[torch.Tensor, torch.Tensor]] = {}
 
     def should_provide_draft_probs(self, request) -> bool:
         return True
@@ -205,24 +231,108 @@ class SMCSampler(TorchSampler):
             return self._process_draft_tokens_greedy(
                 request, new_tokens=new_tokens_list, finish_reasons=finish_reasons)
 
-        num_accepted = super().process_draft_tokens(
-            request,
-            new_tokens_tensor,
-            new_tokens_list,
-            finish_reasons,
-            resource_manager,
-        )
+        if getattr(request, "py_target_probs", None) is None:
+            raise RuntimeError("SMC-SD requires target token probabilities.")
+        if getattr(request, "py_smc_draft_token_log_probs", None) is None:
+            raise RuntimeError(
+                "SMC-SD requires selected draft token log probabilities.")
 
+        logprob_diffs = self._compute_particle_logprob_diffs(request)
+        selected_particle = int(torch.argmax(logprob_diffs).item())
         if resource_manager is not None:
             spec_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if isinstance(spec_manager, SMCResourceManager):
-                group_id = int(getattr(request, "py_smc_group_id", request.py_request_id))
-                particle_idx = int(getattr(request, "py_smc_particle_idx", 0))
+                group_id = int(getattr(
+                    request, "py_smc_group_id", request.py_request_id))
+                selected_particle, ess = spec_manager.select_particle(
+                    group_id, logprob_diffs)
+                setattr(request, "py_smc_effective_sample_size", ess)
+                setattr(request, "py_smc_selected_particle", selected_particle)
+
+        num_accepted = self._accept_selected_particle(
+            request=request,
+            selected_particle=selected_particle,
+            new_tokens_tensor=new_tokens_tensor,
+            new_tokens_list=new_tokens_list,
+            finish_reasons=finish_reasons,
+        )
+        if resource_manager is not None:
+            spec_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if isinstance(spec_manager, SMCResourceManager):
+                group_id = int(getattr(
+                    request, "py_smc_group_id", request.py_request_id))
                 spec_manager.record_acceptance(group_id, num_accepted)
-                logprob_diff = self._compute_logprob_diff(request, num_accepted)
-                if logprob_diff is not None:
-                    spec_manager.record_logprob_diff(group_id, particle_idx, logprob_diff)
+        return num_accepted
+
+    def _get_particle_index_tensors(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        index_cache = getattr(self, "_particle_index_cache", None)
+        if index_cache is None:
+            index_cache = {}
+            self._particle_index_cache = index_cache
+        if device not in index_cache:
+            particle_token_indices = torch.tensor(
+                self._particle_token_indices, dtype=torch.long, device=device)
+            parent_steps = torch.empty_like(particle_token_indices)
+            parent_steps[:, 0] = 0
+            if self.gamma > 1:
+                parent_steps[:, 1:] = particle_token_indices[:, :-1] + 1
+            index_cache[device] = (particle_token_indices, parent_steps)
+        return index_cache[device]
+
+    def _compute_particle_logprob_diffs(self, request) -> torch.Tensor:
+        target_probs = request.py_target_probs
+        draft_log_probs = request.py_smc_draft_token_log_probs
+        device = target_probs.device
+        particle_token_indices, parent_steps = self._get_particle_index_tensors(
+            device)
+        draft_token_ids = torch.tensor(
+            [int(token) for token in request.py_draft_tokens],
+            dtype=torch.long,
+            device=device,
+        )[particle_token_indices]
+        target_token_probs = target_probs[parent_steps.reshape(-1)].gather(
+            1, draft_token_ids.reshape(-1, 1)).reshape(self.n_particles,
+                                                       self.gamma)
+        selected_draft_log_probs = draft_log_probs.to(
+            device=device, dtype=torch.float32)[particle_token_indices]
+        return (torch.log(target_token_probs.clamp_min(1e-30)) -
+                selected_draft_log_probs).sum(dim=1)
+
+    def _accept_selected_particle(
+        self,
+        request,
+        selected_particle: int,
+        new_tokens_tensor: torch.Tensor,
+        new_tokens_list: list[list[list[int]]],
+        finish_reasons: FinishReasonsList,
+    ) -> int:
+        token_indices = self._particle_token_indices[selected_particle]
+        request.py_num_accepted_draft_tokens_indices = token_indices
+        seq_slot = request.py_seq_slot
+        assert seq_slot is not None
+
+        num_accepted = 0
+        for step, token_idx in enumerate(token_indices):
+            new_token = int(request.py_draft_tokens[token_idx])
+            new_tokens_tensor[step, seq_slot, DEFAULT_BEAM_IDX] = new_token
+            request.add_new_token(new_token, DEFAULT_BEAM_IDX)
+            num_accepted += 1
+            if self._handle_stop_criteria(
+                    request,
+                    new_token,
+                    beam_idx=DEFAULT_BEAM_IDX,
+                    max_seq_len=self.max_seq_len):
+                return num_accepted
+
+        bonus_step = token_indices[-1] + 1
+        new_token = add_token(request, new_tokens_list,
+                              beam_idx=DEFAULT_BEAM_IDX, step=bonus_step)
+        self.finish_if_reason(request, finish_reasons, step=bonus_step,
+                              beam_idx=DEFAULT_BEAM_IDX)
         return num_accepted
 
     def _compute_logprob_diff(self, request, num_accepted: int) -> torch.Tensor | None:
