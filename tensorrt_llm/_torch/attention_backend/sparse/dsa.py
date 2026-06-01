@@ -14,6 +14,8 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs, AttentionInputType, MLAParams,
     PositionalEmbeddingParams)
+from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
+    LayerSplitOwnership, LayerSplitRuntimeState)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -3356,11 +3358,32 @@ class DSACacheManager(KVCacheManager):
         """Initialize cache manager with indexer K-cache pool per layer."""
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
-        if getattr(sparse_attn_config, "layersplit_enabled", False):
-            raise NotImplementedError(
-                "LayerSplit config parsing is available, but op-trt DSA cache "
-                "ownership and cache-transfer runtime integration are not "
-                "implemented yet.")
+
+        # LayerSplit runtime state: owner_map + side-stream + transfer-backend
+        # selection. The state object is inert when layersplit_enabled is
+        # False, so the regular DSA path is unchanged in that case. The
+        # ownership table sits on a separate helper so it can be unit-tested
+        # without instantiating the C++ WindowBlockManager parent.
+        cp_size = getattr(mapping, "cp_size", 1) if mapping is not None else 1
+        cp_rank = getattr(mapping, "cp_rank", 0) if mapping is not None else 0
+        self.layersplit_state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=sparse_attn_config,
+            num_layers=num_layers,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+        if self.layersplit_state.enabled:
+            logger.info(
+                "LayerSplit enabled: %d layers across %d CP ranks via "
+                "policy=%s, transfer_backend=%s. Replicated-materialization "
+                "mode (M3): full DSA KV/indexer pool allocated on every rank; "
+                "owner-local allocation activates in M4.",
+                num_layers,
+                cp_size,
+                self.layersplit_state.ownership.policy,
+                self.layersplit_state.transfer_backend,
+            )
+
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.

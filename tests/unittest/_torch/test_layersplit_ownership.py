@@ -1,8 +1,10 @@
 """Unit tests for tensorrt_llm._torch.attention_backend.sparse.layersplit."""
+from types import SimpleNamespace
+
 import pytest
 
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
-    LayerSplitOwnership, compute_owner_assignment)
+    LayerSplitOwnership, LayerSplitRuntimeState, compute_owner_assignment)
 
 
 def test_cp_size_1_collapses_all_layers_to_rank_0():
@@ -110,3 +112,153 @@ def test_default_policy_is_round_robin():
     own = compute_owner_assignment(8, 4)
     assert own.policy == "round_robin"
     assert own.owner_map == (0, 1, 2, 3, 0, 1, 2, 3)
+
+
+# ---------------------------------------------------------------------------
+# LayerSplitRuntimeState (M3) tests
+# ---------------------------------------------------------------------------
+
+
+def _sparse_cfg(**overrides):
+    cfg = {
+        "layersplit_enabled": True,
+        "layersplit_owner_assignment": "round_robin",
+        "layersplit_transfer_backend": "auto",
+        "layersplit_all_cp_ranks_transfer": True,
+    }
+    cfg.update(overrides)
+    return SimpleNamespace(**cfg)
+
+
+def test_runtime_state_disabled_path_is_inert():
+    state = LayerSplitRuntimeState.disabled()
+    assert state.enabled is False
+    assert state.ownership is None
+    assert state.comm_stream is None
+    # The off path acts as "everyone owns every layer" so callers can use the
+    # ownership query unconditionally without branching on `enabled`.
+    assert state.is_owner(0) is True
+    assert state.is_owner(60) is True
+    assert state.owner_of(0) == 0
+    # The no-op transfer must be safe to call on the off path.
+    state.layersplit_noop_transfer(layer_idx=0)
+
+
+def test_runtime_state_built_from_disabled_sparse_config():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(layersplit_enabled=False),
+        num_layers=61,
+        cp_size=8,
+        cp_rank=3,
+    )
+    assert state.enabled is False
+    assert state.ownership is None
+    assert state.comm_stream is None
+
+
+def test_runtime_state_built_round_robin_cp_size_8():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(),
+        num_layers=61,
+        cp_size=8,
+        cp_rank=3,
+        create_comm_stream=False,
+    )
+    assert state.enabled is True
+    assert state.ownership is not None
+    assert state.ownership.policy == "round_robin"
+    assert state.cp_size == 8
+    assert state.cp_rank == 3
+    assert state.transfer_backend == "auto"
+    assert state.all_cp_ranks_transfer is True
+    # owner_of(layer) on the off path returned 0; on the on path it returns
+    # the actual owner per the policy table.
+    assert state.owner_of(0) == 0
+    assert state.owner_of(3) == 3
+    assert state.owner_of(8) == 0
+    # is_owner reflects the cp_rank we built the state with.
+    assert state.is_owner(3) is True
+    assert state.is_owner(0) is False
+
+
+def test_runtime_state_contiguous_policy_propagates():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment="contiguous"),
+        num_layers=61,
+        cp_size=8,
+        cp_rank=5,
+        create_comm_stream=False,
+    )
+    assert state.ownership.policy == "contiguous"
+    # ranks 0..4 own 8 layers each (40 total); rank 5 owns layers 40..46
+    assert state.is_owner(40) is True
+    assert state.is_owner(46) is True
+    assert state.is_owner(47) is False
+
+
+def test_runtime_state_rejects_partial_rank_transfer():
+    # The SparseAttentionConfig validator should already reject this, but
+    # belt-and-suspenders: the runtime state factory rejects it too so a
+    # programmatic constructor cannot smuggle the case past the validator.
+    with pytest.raises(ValueError,
+                       match="layersplit_all_cp_ranks_transfer=False"):
+        LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_all_cp_ranks_transfer=False),
+            num_layers=61,
+            cp_size=8,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+
+
+def test_runtime_state_rejects_unknown_transfer_backend():
+    with pytest.raises(ValueError, match="unknown layersplit_transfer_backend"):
+        LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_transfer_backend="mpi"),
+            num_layers=8,
+            cp_size=2,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+
+
+def test_runtime_state_skips_comm_stream_on_cpu_only_host():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(),
+        num_layers=4,
+        cp_size=2,
+        cp_rank=0,
+        create_comm_stream=False,
+    )
+    assert state.comm_stream is None
+    # Even without a comm stream the no-op transfer must not raise.
+    state.layersplit_noop_transfer(layer_idx=0)
+
+
+def test_runtime_state_cp_size_1_collapses_to_owns_everything():
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(),
+        num_layers=61,
+        cp_size=1,
+        cp_rank=0,
+        create_comm_stream=False,
+    )
+    assert state.enabled is True
+    assert state.ownership.owner_map == tuple([0] * 61)
+    assert state.is_owner(0) and state.is_owner(60)
+
+
+def test_runtime_state_carries_all_transfer_backends():
+    for backend in ("auto", "ucx", "nixl"):
+        state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=_sparse_cfg(
+                layersplit_transfer_backend=backend),
+            num_layers=8,
+            cp_size=2,
+            cp_rank=0,
+            create_comm_stream=False,
+        )
+        assert state.transfer_backend == backend

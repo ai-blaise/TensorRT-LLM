@@ -39,10 +39,16 @@ Edge cases the policies must handle without surprise:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Any, Optional, Tuple
+
+try:
+    import torch
+except ImportError:  # pragma: no cover - torch is always available in prod
+    torch = None  # type: ignore[assignment]
 
 _VALID_POLICIES = ("round_robin", "contiguous")
+_VALID_TRANSFER_BACKENDS = ("auto", "ucx", "nixl")
 
 
 @dataclass(frozen=True)
@@ -106,3 +112,151 @@ def compute_owner_assignment(
     return LayerSplitOwnership(owner_map=owner_map,
                                cp_size=cp_size,
                                policy=policy)
+
+
+@dataclass
+class LayerSplitRuntimeState:
+    """All LayerSplit state the DSA runtime needs for one model load.
+
+    This object is built once per ``DSACacheManager`` instance and lives for
+    the model's lifetime. Holding it as a separate dataclass keeps
+    ``DSACacheManager``'s diff tiny and lets the runtime logic
+    (ownership lookups, the side-stream synchronization placeholder, the
+    transfer-backend selection) be unit-tested without the C++ KV cache
+    manager parent.
+
+    Fields:
+    - ``enabled``: whether LayerSplit is configured on. When False all the
+      other fields are inert (``ownership`` is None, no comm stream is
+      created) so the runtime path collapses to the regular DSA behavior.
+    - ``ownership``: the per-layer owner table (see :class:`LayerSplitOwnership`).
+    - ``transfer_backend``: ``"auto" | "ucx" | "nixl"``. Auto resolves at
+      M5+ when the broadcast path is wired; M3 only records the selection.
+    - ``all_cp_ranks_transfer``: must be True today; partial-rank transfer
+      is not implemented and is rejected by ``SparseAttentionConfig``.
+    - ``cp_size`` / ``cp_rank``: cached from the model's ``Mapping`` so the
+      runtime does not have to re-traverse the parallel config on every
+      layer call.
+    - ``comm_stream``: a dedicated ``torch.cuda.Stream`` for owner -> peers
+      broadcasts. Created at model-load time so it stays graph-stable
+      (CUDA-graph capture freezes the stream identity at capture time).
+      ``None`` when LayerSplit is disabled or when CUDA is unavailable
+      (CPU-only tests, doc generation).
+    """
+
+    enabled: bool
+    ownership: Optional[LayerSplitOwnership]
+    transfer_backend: str
+    all_cp_ranks_transfer: bool
+    cp_size: int
+    cp_rank: int
+    comm_stream: Optional[Any] = field(default=None, repr=False)
+
+    @classmethod
+    def disabled(cls) -> "LayerSplitRuntimeState":
+        """Inert state for the LayerSplit-off path."""
+        return cls(
+            enabled=False,
+            ownership=None,
+            transfer_backend="auto",
+            all_cp_ranks_transfer=True,
+            cp_size=1,
+            cp_rank=0,
+            comm_stream=None,
+        )
+
+    @classmethod
+    def from_sparse_config(
+            cls,
+            sparse_attn_config: Any,
+            num_layers: int,
+            cp_size: int,
+            cp_rank: int = 0,
+            create_comm_stream: Optional[bool] = None,
+    ) -> "LayerSplitRuntimeState":
+        """Build runtime state from a ``SparseAttentionConfig`` instance.
+
+        ``create_comm_stream`` defaults to "yes if torch.cuda is available"
+        so unit tests on a CPU-only host can disable it explicitly.
+        """
+        enabled = bool(
+            getattr(sparse_attn_config, "layersplit_enabled", False))
+        if not enabled:
+            return cls.disabled()
+
+        policy = str(
+            getattr(sparse_attn_config, "layersplit_owner_assignment",
+                    "round_robin"))
+        transfer_backend = str(
+            getattr(sparse_attn_config, "layersplit_transfer_backend", "auto"))
+        all_cp_ranks_transfer = bool(
+            getattr(sparse_attn_config, "layersplit_all_cp_ranks_transfer",
+                    True))
+        if transfer_backend not in _VALID_TRANSFER_BACKENDS:
+            raise ValueError(
+                f"unknown layersplit_transfer_backend {transfer_backend!r}; "
+                f"expected one of {_VALID_TRANSFER_BACKENDS}")
+        if not all_cp_ranks_transfer:
+            raise ValueError(
+                "layersplit_all_cp_ranks_transfer=False is not yet "
+                "implemented at the DSA runtime layer; the SparseAttentionConfig "
+                "validator should have rejected this earlier.")
+
+        ownership = compute_owner_assignment(num_layers, cp_size, policy)
+
+        if create_comm_stream is None:
+            create_comm_stream = (torch is not None
+                                  and torch.cuda.is_available())
+        comm_stream = (torch.cuda.Stream()
+                       if (create_comm_stream and torch is not None
+                           and torch.cuda.is_available()) else None)
+
+        return cls(
+            enabled=True,
+            ownership=ownership,
+            transfer_backend=transfer_backend,
+            all_cp_ranks_transfer=all_cp_ranks_transfer,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            comm_stream=comm_stream,
+        )
+
+    def is_owner(self, layer_idx: int) -> bool:
+        if not self.enabled:
+            return True  # everyone owns every layer in the off path
+        assert self.ownership is not None
+        return self.ownership.is_owner(layer_idx, self.cp_rank)
+
+    def owner_of(self, layer_idx: int) -> int:
+        if not self.enabled:
+            return 0
+        assert self.ownership is not None
+        return self.ownership.owner_of(layer_idx)
+
+    def layersplit_noop_transfer(self, layer_idx: int) -> None:
+        """Graph-stable no-op transfer placeholder.
+
+        Mirrors the synchronization shape of a real owner-to-peers broadcast
+        without actually moving data:
+
+        - On the default stream we record an event marking "the producer of
+          layer ``layer_idx``'s KV/indexer is done".
+        - The comm stream waits on that event. M5 will additionally call
+          ``ncclBroadcast`` between record and the consumer wait; M6 will
+          start the next layer's broadcast here while the current layer's
+          attention runs on the default stream.
+
+        Calling this method on the off path or when CUDA is unavailable is
+        a no-op so the wiring is safe to drop into the model forward
+        unconditionally.
+        """
+        del layer_idx  # only used by future milestones for keying state
+        if not self.enabled:
+            return
+        if self.comm_stream is None or torch is None:
+            return
+        if not torch.cuda.is_available():
+            return
+        event = torch.cuda.Event()
+        event.record()
+        self.comm_stream.wait_event(event)
