@@ -524,6 +524,63 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
     """Static-tree drafter for two-model SMC-SD particle proposals."""
 
+    @staticmethod
+    def _gather_logits_for_batch(logits: torch.Tensor,
+                                 gather_ids: torch.Tensor,
+                                 batch_size: int,
+                                 tokens_per_request: int) -> torch.Tensor:
+        if gather_ids.shape[0] > batch_size:
+            if gather_ids.shape[0] % tokens_per_request == 0:
+                gather_ids = gather_ids[::tokens_per_request]
+            elif gather_ids.shape[0] % batch_size == 0:
+                gather_ids = gather_ids[::gather_ids.shape[0] // batch_size]
+            else:
+                gather_ids = gather_ids[:batch_size]
+
+        if gather_ids.shape[0] == batch_size:
+            return logits[gather_ids]
+
+        assert gather_ids.shape[0] < batch_size
+        pad_ids = gather_ids.new_full((batch_size - gather_ids.shape[0], ),
+                                      gather_ids[0])
+        padded_gather_ids = torch.cat((gather_ids, pad_ids), dim=0)
+        return logits[padded_gather_ids]
+
+    def _record_layer_draft_log_probs(self, draft_log_prob_buffer: torch.Tensor,
+                                      logits: torch.Tensor, batch_size: int,
+                                      cur_draft_idx: int,
+                                      spec_tree_manager: SpecTreeManager) -> None:
+        start = 0
+        for layer_idx in range(cur_draft_idx):
+            start += sum(int(repeat) for repeat in
+                         spec_tree_manager.top_k_list[layer_idx].tolist())
+        repeats = [int(repeat) for repeat in
+                   spec_tree_manager.top_k_list[cur_draft_idx].tolist()]
+        end = start + sum(repeats)
+        if start == end:
+            return
+
+        if cur_draft_idx == 0:
+            parent_logits = logits.reshape(batch_size,
+                                           logits.shape[-1]).unsqueeze(1)
+        else:
+            parent_indices = spec_tree_manager.tokens_gather_idx_for_drafter_model[
+                cur_draft_idx].long()
+            parent_logits = logits.reshape(
+                batch_size, self.max_total_draft_tokens + 1,
+                logits.shape[-1]).index_select(1, parent_indices)
+
+        child_tokens = self.draft_tokens_buffer[:batch_size, start:end].long()
+        cursor = 0
+        for parent_idx, repeat in enumerate(repeats):
+            parent = parent_logits[:, parent_idx, :].float()
+            normalizer = torch.logsumexp(parent, dim=-1, keepdim=True)
+            next_cursor = cursor + int(repeat)
+            selected = parent.gather(1, child_tokens[:, cursor:next_cursor])
+            draft_log_prob_buffer[:, start + cursor:start + next_cursor] = (
+                selected - normalizer)
+            cursor = next_cursor
+
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
                 **kwargs) -> dict[str, torch.Tensor]:
@@ -538,19 +595,25 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
                                           spec_metadata=spec_metadata,
                                           return_context_logits=True)
         batch_size = attn_metadata.num_seqs
-        vocab_size = logits.shape[-1]
-        logits = logits[spec_metadata.gather_ids]
+        logits = self._gather_logits_for_batch(
+            logits, spec_metadata.gather_ids, batch_size,
+            self.max_total_draft_tokens + 1)
 
         new_draft_tokens = self.sample(logits=logits,
                                        max_top_k=spec_tree_manager.max_top_k)
+        draft_log_prob_buffer = torch.empty(
+            (batch_size, self.max_total_draft_tokens),
+            dtype=torch.float32,
+            device=logits.device)
         self.extract_real_draft_tokens(
             cur_draft_idx=0,
             batch_size=batch_size,
             new_draft_tokens=new_draft_tokens,
             use_cuda_graph=attn_metadata.is_cuda_graph,
             spec_tree_manager=spec_tree_manager)
+        self._record_layer_draft_log_probs(draft_log_prob_buffer, logits,
+                                           batch_size, 0, spec_tree_manager)
 
-        return_draft_logits = None
         with save_metadata_state(attn_metadata, spec_metadata):
             batch_size = attn_metadata.num_seqs
             self.prepare_for_generation(attn_metadata=attn_metadata,
@@ -577,31 +640,22 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
                     new_draft_tokens=new_draft_tokens,
                     use_cuda_graph=attn_metadata.is_cuda_graph,
                     spec_tree_manager=spec_tree_manager)
-
-                if layer_idx == self.max_draft_len - 1:
-                    return_draft_logits = logits
+                self._record_layer_draft_log_probs(draft_log_prob_buffer, logits,
+                                                   batch_size, layer_idx,
+                                                   spec_tree_manager)
 
         return_new_draft_tokens = torch.transpose(
             self.draft_tokens_buffer[:batch_size, :-1], 0, 1)
-
-        if return_draft_logits is None:
-            return_draft_logits = logits.unsqueeze(1).expand(
-                batch_size, self.max_total_draft_tokens + 1,
-                vocab_size).reshape(-1, vocab_size)
-
-        return_draft_logits = return_draft_logits.reshape(
-            batch_size, self.max_total_draft_tokens + 1, vocab_size)
-        return_draft_logits = torch.transpose(return_draft_logits[:, :-1, :],
-                                              0, 1)
+        return_draft_log_probs = torch.transpose(draft_log_prob_buffer, 0, 1)
 
         assert return_new_draft_tokens.shape == (self.max_total_draft_tokens,
                                                  batch_size)
-        assert return_draft_logits.shape == (self.max_total_draft_tokens,
-                                             batch_size, vocab_size)
+        assert return_draft_log_probs.shape == (self.max_total_draft_tokens,
+                                                batch_size)
 
         return {
             "new_draft_tokens": return_new_draft_tokens,
-            "draft_logits": return_draft_logits,
+            "draft_token_log_probs": return_draft_log_probs,
         }
 
     def prepare_for_generation(self, attn_metadata: AttentionMetadata,

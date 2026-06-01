@@ -566,11 +566,15 @@ def create_py_executor(
 
             draft_llm_args = copy.copy(llm_args)
             if spec_config.spec_dec_mode.is_smc():
-                if spec_config.draft_kv_cache_dtype != "auto":
+                draft_kv_cache_dtype = spec_config.draft_kv_cache_dtype
+                if draft_kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
+                    draft_kv_cache_dtype = "fp8"
+                elif draft_kv_cache_dtype == "bfloat16":
+                    draft_kv_cache_dtype = "auto"
+                if draft_kv_cache_dtype != "auto":
                     draft_llm_args.kv_cache_config = copy.copy(
                         llm_args.kv_cache_config)
-                    draft_llm_args.kv_cache_config.dtype = (
-                        spec_config.draft_kv_cache_dtype)
+                    draft_llm_args.kv_cache_config.dtype = draft_kv_cache_dtype
                 if spec_config.draft_attention_backend == "trtllm_mha":
                     draft_llm_args.attn_backend = "TRTLLM"
             if spec_config.load_format == "dummy":

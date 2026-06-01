@@ -149,7 +149,28 @@ class SMCResourceManager(BaseResourceManager):
 class SMCModelDrafter(ModelDrafter):
     """Two-model drafter for SMC-SD."""
 
-    pass
+    def process_static_draft_outputs(self, outputs, draft_batch) -> None:
+        if not isinstance(outputs, dict) or "draft_token_log_probs" not in outputs:
+            super().process_static_draft_outputs(outputs, draft_batch)
+            return
+
+        draft_tokens_host = outputs["new_draft_tokens"].cpu()
+        draft_token_log_probs = outputs["draft_token_log_probs"]
+
+        for req_idx, req in enumerate(draft_batch.all_requests()):
+            target_model_req = self.req_id_to_old_request[req.py_request_id]
+            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                continue
+            target_model_req.py_draft_tokens = []
+            token_log_probs = []
+            for token_idx in range(self.max_total_draft_tokens):
+                target_model_req.py_draft_tokens.append(
+                    draft_tokens_host[token_idx][req_idx])
+                token_log_probs.append(draft_token_log_probs[token_idx][req_idx])
+
+            target_model_req.py_draft_logits = None
+            target_model_req.py_smc_draft_token_log_probs = torch.stack(
+                token_log_probs)
 
 
 class SMCSampler(TorchSampler):
@@ -208,30 +229,40 @@ class SMCSampler(TorchSampler):
         if num_accepted == 0:
             return None
         draft_logits = request.py_draft_logits
+        draft_token_log_probs = getattr(
+            request, "py_smc_draft_token_log_probs", None)
         target_probs = request.py_target_probs
-        if draft_logits is None or target_probs is None:
+        if target_probs is None:
+            return None
+        if draft_logits is None and draft_token_log_probs is None:
             return None
 
         accepted_indices = getattr(
-            request, py_num_accepted_draft_tokens_indices, [])
+            request, "py_num_accepted_draft_tokens_indices", [])
         if accepted_indices:
             token_indices = [int(i) for i in accepted_indices[:num_accepted]]
         else:
             token_indices = list(range(num_accepted))
 
-        draft_logits = draft_logits[token_indices].float()
         target_probs = target_probs[token_indices].float()
+        if draft_token_log_probs is not None:
+            draft_token_log_probs = draft_token_log_probs[token_indices].float()
+            log_prob_device = draft_token_log_probs.device
+        else:
+            draft_logits = draft_logits[token_indices].float()
+            log_prob_device = draft_logits.device
+
         draft_tokens = torch.tensor(
             [int(request.py_draft_tokens[i]) for i in token_indices],
             dtype=torch.long,
-            device=draft_logits.device,
+            device=log_prob_device,
         )
-        draft_log_probs = torch.log_softmax(
-            draft_logits / max(self.draft_temperature, 1e-6), dim=-1
-        )
-        target_token_probs = target_probs.gather(1, draft_tokens.unsqueeze(1)).squeeze(1)
-        draft_token_log_probs = draft_log_probs.gather(
-            1, draft_tokens.unsqueeze(1)
-        ).squeeze(1)
+        target_token_probs = target_probs.gather(
+            1, draft_tokens.to(target_probs.device).unsqueeze(1)).squeeze(1)
+        if draft_token_log_probs is None:
+            draft_log_probs = torch.log_softmax(
+                draft_logits / max(self.draft_temperature, 1e-6), dim=-1)
+            draft_token_log_probs = draft_log_probs.gather(
+                1, draft_tokens.unsqueeze(1)).squeeze(1)
         return (torch.log(target_token_probs.clamp_min(1e-30)) -
-                draft_token_log_probs).sum()
+                draft_token_log_probs.to(target_probs.device)).sum()

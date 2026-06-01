@@ -225,8 +225,17 @@ path is surfaced to the user.
 
 The draft model receives an independent KV cache config when
 `draft_kv_cache_dtype` is set. This keeps the target KV cache configuration
-separate from the draft model's FP8 cache requirement. The `trtllm_mha` draft
-attention selector maps to TensorRT-LLM's `TRTLLM` attention backend.
+separate from the draft model's FP8 cache requirement. SMC accepts the deployment
+spelling `fp8_e4m3` and maps it to TensorRT-LLM's unified `fp8` KV cache selector
+for the draft model. The `trtllm_mha` draft attention selector maps to
+TensorRT-LLM's `TRTLLM` attention backend.
+
+The SMC drafter keeps the particle tree internal and returns selected draft-token
+log probabilities, not full per-token draft logits. This preserves SMC log-weight
+accounting while avoiding a `gamma * n_particles * batch * vocab` output tensor in
+the static drafting loop. CUDA graph capture pads only hidden dummy drafter rows;
+`SMCModelDrafter` copies results back to the visible requests in the scheduled
+draft batch.
 
 ## LayerSplit
 

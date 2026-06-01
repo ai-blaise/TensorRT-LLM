@@ -103,3 +103,61 @@ def test_smc_drafter_does_not_require_tree_manager():
     drafter = object.__new__(SMCModelDrafter)
 
     assert drafter.update_cur_draft_layer_idx(0, ResourceManagerStub()) is None
+
+
+def test_smc_logprob_diff_uses_accepted_tree_indices():
+    sampler = object.__new__(SMCSampler)
+    sampler.draft_temperature = 1.0
+    request = SimpleNamespace(
+        py_draft_tokens=[3, 4, 5, 1],
+        py_num_accepted_draft_tokens_indices=[2, 0],
+        py_draft_logits=torch.full((4, 8), -20.0, device="cuda"),
+        py_target_probs=torch.full((4, 8), 1e-6, device="cuda"),
+    )
+    request.py_draft_logits[2, 5] = 0.0
+    request.py_draft_logits[0, 3] = 0.0
+    request.py_target_probs[2, 5] = 0.25
+    request.py_target_probs[0, 3] = 0.5
+
+    actual = sampler._compute_logprob_diff(request, num_accepted=2)
+    expected = (
+        torch.log(torch.tensor(0.25, device="cuda"))
+        + torch.log(torch.tensor(0.5, device="cuda"))
+        - torch.log_softmax(request.py_draft_logits[2], dim=-1)[5]
+        - torch.log_softmax(request.py_draft_logits[0], dim=-1)[3]
+    )
+
+    assert torch.allclose(actual, expected)
+
+
+def test_smc_logprob_diff_falls_back_to_prefix_indices():
+    sampler = object.__new__(SMCSampler)
+    sampler.draft_temperature = 1.0
+    request = SimpleNamespace(
+        py_draft_tokens=[1, 2],
+        py_num_accepted_draft_tokens_indices=[],
+        py_draft_logits=torch.zeros((2, 4), device="cuda"),
+        py_target_probs=torch.full((2, 4), 0.25, device="cuda"),
+    )
+
+    assert torch.isfinite(sampler._compute_logprob_diff(request, num_accepted=2))
+
+
+def test_smc_logprob_diff_accepts_selected_token_log_probs():
+    sampler = object.__new__(SMCSampler)
+    sampler.draft_temperature = 1.0
+    request = SimpleNamespace(
+        py_draft_tokens=[7, 8, 9],
+        py_num_accepted_draft_tokens_indices=[1, 2],
+        py_draft_logits=None,
+        py_smc_draft_token_log_probs=torch.log(
+            torch.tensor([0.2, 0.25, 0.5], device="cuda")),
+        py_target_probs=torch.full((3, 16), 1e-6, device="cuda"),
+    )
+    request.py_target_probs[1, 8] = 0.5
+    request.py_target_probs[2, 9] = 0.25
+
+    actual = sampler._compute_logprob_diff(request, num_accepted=2)
+    expected = torch.log(torch.tensor(0.5 / 0.25 * 0.25 / 0.5, device="cuda"))
+
+    assert torch.allclose(actual, expected)
