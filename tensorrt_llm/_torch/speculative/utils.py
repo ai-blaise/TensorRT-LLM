@@ -30,6 +30,8 @@ from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
+from .smc import (SMCModelDrafter, SMCSampler, SMCResourceManager,
+                  SMCSpecMetadata)
 from .suffix_automaton import SuffixAutomatonManager
 
 
@@ -127,9 +129,18 @@ def get_spec_metadata(spec_config,
             dtype=model_config.torch_dtype,
         )
     if spec_config.spec_dec_mode.is_smc():
-        raise NotImplementedError(
-            "SMC-SD config parsing is available, but the PyTorch runtime "
-            "worker/resource integration is not implemented yet.")
+        return SMCSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            gamma=spec_config.gamma,
+            n_particles=spec_config.n_particles,
+            resample_threshold=spec_config.resample_threshold,
+            target_temperature=spec_config.target_temperature,
+            draft_temperature=spec_config.draft_temperature,
+            smc_resource_manager=spec_resource_manager,
+        )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -259,9 +270,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return SuffixAutomatonManager(spec_config, max_num_requests,
                                       max_seq_len)
     if spec_dec_mode.is_smc():
-        raise NotImplementedError(
-            "SMC-SD resource management has not been wired into the PyTorch "
-            "executor yet.")
+        return SMCResourceManager(spec_config, max_num_requests)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
@@ -287,8 +296,13 @@ def get_spec_decoder(
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSampler(sampler_args)
     if spec_config.spec_dec_mode.is_smc():
-        raise NotImplementedError(
-            "SMC-SD sampling is not implemented in TensorRT-LLM yet.")
+        return SMCSampler(
+            sampler_args,
+            gamma=spec_config.gamma,
+            n_particles=spec_config.n_particles,
+            resample_threshold=spec_config.resample_threshold,
+            draft_temperature=spec_config.draft_temperature,
+        )
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -308,22 +322,21 @@ def get_spec_drafter(model_engine,
     max_num_requests = model_engine.batch_size
     if spec_config.spec_dec_mode.is_draft_target(
     ) or spec_config.spec_dec_mode.is_eagle3(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
-        return ModelDrafter(spec_config,
-                            draft_model_engine,
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1,
-                            SeqSlotManager(max_num_requests),
-                            sampler,
-                            spec_resource_manager=spec_resource_manager,
-                            guided_decoder=guided_decoder)
+    ) or spec_config.spec_dec_mode.is_mtp_eagle(
+    ) or spec_config.spec_dec_mode.is_smc():
+        drafter_cls = (SMCModelDrafter
+                       if spec_config.spec_dec_mode.is_smc() else ModelDrafter)
+        return drafter_cls(spec_config,
+                           draft_model_engine,
+                           spec_config.max_draft_len,
+                           spec_config.tokens_per_gen_step - 1,
+                           SeqSlotManager(max_num_requests),
+                           sampler,
+                           spec_resource_manager=spec_resource_manager,
+                           guided_decoder=guided_decoder)
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
-    if spec_config.spec_dec_mode.is_smc():
-        raise NotImplementedError(
-            "SMC-SD drafting requires its dedicated particle worker; the "
-            "generic model drafter is not sufficient.")
 
     return None
 
@@ -363,8 +376,7 @@ def get_spec_worker(spec_config,
         return DraftTargetOneModelWorker(spec_config, mapping,
                                          use_separate_draft_kv_cache)
     if spec_dec_mode.is_smc():
-        raise NotImplementedError(
-            "SMC-SD worker integration is not implemented yet.")
+        return None
     return None
 
 

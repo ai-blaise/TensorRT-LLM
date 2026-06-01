@@ -14,6 +14,8 @@ from .sa_enhancer import SADraftEnhancer
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
+from .smc import (SMCModelDrafter, SMCSampler, SMCResourceManager,
+                  SMCSpecMetadata)
 from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
                                 SpecSamplerBase)
 from .spec_tree_manager import SpecTreeManager
@@ -46,6 +48,10 @@ __all__ = [
     "SampleStateTensorsSpec",
     "SaveHiddenStatesResourceManager",
     "SaveHiddenStatesSpecMetadata",
+    "SMCModelDrafter",
+    "SMCSampler",
+    "SMCResourceManager",
+    "SMCSpecMetadata",
     "SpecMetadata",
     "SpecSamplerBase",
     "SpecWorkerBase",

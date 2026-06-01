@@ -437,7 +437,8 @@ class ModelDrafter(Drafter):
         if spec_resource_manager is None:
             return None
 
-        spec_tree_manager = spec_resource_manager.spec_tree_manager
+        spec_tree_manager = getattr(spec_resource_manager,
+                                    "spec_tree_manager", None)
         if spec_tree_manager is not None:
             spec_tree_manager.cur_draft_layer_idx = cur_draft_layer_idx
 

@@ -539,6 +539,7 @@ def create_py_executor(
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
                         LinearDraftingLoopWrapper,
+                        SMCStaticParticleDraftingLoopWrapper,
                         StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
@@ -551,6 +552,11 @@ def create_py_executor(
                             spec_config.max_draft_len,
                             spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)
+                    elif spec_config.spec_dec_mode.is_smc():
+                        return SMCStaticParticleDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.tokens_per_gen_step - 1, max_batch_size,
+                            model)
                     else:
                         return LinearDraftingLoopWrapper(
                             spec_config.max_draft_len,
@@ -559,6 +565,14 @@ def create_py_executor(
                 drafting_loop_wrapper = None
 
             draft_llm_args = copy.copy(llm_args)
+            if spec_config.spec_dec_mode.is_smc():
+                if spec_config.draft_kv_cache_dtype != "auto":
+                    draft_llm_args.kv_cache_config = copy.copy(
+                        llm_args.kv_cache_config)
+                    draft_llm_args.kv_cache_config.dtype = (
+                        spec_config.draft_kv_cache_dtype)
+                if spec_config.draft_attention_backend == "trtllm_mha":
+                    draft_llm_args.attn_backend = "TRTLLM"
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
 

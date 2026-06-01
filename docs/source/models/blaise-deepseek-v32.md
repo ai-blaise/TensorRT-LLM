@@ -213,6 +213,21 @@ optimization target remains a CuTe/CZS or TensorRT fused block-score+top-k
 selector, but the deployed block scorer is now the compressed DeepGEMM NVFP4
 tensor path rather than the TF32 fallback.
 
+## SMC-SD runtime configuration
+
+SMC-SD is a deployment/runtime feature, not a target-model architecture field.
+For the Blaise DeepSeek-V3.2 path, configure it through TensorRT-LLM/Dynamo
+runtime arguments with the GLM draft model, `gamma=6`, `n_particles=4`, and draft
+KV dtype `fp8_e4m3`. The SMC token-count contract is a hidden particle tree:
+TensorRT-LLM stores `max_total_draft_tokens=gamma * n_particles` and verifies
+`max_total_draft_tokens + 1` target positions, while only the selected parent
+path is surfaced to the user.
+
+The draft model receives an independent KV cache config when
+`draft_kv_cache_dtype` is set. This keeps the target KV cache configuration
+separate from the draft model's FP8 cache requirement. The `trtllm_mha` draft
+attention selector maps to TensorRT-LLM's `TRTLLM` attention backend.
+
 ## LayerSplit
 
 LayerSplit is represented as a DeepSeek DSA sparse-attention overlay:

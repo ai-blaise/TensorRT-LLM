@@ -162,6 +162,34 @@ speculative_config = DFlashDecodingConfig(
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
+### SMC-SD
+
+SMC-SD is available as a two-model PyTorch speculative decoding mode for the
+Blaise DeepSeek-V3.2 runtime path. It builds `n_particles` hidden static-tree
+particle chains of length `gamma` under one visible request, then verifies those
+particle proposals plus the target bonus position without exposing multi-return
+responses. The runtime contract is therefore `max_draft_len == gamma`,
+`max_total_draft_tokens == gamma * n_particles`, and
+`tokens_per_gen_step == max_total_draft_tokens + 1`.
+
+```python
+from tensorrt_llm.llmapi import SMCDecodingConfig
+
+speculative_config = SMCDecodingConfig(
+    speculative_model="BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+    gamma=6,
+    n_particles=4,
+    resample_threshold=0.5,
+    draft_kv_cache_dtype="fp8_e4m3",
+    draft_attention_backend="trtllm_mha",
+)
+```
+
+SMC-SD configuration is runtime-owned. Do not encode it in the target model Hugging
+Face config: target model cards describe architecture and quantization, while
+SMC-SD selects a scheduler, draft model, draft KV cache dtype, and draft attention
+backend for a particular deployment.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.

@@ -240,14 +240,14 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.max_draft_loop_tokens = self.original_max_total_draft_tokens
 
-        preserve_wrapped_eagle3_widths = (spec_config is not None
-                                          and is_draft_model
-                                          and drafting_loop_wrapper is not None
-                                          and
-                                          spec_config.spec_dec_mode.is_eagle3())
+        preserve_wrapped_tree_widths = (spec_config is not None
+                                        and is_draft_model
+                                        and drafting_loop_wrapper is not None
+                                        and (spec_config.spec_dec_mode.is_eagle3()
+                                             or spec_config.spec_dec_mode.is_smc()))
         # The draft model won't have any draft tokens attached to
         # generation requests when we invoke it autoregressively
-        if spec_config is not None and is_draft_model and not preserve_wrapped_eagle3_widths:
+        if spec_config is not None and is_draft_model and not preserve_wrapped_tree_widths:
             spec_config.max_draft_len = 0
             spec_config.max_total_draft_tokens = 0
         self.spec_config = spec_config

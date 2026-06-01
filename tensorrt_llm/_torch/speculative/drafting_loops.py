@@ -9,6 +9,7 @@ for speculation can be launched as a single CUDA graph.
 """
 
 from abc import ABC, abstractmethod
+import math
 from contextlib import contextmanager
 from typing import Optional, final
 
@@ -518,3 +519,145 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         spec_metadata.is_first_draft = False
 
         return
+
+
+class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
+    """Static-tree drafter for two-model SMC-SD particle proposals."""
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
+                attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
+                **kwargs) -> dict[str, torch.Tensor]:
+        spec_resource_manager = getattr(spec_metadata, "smc_resource_manager",
+                                        None)
+        assert spec_resource_manager is not None
+        spec_tree_manager = spec_resource_manager.spec_tree_manager
+
+        logits = self.draft_model.forward(input_ids=input_ids,
+                                          position_ids=position_ids,
+                                          attn_metadata=attn_metadata,
+                                          spec_metadata=spec_metadata,
+                                          return_context_logits=True)
+        batch_size = attn_metadata.num_seqs
+        vocab_size = logits.shape[-1]
+        logits = logits[spec_metadata.gather_ids]
+
+        new_draft_tokens = self.sample(logits=logits,
+                                       max_top_k=spec_tree_manager.max_top_k)
+        self.extract_real_draft_tokens(
+            cur_draft_idx=0,
+            batch_size=batch_size,
+            new_draft_tokens=new_draft_tokens,
+            use_cuda_graph=attn_metadata.is_cuda_graph,
+            spec_tree_manager=spec_tree_manager)
+
+        return_draft_logits = None
+        with save_metadata_state(attn_metadata, spec_metadata):
+            batch_size = attn_metadata.num_seqs
+            self.prepare_for_generation(attn_metadata=attn_metadata,
+                                        spec_metadata=spec_metadata,
+                                        spec_tree_manager=spec_tree_manager,
+                                        position_ids=position_ids)
+
+            for layer_idx in range(1, self.max_draft_len):
+                logits = self.draft_model.forward(
+                    input_ids=self.draft_tokens_buffer[:batch_size, :self.
+                                                       max_total_draft_tokens +
+                                                       1].reshape(-1),
+                    position_ids=self.
+                    position_ids_buffer[:batch_size, :self.
+                                        max_total_draft_tokens + 1].reshape(-1),
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    return_context_logits=True)
+                new_draft_tokens = self.sample(
+                    logits=logits, max_top_k=spec_tree_manager.max_top_k)
+                self.extract_real_draft_tokens(
+                    cur_draft_idx=layer_idx,
+                    batch_size=batch_size,
+                    new_draft_tokens=new_draft_tokens,
+                    use_cuda_graph=attn_metadata.is_cuda_graph,
+                    spec_tree_manager=spec_tree_manager)
+
+                if layer_idx == self.max_draft_len - 1:
+                    return_draft_logits = logits
+
+        return_new_draft_tokens = torch.transpose(
+            self.draft_tokens_buffer[:batch_size, :-1], 0, 1)
+
+        if return_draft_logits is None:
+            return_draft_logits = logits.unsqueeze(1).expand(
+                batch_size, self.max_total_draft_tokens + 1,
+                vocab_size).reshape(-1, vocab_size)
+
+        return_draft_logits = return_draft_logits.reshape(
+            batch_size, self.max_total_draft_tokens + 1, vocab_size)
+        return_draft_logits = torch.transpose(return_draft_logits[:, :-1, :],
+                                              0, 1)
+
+        assert return_new_draft_tokens.shape == (self.max_total_draft_tokens,
+                                                 batch_size)
+        assert return_draft_logits.shape == (self.max_total_draft_tokens,
+                                             batch_size, vocab_size)
+
+        return {
+            "new_draft_tokens": return_new_draft_tokens,
+            "draft_logits": return_draft_logits,
+        }
+
+    def prepare_for_generation(self, attn_metadata: AttentionMetadata,
+                               spec_metadata: SpecMetadata,
+                               spec_tree_manager: SpecTreeManager,
+                               position_ids: torch.Tensor):
+        batch_size = attn_metadata.num_seqs
+        num_accepted_draft_tokens = spec_metadata.num_accepted_draft_tokens[:
+                                                                            batch_size]
+        seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
+        last_tokens_idx = torch.cumsum(
+            seq_lens, dim=0,
+            dtype=torch.long) - seq_lens + num_accepted_draft_tokens
+        position_start_idx = position_ids[0, last_tokens_idx] + 1
+        self.position_ids_buffer[:batch_size, :-1] = position_start_idx.unsqueeze(
+            1) + spec_tree_manager.spec_dec_position_offsets[0, 1:].unsqueeze(
+                0) - 1
+
+        attn_metadata.kv_lens_cuda[:
+                                   batch_size] -= seq_lens - num_accepted_draft_tokens - 1
+        attn_metadata.kv_lens_cuda[:batch_size] += (
+            self.max_total_draft_tokens + 1)
+        attn_metadata._seq_lens[:batch_size].fill_(self.max_total_draft_tokens +
+                                                   1)
+        attn_metadata._seq_lens_cuda[:batch_size].fill_(
+            self.max_total_draft_tokens + 1)
+        attn_metadata.on_update()
+        attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
+        attn_metadata.num_contexts = 0
+        attn_metadata.use_spec_decoding = True
+        if attn_metadata.spec_decoding_position_offsets is None:
+            attn_metadata.spec_decoding_position_offsets = torch.empty(
+                [attn_metadata.max_num_requests, self.max_total_draft_tokens + 1],
+                dtype=torch.int,
+                device=position_ids.device)
+        if attn_metadata.spec_decoding_packed_mask is None:
+            attn_metadata.spec_decoding_packed_mask = torch.zeros(
+                [attn_metadata.max_num_requests, self.max_total_draft_tokens + 1,
+                 math.ceil((self.max_total_draft_tokens + 1) / 32)],
+                dtype=torch.int,
+                device=position_ids.device)
+        if attn_metadata.spec_decoding_generation_lengths is None:
+            attn_metadata.spec_decoding_generation_lengths = torch.empty(
+                [attn_metadata.max_num_requests],
+                dtype=torch.int,
+                device=position_ids.device)
+        attn_metadata.spec_decoding_position_offsets[:batch_size, :self.
+                                                     max_total_draft_tokens] = spec_tree_manager.spec_dec_position_offsets[
+                                                         0, 1:self.
+                                                         max_total_draft_tokens +
+                                                         1].unsqueeze(0) - 1
+        attn_metadata.spec_decoding_position_offsets[:batch_size, self.
+                                                     max_total_draft_tokens] = 0
+        attn_metadata.spec_decoding_packed_mask[:
+                                                batch_size, :, :] = spec_tree_manager.spec_dec_packed_mask_for_drafter_model
+        attn_metadata.spec_decoding_generation_lengths[:
+                                                       batch_size] = self.max_total_draft_tokens + 1
+        spec_metadata.num_tokens = batch_size * (self.max_total_draft_tokens +
+                                                 1)

@@ -1963,12 +1963,12 @@ class SMCDecodingConfig(DecodingBaseConfig):
         if self.max_draft_len is not None and self.max_draft_len != self.gamma:
             raise ValueError("max_draft_len must match gamma for SMC.")
         self.max_draft_len = self.gamma
-        self.max_total_draft_tokens = self.gamma + 1
+        self.max_total_draft_tokens = self.gamma * self.n_particles
         return self
 
     @property
     def tokens_per_gen_step(self) -> int:
-        return self.gamma + 1
+        return self.max_total_draft_tokens + 1
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
