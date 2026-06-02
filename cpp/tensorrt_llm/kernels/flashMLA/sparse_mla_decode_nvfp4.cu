@@ -30,8 +30,10 @@ constexpr int32_t kFixedOverheadBlocks = 5;
 constexpr int32_t kBlockSizeTopK = 64;
 constexpr int32_t kMaxProducerBlocksPerSplit = 3;
 constexpr int32_t kMaxNvfp4NumSmParts = 4096;
+constexpr int32_t kSingleBatchSchedulerOverhead = 16;
 constexpr int32_t kShortBatchSchedulerOverhead = 15;
-constexpr int32_t kLongBatchSchedulerOverhead = 8;
+constexpr int32_t kMediumBatchSchedulerOverhead = 14;
+constexpr int32_t kLongBatchSchedulerOverhead = 5;
 
 int32_t ceilDiv(int32_t x, int32_t y)
 {
@@ -95,17 +97,19 @@ int32_t getSparseMlaDecodeNvfp4NumSmPartsForShape(int32_t b, int32_t sQ, int32_t
     int32_t const workBlocks = b * (topkBlocks + kFixedOverheadBlocks);
     int32_t const boundedParts = ceilDiv(workBlocks, kMaxProducerBlocksPerSplit);
 
-    // FlashMLA's API layer uses max(num_sms / s_q, 1). That can group
-    // multiple 64-token top-k blocks into one producer split for V3.2 NVFP4,
-    // which is non-finite for random mixed packed-FP4 payloads at B>=8 on the
-    // current reference kernel. Keep the imported producer logic intact and
-    // constrain scheduling in the op-trt adapter until the multi-block producer
-    // path is fixed and revalidated. Empirical B200 sweeps for topk=1024 show
-    // +15 is fastest/equivalent for B8/B16/B32, while +8 is fastest/equivalent
-    // for B64/B128 because it reduces producer-part and combine pressure.
-    int32_t const schedulerOverhead = b >= 64 ? kLongBatchSchedulerOverhead : kShortBatchSchedulerOverhead;
+    // FlashMLA's API layer uses max(num_sms / s_q, 1). For V3.2 NVFP4
+    // topk=1024, B200 sweeps show that SM-count flooring over-splits B1 and
+    // excess long-batch parts add combine pressure without improving producer
+    // correctness. Keep the imported producer logic intact and choose the
+    // smallest output-equivalent one-block scheduler that passed random packed
+    // FP4 sweeps. For smaller top-k values, retain the FlashMLA SM floor until
+    // they are swept separately.
+    int32_t const schedulerOverhead = b == 1 ? kSingleBatchSchedulerOverhead
+        : b >= 64                    ? kLongBatchSchedulerOverhead
+        : b >= 32                    ? kMediumBatchSchedulerOverhead
+                                      : kShortBatchSchedulerOverhead;
     int32_t const oneBlockParts = b * (topkBlocks + schedulerOverhead);
-    int32_t const smFloor = getSparseMlaDecodeNvfp4NumSmParts(sQ);
+    int32_t const smFloor = topK >= 1024 ? 1 : getSparseMlaDecodeNvfp4NumSmParts(sQ);
     return std::min(std::max({smFloor, boundedParts, oneBlockParts}), kMaxNvfp4NumSmParts);
 }
 

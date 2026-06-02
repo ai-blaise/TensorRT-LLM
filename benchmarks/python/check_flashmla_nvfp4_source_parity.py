@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import re
 from pathlib import Path
 import sys
 
@@ -104,6 +105,30 @@ def normalize_allowed_kernel_delta(text: str) -> str:
         """    if constexpr (MODEL_TYPE == ModelType::MODEL1) {\n        constexpr int BYTES_PER_TOKEN = NVFP4_TOKEN_BYTES;\n        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous\n    }\n""",
         """    constexpr int BYTES_PER_TOKEN = NVFP4_TOKEN_BYTES;\n    KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in NVFP4 KV cache must be contiguous for head64 sparse decoding attention");\n    if constexpr (MODEL_TYPE == ModelType::V32) {\n        KU_ASSERT(params.kv_scales != nullptr, "V3.2 NVFP4 decode requires separate KV scale pool");\n        KU_ASSERT(params.stride_kv_scales_row == NUM_SCALES_EACH_TOKEN, "V3.2 NVFP4 scales must be contiguous per token");\n    }\n""",
     )
+    text = re.sub(
+        r"\s+uint32_t scale_f16x2_bits;.*?scale_x2_arr_all\[local_row_idx\]\[c\] = \{.*?\};",
+        "\n                            /* normalized e4m3->bf16x2 scale conversion */",
+        text,
+        flags=re.S,
+    )
+    text = re.sub(
+        r"\s+uint32_t scale_bits;.*?scale_x2_arr_all\[local_row_idx\]\[c\] = \*reinterpret_cast<__nv_bfloat162\*>\(&scale_bits\);",
+        "\n                            /* normalized e4m3->bf16x2 scale conversion */",
+        text,
+        flags=re.S,
+    )
+    text = re.sub(
+        r"\s+uint32_t f16x2_packed\[4\];.*?__nv_bfloat162 bf16x2 = \{.*?\};",
+        "\n                                /* normalized e2m1->bf16x2 data conversion */\n                                __nv_bfloat162 bf16x2{};",
+        text,
+        flags=re.S,
+    )
+    text = re.sub(
+        r"\s+uint32_t bf16x2_packed\[4\];.*?__nv_bfloat162 bf16x2 = \*reinterpret_cast<__nv_bfloat162\*>\(&bf16x2_packed\[b\]\);",
+        "\n                                /* normalized e2m1->bf16x2 data conversion */\n                                __nv_bfloat162 bf16x2{};",
+        text,
+        flags=re.S,
+    )
     return text
 
 
@@ -188,7 +213,7 @@ def main() -> int:
         return 1
     print("FlashMLA NVFP4 source parity passed")
     print(f"strict_exact_files={strict_pair_count}")
-    print("allowed_config_kernel_delta=split op-trt data/scale pools instead of FlashMLA inline 336B row; scalar 32-bit scale loads because 36B split-scale rows are not 16B-aligned")
+    print("allowed_config_kernel_delta=split op-trt data/scale pools instead of FlashMLA inline 336B row; scalar 32-bit scale loads because 36B split-scale rows are not 16B-aligned; direct bf16x2 PTX conversion retained when the reference branch carries the older f16x2 round trip")
     print("allowed_combine_delta=dispatch buckets <=256/512/1024; dynamic shared-memory launch size normalized to FlashMLA latest zero-smem launch")
     print("intentionally_omitted=FlashMLA api/cutlass vendor tree/head128/head64 BF16/prefill/sm90/model1/q_prequant, because this import targets only sparse MLA NVFP4 decode through op-trt wrappers")
     return 0
