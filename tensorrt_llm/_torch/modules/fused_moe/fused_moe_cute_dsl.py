@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -464,6 +465,29 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
 
+        # WarpDecode tile-mode policy (output-owned NVFP4 decode).
+        # tile_mode resolves the grouped-GEMM tiling for run_moe_nvfp4:
+        #   'autotune'     -> AutoTuner profiles tile_size in {128, 256}
+        #                     and caches the fastest per shape (decode picks
+        #                     1-CTA / tile_size=128 automatically).
+        #   'decode_1cta'  -> pin tile_size=128 (1-CTA), skip profiling.
+        #   'prefill_2cta' -> pin tile_size=256 (2-CTA), prefill/large-batch.
+        # Only consulted on the WARPDECODE backend; CUTEDSL keeps 'autotune'
+        # so the default CuteDslFusedMoE behavior is unchanged.
+        self.is_warp_decode = str(
+            getattr(self, "moe_backend", "") or "").upper() == "WARPDECODE"
+        self.warp_decode_tile_mode = "autotune"
+        warp_decode_config = getattr(model_config, "warp_decode_config", None)
+        if self.is_warp_decode and warp_decode_config is not None:
+            self.warp_decode_tile_mode = getattr(
+                warp_decode_config, "tile_mode", "autotune")
+        if self.is_warp_decode:
+            logger.info_once(
+                "WarpDecode backend active: CuteDslFusedMoE output-owned "
+                "NVFP4 decode, tile_mode=%s." % self.warp_decode_tile_mode,
+                key="warp_decode_backend_cute_dsl_active",
+            )
+
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build weight view for non-DWDP path (single-element lists)."""
         return NvFp4WeightView(
@@ -571,6 +595,34 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         is_dwdp = len(weight_view.w3_w1_weight) > 1
         forward_impl = self.run_moe_nvfp4_impl_dwdp if is_dwdp else self.run_moe_nvfp4_impl
+
+        # WarpDecode forced tile modes bypass AutoTuner profiling and pin the
+        # grouped-GEMM tile_size directly. 'autotune' (the default, and the
+        # only mode reachable when not on the WARPDECODE backend) falls
+        # through to the AutoTuner path below, which profiles tile_size in
+        # {128, 256} and caches the fastest per shape.
+        tile_mode = getattr(self, "warp_decode_tile_mode", "autotune")
+        forced_tile_size = {"decode_1cta": 128, "prefill_2cta": 256}.get(tile_mode)
+        if forced_tile_size is not None:
+            logger.info_once(
+                "WarpDecode run_moe_nvfp4 SELECTED forced tile_mode=%s "
+                "(tile_size=%d, %s)." % (
+                    tile_mode,
+                    forced_tile_size,
+                    "1-CTA" if forced_tile_size == 128 else "2-CTA",
+                ),
+                key="warp_decode_forced_tile_mode_%s" % tile_mode,
+            )
+            return forward_impl(
+                x,
+                token_selected_experts,
+                token_final_scales,
+                x_sf,
+                moe_output,
+                weight_view,
+                enable_alltoall=enable_alltoall,
+                tile_size=forced_tile_size,
+            )
 
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(

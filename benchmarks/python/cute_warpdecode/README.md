@@ -34,9 +34,28 @@ Experts stay EP-sharded — the win is the kernel structure, not DP-replication.
   the M-tile count and silently truncates the contraction.
 - **Scatter**: `cute.arch.atomic_add(mOut.iterator + (t*HIDDEN + h), contrib)`.
 
-## Status
+## Status and measured outcome
 
-Correctness complete. Next: vectorized FP4 loads + occupancy tuning toward the Cursor 3.95 TB/s
-(58% of B200 6.8 TB/s peak) bandwidth, fuse the intermediate NVFP4 quant into the gate_up
-epilogue, then the full {2,4,8 GPU}×{16,32 conc}×{1k–128k ctx} matrix vs the native grouped
-NVFP4 runner.
+**Correctness complete** for the output-owned NVFP4 decode kernels (cosine 1.0 vs
+the quant reference; the NVFP4 intermediate is the only numerical floor). The key
+findings from this exploration are:
+
+- The output-owned structure is **correct** (cosine 1.0).
+- At decode, this path is **compute-/bandwidth-bound on the routed expert weight
+  reads**, not on the padding/scatter overhead that the Cursor blog targets.
+  Tensor-core utilization (not the gather structure) is the lever.
+
+**Honest end-to-end result.** When wired into the production path as the
+`WARPDECODE` backend (`CuteDslFusedMoE`) and compared against op-trt's *fused*
+native NVFP4 runner on B200 with real NCCL all-to-all, the measured speedup is
+**~1.0-1.13× local and ~1.05× system**, context-independent. It is **not** the
+Cursor blog's 1.84× — that figure was measured on a single GPU against an unfused
+BF16-activation baseline with no all-to-all, whereas op-trt native already fuses
+the gather/scatter/finalize stages and (on this 196.6 GB model, which does not
+fit on one 179 GB B200) both paths pay the same all-to-all. Earlier inflated
+figures in this folder's history (e.g. multi-× speedups, 3.95 TB/s targets) are
+superseded by the measured tables.
+
+See `WARPDECODE.md` and `docs/source/features/warpdecode_deployment_guide.md` for
+the measured performance, the model-physics reason the all-to-all is common, and
+the configuration (`moe_backend="WARPDECODE"` + `WarpDecodeConfig.tile_mode`).

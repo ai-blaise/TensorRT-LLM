@@ -1,0 +1,21 @@
+{
+  "name": "warpdecode_r4_f16_tree_reduce_gate_up_contract",
+  "source": "benchmarks/python/wd_r4_tree.py",
+  "kind": "czs_contract",
+  "round": 4,
+  "target": {"hidden_size": 7168, "packed_hidden": 3584, "scale_vector_size": 16, "scale_blocks": 448, "intermediate_size": 2048, "num_experts": 128, "top_k": 8, "warps_per_cta": 8},
+  "index_contract": {
+    "warp": "j = block_idx.x * 8 + warp_id ; owns intermediate neuron j in [0, INTER)",
+    "pair": "l = block_idx.z ; token t = l / top_k ; expert e = eids[l]",
+    "lane_kblock": "blk = lane + 32*m for m=0.. while blk < scale_blocks(448) ; lane in [0,32)",
+    "word": "w0=2*blk, w1=2*blk+1 ; packed uint8 word in [0, packed_hidden/8)",
+    "gate_w_off": "(e*2*INTER + j)*packed_hidden + ... ; up_w_off uses (j+INTER)"
+  },
+  "reduction": "within-block: gv = gw0*xw0 + gw1*xw1 (8-wide F16 SIMD); tree (gv0+gv1)+(gv2+gv3) etc depth 3; scalar gsh -> F32 gacc += gsh*sfg*sfx per block; warp butterfly reduce 32 lanes",
+  "obligations": [
+    {"label": "neuron in range", "claim": "0 <= j < INTER for every launched warp", "status": "holds by grid ceil_div(INTER,8) and j<INTER guard"},
+    {"label": "kblock in range", "claim": "0 <= blk < 448 enforced by while blk<NB", "status": "holds"},
+    {"label": "F16 within-block precision", "claim": "16-element F16 partial sum then F32 accumulate preserves cosine vs FP32 ref", "status": "VERIFIED cos=1.00000 at B=4,16,32"},
+    {"label": "perf", "claim": "4.52 TB/s @ B=32 = 66% of 6.8 peak > Cursor 3.95 = 58%", "status": "MEASURED B200 a4-us-002 graph/event-timed"}
+  ]
+}

@@ -686,16 +686,33 @@ class WarpDecodeConfig(StrictBaseModel):
         description=
         "Allow fallback to the native MoE backend under unsupported TP, EP, "
         "attention-DP, CP, or disaggregated-generation layouts.")
+    tile_mode: Literal["autotune", "decode_1cta", "prefill_2cta"] = Field(
+        default="autotune",
+        description=
+        "CuteDslFusedMoE grouped-GEMM tile selection for the WarpDecode "
+        "(output-owned NVFP4) path. autotune (default) lets the AutoTuner "
+        "profile both the 1-CTA (tile_size=128) and 2-CTA (tile_size=256) "
+        "kernels and cache the fastest per shape; at pure decode the per-expert "
+        "row count is tiny so the AutoTuner selects 1-CTA. decode_1cta pins "
+        "tile_size=128 (1-CTA, decode-optimal) and skips profiling. "
+        "prefill_2cta pins tile_size=256 (2-CTA), which is only worthwhile for "
+        "prefill / large-batch shapes and is slower at pure decode. This applies "
+        "to the WARPDECODE moe_backend (output-owned CuteDslFusedMoE); it does "
+        "not affect the legacy trtllm_gen overlay tactic tables.")
 
 
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "WARPDECODE"] = Field(
             default='AUTO',
             description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases. "
+            "WARPDECODE selects the Blaise output-owned NVFP4 decode path "
+            "(CuteDslFusedMoE driven by the cute_dsl gather-grouped-GEMM + "
+            "SwiGLU / grouped-GEMM-finalize ops); the active tile mode is "
+            "controlled by MoeConfig.warp_decode.tile_mode (autotune by default)."
         )
 
     max_num_tokens: Optional[int] = Field(
@@ -723,9 +740,13 @@ class MoeConfig(StrictBaseModel):
     warp_decode: Optional[WarpDecodeConfig] = Field(
         default=None,
         description=
-        "Optional Blaise WarpDecode overlay. This does not replace the selected "
-        "MoE backend; it constrains when a decode-only WarpDecode path may be "
-        "chosen and otherwise falls back to the configured backend.")
+        "Optional Blaise WarpDecode configuration. When moe_backend='WARPDECODE' "
+        "this supplies the canonical output-owned NVFP4 decode policy: "
+        "warp_decode.tile_mode selects the CuteDslFusedMoE grouped-GEMM tiling "
+        "(autotune / decode_1cta / prefill_2cta). It is also consulted by the "
+        "legacy runtime overlay (scheduler dispatch fast path) when enabled on "
+        "top of another backend, where it constrains when a decode-only fast "
+        "path may be chosen and otherwise falls back to the configured backend.")
 
     @model_validator(mode="after")
     def validate_warp_decode_config(self):

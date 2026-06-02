@@ -51,15 +51,17 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.modules.fused_moe import (
+    CutlassFusedMoE, CuteDslFusedMoE, RenormalizeMoeRoutingMethod)
+from tensorrt_llm._torch.modules.fused_moe.create_moe import (
+    create_moe_backend, get_moe_cls)
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -773,3 +775,43 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def _make_selection_model_config(moe_backend, quant_algo, warp_decode=None):
+    """Minimal ModelConfig for exercising create_moe.get_moe_cls selection only."""
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = 128
+    pretrained_config.hidden_size = 7168
+    pretrained_config.moe_intermediate_size = 2048
+    pretrained_config.torch_dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo is not None else None
+    return ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=quant_config,
+        moe_backend=moe_backend,
+        warp_decode_config=warp_decode,
+    )
+
+
+def test_warpdecode_backend_selection():
+    """moe_backend='WARPDECODE' resolves to CuteDslFusedMoE for NVFP4.
+
+    Selection-only test: exercises create_moe.get_moe_cls without building a
+    backend, so it needs no GPU and no model weights. Confirms (a) the
+    WARPDECODE alias maps to the canonical output-owned CuteDslFusedMoE path and
+    matches MoeBackendType.WARPDECODE's class map, and (b) that a non-NVFP4
+    quant config falls back to CutlassFusedMoE just like the CUTEDSL path.
+    """
+    # (a) NVFP4 -> CuteDslFusedMoE, both via the alias and the test enum map.
+    model_config = _make_selection_model_config("WARPDECODE", QuantAlgo.NVFP4)
+    assert get_moe_cls(model_config) is CuteDslFusedMoE
+    assert get_backend_class(MoeBackendType.WARPDECODE) is CuteDslFusedMoE
+
+    # The WARPDECODE alias must resolve to the same class as CUTEDSL for NVFP4
+    # (it is the same output-owned cute_dsl path, just explicitly named).
+    cutedsl_config = _make_selection_model_config("CUTEDSL", QuantAlgo.NVFP4)
+    assert get_moe_cls(model_config) is get_moe_cls(cutedsl_config)
+
+    # (b) Non-NVFP4 quant -> CutlassFusedMoE fallback.
+    fp8_config = _make_selection_model_config("WARPDECODE", QuantAlgo.FP8)
+    assert get_moe_cls(fp8_config) is CutlassFusedMoE

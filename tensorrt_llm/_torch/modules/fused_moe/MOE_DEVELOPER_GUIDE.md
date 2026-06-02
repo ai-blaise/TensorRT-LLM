@@ -117,6 +117,7 @@ The codebase is transitioning between two architectures:
 
 ConfigurableMoE currently supports these backends (`create_moe.py`):
 - `CutlassFusedMoE`, `TRTLLMGenFusedMoE`, `DeepGemmFusedMoE`, `CuteDslFusedMoE`, `DenseGEMMFusedMoE`, `MegaMoEDeepGemm`
+  - `WARPDECODE` is an explicit `moe_backend` alias that resolves to `CuteDslFusedMoE` (output-owned NVFP4 decode); see the WARPDECODE section below.
 
 Still on old path (standalone, with embedded communication):
 - `TritonFusedMoE`, `WideEPMoE`, `VanillaMoE`
@@ -137,6 +138,7 @@ Still on old path (standalone, with embedded communication):
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
+| `warp_decode.py` | Optional **legacy** WarpDecode overlay (trtllm_gen fast path at scheduler dispatch). Secondary to the canonical `WARPDECODE` backend; see the WARPDECODE section. |
 
 ### Backends (`fused_moe/`)
 
@@ -181,6 +183,74 @@ Communication strategies are auto-selected at runtime by `CommunicationFactory` 
 | `test_moe_module.py` | ConfigurableMoE integration tests (Backend × Comm × EPLB) | Active |
 | `test_fused_moe.py` | Legacy MoE tests | Being replaced, do NOT add new tests here |
 | `test_moe.py` | Legacy TRTLLM backend tests | Being replaced, do NOT add new tests here |
+
+## WarpDecode (WARPDECODE backend)
+
+**WarpDecode** is the Blaise output-owned NVFP4 MoE **decode** path for
+DeepSeek-V3.2-REAP-345B on B200. It is **not a new backend class** — it is an
+explicit `moe_backend="WARPDECODE"` alias that `create_moe.get_moe_cls` resolves
+to **`CuteDslFusedMoE`** (the output-owned `cute_dsl` gather-grouped-GEMM +
+SwiGLU / grouped-GEMM-finalize path), with explicit logging and a tile-mode
+policy. Full reference:
+`benchmarks/python/cute_warpdecode/WARPDECODE.md`.
+
+### Configuration
+
+```python
+from tensorrt_llm.llmapi import MoeConfig, WarpDecodeConfig
+
+MoeConfig(backend="WARPDECODE")                                   # autotune (default)
+MoeConfig(backend="WARPDECODE",
+          warp_decode=WarpDecodeConfig(enabled=True, tile_mode="decode_1cta"))   # pin 1-CTA
+MoeConfig(backend="WARPDECODE",
+          warp_decode=WarpDecodeConfig(enabled=True, tile_mode="prefill_2cta"))  # pin 2-CTA
+```
+
+`WarpDecodeConfig.tile_mode` controls the grouped-GEMM `tile_size`
+(`cluster_shape = (tile_size // 128, 1)`):
+
+| value | tile_size | CTA | use |
+|-------|-----------|-----|-----|
+| `autotune` (default) | profiled in `{128, 256}` | picks 1-CTA at decode | always safe |
+| `decode_1cta` | 128 | 1-CTA | pure decode, no profiling |
+| `prefill_2cta` | 256 | 2-CTA | prefill / large batch; slower at pure decode |
+
+`autotune` keeps the `CuteDslFusedMoENvfp4Runner` + `AutoTuner.choose_one` flow
+(`get_valid_tactics() -> [128, 256]`). Forced modes bypass profiling and call
+the impl with the pinned `tile_size`. `tile_mode` affects only the `WARPDECODE`
+backend; the plain `CUTEDSL` backend is unchanged.
+
+### Explicit labeling
+
+`Selecting CuteDslFusedMoE for WarpDecode (... tile_mode=...)` at selection;
+`WarpDecode backend active: CuteDslFusedMoE output-owned NVFP4 decode,
+tile_mode=...` at init; `WarpDecode run_moe_nvfp4 SELECTED forced tile_mode=...`
+on a forced tile mode.
+
+### Measured performance (honest)
+
+B200, graph + PDL, real NCCL all-to-all; decode is context-independent (each
+`(GPU, users)` cell holds across `1k..128k` context). WarpDecode-1CTA vs native
+NVFP4: **~1.0-1.13× local, ~1.05× system**. Forced 2-CTA is correct (cosine
+0.99999) but slower at decode (0.69-0.84×); the AutoTuner prunes it and selects
+1-CTA. **The all-to-all is common to both paths** — the 196.6 GB model does not
+fit on one 179 GB B200, so experts are expert-parallel sharded on both and both
+pay the same a2a. Do not benchmark WarpDecode with zero a2a vs a native path that
+pays full a2a. See `docs/source/features/warpdecode_deployment_guide.md` and
+`warpdecode_hbm_floor_analysis.md`.
+
+### Legacy overlay (`warp_decode.py`)
+
+`warp_decode.py` is a **separate, optional** runtime overlay that runs a
+trtllm_gen `FP4BlockScaleMoERunner` at the scheduler dispatch point when
+`MoeConfig.warp_decode.enabled` is set on top of another backend. It is
+**secondary** to the `WARPDECODE` backend, defaults to letting the runner pick
+its tactic automatically (`tactic=[-1, -1]`, matching the autotune-default
+policy), and logs `WarpDecode SELECTED (overlay): ...` / `WarpDecode FALLBACK ...
+(reason=...)`. Prefer the `WARPDECODE` backend; keep the overlay disabled unless
+you specifically need the trtllm_gen fast path. Its hand-enumerated tactic tables
+are an opt-in override only (`TRTLLM_WARP_DECODE_FIXED_TACTIC=1`) and imply no
+measured speedup.
 
 ## Backend Capability Matrix
 

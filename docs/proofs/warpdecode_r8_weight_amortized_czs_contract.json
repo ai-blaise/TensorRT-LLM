@@ -1,0 +1,18 @@
+{
+  "name": "warpdecode_r8_weight_amortized_gate_up_contract",
+  "source": "benchmarks/python/wd_r8_amortize.py",
+  "kind": "czs_contract", "round": 8,
+  "structure": "warp owns (expert e, neuron j); group g carries (t0,t1,valid1) two tokens of expert e; weight gw/uw dequant ONCE per block, reused for both tokens; x per-token",
+  "index_contract": {
+    "group": "g = block_idx.z in [0, NG) ; e=GE[g], t0=GT0[g], t1=GT1[g] (valid iff GV[g]>0)",
+    "neuron": "j = block_idx.x*8 + warp in [0,INTER)",
+    "kblock": "blk = lane + 32m while blk < 448",
+    "output": "Inter[GP0[g], j] and (if valid1) Inter[GP1[g], j] -- distinct pair rows, no collision (grouping is a partition of the LP pairs)"
+  },
+  "obligations": [
+    {"label": "partition", "claim": "every original (token,expert) pair appears in exactly one group slot (gp0 or gp1)", "status": "holds by argsort-by-expert + sequential 2-chunking"},
+    {"label": "same-expert reuse valid", "claim": "t0,t1 share expert e so weight (e,j) is correct for both", "status": "holds: 2nd token only paired when eid matches"},
+    {"label": "correctness", "claim": "cosine(out, FP32 ref) ~ 1.0 for BOTH tokens", "status": "VERIFIED cos=1.00000 B=32"},
+    {"label": "perf", "claim": "668.6us vs per-pair R4 832us = 1.24x at B=32; 5.62 TB/s effective", "status": "MEASURED B200 a4-us-002"}
+  ]
+}

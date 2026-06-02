@@ -1,13 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Runtime-gated WarpDecode MoE fast path.
+"""Runtime-gated WarpDecode MoE fast path (legacy trtllm_gen overlay).
 
-WarpDecode is an overlay on the existing MoE backend. It is intentionally
-invoked at the scheduler dispatch point after routing, optional EPLB routing,
-and quantization metadata have been materialized. The native scheduler remains
-responsible for TP/EP, attention-DP, CUDA-graph, and disaggregated-serving
-control flow.
+Relationship to the canonical WarpDecode backend
+-------------------------------------------------
+The CANONICAL WarpDecode path is the output-owned NVFP4 decode realized by
+``CuteDslFusedMoE`` and selected with ``moe_backend="WARPDECODE"`` (see
+``create_moe.get_moe_cls`` and ``WARPDECODE.md``). That path drives the
+``cute_dsl`` gather-grouped-GEMM + SwiGLU / grouped-GEMM-finalize ops under the
+AutoTuner and is controlled by ``WarpDecodeConfig.tile_mode``.
+
+This module is a SECONDARY, opt-in overlay that runs a trtllm_gen
+``FP4BlockScaleMoERunner`` at the scheduler dispatch point (after routing,
+optional EPLB routing, and quantization metadata are materialized) when
+``MoeConfig.warp_decode.enabled`` is set on top of another backend. It exists
+for the decode-only crossover where the trtllm_gen runner is competitive; the
+native scheduler remains responsible for TP/EP, attention-DP, CUDA-graph, and
+disaggregated-serving control flow. By default it lets the runner pick its
+tactic automatically (``tactic=[-1, -1]``); the frozen ``_NVFP4_TARGET_*``
+tables are an explicitly-selected override only and imply no measured speedup.
+Prefer the ``WARPDECODE`` backend; keep this overlay disabled unless you have a
+specific reason to use the trtllm_gen fast path.
 """
 
 from __future__ import annotations
@@ -48,14 +62,23 @@ _NVFP4_CURSOR_GRAPH_BUCKETS = (1, 2, 4, 8, 16, 32)
 _NVFP4_CURSOR_WARPS_PER_CTA = 8
 _TRTLLM_GEN_DEEPSEEK_V3_ROUTING = 2
 _TRTLLM_GEN_SWIGLU = 0
+# Hand-enumerated [tile, tactic] pairs for the trtllm_gen FP4BlockScaleMoERunner,
+# one per decode token bucket. These are an OPTIONAL explicitly-selected mode for
+# the legacy overlay only; they are NOT used by default. The default overlay path
+# (and the canonical WARPDECODE backend) lets the runner / AutoTuner pick the
+# tactic automatically (tactic=[-1, -1]). The values below were chosen by a local
+# get_valid_tactics() enumeration on the target shape; treat them as a frozen,
+# shape-specific override, not a measured-speedup claim. See WARPDECODE.md for the
+# honest measured performance of the canonical path.
 _NVFP4_TARGET_TACTICS = {
     1: [8, 26],
     2: [8, 75],
     4: [8, 53],
     8: [8, 53],
-    16: [8, 53],
-    32: [16, 52],
+    16: [16, 52],
+    32: [32, 36],
 }
+
 
 
 @dataclass(frozen=True)
@@ -182,10 +205,10 @@ def _guard_failure(moe: "ConfigurableMoE", config, reason: str) -> None:
     if _policy(config) == "force" or (
             _policy(config) != "fallback_only" and not fallback_allowed):
         raise NotImplementedError(
-            f"WarpDecode runtime guard failed: {reason}.")
+            f"WarpDecode FALLBACK forbidden by policy; runtime guard failed (reason={reason}).")
     if _policy(config) != "fallback_only":
         logger.warning_once(
-            f"WarpDecode falling back to native MoE backend: {reason}.",
+            f"WarpDecode FALLBACK to native MoE backend (reason={reason}).",
             key=_log_key(reason))
 
 
@@ -243,9 +266,30 @@ def _required_nvfp4_ops_available() -> bool:
     return trtllm_ops is not None and callable(FP4BlockScaleMoERunner)
 
 
+_TRTLLM_GEN_AUTO_TACTIC = [-1, -1]
+
+
+def _use_fixed_overlay_tactic() -> bool:
+    """Whether the overlay should pin a hand-enumerated [tile, tactic] pair.
+
+    Default is False: the overlay lets the trtllm_gen runner choose its config
+    automatically (``tactic=[-1, -1]``), matching the autotune-default policy of
+    the canonical WARPDECODE backend. Set ``TRTLLM_WARP_DECODE_FIXED_TACTIC=1``
+    to opt into the frozen ``_NVFP4_TARGET_TACTICS`` table for the target shape.
+    """
+    return os.environ.get("TRTLLM_WARP_DECODE_FIXED_TACTIC", "0") == "1"
+
+
 def _nvfp4_target_tactic(num_tokens: int) -> List[int]:
     bucket_tokens = _cursor_bucket_for_num_tokens(num_tokens)
     return _NVFP4_TARGET_TACTICS[bucket_tokens]
+
+
+def _nvfp4_overlay_tactic(num_tokens: int) -> List[int]:
+    """Tactic for the overlay runner: auto by default, fixed table only on opt-in."""
+    if _use_fixed_overlay_tactic():
+        return _nvfp4_target_tactic(num_tokens)
+    return list(_TRTLLM_GEN_AUTO_TACTIC)
 
 
 def _run_nvfp4_explicit_tactic(
@@ -268,10 +312,11 @@ def _run_nvfp4_explicit_tactic(
     scaling_vector_size: int,
 ) -> torch.Tensor:
     del hidden_size, scaling_vector_size
-    # Decode-bucket PDL is a measured win for this target path. The explicit
-    # C++ runner call avoids the registered custom-op dispatcher and Python
-    # TunableRunner wrapper while preserving the same TRTLLMGen kernels and
-    # tactics.
+    # Enable PDL for the decode bucket. The direct C++ runner call avoids the
+    # registered custom-op dispatcher and Python TunableRunner wrapper while
+    # preserving the same trtllm_gen kernels. Tactic selection defaults to auto
+    # (_nvfp4_overlay_tactic) so this stays consistent with the canonical
+    # WARPDECODE backend's autotune-default policy.
     os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
     runner = _nvfp4_torch_runner()
     return runner.run_moe(
@@ -301,7 +346,7 @@ def _run_nvfp4_explicit_tactic(
         None,
         _TRTLLM_GEN_DEEPSEEK_V3_ROUTING,
         True,
-        _nvfp4_target_tactic(int(x.shape[0])),
+        _nvfp4_overlay_tactic(int(x.shape[0])),
         topk_weights.to(torch.bfloat16),
         topk_ids,
         None,
@@ -807,15 +852,15 @@ def try_run_warp_decode(
         )
         if selected_reason == "nvfp4_cursor_op":
             _record(moe, WarpDecodeStatus.SELECTED, selected_reason)
-            logger.info_once("WarpDecode selected Cursor NVFP4 path.",
+            logger.info_once("WarpDecode SELECTED (overlay): Cursor NVFP4 path.",
                              key="warp_decode_selected_nvfp4_cursor")
         elif selected_reason == "nvfp4_explicit_tactic_op":
             _record(moe, WarpDecodeStatus.SELECTED, selected_reason)
-            logger.info_once("WarpDecode selected explicit-tactic NVFP4 bridge path.",
+            logger.info_once("WarpDecode SELECTED (overlay): trtllm_gen NVFP4 path.",
                              key="warp_decode_selected_nvfp4_explicit_tactic")
         else:
             _record(moe, WarpDecodeStatus.SELECTED, selected_reason)
-            logger.info_once("WarpDecode selected native NVFP4 path.",
+            logger.info_once("WarpDecode SELECTED (overlay): native NVFP4 path.",
                              key="warp_decode_selected_nvfp4")
     else:
         output = _run_bf16_warp_decode(
@@ -825,6 +870,6 @@ def try_run_warp_decode(
             token_final_scales=token_final_scales,
         )
         _record(moe, WarpDecodeStatus.SELECTED, "bf16_op")
-        logger.info_once("WarpDecode selected BF16 OP-compatible path.",
+        logger.info_once("WarpDecode SELECTED (overlay): BF16 OP-compatible path.",
                          key="warp_decode_selected_bf16")
     return output

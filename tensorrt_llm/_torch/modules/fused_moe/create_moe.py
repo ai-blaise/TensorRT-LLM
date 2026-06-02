@@ -75,24 +75,28 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
     elif moe_backend.upper() == "WARPDECODE":
-        # WarpDecode: the output-owned, output-fused NVFP4 MoE decode path.
-        # This selects CuteDslFusedMoE driving the CuTe-DSL
-        # gather_grouped_gemm_act_fusion (FC1 + SwiGLU, gather-fused) ->
-        # grouped_gemm_finalize_inplace (FC2 + combine) kernels -- the fused
-        # "warp compute" that eliminates the traditional gather / pad / scatter /
-        # reduce bookkeeping stages of expert-centric MoE. Requires NVFP4 on
-        # SM100/SM103; falls back to CutlassFusedMoE otherwise.
-        # CuteDslFusedMoE.can_implement enforces the remaining hardware/shape
-        # constraints downstream.
+        # WarpDecode = Blaise output-owned NVFP4 decode. It is realized by
+        # CuteDslFusedMoE (the cute_dsl gather-grouped-GEMM + SwiGLU /
+        # grouped-GEMM-finalize ops); WARPDECODE is an explicit alias so the
+        # selection is named in logs and the WarpDecode tile_mode policy is
+        # applied. It requires NVFP4 on SM100/SM103; otherwise it falls back
+        # to CutlassFusedMoE exactly like the CUTEDSL path.
         if quant_config is not None and quant_config.quant_mode.has_nvfp4():
+            tile_mode = "autotune"
+            warp_decode_config = getattr(model_config, "warp_decode_config", None)
+            if warp_decode_config is not None:
+                tile_mode = getattr(warp_decode_config, "tile_mode", "autotune")
             logger.info(
-                f"{layer_prefix}Selecting CuteDslFusedMoE for WarpDecode "
-                "(output-owned NVFP4 MoE decode).")
+                "%sSelecting CuteDslFusedMoE for WarpDecode "
+                "(output-owned NVFP4 decode, tile_mode=%s).",
+                layer_prefix,
+                tile_mode,
+            )
             return CuteDslFusedMoE
         logger.warning(
-            f"{layer_prefix}WarpDecode only supports NVFP4. "
-            f"Check out details in quant_config: {quant_config}. "
-            "Using CutlassFusedMoE instead.")
+            f"{layer_prefix}WarpDecode (WARPDECODE) requires NVFP4 quantization; "
+            f"quant_config={quant_config} is unsupported. Using CutlassFusedMoE instead."
+        )
         return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
