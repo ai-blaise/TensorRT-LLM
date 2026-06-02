@@ -4,8 +4,9 @@
 
 The native op-trt NVFP4 sparse MLA decode path is a direct FlashMLA port with a
 narrow op-trt storage/scheduler adapter. The current source reference is
-`ai-blaise/FlashMLA` branch `ai-blaise/nvfp4-kv-decode` at commit
-`a2e19e067e8b92546462e59728c0b7dced0f9b1f`.
+`ai-blaise/FlashMLA` branch `ai-blaise/nvfp4-kv-decode-cute` at commit
+`6b6a6ccebab96ef0d9a973bee251034122b63d86` (`iter20+21: Q TMA
+EVICT_LAST + L2_256B promotion for Q & K rope tensormaps`).
 
 The porting rule is strict: copy FlashMLA kernel/support source as-is where
 possible, normalize only the op-trt boundary differences, then measure every
@@ -18,13 +19,13 @@ The source parity gate is:
 python3 benchmarks/python/check_flashmla_nvfp4_source_parity.py   --flashmla-csrc /path/to/FlashMLA/csrc   --optrt-nvfp4-sparse cpp/tensorrt_llm/kernels/flashMLA/nvfp4_sparse
 ```
 
-Current parity result against `ai-blaise/nvfp4-kv-decode`:
+Current parity result against `ai-blaise/nvfp4-kv-decode-cute` `6b6a6cc`:
 
 | gate | result |
 |---|---|
 | strict exact copied files | 23 |
 | config/kernel allowed delta | op-trt split data/scale pools instead of FlashMLA inline 336 B rows |
-| conversion allowed delta | op-trt keeps direct `bf16x2` PTX conversion when the branch carries the older `f16x2` round trip |
+| conversion allowed delta | op-trt keeps direct `bf16x2` PTX conversion when the reference branch carries the older `f16x2` round trip |
 | scale-load allowed delta | scalar 32-bit loads because 36 B split-scale rows are not 16 B aligned |
 | combine allowed delta | dispatch buckets through 1024 splits; zero dynamic shared-memory launch |
 
@@ -79,6 +80,8 @@ used.
    B1 uses `topk_blocks + 16`, B8/B16 use `+15`, B32 uses `+14`, and B64/B128
    use `+5`. For `topk < 1024`, the FlashMLA SM floor remains until separately
    swept.
+5. Mirrored the iter20+21 cache hints that are valid for the op-trt split-pool
+   mapping: Q TMA `EVICT_LAST` and Q/K RoPE tensormap `L2_256B` promotion.
 
 The direct BF16x2 PTX path requires the CUDA 13.2 ptxas/PTX 9.2 build path used
 in the B200 buildtools environment. The verified container used the documented
@@ -111,23 +114,27 @@ scheduler policy is part of the production correctness boundary.
 ## Executable FlashMLA Comparison
 
 A FlashMLA reference extension was built on `a4-us-002-rl9` from
-`ai-blaise/FlashMLA` `a2e19e0` using the matching CUTLASS submodule
-`147f5673` and the B200 buildtools image. The build required FlashInfer's
-bundled CCCL/libcudacxx include path.
+`ai-blaise/FlashMLA` `6b6a6cc` using CUTLASS `147f5673` and the B200
+buildtools image. The CUDA 13.1 container path hit the PTX 9.2 `cvt`
+assembler issue, so the successful build used the documented CUDA 13.2 ptxas
+wrapper (`/tmp/ptxas_132_wrapper.sh`).
 
-The executable comparison separates source parity from scheduler safety:
+The executable comparison separates source parity, storage layout, and scheduler
+safety:
 
 | case | result | interpretation |
 |---|---|---|
-| B1/B4, FlashMLA default scheduler vs op-trt native | exact output match; op-trt faster by 1.040x at B1 and 1.003x at B4 | direct-port kernel behavior matches FlashMLA for finite default-scheduler shapes |
-| B8/B16/B32, FlashMLA default scheduler | FlashMLA output/lse non-finite; op-trt native finite | stock `max(num_sms / s_q, 1)` scheduling is not safe for this V3.2 `topk=1024` shape |
-| B8, FlashMLA kernel with op-trt scheduler metadata | finite and exact vs op-trt native | producer behavior still matches when given a safe scheduler |
-| B16+ with op-trt scheduler metadata passed into stock FlashMLA | not a valid baseline | stock FlashMLA combine lacks op-trt's 256/512/1024 split buckets, so metadata interop is incomplete |
+| source parity vs FlashMLA iter20+21 | pass with normalized op-trt deltas | op-trt keeps a direct-port kernel surface plus split-pool scheduler/combine boundary |
+| B1/B4, FlashMLA compact scheduler vs op-trt split native | exact output match; op-trt is 1.059x faster at B1 and effectively equal at B4 | direct-port behavior matches the finite FlashMLA shapes and preserves iter20+21 cache hints |
+| B8+ at `topk=1024`, FlashMLA compact scheduler | FlashMLA output/lse becomes non-finite; op-trt split native remains finite | FlashMLA's compact scheduler is not a production-correct baseline for the target batch/topk range |
+| FlashMLA compact scheduler metadata reused in op-trt | reproduces non-finite B8+ behavior | the failure follows scheduler/split coverage, not split-vs-inline storage |
+| exact inline 336 B row scratch with op-trt safe scheduler | exact at B1/B4, finite at B8+, but slower than split storage at every measured B | inline storage is a reference layout, not a promotion candidate for op-trt today |
 
-Therefore, the required production delta is not a native rewrite: it is the
-op-trt scheduler/combine adapter layered over the direct FlashMLA port. Future
-optimization work should keep this direct-port surface as the oracle boundary and
-only indigenize pieces after they beat this executable baseline.
+Therefore, the required production delta is the op-trt scheduler/combine adapter
+layered over the direct FlashMLA producer, while preserving split NVFP4 data and
+E4M3 scale pools. The iter20+21 FlashMLA branch remains the layout/cache-hint
+reference, but its compact scheduler timings are not accepted when the output is
+non-finite.
 
 Latest native-only B200 gate, `topk=1024`, cached focused extension:
 
@@ -151,7 +158,7 @@ Static/build gates:
 
 | gate | result |
 |---|---|
-| source parity vs FlashMLA `a2e19e0` with normalized op-trt deltas | pass |
+| source parity vs FlashMLA `6b6a6cc` with normalized op-trt deltas | pass |
 | `git diff --check` | pass |
 | `py_compile` for touched Python benchmark/parity files | pass |
 | focused torch-extension rebuild | pass |
@@ -206,6 +213,8 @@ reliable profiler for this checkpoint.
 | candidate | result | reason |
 |---|---|---|
 | FlashMLA `uint4` vector scale load on split scale pool | rejected | 36 B scale rows are not 16 B aligned; produced misaligned-address failure |
+| FlashMLA inline 336 B row in op-trt safe scheduler | rejected | exact/finite but slower than split storage: B1 38.99 us, B4 57.45 us, B8 80.46 us, B16 151.68 us, B32 294.47 us, B64 473.81 us, B128 937.94 us |
+| FlashMLA iter20+21 compact scheduler as production baseline | rejected | non-finite for `topk=1024` at B8 and above |
 | B4 64 parts | rejected | non-finite, split count collapsed to 32 |
 | B8 160 parts | rejected | non-finite, split count collapsed to 64 |
 | B16 320 parts | rejected | non-finite, split count collapsed to 128 |
@@ -219,5 +228,6 @@ reliable profiler for this checkpoint.
 This is still a BF16 dequant bridge around a pure NVFP4 cache. The next major
 performance target is native full-NVFP4 tensor-core QK/PV integration using the
 validated CuTe/CZS cache-row scaffold, while preserving the op-trt scheduler and
-KV-manager contract. FlashMLA remains the correctness and performance oracle;
-op-trt should not add request-time repacking to chase the inline 336 B layout.
+KV-manager contract. FlashMLA remains the source/layout reference; production
+acceptance requires finite outputs across the target B/topk range, so op-trt
+should not add request-time repacking to chase the inline 336 B layout.
