@@ -210,7 +210,7 @@ void run_flash_mla_combine_kernel(CombineParams &params) {
         cudaLaunchConfig_t combine_kernel_config = {
             dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
             dim3(NUM_THREADS, 1, 1),
-            smem_size,
+            0,
             params.stream,
             attribute,
             1

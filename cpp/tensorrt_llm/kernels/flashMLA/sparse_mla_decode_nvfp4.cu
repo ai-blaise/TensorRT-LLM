@@ -30,7 +30,8 @@ constexpr int32_t kFixedOverheadBlocks = 5;
 constexpr int32_t kBlockSizeTopK = 64;
 constexpr int32_t kMaxProducerBlocksPerSplit = 3;
 constexpr int32_t kMaxNvfp4NumSmParts = 4096;
-constexpr int32_t kVerifiedOneBlockSchedulerOverhead = 15;
+constexpr int32_t kShortBatchSchedulerOverhead = 15;
+constexpr int32_t kLongBatchSchedulerOverhead = 8;
 
 int32_t ceilDiv(int32_t x, int32_t y)
 {
@@ -97,12 +98,13 @@ int32_t getSparseMlaDecodeNvfp4NumSmPartsForShape(int32_t b, int32_t sQ, int32_t
     // FlashMLA's API layer uses max(num_sms / s_q, 1). That can group
     // multiple 64-token top-k blocks into one producer split for V3.2 NVFP4,
     // which is non-finite for random mixed packed-FP4 payloads at B>=8 on the
-    // current reference kernel. Keep the imported kernel byte-identical and
+    // current reference kernel. Keep the imported producer logic intact and
     // constrain scheduling in the op-trt adapter until the multi-block producer
-    // path is fixed and revalidated. The overhead value is empirical for the
-    // c32/topk1024 production target: +15 selects 992 parts at B32, preserving
-    // one block per split while avoiding the slower 896-part schedule.
-    int32_t const oneBlockParts = b * (topkBlocks + kVerifiedOneBlockSchedulerOverhead);
+    // path is fixed and revalidated. Empirical B200 sweeps for topk=1024 show
+    // +15 is fastest/equivalent for B8/B16/B32, while +8 is fastest/equivalent
+    // for B64/B128 because it reduces producer-part and combine pressure.
+    int32_t const schedulerOverhead = b >= 64 ? kLongBatchSchedulerOverhead : kShortBatchSchedulerOverhead;
+    int32_t const oneBlockParts = b * (topkBlocks + schedulerOverhead);
     int32_t const smFloor = getSparseMlaDecodeNvfp4NumSmParts(sQ);
     return std::min(std::max({smFloor, boundedParts, oneBlockParts}), kMaxNvfp4NumSmParts);
 }
