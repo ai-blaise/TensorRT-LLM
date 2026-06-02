@@ -41,3 +41,23 @@ The per-thread kernels here are the verified correctness reference + the compute
 14 gate_up faithful · 15 down faithful · 16 full matrix WD-vs-native · 17 native baseline matrix ·
 18 down multi-h optimized (3.09 TB/s) · 19 full matrix optimized · 20 load-ceiling compute-bound proof ·
 21 gate_up block-aligned SF.
+
+## Tensor-core optimization round (after direct analysis of arxiv/Colfax/Veitner)
+
+Reading Colfax "Hardware-supported Block-scaling" (Part 4) surfaced the **`cta_group::2`** lever (two
+SMs cooperate per UMMA). Applied to the tensor-core FC1 (NVFP4, 16-experts BW-bound):
+
+| config | FC1 latency |
+|---|---|
+| mma_tiler 128×128, cluster 1,1 (1-CTA) | 30.96us (baseline) |
+| mma_tiler 256×128, cluster 2,1 (2-CTA) | 38.47us |
+| mma_tiler 128×256, cluster 1,1 | 32.47us |
+| **mma_tiler 256×256, cluster 2,1 (2-CTA)** | **24.33us** ← best, 1.27× over baseline |
+| 256×256, cluster 2,2 | 25.05us |
+
+**FC1: 30.96 → 24.33us (1.27×)** via 2-CTA + 256×256 tile — and 3.3× over the per-thread gate_up (80us).
+FC2 weight is ~half (117 MB) → ~12us at the same efficiency. **Optimized tensor-core MoE ≈ 36us GEMM
+vs native 78us** (~2× GEMM-only; ~1.5× full-pipeline after the shared routing/finalize). The proper
+decode FC2 is the grouped kernel (moe_as_dense FC2's `k=expert×INTER` framing is a concatenated GEMM,
+wrong for decode). Remaining juice: pipeline stages, TMA multicast for shared weight, persistent tile
+scheduler, and the grouped-kernel FC2. Resource analyses logged to agentmemory :3811.
