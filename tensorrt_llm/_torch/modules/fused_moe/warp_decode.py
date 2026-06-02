@@ -269,39 +269,48 @@ def _run_nvfp4_explicit_tactic(
 ) -> torch.Tensor:
     del hidden_size, scaling_vector_size
     # Decode-bucket PDL is a measured win for this target path. The explicit
-    # Python runner call avoids the registered custom-op dispatcher overhead in
-    # eager decode while preserving the same TRTLLMGen kernels and tactics.
+    # C++ runner call avoids the registered custom-op dispatcher and Python
+    # TunableRunner wrapper while preserving the same TRTLLMGen kernels and
+    # tactics.
     os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
-    runner = _nvfp4_runner(
+    runner = _nvfp4_torch_runner()
+    return runner.run_moe(
+        None,
+        None,
+        x,
+        x_sf.flatten().view(torch.float8_e4m3fn),
+        w13,
+        w13_scale.view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        w2,
+        w2_scale.view(torch.float8_e4m3fn),
+        None,
+        output1_scale,
+        output1_gate_scale,
+        output2_scale,
         num_experts,
         topk_ids.shape[1],
+        8,
+        4,
         intermediate_size,
         local_expert_offset,
         local_num_experts,
-    )
-    return runner.forward(
-        [
-            None,
-            None,
-            x,
-            x_sf.flatten().view(torch.float8_e4m3fn),
-            w13,
-            w13_scale.view(torch.float8_e4m3fn),
-            None,
-            None,
-            None,
-            None,
-            w2,
-            w2_scale.view(torch.float8_e4m3fn),
-            None,
-            output1_scale,
-            output1_gate_scale,
-            output2_scale,
-            topk_weights.to(torch.bfloat16),
-            topk_ids,
-        ],
-        tactic=_nvfp4_target_tactic(int(x.shape[0])),
+        None,
+        _TRTLLM_GEN_DEEPSEEK_V3_ROUTING,
+        True,
+        _nvfp4_target_tactic(int(x.shape[0])),
+        topk_weights.to(torch.bfloat16),
+        topk_ids,
+        None,
     )[0]
+
+
+@lru_cache(maxsize=None)
+def _nvfp4_torch_runner():
+    return torch.classes.trtllm.FP4BlockScaleMoERunner(_TRTLLM_GEN_SWIGLU)
 
 
 @lru_cache(maxsize=None)
