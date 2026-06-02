@@ -225,6 +225,34 @@ endif()
 
 find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
 
+function(trtllm_define_cuda_imported_target target_name library_names)
+  if(TARGET ${target_name})
+    return()
+  endif()
+
+  string(REPLACE "::" "_" cache_suffix "${target_name}")
+  find_library(
+    TRTLLM_${cache_suffix}_LIB
+    NAMES ${library_names}
+    HINTS "${CUDAToolkit_LIBRARY_DIR}" "${CUDAToolkit_LIBRARY_ROOT}/lib64"
+          "${CUDAToolkit_ROOT}/lib64" ENV LD_LIBRARY_PATH
+    PATH_SUFFIXES lib lib64)
+  if(NOT TRTLLM_${cache_suffix}_LIB)
+    message(FATAL_ERROR "Could not locate CUDA library for imported target ${target_name}; tried ${library_names}")
+  endif()
+
+  add_library(${target_name} UNKNOWN IMPORTED)
+  set_target_properties(
+    ${target_name}
+    PROPERTIES IMPORTED_LOCATION "${TRTLLM_${cache_suffix}_LIB}"
+               INTERFACE_INCLUDE_DIRECTORIES "${CUDAToolkit_INCLUDE_DIRS}")
+  message(STATUS "Defined ${target_name} from ${TRTLLM_${cache_suffix}_LIB}")
+endfunction()
+
+trtllm_define_cuda_imported_target(CUDA::cublas "cublas;libcublas.so.13")
+trtllm_define_cuda_imported_target(CUDA::cublasLt "cublasLt;libcublasLt.so.13")
+trtllm_define_cuda_imported_target(CUDA::curand "curand;libcurand.so.10")
+
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
@@ -245,6 +273,7 @@ if(ENABLE_MULTI_DEVICE)
   # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
   # unconditionally in allreduceOp.cpp
   find_package(NCCL 2.29 REQUIRED)
+  include_directories(SYSTEM ${NCCL_INCLUDE_DIR})
   set(NCCL_LIB NCCL::nccl)
 endif()
 

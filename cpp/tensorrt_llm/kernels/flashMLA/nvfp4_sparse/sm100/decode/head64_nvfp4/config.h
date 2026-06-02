@@ -1,0 +1,324 @@
+#pragma once
+
+#include "kernel.h"
+
+#include <cuda_fp8.h>
+#include <cutlass/barrier.h>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
+#include <cute/tensor.hpp>
+
+#include <kerutils/kerutils.cuh>
+
+#include "defines.h"
+#include "params.h"
+
+namespace sm100::decode::head64_nvfp4 {
+
+using cutlass::arch::fence_view_async_shared;
+using cutlass::arch::NamedBarrier;
+using e8m0 = __nv_fp8_e8m0;
+using e4m3 = cutlass::float_e4m3_t;
+using e2m1 = cutlass::float_e2m1_t;
+using ue4m3 = cutlass::float_ue4m3_t;
+using namespace cute;
+
+enum NamedBarriers : uint32_t {
+    main_loop_sync = 0,
+    wg0_sync = 1,
+    wg0_warp02_sync = 2,
+    wg0_warp13_sync = 3,
+    everyone_sync = 4
+};
+
+template<ModelType MODEL_TYPE>
+struct KernelTemplate {
+
+static constexpr int D_Q = MODEL_TYPE == ModelType::V32 ? 576 : 512;
+static constexpr int D_K = D_Q;
+static constexpr int D_V = 512;
+static constexpr int D_NOPE = MODEL_TYPE == ModelType::V32 ? 512 : 448;
+static constexpr int D_ROPE = 64;
+static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
+static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
+static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 36 : 32;
+// V32 full-NVFP4 score cache layout for op-trt: 576 packed FP4 score dims
+// (288 B/token) in the KV data pool. E4M3 block scales are stored in the
+// separate KV scale pool at 36 B/token, matching TensorRT-LLM NVFP4 cache
+// storage and avoiding request-time repacking. PV consumes the first D_V=512
+// dequantized dims.
+static constexpr int NVFP4_SCORE_BYTES = MODEL_TYPE == ModelType::V32 ? D_Q / 2 : D_NOPE / 2;
+static constexpr int NVFP4_TOKEN_BYTES = MODEL_TYPE == ModelType::V32 ? NVFP4_SCORE_BYTES : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;
+static constexpr int TMA_K_STRIDE = NVFP4_TOKEN_BYTES;
+static_assert(D_NOPE + D_ROPE == D_Q);
+static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
+
+static constexpr int B_H = 64;
+static constexpr int B_TOPK = 64;
+static constexpr int NVFP4_DUAL_QK_PACKED_BYTES = B_H * NVFP4_SCORE_BYTES * 2;
+static constexpr int NVFP4_DUAL_QK_SCALE_BYTES = B_TOPK * NUM_SCALES_EACH_TOKEN * 2;
+static constexpr int NVFP4_NATIVE_Q_PACKED_BYTES = NVFP4_DUAL_QK_PACKED_BYTES;
+static constexpr int NVFP4_NATIVE_Q_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
+static constexpr int NVFP4_NATIVE_K_PACKED_BYTES = B_TOPK * NVFP4_SCORE_BYTES;
+static constexpr int NVFP4_NATIVE_K_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
+static constexpr int NUM_NATIVE_INDEX_BUFS = 2;
+static constexpr int NUM_BUFS = 2;
+// raw_nope is double-buffered with NUM_BUFS in the canonical Phase 2 layout, but the
+// raw KV producer (warp 5) and the dequant warp are decoupled from the V dequant ring,
+// so we can give raw_nope a deeper pipeline of NUM_RAW_BUFS=3 without growing kv (kv is
+// dequant[NUM_BUFS]=144K + raw_nope[NUM_RAW_BUFS]=54K = 198K, still smaller than qo=202K
+// in the union, so the union size and SMEM total stay at the same 227K as NUM_BUFS=2).
+static constexpr int NUM_RAW_BUFS = 3;
+static constexpr int NUM_INDEX_BUFS = 3;  // NVFP4: reduced from 4 to fit SMEM (32 scales/token expands SMEM)
+static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
+static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
+
+static constexpr int D_Q_SW128 = 512;
+static constexpr int D_Q_SW64 = MODEL_TYPE == ModelType::V32 ? 64 : 0;
+static_assert(D_Q_SW128 + D_Q_SW64 == D_Q);
+static constexpr int K_ROPE_SW = MODEL_TYPE == ModelType::V32 ? 64 : 128; // RoPE part stored in SW64 (for V32) or SW128 (for MODEL1), in bytes
+
+template<
+    typename Shape_Q_SW128, typename TMA_Q_SW128,
+    typename Shape_O, typename TMA_O
+>
+struct TmaParams {
+    Shape_Q_SW128 shape_Q_SW128; TMA_Q_SW128 tma_Q_SW128;
+    Shape_O shape_O; TMA_O tma_O;
+    CUtensorMap tensor_map_q_sw64;  // Invalid if D_Q_SW64 == 0
+    CUtensorMap tensor_map_kv_nope;
+    CUtensorMap tensor_map_kv_rope;
+    CUtensorMap tensor_map_extra_kv_nope;
+    CUtensorMap tensor_map_extra_kv_rope;
+};
+
+// Tensor memory columns
+struct tmem_cols {
+    //   0 ~ 256: output
+    // 256 ~ 256 + 64*D_Q/256: Q
+    // 400 ~ 464: P
+    static constexpr int O = 0;
+    static constexpr int Q = 256;
+    static constexpr int Q_Tail = 256 + B_H*D_NOPE/2/128;
+    static constexpr int P = 400;
+};
+
+template<int NUM_TILES>
+using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<NUM_TILES*64>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutQ_SW128 = SmemLayoutQTiles<D_Q_SW128/64>;
+
+using SmemLayoutOBuf = decltype(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_V>>{}
+));
+
+using SmemLayoutOBuf_TMA = decltype(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<64>>{}
+)); // A TMA tile
+
+static_assert(D_V == 512);
+using SmemLayoutOAccumBuf = Layout<
+    Shape<Int<B_H>, Int<D_V>>,
+    Stride<Int<520>, _1>	// We use stride = 520 here to avoid bank conflict
+>;
+
+using SmemLayoutS = decltype(tile_to_shape(
+    UMMA::Layout_K_INTER_Atom<bf16>{},
+    Shape<Int<B_H>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
+));
+
+template<int NUM_TILES>
+using SmemLayoutKTiles_SW128 = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+template<int NUM_TILES>
+using SmemLayoutKTiles_DualGemm_SW128 = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H*2>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+template<int NUM_TILES>
+using SmemLayoutKTilesTransposed_SW128 = decltype(composition(
+    SmemLayoutKTiles_SW128<NUM_TILES>{},
+    Layout<
+        Shape<Int<64*NUM_TILES>, Int<B_TOPK>>,
+        Stride<Int<B_TOPK>, _1>
+    >{}
+));
+
+template<int NUM_TILES>
+using SmemLayoutKTiles_SW64 = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_H>, Int<32*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+template<int NUM_TILES>
+using SmemLayoutKTiles_DualGemm_SW64 = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_H*2>, Int<32*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+template<int NUM_TILES>
+using SmemLayoutKTilesTransposed_SW64 = decltype(composition(
+    SmemLayoutKTiles_SW64<NUM_TILES>{},
+    Layout<
+        Shape<Int<32*NUM_TILES>, Int<B_TOPK>>,
+        Stride<Int<B_TOPK>, _1>
+    >{}
+));
+
+struct NativeQKSharedMemoryPlan {
+    struct NativeMainloopScratch {
+        struct {
+            array_aligned<uint8_t, NVFP4_NATIVE_Q_PACKED_BYTES, 128> q;
+            CUTE_ALIGNAS(16) uint8_t scales[NVFP4_NATIVE_Q_SCALE_BYTES];
+        } q;
+        struct Buffer {
+            union {
+                struct {
+                    array_aligned<uint8_t, NVFP4_NATIVE_K_PACKED_BYTES, 128> k;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_NATIVE_K_SCALE_BYTES];
+                } native_k;
+                array_aligned<bf16, B_TOPK*D_V> v;
+            } decoded;
+            array_aligned<uint8_t, B_TOPK*NVFP4_SCORE_BYTES, 128> raw;
+        } kv[NUM_BUFS];
+    } mainloop;
+    union {
+        float4 p_exchange_buf[4][16 * B_TOPK / 4];
+        array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    } s_p;
+    CUTE_ALIGNAS(16) float rowwise_max_buf[128];
+    char is_token_valid[NUM_NATIVE_INDEX_BUFS][B_TOPK/8];
+    CUTE_ALIGNAS(16) int tma_coord[NUM_NATIVE_INDEX_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) e4m3 scales[NUM_NATIVE_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
+    array_aligned<uint32_t, 1> tmem_start_addr;
+    transac_bar_t bar_last_store_done;
+    transac_bar_t bar_q_native_ready;
+    transac_bar_t bar_k_native_ready[NUM_BUFS];
+    transac_bar_t bar_v_ready[NUM_BUFS];
+    transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
+    transac_bar_t bar_valid_coord_scale_ready[NUM_NATIVE_INDEX_BUFS], bar_valid_coord_scale_free[NUM_NATIVE_INDEX_BUFS];
+    transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
+};
+static_assert(sizeof(NativeQKSharedMemoryPlan) < 232448,
+              "Native NVFP4 QK shared-memory plan must fit B200 opt-in SMEM");
+
+struct SharedMemoryPlan {
+    union {
+        struct {
+            array_aligned<bf16, cosize_v<SmemLayoutQ_SW128>> q;
+            bf16 q_sw64[B_H*D_Q_SW64];  // NOTE D_Q_SW64 may be 0 but array_aligned<bf16, 0> will have a size of 16, so we use array here. The former tensor (`q`) promises its alignment.
+            union {
+                array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
+                array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
+                struct {
+                    array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> q;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
+                } native_qk;
+            } o;
+        } qo;
+        struct {
+            union {
+                struct {
+                    array_aligned<bf16, B_H*D_NOPE> nope; // NoPE part, dequantized
+                    array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
+                } dequant[NUM_BUFS];
+                struct {
+                    array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> k;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
+                } native_qk[NUM_BUFS];
+            };
+            static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
+            // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope.
+            // Deeper pipelined than dequant: NUM_RAW_BUFS=3 lets the raw KV TMA producer
+            // run two blocks ahead of the WG2 dequant warp.
+            array_aligned<uint8_t, B_H*NVFP4_SCORE_BYTES> raw_nope[NUM_RAW_BUFS];  // Raw FP4-packed score dims
+        } kv;
+    } u;
+    union {
+        float4 p_exchange_buf[4][16 * B_TOPK / 4];
+        array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    } s_p;
+    CUTE_ALIGNAS(16) float rowwise_max_buf[128];
+    char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
+    CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) e4m3 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];  // NVFP4 E4M3 per-block scales
+    array_aligned<uint32_t, 1> tmem_start_addr;
+    transac_bar_t bar_last_store_done;
+    transac_bar_t bar_q_tma, bar_q_utccp;
+    transac_bar_t bar_rope_ready[NUM_BUFS];
+    transac_bar_t bar_nope_ready[NUM_BUFS];
+    transac_bar_t bar_raw_ready[NUM_RAW_BUFS], bar_raw_free[NUM_RAW_BUFS];
+    transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
+    transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
+};
+
+using TiledMMA_P = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_H, B_TOPK*2, UMMA::Major::K, UMMA::Major::K>{}
+)); // *2 for dual gemm
+
+using TiledMMA_O = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+static constexpr int NVFP4_SF_VEC = 16;
+static constexpr int NVFP4_QK_M = B_H * 2;
+static constexpr int NVFP4_QK_N = B_TOPK;
+static constexpr int NVFP4_QK_K = D_Q;
+
+using TiledMMA_QK_NVFP4 = decltype(make_tiled_mma(
+    SM100_MMA_MXF4_SS<
+        e2m1,
+        e2m1,
+        float,
+        ue4m3,
+        NVFP4_QK_M,
+        NVFP4_QK_N,
+        NVFP4_SF_VEC,
+        UMMA::Major::K,
+        UMMA::Major::K>{}
+));
+
+using TileShapeQKNVFP4 = Shape<Int<NVFP4_QK_M>, Int<NVFP4_QK_N>, Int<NVFP4_QK_K>>;
+using MmaShapeAQKNVFP4 = decltype(partition_shape_A(
+    TiledMMA_QK_NVFP4{}, Shape<Int<NVFP4_QK_M>, Int<NVFP4_QK_K>>{}));
+using MmaShapeBQKNVFP4 = decltype(partition_shape_B(
+    TiledMMA_QK_NVFP4{}, Shape<Int<NVFP4_QK_N>, Int<NVFP4_QK_K>>{}));
+
+using SmemLayoutQNVFP4 = decltype(UMMA::tile_to_mma_shape(
+    UMMA::Layout_K_SW32_Atom<e2m1>{},
+    append(MmaShapeAQKNVFP4{}, _1{}),
+    Step<_1, _2, _3>{}));
+using SmemLayoutKNVFP4 = decltype(UMMA::tile_to_mma_shape(
+    UMMA::Layout_K_SW32_Atom<e2m1>{},
+    append(MmaShapeBQKNVFP4{}, _1{}),
+    Step<_1, _2, _3>{}));
+
+using NVFP4QKScaleLayout = cutlass::detail::Sm1xxBlockScaledConfig<NVFP4_SF_VEC>;
+using SmemLayoutQScaleNVFP4 = decltype(
+    NVFP4QKScaleLayout::deduce_smem_layoutSFA(TiledMMA_QK_NVFP4{}, TileShapeQKNVFP4{}));
+using SmemLayoutKScaleNVFP4 = decltype(
+    NVFP4QKScaleLayout::deduce_smem_layoutSFB(TiledMMA_QK_NVFP4{}, TileShapeQKNVFP4{}));
+
+template<typename TmaParam>
+static __device__ void
+flash_fwd_splitkv_mla_fp8_sparse_kernel_devfunc(const SparseAttnDecodeParams &params, const TmaParam &tma_params);
+
+static void run(const SparseAttnDecodeParams &params);
+
+};
+
+}
