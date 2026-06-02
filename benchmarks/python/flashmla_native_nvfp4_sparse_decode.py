@@ -31,6 +31,7 @@ D_V = 512
 PAGE_BLOCK_SIZE = 64
 PACKED_BYTES = 288
 SCALE_BYTES = 36
+FLASHMLA_INLINE_BYTES = 336
 SCALE_BLOCK = 16
 DEVICE = "cuda"
 
@@ -148,6 +149,16 @@ def make_inputs(batch_size: int, topk: int, num_blocks: int | None = None, seed:
     return q, kv, kv_scales, indices, topk_length, sm_scale
 
 
+def make_flashmla_inline_kv(kv: torch.Tensor, kv_scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map op-trt split V3.2 NVFP4 storage to FlashMLA's inline row layout."""
+    inline = torch.empty(*kv.shape[:-1], FLASHMLA_INLINE_BYTES, dtype=torch.uint8, device=kv.device)
+    inline[..., :PACKED_BYTES].copy_(kv)
+    inline[..., PACKED_BYTES:PACKED_BYTES + SCALE_BYTES].copy_(kv_scales)
+    inline[..., PACKED_BYTES + SCALE_BYTES:].zero_()
+    unused_scales = torch.zeros(*kv.shape[:-1], 32, dtype=torch.uint8, device=kv.device)
+    return inline, unused_scales
+
+
 def time_cuda(fn: Callable[[], object], warmup: int, iters: int) -> tuple[float, float, list[float]]:
     for _ in range(warmup):
         fn()
@@ -208,7 +219,8 @@ def run_correctness(native_ext, fc, args):
             "finite": bool(torch.isfinite(native_out).all().item()) and bool(torch.isfinite(native_lse).all().item()),
         }
         if fc is not None:
-            flash_out, _, _, _ = flashmla_call(fc, q, kv, kv_scales, indices, topk_length, sm_scale)
+            flash_kv, flash_scales = make_flashmla_inline_kv(kv, kv_scales)
+            flash_out, _, _, _ = flashmla_call(fc, q, flash_kv, flash_scales, indices, topk_length, sm_scale)
             row["native_vs_flashmla"] = tensor_compare(native_out, flash_out)
         row["passed"] = (
             row["finite"]
@@ -250,13 +262,20 @@ def run_bench(native_ext, fc, args):
             "native_splits_last": int(native_splits[-1].item()),
         }
         if fc is not None:
-            flash_out, _, flash_meta, flash_splits = flashmla_call(fc, q, kv, kv_scales, indices, topk_length, sm_scale)
+            flash_kv, flash_scales = make_flashmla_inline_kv(kv, kv_scales)
+            flash_out, flash_lse, flash_meta, flash_splits = flashmla_call(fc, q, flash_kv, flash_scales, indices, topk_length, sm_scale)
             torch.cuda.synchronize()
+            row["flashmla_finite"] = bool(torch.isfinite(flash_out).all().item()) and bool(torch.isfinite(flash_lse).all().item())
             cmp_row = tensor_compare(native_out, flash_out)
-            if not (cmp_row["max_abs"] < 0.5 and cmp_row["rms"] < 0.065 and cmp_row["cosine"] > 0.994):
-                raise AssertionError(f"native output does not match FlashMLA at batch={batch_size}: {cmp_row}")
+            row["compare"] = cmp_row
+            row["flashmla_valid_baseline"] = (
+                row["flashmla_finite"]
+                and cmp_row["max_abs"] < 0.5
+                and cmp_row["rms"] < 0.065
+                and cmp_row["cosine"] > 0.994
+            )
             flash_min, flash_med, flash_vals = time_cuda(
-                lambda: flashmla_call(fc, q, kv, kv_scales, indices, topk_length, sm_scale, flash_meta, flash_splits),
+                lambda: flashmla_call(fc, q, flash_kv, flash_scales, indices, topk_length, sm_scale, flash_meta, flash_splits),
                 args.warmup,
                 iters,
             )
@@ -264,7 +283,6 @@ def run_bench(native_ext, fc, args):
                 "flashmla_prealloc_min_us": flash_min,
                 "flashmla_prealloc_median_us": flash_med,
                 "flashmla_values_us": flash_vals,
-                "compare": cmp_row,
             })
         native_min, native_med, native_vals = time_cuda(
             lambda: native_call(native_ext, q, kv, kv_scales, indices, topk_length, sm_scale, native_meta, native_splits),
@@ -278,7 +296,7 @@ def run_bench(native_ext, fc, args):
         })
         if fc is not None:
             row["native_vs_flashmla_speedup_median"] = row["flashmla_prealloc_median_us"] / native_med
-            row["accepted_vs_flashmla"] = native_med <= row["flashmla_prealloc_median_us"]
+            row["accepted_vs_flashmla"] = row["flashmla_valid_baseline"] and native_med <= row["flashmla_prealloc_median_us"]
         print(json.dumps(row, sort_keys=True))
         rows.append(row)
     return rows

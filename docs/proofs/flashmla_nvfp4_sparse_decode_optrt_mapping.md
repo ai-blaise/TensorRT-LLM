@@ -125,9 +125,9 @@ safety:
 | case | result | interpretation |
 |---|---|---|
 | source parity vs FlashMLA iter20+21 | pass with normalized op-trt deltas | op-trt keeps a direct-port kernel surface plus split-pool scheduler/combine boundary |
-| B1/B4, FlashMLA compact scheduler vs op-trt split native | exact output match; op-trt is 1.059x faster at B1 and effectively equal at B4 | direct-port behavior matches the finite FlashMLA shapes and preserves iter20+21 cache hints |
+| B1/B4, FlashMLA compact scheduler vs op-trt split native | exact output match; op-trt is 1.049x faster at B1 and effectively equal at B4 | direct-port behavior matches the finite FlashMLA shapes and preserves iter20+21 cache hints |
 | B8+ at `topk=1024`, FlashMLA compact scheduler | FlashMLA output/lse becomes non-finite; op-trt split native remains finite | FlashMLA's compact scheduler is not a production-correct baseline for the target batch/topk range |
-| FlashMLA compact scheduler metadata reused in op-trt | reproduces non-finite B8+ behavior | the failure follows scheduler/split coverage, not split-vs-inline storage |
+| FlashMLA compact scheduler metadata reused in op-trt | reproduces non-finite B8+ behavior in prior diagnostic sweeps | the failure follows scheduler/split coverage, not split-vs-inline storage |
 | exact inline 336 B row scratch with op-trt safe scheduler | exact at B1/B4, finite at B8+, but slower than split storage at every measured B | inline storage is a reference layout, not a promotion candidate for op-trt today |
 
 Therefore, the required production delta is the op-trt scheduler/combine adapter
@@ -137,6 +137,24 @@ reference, but its compact scheduler timings are not accepted when the output is
 non-finite.
 
 Latest native-only B200 gate, `topk=1024`, cached focused extension:
+
+Explicit FlashMLA iter20+21 executable comparison after packing op-trt split
+storage into FlashMLA's inline 336 B row outside the timed region:
+
+| B | op-trt split median us | FlashMLA inline median us | FlashMLA finite | accepted vs FlashMLA |
+|---:|---:|---:|---|---|
+| 1 | 29.350 | 30.774 | yes | yes, 1.049x faster |
+| 4 | 30.789 | 30.803 | yes | yes, equivalent |
+| 8 | 30.803 | 32.813 | no | no, invalid FlashMLA output |
+| 16 | 56.315 | 37.148 | no | no, invalid FlashMLA output |
+| 32 | 111.860 | 43.094 | no | no, invalid FlashMLA output |
+| 64 | 214.549 | 59.657 | no | no, invalid FlashMLA output |
+| 128 | 421.416 | 72.012 | no | no, invalid FlashMLA output |
+
+The FlashMLA-invalid rows are retained as diagnostics only. They are not treated
+as performance wins because the output and LSE are non-finite while the op-trt
+split scheduler remains finite on the same packed values and finite E4M3 scale
+byte range.
 
 | B | scheduler parts | split count | finite | median us |
 |---:|---:|---:|---|---:|
@@ -226,8 +244,26 @@ from independent final matrices, not a scheduler policy change.
 Nsight Systems B32 attribution from the previous checkpoint remains the usable
 profiler signal: producer ~76%, combine ~20%, scheduler metadata ~2%. IKP CUPTI
 SASS collection selected producer/combine kernels but returned zero
-`smsp__sass_inst_executed` in the container run, so Nsight Systems remains the
-reliable profiler for this checkpoint.
+`smsp__sass_inst_executed` in the container run, and later CUPTI PC sampling
+returned `CUPTI_ERROR_INSUFFICIENT_PRIVILEGES` on this node. Timing,
+decomposition, source parity, and correctness gates are therefore the accepted
+profile signals for this direct-port checkpoint.
+
+Direct-port post-promotion candidate sweep:
+
+| candidate | median us at B16/B32/B64/B128 | result |
+|---|---|---|
+| `NUM_RAW_BUFS=2` | 56.846 / 111.848 / 214.558 / 421.551 | rejected; no win over current raw-buffer depth 3 |
+| `NUM_RAW_BUFS=4` | build failed | rejected; shared-memory static assertions exceed B200 limit |
+| `NUM_INDEX_BUFS=2` | 56.789 / 111.760 / 214.517 / 421.617 | rejected; no material win over current index-buffer depth 3 |
+| `NUM_INDEX_BUFS=4` | runtime invalid argument | rejected; launch/shared-memory constraint failure |
+| combine `BLOCK_SIZE_M=16` | build failed | rejected; 1024-split combine instantiation exceeds shared-memory limit |
+| combine `BLOCK_SIZE_M=4` | 55.859 / 112.037 / 213.765 / 421.936 | rejected; small B16/B64 movement but worse B32/B128 and no consistent win |
+
+The direct-port surface is locally saturated under the current split-storage
+contract: the accepted raw NoPE `EVICT_LAST` change is the only measured kernel
+delta that preserves correctness and improves the target matrix without moving
+to a larger structural redesign.
 
 ## Rejected Candidates
 
