@@ -107,6 +107,41 @@ Current policy for `topk=1024`:
 The multi-block producer path remains a correctness target. Until fixed, this
 scheduler policy is part of the production correctness boundary.
 
+
+## Executable FlashMLA Comparison
+
+A FlashMLA reference extension was built on `a4-us-002-rl9` from
+`ai-blaise/FlashMLA` `a2e19e0` using the matching CUTLASS submodule
+`147f5673` and the B200 buildtools image. The build required FlashInfer's
+bundled CCCL/libcudacxx include path.
+
+The executable comparison separates source parity from scheduler safety:
+
+| case | result | interpretation |
+|---|---|---|
+| B1/B4, FlashMLA default scheduler vs op-trt native | exact output match; op-trt faster by 1.040x at B1 and 1.003x at B4 | direct-port kernel behavior matches FlashMLA for finite default-scheduler shapes |
+| B8/B16/B32, FlashMLA default scheduler | FlashMLA output/lse non-finite; op-trt native finite | stock `max(num_sms / s_q, 1)` scheduling is not safe for this V3.2 `topk=1024` shape |
+| B8, FlashMLA kernel with op-trt scheduler metadata | finite and exact vs op-trt native | producer behavior still matches when given a safe scheduler |
+| B16+ with op-trt scheduler metadata passed into stock FlashMLA | not a valid baseline | stock FlashMLA combine lacks op-trt's 256/512/1024 split buckets, so metadata interop is incomplete |
+
+Therefore, the required production delta is not a native rewrite: it is the
+op-trt scheduler/combine adapter layered over the direct FlashMLA port. Future
+optimization work should keep this direct-port surface as the oracle boundary and
+only indigenize pieces after they beat this executable baseline.
+
+Latest native-only B200 gate, `topk=1024`, cached focused extension:
+
+| B | scheduler parts | split count | finite | median us |
+|---:|---:|---:|---|---:|
+| 1 | 32 | 16 | yes | 29.636 |
+| 4 | 124 | 64 | yes | 30.815 |
+| 8 | 248 | 128 | yes | 30.922 |
+| 16 | 496 | 256 | yes | 57.458 |
+| 32 | 960 | 512 | yes | 114.799 |
+| 64 | 1344 | 1024 | yes | 214.270 |
+| 128 | 2688 | 2048 | yes | 422.124 |
+
+
 ## Verification
 
 Focused gates were run on `a4-us-002-rl9` in the B200 buildtools image with the
