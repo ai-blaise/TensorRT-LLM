@@ -126,6 +126,41 @@ simulated per-layer indexer + sparse-attn compute window driven via
 | 1 MB    | 0          | 2.47 ms   | 3.29 ms           | 7.27 ms            | -33 %    | -195 %    |
 | 1 MB    | 500 us     | 23.56 ms  | 23.64 ms          | 23.72 ms           | -0.4 %   | -0.7 %    |
 
+### M5e vs M5d wire-byte + wall-time sweep (CP=2, B200, GPUs 3+4)
+
+The bench (`tests/unittest/_torch/bench_layersplit_m5e_vs_m5d.py`) drives
+two NCCL ranks through 61 layers of broadcasts at six
+`(num_blocks_per_layer, active_per_step)` shapes, measuring three modes:
+
+- **M5d_full** — `dist.broadcast(cache_slot, src=owner)` per layer (the
+  M5d shipment before M5e fixed it; included to quantify the
+  improvement).
+- **M5e_active** — `cache_slot.index_select(0, active_ids)` + broadcast
+  + `cache_slot.index_copy_(0, active_ids, recv_buf)` per layer
+  (production today).
+- **noop** — no broadcast at all (compute floor).
+
+Measured on `a4-us-001-rl9` GPUs 3+4, NCCL_NVLS_ENABLE=0 to coexist
+with the production sglang TP=8 tenant, 3 warmup + 10 measure iters:
+
+| `num_blocks` | `active` | M5d wire | M5e wire | wire ↓ | M5d ms | M5e ms | **M5e wins**           |
+|-------------:|---------:|---------:|---------:|-------:|-------:|-------:|------------------------|
+| 1 024        | 1        | 512 MB   | 0.5 MB   | 1024×  | 2.18   | 2.67   | 0.81× (overhead loses at tiny `active`) |
+| 1 024        | 256      | 512 MB   | 128 MB   | 4×     | 2.49   | 5.34   | 0.47× (overhead loses) |
+| 4 096        | 256      | 2.0 GB   | 128 MB   | 16×    | 3.84   | 3.47   | **1.11×**              |
+| 16 384       | 256      | 8.2 GB   | 128 MB   | 64×    | 12.98  | 3.32   | **3.92×** (9.7 ms saved / forward step) |
+| 65 536       | 1 024    | 32.7 GB  | 512 MB   | 64×    | 48.11  | 3.46   | **13.89×** (44.6 ms saved / forward step) |
+| 262 144      | 4 096    | 131 GB   | 2.0 GB   | 64×    | 188.69 | 8.96   | **21.06× (179.7 ms saved / forward step)** |
+
+The **production-scale row** (262 144 blocks × 8 KB ≈ 2 GB / layer
+pool — matches DeepSeek-V3.2-REAP-345B at long context with batch
+≥ 256) shows the M5e win plainly: ~180 ms saved per forward step over
+the M5d baseline, **21× lower broadcast latency**. The cross-over is
+at `num_blocks ≈ 4096`: below that the gather + scatter overhead
+exceeds the wire savings; above it, M5e dominates because it scales
+with `active_per_step × block_bytes` instead of `num_blocks ×
+block_bytes`.
+
 ### M9-extended sweep (4 MB / 16 MB / 64 MB at 500 us compute, CP=2 and CP=4)
 
 The M9-extended matrix walked the bench across realistic per-layer
