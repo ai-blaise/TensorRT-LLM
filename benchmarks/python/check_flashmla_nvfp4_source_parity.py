@@ -129,6 +129,10 @@ def normalize_allowed_kernel_delta(text: str) -> str:
         text,
         flags=re.S,
     )
+    text = text.replace(
+        "(int64_t)TMA::CacheHintSm90::EVICT_NORMAL",
+        "(int64_t)TMA::CacheHintSm90::EVICT_LAST",
+    )
     return text
 
 
@@ -213,7 +217,7 @@ def main() -> int:
         return 1
     print("FlashMLA NVFP4 source parity passed")
     print(f"strict_exact_files={strict_pair_count}")
-    print("allowed_config_kernel_delta=split op-trt data/scale pools instead of FlashMLA inline 336B row; scalar 32-bit scale loads because 36B split-scale rows are not 16B-aligned; direct bf16x2 PTX conversion retained when the reference branch carries the older f16x2 round trip")
+    print("allowed_config_kernel_delta=split op-trt data/scale pools instead of FlashMLA inline 336B row; scalar 32-bit scale loads because 36B split-scale rows are not 16B-aligned; raw NoPE TMA EVICT_LAST cache hint accepted by B200 A/B; direct bf16x2 PTX conversion retained when the reference branch carries the older f16x2 round trip")
     print("allowed_combine_delta=dispatch buckets <=256/512/1024; dynamic shared-memory launch size normalized to FlashMLA latest zero-smem launch")
     print("intentionally_omitted=FlashMLA api/cutlass vendor tree/head128/head64 BF16/prefill/sm90/model1/q_prequant, because this import targets only sparse MLA NVFP4 decode through op-trt wrappers")
     return 0

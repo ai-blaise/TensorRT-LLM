@@ -165,17 +165,38 @@ Static/build gates:
 | ptxas for V3.2 producer | 168 registers, 16 barriers, 0 stack, 0 spills |
 | B1 reference correctness topk64/topk1024 | pass |
 
-Final B200 preallocated native-only benchmark, `topk=1024`:
+Final B200 preallocated native-only benchmark after the raw NoPE TMA
+`EVICT_LAST` promotion, `topk=1024`:
 
 | B | scheduler parts | split count | finite | median us |
 |---:|---:|---:|---|---:|
-| 1 | 32 | 16 | yes | 29.783 |
-| 4 | 124 | 64 | yes | 30.818 |
-| 8 | 248 | 128 | yes | 30.944 |
-| 16 | 496 | 256 | yes | 57.432 |
-| 32 | 960 | 512 | yes | 114.767 |
-| 64 | 1344 | 1024 | yes | 214.384 |
-| 128 | 2688 | 2048 | yes | 422.243 |
+| 1 | 32 | 16 | yes | 29.388 |
+| 4 | 124 | 64 | yes | 30.784 |
+| 8 | 248 | 128 | yes | 30.831 |
+| 16 | 496 | 256 | yes | 56.088 |
+| 32 | 960 | 512 | yes | 111.688 |
+| 64 | 1344 | 1024 | yes | 214.272 |
+| 128 | 2688 | 2048 | yes | 421.634 |
+
+Final gate artifact: `.logs/raw_tma_evict_last_final_20260602T165351.json`.
+
+Raw NoPE TMA cache-policy A/B, same focused harness settings
+(`warmup=80`, `iters=220`, native-only, `topk=1024`):
+
+| B | `EVICT_NORMAL` median us | `EVICT_LAST` median us | speedup |
+|---:|---:|---:|---:|
+| 1 | 29.267 | 29.144 | 1.004x |
+| 4 | 30.783 | 30.788 | 1.000x |
+| 8 | 30.818 | 30.816 | 1.000x |
+| 16 | 56.960 | 56.008 | 1.017x |
+| 32 | 114.733 | 111.657 | 1.028x |
+| 64 | 214.538 | 214.238 | 1.001x |
+| 128 | 421.928 | 421.654 | 1.001x |
+
+`EVICT_FIRST` was also functionally valid, but `EVICT_LAST` was better at B1,
+B16, B32, and was neutral elsewhere. The promoted change is only the raw NoPE
+TMA gather hint; Q TMA and K/RoPE tensormap promotions remain the iter20+21
+FlashMLA settings.
 
 Same-seed scheduler confirmation for changed points:
 
@@ -212,6 +233,8 @@ reliable profiler for this checkpoint.
 
 | candidate | result | reason |
 |---|---|---|
+| raw NoPE TMA `EVICT_FIRST` | rejected | correct and slightly faster than normal at B16/B32, but slower than `EVICT_LAST` at the main changed points |
+| raw NoPE TMA `EVICT_NORMAL` | replaced | same-run A/B showed `EVICT_LAST` wins at B1/B16/B32 and is neutral elsewhere |
 | FlashMLA `uint4` vector scale load on split scale pool | rejected | 36 B scale rows are not 16 B aligned; produced misaligned-address failure |
 | FlashMLA inline 336 B row in op-trt safe scheduler | rejected | exact/finite but slower than split storage: B1 38.99 us, B4 57.45 us, B8 80.46 us, B16 151.68 us, B32 294.47 us, B64 473.81 us, B128 937.94 us |
 | FlashMLA iter20+21 compact scheduler as production baseline | rejected | non-finite for `topk=1024` at B8 and above |
