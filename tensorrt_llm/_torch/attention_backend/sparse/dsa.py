@@ -3277,14 +3277,12 @@ class Indexer(nn.Module):
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
-            # Compute the active block id set ONCE per layer; reused for
-            # both the indexer-K (M5e) and dense KV (M5f) broadcasts
+            # Compute the active block id set ONCE per layer; reused
+            # across BOTH the indexer-K (M5e) and dense KV (M5f) pools
             # because both caches use the same per-layer block_table.
             active_block_ids = _layersplit_compute_active_block_ids(metadata)
 
-            # M5e: indexer-K cache slot broadcast (small per-token bytes;
-            # ~84 B / token at NVFP4 with head_dim_indexer=128, half of
-            # which is packed FP4 data + 4 scale bytes).
+            # M5e indexer-K broadcast.
             indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
             layersplit_state.maybe_broadcast_active_blocks(
@@ -3294,24 +3292,16 @@ class Indexer(nn.Module):
                 cp_group=layersplit_state.cp_group,
             )
 
-            # M5f: dense KV cache slot broadcast (~656 B / token at V3.2:
-            # kv_lora_rank=512 + qk_rope_head_dim=64 across kv_factor=2),
-            # which the sparse_attn step reads after the indexer top-K
-            # selects which blocks to attend over. Matches the z.ai
-            # "Scaling Pain" §4 'broadcast both caches' pattern.
-            # get_buffers may return None for layers outside the
-            # current manager (e.g. PP-partitioned drafts) — skip
-            # silently in that case.
+            # M5f dense KV broadcast.
+            # get_buffers may return None for layers outside the current
+            # manager (PP-partitioned drafts etc.) — skip the dense
+            # broadcast silently in that case so the indexer-K
+            # broadcast still runs.
             try:
                 dense_kv_slot = kv_cache_manager.get_buffers(self.layer_idx)
             except (AttributeError, IndexError, KeyError):
                 dense_kv_slot = None
             if dense_kv_slot is not None:
-                # Reshape to (num_blocks, ...) for the broadcast: get_buffers
-                # returns NHD layout (max_num_pages, kv_factor, page_size,
-                # num_kv_heads, head_dim); flatten everything past dim 0
-                # so the broadcast helper treats it as a (num_blocks, K)
-                # pool exactly like the indexer-K slot.
                 flat_dense = dense_kv_slot.view(dense_kv_slot.shape[0], -1)
                 layersplit_state.maybe_broadcast_active_blocks(
                     layer_idx=self.layer_idx,
@@ -3319,6 +3309,18 @@ class Indexer(nn.Module):
                     active_block_ids=active_block_ids,
                     cp_group=layersplit_state.cp_group,
                 )
+
+            # M5g (system-level fusion) tested and measured to be
+            # 0.77x slower than the separate path at V3.2 production
+            # scale (num_blocks=262144, active=4096, 61 layers, CP=2):
+            # the torch.cat / split kernels needed to pack/unpack the
+            # two cache rows add more launch overhead than the single
+            # saved NCCL broadcast. The fused helper
+            # (maybe_broadcast_active_blocks_fused) stays in the
+            # runtime state for regimes where NCCL launch overhead
+            # dominates (e.g. very small batches with sub-microsecond
+            # per-cache bytes) or for future cross-layer batching, but
+            # production today uses the separate-call path above.
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)

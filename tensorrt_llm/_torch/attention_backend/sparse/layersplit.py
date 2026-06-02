@@ -431,6 +431,85 @@ class LayerSplitRuntimeState:
         cache_slot.index_copy_(0, active_block_ids, send_buffer)
         return True
 
+    def maybe_broadcast_active_blocks_fused(
+            self,
+            layer_idx: int,
+            cache_slots,
+            active_block_ids: Optional[Any],
+            cp_group: Optional[Any] = None) -> bool:
+        """M5g: per-layer system-level fusion — pack N cache pools
+        (e.g. the indexer-K pool + the dense KV pool) into a SINGLE
+        contiguous send buffer and issue ONE ``dist.broadcast`` instead
+        of N. Cuts NCCL launches per layer from N to 1; at the V3.2
+        shape with the indexer + dense pair this halves per-layer
+        broadcast launch count (and at 61 layers per forward step
+        eliminates 61 NCCL launches per step).
+
+        ``cache_slots`` is an iterable of ``(num_blocks, row_bytes_i)``
+        tensors that share the first dimension (the block id) but may
+        have different second-dim sizes. The helper gathers each into
+        a contiguous (num_active, row_bytes_i) view, concatenates them
+        along dim 1 into one (num_active, sum(row_bytes_i)) send buffer,
+        broadcasts, then splits + scatters each chunk back to its
+        respective cache pool.
+
+        Returns True iff the broadcast was issued. Same no-op guards
+        as ``maybe_broadcast_active_blocks``. Falls back gracefully
+        when ``cache_slots`` is empty or contains None entries (those
+        entries are skipped).
+        """
+        if not self.enabled or self.ownership is None:
+            return False
+        if self.cp_size <= 1 or cp_group is None:
+            return False
+        if active_block_ids is None:
+            return False
+        if torch is None or not torch.cuda.is_available():
+            return False
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return False
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+        if active_block_ids.numel() == 0:
+            return False
+
+        # Filter None entries; keep originals for the scatter-back step.
+        slots = [(idx, s) for idx, s in enumerate(cache_slots)
+                 if s is not None]
+        if not slots:
+            return False
+
+        # Gather each pool's active rows into a contiguous 2-D view.
+        gathered = []
+        row_widths = []
+        for _, slot in slots:
+            flat = slot if slot.dim() == 2 else slot.view(slot.shape[0], -1)
+            g = flat.index_select(0, active_block_ids).contiguous()
+            gathered.append(g)
+            row_widths.append(g.shape[1])
+
+        # Concatenate along the row dimension into ONE send buffer +
+        # one broadcast — the system-level fusion.
+        send_buffer = torch.cat(gathered, dim=1).contiguous()
+        src_rank = self.ownership.owner_of(layer_idx)
+        dist.broadcast(send_buffer,
+                       src=src_rank,
+                       group=cp_group,
+                       async_op=False)
+
+        # Split + scatter back into each cache pool.
+        offset = 0
+        for (_, slot), width in zip(slots, row_widths):
+            chunk = send_buffer[:, offset:offset + width].contiguous()
+            offset += width
+            flat = slot if slot.dim() == 2 else slot.view(slot.shape[0], -1)
+            flat.index_copy_(0, active_block_ids, chunk)
+            # When we reshaped above, ``flat`` is a view of ``slot`` so
+            # the index_copy_ already updated ``slot`` in place.
+        return True
+
     @classmethod
     def disabled(cls) -> "LayerSplitRuntimeState":
         """Inert state for the LayerSplit-off path."""

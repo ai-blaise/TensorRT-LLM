@@ -163,6 +163,14 @@ def main() -> int:
                            worker_fn="_worker_m5f",
                            world_size=cp_size):
                 overall = False
+        # M5g FUSED dual-cache broadcast (one NCCL call per layer for
+        # both caches — system-level launch-overhead fusion)
+        for i, policy in enumerate(["round_robin", "contiguous"]):
+            if not run_one(policy,
+                           port_base + 50 + i,
+                           worker_fn="_worker_m5g",
+                           world_size=cp_size):
+                overall = False
     return 0 if overall else 1
 
 

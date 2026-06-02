@@ -468,3 +468,35 @@ CZS proof:
 - NVIDIA CuTe DSL docs: <https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl.html>
 - CuTe paper: <https://arxiv.org/pdf/2603.02298>
 - veitner CuTe blog: <https://veitner.bearblog.dev/blog/>
+
+## M5g system-level fusion: tested-but-not-faster
+
+Per the goal directive to explore "broader solutions at both the
+kernel and systems level eg fusions", attempted M5g: fuse the M5e
+indexer-K + M5f dense KV broadcasts into ONE NCCL call per layer
+(instead of two) via `maybe_broadcast_active_blocks_fused`. Cuts NCCL
+launches per forward step from 122 to 61.
+
+**Measured on `a4-us-001-rl9` GPUs 3+4** (CP=2, num_layers=61,
+num_blocks=262144, indexer_bytes=256, dense_bytes=2048, active=4096,
+3 warmup + 10 measure iters):
+
+| mode                                       | min ms | mean ms | max ms |
+|--------------------------------------------|-------:|--------:|-------:|
+| separate (M5e + M5f, 2 NCCL/layer)         |  5.71  |   6.45  |  11.75 |
+| fused (M5g, 1 NCCL/layer)                  |  6.13  |   8.36  |  17.18 |
+
+**M5g is 0.77× the speed of separate** (1.91 ms LOST per forward step).
+The `torch.cat` / `torch.split` kernels needed to pack/unpack the two
+cache rows add more launch overhead than the single saved NCCL
+broadcast — at production scale NCCL launch overhead is already
+amortized into the actual broadcast bytes.
+
+The fused helper (`maybe_broadcast_active_blocks_fused`) stays in
+`LayerSplitRuntimeState` for future regimes where NCCL launch
+overhead would dominate (very small batches with sub-microsecond
+per-cache bytes, or future cross-layer batching where the cat/split
+cost amortizes across many layers' fused payloads) but the production
+hook uses the separate-call path. Test coverage: `_worker_m5g` is
+included in the multi-proc NCCL runner (24 tests total: M5 / M6 / M8b
+/ M5e / M5f / M5g × CP=2/4 × 2 policies, all PASS).
