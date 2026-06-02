@@ -1,0 +1,244 @@
+{
+  "cost_models": [],
+  "layouts": [
+    {
+      "label": "x_packed_row_3584_uint8_v16",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 3584
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "x_scale_row_448_uint8_v16",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 448
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "w3_w1_packed_inner_3584_uint8_v16",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 3584
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "w3_w1_scale_inner_448_uint8_v16",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 448
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "w2_packed_inner_1024_uint8_v16",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 1024
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "w2_scale_inner_128_uint8_v16",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 128
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "topk_ids_inner_8_int32_v4",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 8
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "output_bf16_row_7168_v8",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 7168
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    }
+  ],
+  "ldmatrix_ops": [],
+  "mma_atoms": [
+    {
+      "a_k_major": true,
+      "a_swizzle": 128,
+      "b_k_major": true,
+      "b_swizzle": 128,
+      "element_bytes_a": 1,
+      "element_bytes_b": 1,
+      "k": 32,
+      "kind": 4,
+      "label": "fc1_sm100_umma_nvfp4_inner_tile",
+      "m": 128,
+      "n": 256
+    },
+    {
+      "a_k_major": true,
+      "a_swizzle": 128,
+      "b_k_major": true,
+      "b_swizzle": 128,
+      "element_bytes_a": 1,
+      "element_bytes_b": 1,
+      "k": 32,
+      "kind": 4,
+      "label": "fc2_sm100_umma_nvfp4_inner_tile",
+      "m": 128,
+      "n": 256
+    }
+  ],
+  "name": "warpdecode_nvfp4_b200_target_inner_slice",
+  "notes": [
+    "Target shape D=7168 I=2048 E=128 topk=8 scaling_vector_size=16.",
+    "Vectorization obligations are per-row/per-inner-tile slices only; do not promote the disproved full symbolic [token/expert,row,col] tensor form."
+  ],
+  "swizzled_layouts": [],
+  "swizzles": [],
+  "tma_descriptors": [],
+  "vectorization_ops": [
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268435456
+      },
+      "element_bytes": 1,
+      "label": "x_packed_row_3584_uint8_v16",
+      "layout_idx": 0,
+      "vector_width": 16
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268439552
+      },
+      "element_bytes": 1,
+      "label": "x_scale_row_448_uint8_v16",
+      "layout_idx": 1,
+      "vector_width": 16
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268443648
+      },
+      "element_bytes": 1,
+      "label": "w3_w1_packed_inner_3584_uint8_v16",
+      "layout_idx": 2,
+      "vector_width": 16
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268447744
+      },
+      "element_bytes": 1,
+      "label": "w3_w1_scale_inner_448_uint8_v16",
+      "layout_idx": 3,
+      "vector_width": 16
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268451840
+      },
+      "element_bytes": 1,
+      "label": "w2_packed_inner_1024_uint8_v16",
+      "layout_idx": 4,
+      "vector_width": 16
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268455936
+      },
+      "element_bytes": 1,
+      "label": "w2_scale_inner_128_uint8_v16",
+      "layout_idx": 5,
+      "vector_width": 16
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268460032
+      },
+      "element_bytes": 4,
+      "label": "topk_ids_inner_8_int32_v4",
+      "layout_idx": 6,
+      "vector_width": 4
+    },
+    {
+      "base_address": {
+        "is_static": true,
+        "value": 268464128
+      },
+      "element_bytes": 2,
+      "label": "output_bf16_row_7168_v8",
+      "layout_idx": 7,
+      "vector_width": 8
+    }
+  ]
+}

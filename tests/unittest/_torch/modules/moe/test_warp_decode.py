@@ -3,8 +3,10 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe import warp_decode
 from tensorrt_llm._torch.modules.fused_moe.warp_decode import (
-    get_warp_decode_guard_failure, try_run_warp_decode)
+    get_cursor_warp_decode_plan, get_warp_decode_guard_failure,
+    try_run_warp_decode)
 
 
 class CutlassFusedMoE:
@@ -13,6 +15,25 @@ class CutlassFusedMoE:
 
 class TRTLLMGenFusedMoE:
     pass
+
+
+def _populate_nvfp4_backend(backend, *, weights=True, local_experts=128):
+    backend.hidden_size = 7168
+    backend.intermediate_size = 2048
+    backend.num_experts = 128
+    backend.num_slots = 128
+    backend.expert_size_per_partition = local_experts
+    backend.slot_start = 0
+    backend.scaling_vector_size = 16
+    if weights:
+        backend.w3_w1_weight = torch.empty((local_experts, 4096, 3584), dtype=torch.uint8)
+        backend.w3_w1_weight_scale = torch.empty((local_experts, 4096, 448), dtype=torch.uint8)
+        backend.w2_weight = torch.empty((local_experts, 7168, 1024), dtype=torch.uint8)
+        backend.w2_weight_scale = torch.empty((local_experts, 7168, 128), dtype=torch.uint8)
+        backend.fc31_alpha = torch.ones((local_experts,), dtype=torch.float32)
+        backend.fc2_alpha = torch.ones((local_experts,), dtype=torch.float32)
+        backend.fc2_input_scale = torch.ones((1,), dtype=torch.float32)
+    return backend
 
 
 def _config(policy="auto"):
@@ -59,13 +80,241 @@ def test_warp_decode_requires_runtime_decode_signal():
     assert get_warp_decode_guard_failure(moe, **_inputs()) == "not_decode_only"
 
 
-def test_warp_decode_reports_nvfp4_kernel_gap():
-    backend = TRTLLMGenFusedMoE()
+@pytest.mark.parametrize(
+    ("num_tokens", "bucket_tokens"),
+    [(1, 1), (2, 2), (3, 4), (4, 4), (5, 8), (8, 8), (9, 16), (16, 16), (17, 32), (32, 32)],
+)
+def test_cursor_warp_decode_plan_uses_graph_buckets(num_tokens, bucket_tokens):
+    plan = get_cursor_warp_decode_plan(num_tokens)
+    assert plan.requested_tokens == num_tokens
+    assert plan.bucket_tokens == bucket_tokens
+    assert plan.route_slots_shape == (bucket_tokens, 8)
+    assert plan.route_scales_shape == (bucket_tokens, 8)
+    assert plan.activation_scale_shape == (bucket_tokens, 448)
+    assert plan.exact_expanded_rows == bucket_tokens * 8
+    assert plan.gate_up_warps == bucket_tokens * 8 * 2048
+    assert plan.down_warps == bucket_tokens * 7168
+
+
+def test_cursor_warp_decode_plan_records_required_eliminations():
+    plan = get_cursor_warp_decode_plan(32)
+    assert plan.intermediate_shape == (32, 8, 2048)
+    assert plan.output_shape == (32, 7168)
+    assert plan.warps_per_cta == 8
+    assert set(plan.eliminated_stages) == {
+        "expert_major_batches",
+        "expert_padding",
+        "moe_sort",
+        "scatter_combine",
+        "activation_gather_buffer",
+        "per_expert_output_buffer",
+    }
+
+
+def test_cursor_warp_decode_plan_rejects_unbucketed_decode():
+    with pytest.raises(ValueError, match="does not cover 33 tokens"):
+        get_cursor_warp_decode_plan(33)
+
+
+def test_cursor_warp_decode_plan_covers_only_campaign_concurrency():
+    plan = get_cursor_warp_decode_plan(32)
+    assert plan.bucket_tokens == 32
+    assert plan.exact_expanded_rows == 256
+    with pytest.raises(ValueError, match="does not cover 64 tokens"):
+        get_cursor_warp_decode_plan(64)
+
+
+def test_cursor_warp_decode_plan_uses_post_dispatch_slot_metadata():
+    plan = get_cursor_warp_decode_plan(16)
+    assert plan.route_slots_shape == (16, 8)
+    assert plan.route_scales_shape == (16, 8)
+    assert "moe_sort" in plan.eliminated_stages
+    assert "expert_major_batches" in plan.eliminated_stages
+    assert "scatter_combine" in plan.eliminated_stages
+
+
+def test_warp_decode_reports_nvfp4_op_gap_after_contract_guards(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
     moe = _moe(backend=backend, has_nvfp4=True)
     inputs = _inputs()
-    inputs["x_sf"] = torch.empty((4, 1), dtype=torch.uint8)
+    inputs["x"] = torch.empty((4, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((4, 448), dtype=torch.uint8)
+    monkeypatch.setattr(warp_decode, "_required_nvfp4_ops_available", lambda: False)
     assert get_warp_decode_guard_failure(moe, **inputs) == (
-        "nvfp4_warp_decode_kernel_missing")
+        "nvfp4_warp_decode_op_unavailable")
+
+
+def test_warp_decode_selects_explicit_tactic_nvfp4_op(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    moe = _moe(backend=backend, has_nvfp4=True)
+    inputs = _inputs(num_tokens=2)
+    inputs["x"] = torch.empty((2, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((2, 448), dtype=torch.uint8)
+
+    def _op(*args):
+        assert args[0] is inputs["x"]
+        assert args[1] is inputs["x_sf"]
+        assert args[9] is inputs["token_selected_experts"]
+        assert args[10] is inputs["token_final_scales"]
+        assert args[11:17] == (7168, 2048, 128, 0, 128, 16)
+        return torch.empty((2, 7168), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_op", lambda: _op)
+    output = try_run_warp_decode(moe, **inputs)
+
+    assert output.shape == (2, 7168)
+    assert output.dtype == torch.bfloat16
+    assert moe.warp_decode_last_status == "selected"
+    assert moe.warp_decode_last_reason == "nvfp4_explicit_tactic_op"
+
+
+def test_warp_decode_allows_nvfp4_cuda_graph_bucket(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    moe = _moe(
+        backend=backend,
+        has_nvfp4=True,
+        warp_decode_is_cuda_graph=True,
+    )
+    inputs = _inputs(num_tokens=8)
+    inputs["x"] = torch.empty((8, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((8, 448), dtype=torch.uint8)
+
+    monkeypatch.setattr(warp_decode, "_required_nvfp4_ops_available", lambda: True)
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+
+
+def test_warp_decode_nvfp4_allows_explicit_tactic_above_crossover(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    config = _config()
+    config.max_batch_size = 64
+    moe = _moe(
+        backend=backend,
+        has_nvfp4=True,
+        model_config=types.SimpleNamespace(warp_decode_config=config),
+    )
+    inputs = _inputs(num_tokens=16)
+    inputs["x"] = torch.empty((16, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((16, 448), dtype=torch.uint8)
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_op", lambda: object())
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+
+
+def test_warp_decode_selects_cursor_nvfp4_op_for_c32(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    config = _config()
+    config.max_batch_size = 64
+    moe = _moe(
+        backend=backend,
+        has_nvfp4=True,
+        model_config=types.SimpleNamespace(warp_decode_config=config),
+    )
+    inputs = _inputs(num_tokens=32)
+    inputs["x"] = torch.empty((32, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((32, 448), dtype=torch.uint8)
+
+    def _op(*args):
+        assert args[0] is inputs["x"]
+        assert args[1] is inputs["x_sf"]
+        assert args[9] is inputs["token_selected_experts"]
+        assert args[10] is inputs["token_final_scales"]
+        return torch.empty((32, 7168), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_cursor_op", lambda: _op)
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+    output = try_run_warp_decode(moe, **inputs)
+    assert output.shape == (32, 7168)
+    assert moe.warp_decode_last_status == "selected"
+    assert moe.warp_decode_last_reason == "nvfp4_cursor_op"
+
+
+def test_warp_decode_selects_explicit_nvfp4_op_for_c32_without_cursor(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    config = _config()
+    config.max_batch_size = 64
+    moe = _moe(
+        backend=backend,
+        has_nvfp4=True,
+        model_config=types.SimpleNamespace(warp_decode_config=config),
+    )
+    inputs = _inputs(num_tokens=32)
+    inputs["x"] = torch.empty((32, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((32, 448), dtype=torch.uint8)
+
+    def _op(*args):
+        assert args[0] is inputs["x"]
+        assert args[1] is inputs["x_sf"]
+        assert args[9] is inputs["token_selected_experts"]
+        assert args[10] is inputs["token_final_scales"]
+        return torch.empty((32, 7168), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_op", lambda: _op)
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_cursor_op", lambda: None)
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+    output = try_run_warp_decode(moe, **inputs)
+    assert output.shape == (32, 7168)
+    assert moe.warp_decode_last_status == "selected"
+    assert moe.warp_decode_last_reason == "nvfp4_explicit_tactic_op"
+
+
+def test_warp_decode_rejects_cursor_batch_above_c32(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    config = _config()
+    config.max_batch_size = 64
+    moe = _moe(
+        backend=backend,
+        has_nvfp4=True,
+        model_config=types.SimpleNamespace(warp_decode_config=config),
+    )
+    inputs = _inputs(num_tokens=64)
+    inputs["x"] = torch.empty((64, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((64, 448), dtype=torch.uint8)
+
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_cursor_op", lambda: object())
+
+    assert get_warp_decode_guard_failure(moe, **inputs) == (
+        "nvfp4_batch_above_cursor_bucket")
+
+
+def test_warp_decode_allows_nvfp4_after_external_dispatch(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    moe = _moe(backend=backend, has_nvfp4=True, comm=object())
+    inputs = _inputs(num_tokens=4)
+    inputs["x"] = torch.empty((4, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((4, 448), dtype=torch.uint8)
+
+    monkeypatch.setattr(warp_decode, "_required_nvfp4_ops_available", lambda: True)
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+
+
+def test_warp_decode_allows_nvfp4_eplb_slots(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
+    moe = _moe(
+        backend=backend,
+        has_nvfp4=True,
+        layer_load_balancer=object(),
+    )
+    inputs = _inputs(num_tokens=4)
+    inputs["x"] = torch.empty((4, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((4, 448), dtype=torch.uint8)
+
+    monkeypatch.setattr(warp_decode, "_required_nvfp4_ops_available", lambda: True)
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+
+
+def test_warp_decode_rejects_incomplete_nvfp4_backend():
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE(), weights=False)
+    moe = _moe(backend=backend, has_nvfp4=True)
+    inputs = _inputs()
+    inputs["x"] = torch.empty((4, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((4, 448), dtype=torch.uint8)
+    assert get_warp_decode_guard_failure(moe, **inputs) == (
+        "nvfp4_missing_weights_or_scales")
 
 
 def test_warp_decode_rejects_eplb_slots():

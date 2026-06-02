@@ -1,0 +1,58 @@
+{
+  "name": "warpdecode_cursor_nvfp4_gate_up_direct_slot_contract",
+  "source": "benchmarks/python/warpdecode_cursor_nvfp4_gate_up_prototype.py",
+  "kind": "czs_contract",
+  "status": "manual_range_contract_for_next_czs_frontend_pass",
+  "target": {
+    "hidden_size": 7168,
+    "packed_hidden_size": 3584,
+    "scale_vector_size": 16,
+    "scale_columns": 448,
+    "intermediate_size": 2048,
+    "num_experts": 128,
+    "top_k": 8,
+    "graph_buckets": [1, 2, 4, 8, 16, 32],
+    "warps_per_cta": 8
+  },
+  "index_contract": {
+    "warp_namespace": "warp_id in [0, bucket_tokens * top_k * sampled_intermediate)",
+    "token": "warp_id / (top_k * sampled_intermediate)",
+    "routed": "(warp_id / sampled_intermediate) % top_k",
+    "neuron": "warp_id % sampled_intermediate",
+    "expert": "token_selected_slots[token, routed]",
+    "x_packed_offset": "token * packed_hidden_size + packed_col",
+    "x_sf_offset": "token * scale_columns + min((packed_col * 2) / 16, scale_columns - 1)",
+    "gate_weight_offset": "(expert * (2 * sampled_intermediate) + neuron) * packed_hidden_size + packed_col",
+    "up_weight_offset": "(expert * (2 * sampled_intermediate) + sampled_intermediate + neuron) * packed_hidden_size + packed_col",
+    "scratch_offset": "(token * top_k + routed) * sampled_intermediate + neuron"
+  },
+  "obligations": [
+    {
+      "label": "bucket token in range",
+      "claim": "0 <= token < bucket_tokens for every launched warp"
+    },
+    {
+      "label": "route index in range",
+      "claim": "0 <= routed < top_k for every launched warp"
+    },
+    {
+      "label": "sampled neuron in range",
+      "claim": "0 <= neuron < sampled_intermediate for every launched warp"
+    },
+    {
+      "label": "packed hidden scale mapping in range",
+      "claim": "0 <= min((packed_col * 2) / 16, scale_columns - 1) < scale_columns when 0 <= packed_col < packed_hidden_size"
+    },
+    {
+      "label": "no expert-major padding",
+      "claim": "launched work count is bucket_tokens * top_k * sampled_intermediate, independent of unique expert count"
+    }
+  ],
+  "rejected_patterns": [
+    "moe_sort",
+    "expert_major_batches",
+    "padded_grouped_rows",
+    "activation_gather_buffer",
+    "per_expert_output_buffer"
+  ]
+}
