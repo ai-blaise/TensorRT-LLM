@@ -1212,20 +1212,28 @@ def _create_kv_cache_manager(
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
 
-    # LayerSplit (M4 / M5d): the layer_mask trimming that would have
-    # non-owner CP ranks skip layer-L pool allocation is INCOMPATIBLE
-    # with the M5d real-cache-slot broadcast — the per-layer broadcast
-    # publishes the owner's indexer_k_cache_buffers[L] tensor in place,
-    # so non-owner ranks need that tensor allocated to receive into. The
-    # build_layersplit_layer_mask helper stays in the module for future
-    # M5d-tight work (smaller recv buffer + attention-source override
-    # that lets non-owners read from a compact transient buffer instead
-    # of a pool slot) but is not invoked from production today. Every
-    # rank allocates the full DSA cache pool; the M4 per-rank memory
-    # savings are deferred until the attention-source override ships.
-    # The existing layer_mask consumers (Gemma4 KV sharing, one-model
-    # draft KV separation) are unaffected because we only skip the
-    # LayerSplit path here, not the general layer_mask plumbing.
+    # LayerSplit (M4 + M5d-tight): when LayerSplit is enabled and CP > 1,
+    # trim the C++ pool allocation so each non-owner rank skips the
+    # layer-L slot it doesn't own. The DSACacheManager pairs this with a
+    # per-rank scratch buffer that holds the broadcast-received layer-L
+    # bytes on non-owner ranks; its overridden get_indexer_k_cache_buffers
+    # / get_buffers methods route through that scratch buffer for
+    # non-owned layers so the downstream attention kernel reads the
+    # owner's authoritative bytes via the same accessor it already uses.
+    # Result: per-rank memory savings ≈ num_owned_layers / num_layers
+    # (≈ 49 % at CP=2, ≈ 74 % at CP=4 on the V3.2 61-layer shape) while
+    # the broadcast wire bytes stay at the M5e active-block size.
+    if layer_mask is None and sparse_attn_config is not None:
+        from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
+            build_layersplit_layer_mask)
+        cp_size = getattr(mapping, "cp_size", 1) if mapping is not None else 1
+        cp_rank = getattr(mapping, "cp_rank", 0) if mapping is not None else 0
+        layer_mask = build_layersplit_layer_mask(
+            num_layers=config.num_hidden_layers,
+            sparse_attn_config=sparse_attn_config,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
     # Use provided num_layers if available, otherwise use config.
     # When layer_mask is set (e.g., KV sharing, LayerSplit), num_layers for
     # the cache manager must equal the number of enabled (True) layers in

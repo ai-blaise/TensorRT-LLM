@@ -3591,14 +3591,110 @@ class DSACacheManager(KVCacheManager):
             self.indexer_hisa_page_reps_per_layer = []
             self.indexer_hisa_page_counts_per_layer = []
 
-    def get_indexer_k_cache_buffers(self, layer_idx: int):
-        """Get indexer k cache buffer from a specific layer pool."""
+        # LayerSplit M5d-tight: when LayerSplit is enabled and CP > 1
+        # AND this rank owns at least one layer, allocate a single
+        # shared scratch buffer per cache type for non-owned layers.
+        # The scratch buffer is sized identically to a per-layer pool
+        # slot so the M5e broadcast (gather → broadcast → scatter back)
+        # can index into it via the same active_block_ids that index
+        # into pool slots on owner ranks, and the downstream attention
+        # kernel reads from it via the same get_indexer_k_cache_buffers
+        # / get_buffers accessors (overridden below to dispatch on
+        # ownership). One scratch tensor suffices because layers
+        # execute sequentially in the forward — layer L+1's broadcast
+        # overwrites layer L's scratch bytes after layer L's attention
+        # completes, and CUDA-graph capture serializes this dependency
+        # chain correctly.
+        self._layersplit_indexer_k_scratch = None
+        self._layersplit_dense_kv_scratch = None
+        if (self.layersplit_state.enabled
+                and self.layersplit_state.cp_size > 1):
+            owned = self.layersplit_state.ownership.owned_layers(
+                self.layersplit_state.cp_rank)
+            if owned:
+                # Use the first owned layer's pool-slot tensor as the
+                # template — same shape / dtype / device as every
+                # non-owned layer's slot would have if it were allocated.
+                first_owned = owned[0]
+                try:
+                    indexer_template = self._get_indexer_k_cache_buffers_owned(
+                        first_owned)
+                    self._layersplit_indexer_k_scratch = torch.empty_like(
+                        indexer_template)
+                except (KeyError, IndexError, AttributeError):
+                    # Pool not yet initialized in this draft / spec
+                    # path; LayerSplit broadcast will short-circuit
+                    # when the scratch is None (M5e helper no-ops on
+                    # None cache_slot).
+                    pass
+                try:
+                    dense_template = super().get_buffers(first_owned)
+                    if dense_template is not None:
+                        self._layersplit_dense_kv_scratch = torch.empty_like(
+                            dense_template)
+                except (KeyError, IndexError, AttributeError):
+                    pass
+                if self._layersplit_indexer_k_scratch is not None:
+                    total_layers = self.layersplit_state.ownership.num_layers
+                    logger.info(
+                        "LayerSplit M5d-tight scratch buffers allocated for "
+                        "%d non-owned layers (indexer_k: %s, dense_kv: %s); "
+                        "per-rank memory savings ≈ %.0f%% vs replicated.",
+                        total_layers - len(owned),
+                        tuple(self._layersplit_indexer_k_scratch.shape),
+                        tuple(self._layersplit_dense_kv_scratch.shape)
+                        if self._layersplit_dense_kv_scratch is not None
+                        else "n/a",
+                        100.0 * (1.0 - len(owned) / total_layers),
+                    )
+
+    def _get_indexer_k_cache_buffers_owned(self, layer_idx: int):
+        """Pool-backed accessor for layers this CP rank owns.
+
+        Bypasses the LayerSplit M5d-tight dispatch in
+        :meth:`get_indexer_k_cache_buffers`; intended for the scratch
+        allocator and for callers that have already verified ownership.
+        """
         block_size = self.tokens_per_block
         data_bytes = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
         per_token_size = data_bytes + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
+
+    def get_indexer_k_cache_buffers(self, layer_idx: int):
+        """Get indexer K cache buffer for a layer.
+
+        M5d-tight dispatch: when LayerSplit is enabled and this rank is
+        NOT the owner for ``layer_idx``, return the per-rank scratch
+        buffer (one shared tensor for all non-owned layers; sequential
+        layer execution means each layer's broadcast overwrites the
+        prior layer's content in place). The downstream
+        ``sparse_attn_indexer`` reads from this buffer unchanged because
+        the shape mirrors a pool slot exactly. On the off-path or for
+        owned layers, fall through to the pool-backed accessor.
+        """
+        if (self._layersplit_indexer_k_scratch is not None
+                and not self.layersplit_state.is_owner(layer_idx)):
+            return self._layersplit_indexer_k_scratch
+        return self._get_indexer_k_cache_buffers_owned(layer_idx)
+
+    def get_buffers(self,
+                    layer_idx: int,
+                    kv_layout: str = "NHD"):
+        """Get dense KV cache buffer for a layer.
+
+        M5d-tight dispatch: non-owned layers read from
+        ``_layersplit_dense_kv_scratch`` (sized identically to the
+        per-layer pool slot, including the kv_layout-dependent reshape
+        the base accessor applies). Owned layers fall through to the
+        base ``KVCacheManager.get_buffers``.
+        """
+        if (self._layersplit_dense_kv_scratch is not None
+                and not self.layersplit_state.is_owner(layer_idx)
+                and kv_layout == "NHD"):
+            return self._layersplit_dense_kv_scratch
+        return super().get_buffers(layer_idx, kv_layout=kv_layout)
 
     def get_indexer_hisa_page_rep_buffers(self, layer_idx: int):
         """Get maintained HISA page representatives for a local layer."""
