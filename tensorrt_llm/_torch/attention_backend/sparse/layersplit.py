@@ -706,6 +706,56 @@ class LayerSplitRuntimeState:
                            async_op=async_op)
 
 
+def _balanced_layer_mask(num_layers: int, cp_size: int, cp_rank: int,
+                         policy: str) -> list:
+    """Build a layer_mask whose sum() is identical across every CP rank.
+
+    The naive per-rank mask (just "True at indices this rank owns") has
+    a sum that varies by ±1 across ranks when ``num_layers % cp_size != 0``
+    — e.g. CP=2 with 61 layers gives rank 0 = 31 True, rank 1 = 30 True.
+    The C++ ``KVCacheManager`` sizes ``num_blocks_per_layer`` as
+    ``max_memory / (sum(layer_mask) × per_block_bytes)``, so ranks with
+    different sums get different ``num_blocks`` — which makes the global
+    block-id allocation diverge across ranks and breaks the
+    block-id-based broadcast (block_X on the owner may map to a
+    semantically-different position on the receiver).
+
+    The fix is to pad both the mask length and per-rank True count out
+    to ``ceil(num_layers / cp_size) * cp_size``: every rank has the same
+    target sum (``target_per_rank = ceil(num_layers / cp_size)``); ranks
+    that naturally own fewer layers fill the difference with phantom
+    True slots at indices ``[num_layers, total_length)``. The model
+    never references those layers (the actual layer-loop only iterates
+    ``0..num_layers``), so the phantom slots are pure padding — they
+    cost a small amount of allocated-but-unused memory in exchange for
+    making ``num_blocks`` identical across ranks.
+
+    For DeepSeek-V3.2's 61 layers on CP=2, the phantom slot count is
+    exactly 1 (total length 62, target 31 per rank); on CP=4 it's 3
+    (total 64, target 16 per rank); on CP=8 it's 3 (total 64, target
+    8 per rank). The wasted memory is ~3 / 61 ≈ 5 % of one rank's
+    pool, far smaller than the ~50–87 % savings from owner-local
+    allocation itself.
+    """
+    target_per_rank = (num_layers + cp_size - 1) // cp_size  # ceil
+    total_length = target_per_rank * cp_size
+    ownership = compute_owner_assignment(num_layers, cp_size, policy)
+
+    mask: list = []
+    owned_so_far = 0
+    for idx in range(total_length):
+        if idx < num_layers:
+            owns = ownership.is_owner(idx, cp_rank)
+        else:
+            # Phantom slot: fill it iff this rank still needs padding to
+            # hit target_per_rank True count.
+            owns = owned_so_far < target_per_rank
+        if owns:
+            owned_so_far += 1
+        mask.append(owns)
+    return mask
+
+
 def build_layersplit_layer_mask(
         num_layers: int,
         sparse_attn_config: Optional[Any],
@@ -744,7 +794,13 @@ def build_layersplit_layer_mask(
     policy = str(
         getattr(sparse_attn_config, "layersplit_owner_assignment",
                 "round_robin"))
-    ownership = compute_owner_assignment(num_layers=num_layers,
-                                         cp_size=cp_size,
-                                         policy=policy)
-    return [ownership.owner_of(layer) == cp_rank for layer in range(num_layers)]
+    # M5d-tight-v2: return the *balanced* mask so every CP rank's
+    # sum(layer_mask) is identical and the C++ KVCacheManager allocates
+    # the same num_blocks on every rank — required for the global
+    # block-id space to stay consistent across ranks so the M5e
+    # active-block broadcast writes block_X on the receiver to the same
+    # semantic position as the owner.
+    return _balanced_layer_mask(num_layers=num_layers,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                policy=policy)

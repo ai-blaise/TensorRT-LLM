@@ -302,6 +302,9 @@ def test_layer_mask_none_when_cp_size_is_1():
 
 
 def test_layer_mask_round_robin_rank_0_owns_every_8th_layer():
+    # Balanced layer_mask (M5d-tight-v2): length = ceil(61/8)*8 = 64.
+    # Rank 0 owns the 8 real layers 0,8,...,56; the 3 phantom slots
+    # (61, 62, 63) are False because rank 0 already hits target=8.
     mask = build_layersplit_layer_mask(
         num_layers=61,
         sparse_attn_config=_sparse_cfg(
@@ -310,29 +313,36 @@ def test_layer_mask_round_robin_rank_0_owns_every_8th_layer():
         cp_rank=0,
     )
     assert mask is not None
-    assert len(mask) == 61
-    # Rank 0 in round-robin owns layers 0, 8, 16, 24, 32, 40, 48, 56 → 8 layers
-    expected = [(layer % 8 == 0) for layer in range(61)]
+    assert len(mask) == 64  # ceil(61/8)*8
+    expected = [(layer % 8 == 0) for layer in range(61)] + [False, False,
+                                                              False]
     assert mask == expected
-    assert sum(mask) == 8
+    assert sum(mask) == 8  # target_per_rank = ceil(61/8) = 8
 
 
 def test_layer_mask_round_robin_rank_5_owns_layers_5_13_21_etc():
+    # Balanced layer_mask: rank 5 owns 7 real layers (5, 13, ..., 53) +
+    # 1 phantom True at index 61 to hit target_per_rank = 8. Indices 62,
+    # 63 stay False (already at target).
     mask = build_layersplit_layer_mask(
         num_layers=61,
         sparse_attn_config=_sparse_cfg(),
         cp_size=8,
         cp_rank=5,
     )
-    # Rank 5 owns layers 5, 13, 21, 29, 37, 45, 53 → 7 layers (61 % 8 = 5,
-    # so ranks 0..4 own one extra layer each)
-    expected = [((layer - 5) >= 0 and (layer - 5) % 8 == 0)
-                for layer in range(61)]
+    assert len(mask) == 64
+    real_owned = [((layer - 5) >= 0 and (layer - 5) % 8 == 0)
+                  for layer in range(61)]
+    # The single missing layer is filled by a phantom True at the first
+    # padding slot (idx 61); remaining padding slots stay False.
+    expected = real_owned + [True, False, False]
     assert mask == expected
-    assert sum(mask) == 7
+    assert sum(mask) == 8
 
 
 def test_layer_mask_contiguous_rank_3_owns_block():
+    # Balanced layer_mask: rank 3 owns 8 contiguous real layers
+    # (24..31). target_per_rank = 8, no padding needed.
     mask = build_layersplit_layer_mask(
         num_layers=61,
         sparse_attn_config=_sparse_cfg(
@@ -340,9 +350,9 @@ def test_layer_mask_contiguous_rank_3_owns_block():
         cp_size=8,
         cp_rank=3,
     )
-    # contiguous: ranks 0..4 own 8 layers each, ranks 5..7 own 7 each. Rank
-    # 3 owns layers 24..31 inclusive.
-    expected = [(24 <= layer <= 31) for layer in range(61)]
+    assert len(mask) == 64
+    expected = [(24 <= layer <= 31) for layer in range(61)] + [False, False,
+                                                                False]
     assert mask == expected
     assert sum(mask) == 8
 
@@ -601,12 +611,15 @@ def test_broadcast_skipped_when_dist_not_initialized():
 
 
 def test_layer_mask_sum_across_ranks_covers_every_layer_exactly_once():
-    # Critical correctness invariant for the C++ side: every layer must be
-    # owned by exactly one rank, otherwise some layers go un-allocated and
-    # the broadcast graph cannot reconstruct the full KV pool.
+    # Critical correctness invariant: in the REAL layer range (0..num_layers)
+    # every layer is owned by exactly one rank. Phantom slots at indices
+    # >= num_layers are owned by AT MOST one rank — they exist purely to
+    # balance sum(mask) per rank for consistent num_blocks at the C++
+    # pool layer.
     for policy in ("round_robin", "contiguous"):
         cp_size = 8
         num_layers = 61
+        total_length = ((num_layers + cp_size - 1) // cp_size) * cp_size
         masks = [
             build_layersplit_layer_mask(
                 num_layers=num_layers,
@@ -617,15 +630,65 @@ def test_layer_mask_sum_across_ranks_covers_every_layer_exactly_once():
             ) for rank in range(cp_size)
         ]
         for rank, mask in enumerate(masks):
-            assert mask is not None and len(mask) == num_layers, policy
-        # Each layer is True in exactly one rank's mask.
+            assert mask is not None and len(mask) == total_length, policy
+        # Real-layer rows: exactly one rank owns each.
         per_layer_owners = [
             sum(masks[rank][layer] for rank in range(cp_size))
             for layer in range(num_layers)
         ]
         assert per_layer_owners == [1] * num_layers, (policy, per_layer_owners)
-        # Total layers owned across ranks equals num_layers.
-        assert sum(sum(m) for m in masks) == num_layers, policy
+        # Phantom rows are pure padding to balance sum(mask) per rank —
+        # multiple ranks may "own" the same phantom slot because their
+        # layer counts differed before padding. That's correctness-safe
+        # because the C++ pool allocates the slot on every rank that has
+        # it True, but the model's per-layer loop only iterates
+        # 0..num_layers and so the phantom slots are never read. The only
+        # invariant that matters at this layer is sum(mask) per rank
+        # being identical (checked below) so num_blocks is consistent
+        # across ranks.
+        # Each rank's sum is identical and equals target_per_rank — the
+        # core invariant that makes num_blocks consistent at the C++ pool.
+        target = (num_layers + cp_size - 1) // cp_size
+        for rank, m in enumerate(masks):
+            assert sum(m) == target, (policy, rank, sum(m), target)
+
+
+def test_balanced_layer_mask_keeps_num_layers_divisible_case_unpadded():
+    # When num_layers % cp_size == 0 the balanced mask reduces exactly to
+    # the unbalanced "owned-only" mask (no phantom slots are needed
+    # because target_per_rank * cp_size == num_layers).
+    mask = build_layersplit_layer_mask(
+        num_layers=8,
+        sparse_attn_config=_sparse_cfg(),
+        cp_size=4,
+        cp_rank=2,
+    )
+    assert len(mask) == 8
+    expected = [(layer % 4 == 2) for layer in range(8)]
+    assert mask == expected
+    assert sum(mask) == 2
+
+
+def test_balanced_layer_mask_extreme_cp_greater_than_num_layers():
+    # CP > num_layers: target_per_rank = 1, ranks 0..num_layers-1 own
+    # their natural layer plus 0 phantoms; ranks >= num_layers own only
+    # a phantom slot (so the C++ pool size is consistent).
+    mask = build_layersplit_layer_mask(
+        num_layers=2,
+        sparse_attn_config=_sparse_cfg(),
+        cp_size=4,
+        cp_rank=3,
+    )
+    # length = ceil(2/4)*4 = 4
+    # ownership for cp_size=4: owner_map = (0, 1) — only ranks 0 and 1
+    # have a real owned layer. Rank 3 needs target=1 True, all from
+    # phantom slots.
+    assert len(mask) == 4
+    # No real layers owned by rank 3.
+    assert not mask[0] and not mask[1]
+    # Exactly one phantom is True to hit target=1.
+    assert sum(mask[2:]) == 1
+    assert sum(mask) == 1
 
 
 # ---------------------------------------------------------------------------
