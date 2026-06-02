@@ -3277,15 +3277,48 @@ class Indexer(nn.Module):
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
+            # Compute the active block id set ONCE per layer; reused for
+            # both the indexer-K (M5e) and dense KV (M5f) broadcasts
+            # because both caches use the same per-layer block_table.
             active_block_ids = _layersplit_compute_active_block_ids(metadata)
-            cache_slot = kv_cache_manager.get_indexer_k_cache_buffers(
+
+            # M5e: indexer-K cache slot broadcast (small per-token bytes;
+            # ~84 B / token at NVFP4 with head_dim_indexer=128, half of
+            # which is packed FP4 data + 4 scale bytes).
+            indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
             layersplit_state.maybe_broadcast_active_blocks(
                 layer_idx=self.layer_idx,
-                cache_slot=cache_slot,
+                cache_slot=indexer_slot,
                 active_block_ids=active_block_ids,
                 cp_group=layersplit_state.cp_group,
             )
+
+            # M5f: dense KV cache slot broadcast (~656 B / token at V3.2:
+            # kv_lora_rank=512 + qk_rope_head_dim=64 across kv_factor=2),
+            # which the sparse_attn step reads after the indexer top-K
+            # selects which blocks to attend over. Matches the z.ai
+            # "Scaling Pain" §4 'broadcast both caches' pattern.
+            # get_buffers may return None for layers outside the
+            # current manager (e.g. PP-partitioned drafts) — skip
+            # silently in that case.
+            try:
+                dense_kv_slot = kv_cache_manager.get_buffers(self.layer_idx)
+            except (AttributeError, IndexError, KeyError):
+                dense_kv_slot = None
+            if dense_kv_slot is not None:
+                # Reshape to (num_blocks, ...) for the broadcast: get_buffers
+                # returns NHD layout (max_num_pages, kv_factor, page_size,
+                # num_kv_heads, head_dim); flatten everything past dim 0
+                # so the broadcast helper treats it as a (num_blocks, K)
+                # pool exactly like the indexer-K slot.
+                flat_dense = dense_kv_slot.view(dense_kv_slot.shape[0], -1)
+                layersplit_state.maybe_broadcast_active_blocks(
+                    layer_idx=self.layer_idx,
+                    cache_slot=flat_dense,
+                    active_block_ids=active_block_ids,
+                    cp_group=layersplit_state.cp_group,
+                )
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)

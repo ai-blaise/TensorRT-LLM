@@ -156,6 +156,13 @@ def main() -> int:
                            worker_fn="_worker_m5e",
                            world_size=cp_size):
                 overall = False
+        # M5f dual-cache (indexer + dense KV) broadcast test, both policies
+        for i, policy in enumerate(["round_robin", "contiguous"]):
+            if not run_one(policy,
+                           port_base + 40 + i,
+                           worker_fn="_worker_m5f",
+                           world_size=cp_size):
+                overall = False
     return 0 if overall else 1
 
 
