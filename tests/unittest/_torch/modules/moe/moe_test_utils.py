@@ -68,6 +68,8 @@ class MoeBackendType(str, Enum):
     DENSEGEMM = "DENSEGEMM"
     MEGAMOE = "MEGAMOE_DEEPGEMM"
     CUTE_DSL_B12X = "CUTE_DSL_B12X"
+    # WarpDecode: output-owned NVFP4 MoE decode; routes to CuteDslFusedMoE.
+    WARPDECODE = "WARPDECODE"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -80,6 +82,8 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
         MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
+        # WarpDecode (output-owned NVFP4 decode) is served by CuteDslFusedMoE.
+        MoeBackendType.WARPDECODE: CuteDslFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -588,10 +592,13 @@ def should_skip_cutedsl(
     """
     Check CuteDSL backend specific constraints.
 
+    WARPDECODE (output-owned NVFP4 decode) routes to CuteDslFusedMoE, so it
+    shares the same backend-specific constraints.
+
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.CUTEDSL:
+    if backend_type not in (MoeBackendType.CUTEDSL, MoeBackendType.WARPDECODE):
         return None
 
     if model_config is None:

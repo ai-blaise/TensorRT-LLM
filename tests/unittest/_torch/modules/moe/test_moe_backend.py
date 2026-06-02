@@ -171,6 +171,35 @@ def create_test_backend(
     )
 
 
+def test_warpdecode_backend_selection():
+    """WARPDECODE is configurable and routes to the output-owned NVFP4 decode
+    backend (CuteDslFusedMoE) for NVFP4, falling back to CutlassFusedMoE for
+    non-NVFP4 quant (CPU-only factory routing check)."""
+    from tensorrt_llm._torch.modules.fused_moe.create_moe import get_moe_cls
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
+        CuteDslFusedMoE
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import \
+        CutlassFusedMoE
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+    pretrained_config = PretrainedConfig()
+    pretrained_config.torch_dtype = torch.bfloat16
+
+    nvfp4_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        moe_backend="WARPDECODE",
+    )
+    assert get_moe_cls(nvfp4_config) is CuteDslFusedMoE
+
+    bf16_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=None,
+        moe_backend="WARPDECODE",
+    )
+    assert get_moe_cls(bf16_config) is CutlassFusedMoE
+
+
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
     routing_method = RenormalizeMoeRoutingMethod(top_k=1)
     model_config = ModelConfig(

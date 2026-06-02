@@ -74,6 +74,26 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
+    elif moe_backend.upper() == "WARPDECODE":
+        # WarpDecode: the output-owned, output-fused NVFP4 MoE decode path.
+        # This selects CuteDslFusedMoE driving the CuTe-DSL
+        # gather_grouped_gemm_act_fusion (FC1 + SwiGLU, gather-fused) ->
+        # grouped_gemm_finalize_inplace (FC2 + combine) kernels -- the fused
+        # "warp compute" that eliminates the traditional gather / pad / scatter /
+        # reduce bookkeeping stages of expert-centric MoE. Requires NVFP4 on
+        # SM100/SM103; falls back to CutlassFusedMoE otherwise.
+        # CuteDslFusedMoE.can_implement enforces the remaining hardware/shape
+        # constraints downstream.
+        if quant_config is not None and quant_config.quant_mode.has_nvfp4():
+            logger.info(
+                f"{layer_prefix}Selecting CuteDslFusedMoE for WarpDecode "
+                "(output-owned NVFP4 MoE decode).")
+            return CuteDslFusedMoE
+        logger.warning(
+            f"{layer_prefix}WarpDecode only supports NVFP4. "
+            f"Check out details in quant_config: {quant_config}. "
+            "Using CutlassFusedMoE instead.")
+        return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "DENSEGEMM":

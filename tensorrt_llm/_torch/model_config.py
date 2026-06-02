@@ -260,7 +260,7 @@ class ModelConfig(Generic[TConfig]):
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
-    moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    moe_backend: str = 'CUTLASS'  # options: CUTLASS, TRTLLM, CUTEDSL, DEEPGEMM, DENSEGEMM, WIDEEP, TRITON, VANILLA, MEGAMOE_DEEPGEMM, WARPDECODE (output-owned NVFP4 decode)
     warp_decode_config: Optional[Any] = None
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
