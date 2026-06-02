@@ -77,6 +77,7 @@ Welcome to TensorRT LLM's Documentation!
    features/additional-outputs.md
    features/guided-decoding.md
    features/speculative-decoding.md
+   features/layersplit.md
    features/warpdecode.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md

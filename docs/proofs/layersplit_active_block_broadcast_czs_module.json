@@ -1,0 +1,66 @@
+{
+  "name": "layersplit_active_block_broadcast_m5e",
+  "doc": "CZS proof for the M5e active-block broadcast layouts: cache_slot (num_blocks x block_bytes uint8), active_block_ids (num_active int64), send_buffer (num_active x block_bytes uint8). Attests that the underlying tensor layouts are legal CuTe layouts and that the vectorized loads/stores used by torch.index_select / torch.index_copy_ (LDG.E.128 / STG.E.128 over the row dimension) are vector-width-legal at V=16 elt=1B. Shapes use representative production sizes; the proof generalizes because every step's invariants are layout-static.",
+  "layouts": [
+    {
+      "label": "cache_slot",
+      "shape": [
+        {"is_static": true, "value": 64},
+        {"is_static": true, "value": 256}
+      ],
+      "stride": [
+        {"is_static": true, "value": 256},
+        {"is_static": true, "value": 1}
+      ]
+    },
+    {
+      "label": "active_block_ids",
+      "shape": [{"is_static": true, "value": 4}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "send_buffer",
+      "shape": [
+        {"is_static": true, "value": 4},
+        {"is_static": true, "value": 256}
+      ],
+      "stride": [
+        {"is_static": true, "value": 256},
+        {"is_static": true, "value": 1}
+      ]
+    },
+    {
+      "label": "cache_slot_row",
+      "shape": [{"is_static": true, "value": 256}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "send_buffer_row",
+      "shape": [{"is_static": true, "value": 256}],
+      "stride": [{"is_static": true, "value": 1}]
+    }
+  ],
+  "vectorization_ops": [
+    {
+      "label": "gather_LDG_vec16",
+      "layout_idx": 3,
+      "element_bytes": 1,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 268435456}
+    },
+    {
+      "label": "scatter_STG_vec16",
+      "layout_idx": 4,
+      "element_bytes": 1,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 268435456}
+    },
+    {
+      "label": "active_block_ids_LDG_vec4",
+      "layout_idx": 1,
+      "element_bytes": 8,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 268435456}
+    }
+  ]
+}

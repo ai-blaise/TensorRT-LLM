@@ -123,22 +123,10 @@ def _get_blaise_indexer_overrides(
         if "execution_mode" in hisa:
             overrides["hisa_execution_mode"] = str(hisa["execution_mode"])
 
-    layersplit = _as_dict(indexer_quant.get("layersplit"))
-    if layersplit is not None and bool(layersplit.get("enabled", False)):
-        overrides["layersplit_enabled"] = True
-        owner_assignment = layersplit.get("owner_assignment",
-                                          layersplit.get("layout"))
-        if owner_assignment is not None:
-            owner_assignment = str(owner_assignment)
-            if owner_assignment == "interleaved":
-                owner_assignment = "round_robin"
-            overrides["layersplit_owner_assignment"] = owner_assignment
-        if "transfer_backend" in layersplit:
-            overrides["layersplit_transfer_backend"] = str(
-                layersplit["transfer_backend"])
-        if "all_cp_ranks_transfer" in layersplit:
-            overrides["layersplit_all_cp_ranks_transfer"] = bool(
-                layersplit["all_cp_ranks_transfer"])
+    # LayerSplit is a runtime/system feature: it is not enabled from the HF
+    # model card. Configure it through SparseAttentionConfig.layersplit_*
+    # (e.g. --trtllm.sparse_attention_config.layersplit_enabled=true) so
+    # production enablement always flows from explicit runtime config.
 
     return overrides
 
@@ -781,18 +769,6 @@ class ModelConfig(Generic[TConfig]):
                                 "hisa_min_seq_len", hisa_min_seq_len)
                             hisa_execution_mode = model_overrides.get(
                                 "hisa_execution_mode", hisa_execution_mode)
-                        if (not layersplit_enabled
-                                and model_overrides.get("layersplit_enabled")):
-                            layersplit_enabled = True
-                            layersplit_owner_assignment = model_overrides.get(
-                                "layersplit_owner_assignment",
-                                layersplit_owner_assignment)
-                            layersplit_transfer_backend = model_overrides.get(
-                                "layersplit_transfer_backend",
-                                layersplit_transfer_backend)
-                            layersplit_all_cp_ranks_transfer = model_overrides.get(
-                                "layersplit_all_cp_ranks_transfer",
-                                layersplit_all_cp_ranks_transfer)
                     else:
                         model_overrides = _get_blaise_indexer_overrides(
                             pretrained_config)
@@ -825,14 +801,13 @@ class ModelConfig(Generic[TConfig]):
                             "hisa_min_seq_len", 32768)
                         hisa_execution_mode = model_overrides.get(
                             "hisa_execution_mode", "optimized")
-                        layersplit_enabled = model_overrides.get(
-                            "layersplit_enabled", False)
-                        layersplit_owner_assignment = model_overrides.get(
-                            "layersplit_owner_assignment", "round_robin")
-                        layersplit_transfer_backend = model_overrides.get(
-                            "layersplit_transfer_backend", "auto")
-                        layersplit_all_cp_ranks_transfer = model_overrides.get(
-                            "layersplit_all_cp_ranks_transfer", True)
+                        # LayerSplit defaults stay off here; the HF model card cannot
+                        # enable it. Production enablement flows only through
+                        # SparseAttentionConfig.layersplit_* runtime config.
+                        layersplit_enabled = False
+                        layersplit_owner_assignment = "round_robin"
+                        layersplit_transfer_backend = "auto"
+                        layersplit_all_cp_ranks_transfer = True
                     for key, value in {
                             "dsa_indexer_mode": indexer_mode,
                             "nsa_indexer_mode": indexer_mode,

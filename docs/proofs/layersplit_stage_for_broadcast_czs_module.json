@@ -1,0 +1,81 @@
+{
+  "name": "layersplit_stage_for_broadcast_nvfp4",
+  "layouts": [
+    {
+      "label": "k_fp4_source_row",
+      "shape": [{"is_static": true, "value": 64}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "k_scale_source_row",
+      "shape": [{"is_static": true, "value": 4}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "stage_buffer_row",
+      "shape": [{"is_static": true, "value": 68}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "k_fp8_source_row",
+      "shape": [{"is_static": true, "value": 128}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "stage_buffer_fp8_row",
+      "shape": [{"is_static": true, "value": 132}],
+      "stride": [{"is_static": true, "value": 1}]
+    }
+  ],
+  "vectorization_ops": [
+    {
+      "label": "k_fp4_load_vec16_per_token_row",
+      "layout_idx": 0,
+      "element_bytes": 1,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 268435456}
+    },
+    {
+      "label": "k_fp4_load_vec4_per_token_row",
+      "layout_idx": 0,
+      "element_bytes": 1,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 268435456}
+    },
+    {
+      "label": "k_scale_load_vec4_per_token_row",
+      "layout_idx": 1,
+      "element_bytes": 1,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 268435520}
+    },
+    {
+      "label": "stage_store_vec4_per_token_row",
+      "layout_idx": 2,
+      "element_bytes": 1,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 268500992}
+    },
+    {
+      "label": "k_fp8_load_vec16_per_token_row",
+      "layout_idx": 3,
+      "element_bytes": 1,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 268435456}
+    },
+    {
+      "label": "k_fp8_load_vec4_per_token_row",
+      "layout_idx": 3,
+      "element_bytes": 1,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 268435456}
+    },
+    {
+      "label": "stage_store_fp8_vec4_per_token_row",
+      "layout_idx": 4,
+      "element_bytes": 1,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 268500992}
+    }
+  ]
+}
