@@ -149,6 +149,13 @@ def main() -> int:
                            worker_fn="_worker_m8b",
                            world_size=cp_size):
                 overall = False
+        # M5e active-block broadcast test, both policies
+        for i, policy in enumerate(["round_robin", "contiguous"]):
+            if not run_one(policy,
+                           port_base + 30 + i,
+                           worker_fn="_worker_m5e",
+                           world_size=cp_size):
+                overall = False
     return 0 if overall else 1
 
 

@@ -466,6 +466,157 @@ def test_real_nccl_two_channel_prefetch_pipeline(tmp_path, policy):
             f"rank {rank} failed under policy={policy}:\n{contents}")
 
 
+def _worker_m5e(rank, world_size, master_port, policy, num_layers,
+                tmpdir_path):
+    """Child-process entry point for the M5e active-block broadcast test.
+
+    Mocks a per-layer cache pool tensor (num_blocks × bytes_per_block
+    uint8) + a per-rank-shared 'active block id' set. Owner writes
+    deterministic content into the active block positions for layer L;
+    every rank calls maybe_broadcast_active_blocks; receivers verify
+    their cache pool now matches the owner's at the active block ids
+    AND that the non-active blocks are UNTOUCHED (proves M5e gathers
+    and scatters only the active subset, not the full pool).
+    """
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
+            LayerSplitRuntimeState)
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            layersplit_enabled=True,
+            layersplit_owner_assignment=policy,
+            layersplit_transfer_backend="auto",
+            layersplit_all_cp_ranks_transfer=True,
+        )
+        state = LayerSplitRuntimeState.from_sparse_config(
+            sparse_attn_config=cfg,
+            num_layers=num_layers,
+            cp_size=world_size,
+            cp_rank=rank,
+        )
+        state.bind_cp_group(dist.group.WORLD)
+
+        # Fake per-layer cache pool: num_blocks=64, block_bytes=256 uint8
+        # (similar shape to the real indexer-K pool view but tiny).
+        # Active blocks per layer = {3, 7, 17, 42} — 4 of 64.
+        num_blocks = 64
+        block_bytes = 256
+        active_block_ids = torch.tensor([3, 7, 17, 42],
+                                        dtype=torch.int64,
+                                        device="cuda")
+
+        errors = []
+        for layer_idx in range(num_layers):
+            owner = state.ownership.owner_of(layer_idx)
+            # Per-rank cache pool, initialized with rank-specific bytes
+            # everywhere — receivers' active blocks should END UP with
+            # the OWNER's content; their inactive blocks should be
+            # UNTOUCHED.
+            cache = torch.full((num_blocks, block_bytes),
+                               (rank + 1) * 10,
+                               dtype=torch.uint8,
+                               device="cuda")
+            if rank == owner:
+                # Owner stamps a layer- and block-specific magic value
+                # at the active positions so receivers can verify the
+                # bytes that actually landed.
+                for slot, blk_id in enumerate(active_block_ids.tolist()):
+                    cache[blk_id, :] = (layer_idx * 17 + slot * 3) % 256
+
+            # Snapshot inactive block bytes (rank + 1) * 10 — these must
+            # not change after the M5e broadcast.
+            inactive_mask = torch.ones(num_blocks,
+                                        dtype=torch.bool,
+                                        device="cuda")
+            inactive_mask[active_block_ids] = False
+
+            state.maybe_broadcast_active_blocks(
+                layer_idx=layer_idx,
+                cache_slot=cache,
+                active_block_ids=active_block_ids,
+                cp_group=dist.group.WORLD,
+            )
+            torch.cuda.synchronize()
+
+            # Verify active blocks now hold the owner's stamped bytes.
+            for slot, blk_id in enumerate(active_block_ids.tolist()):
+                expected = (layer_idx * 17 + slot * 3) % 256
+                actual = cache[blk_id, 0].item()
+                if actual != expected:
+                    errors.append(
+                        f"M5e layer {layer_idx} block {blk_id} rank {rank} "
+                        f"owner {owner}: got {actual}, expected {expected}")
+                    break  # one error per layer is enough
+
+            # Verify inactive blocks were NOT touched.
+            inactive_value = (rank + 1) * 10
+            inactive_blocks = cache[inactive_mask]
+            untouched = (inactive_blocks == inactive_value).all().item()
+            if not untouched:
+                differing = (inactive_blocks != inactive_value).any(
+                    dim=1).sum().item()
+                errors.append(
+                    f"M5e layer {layer_idx} rank {rank}: {differing} "
+                    f"inactive blocks were modified (M5e should only touch "
+                    f"active blocks)")
+
+        result_path = os.path.join(tmpdir_path, f"rank{rank}.result")
+        with open(result_path, "w") as f:
+            if errors:
+                f.write("FAIL\n")
+                for e in errors:
+                    f.write(e + "\n")
+            else:
+                f.write(
+                    f"PASS rank={rank} layers={num_layers} "
+                    f"active_blocks={active_block_ids.tolist()}\n")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not HAS_CUDA,
+                    reason="needs >=2 CUDA devices for multi-rank NCCL test")
+@pytest.mark.parametrize("policy", ["round_robin", "contiguous"])
+def test_real_nccl_active_block_broadcast(tmp_path, policy):
+    """End-to-end NCCL test of the M5e active-block broadcast (gather +
+    broadcast + scatter back, leaving inactive blocks untouched)."""
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    num_layers = 8
+    master_port = 29570 + (0 if policy == "round_robin" else 1)
+
+    mp.spawn(
+        _worker_m5e,
+        args=(world_size, master_port, policy, num_layers, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    for rank in range(world_size):
+        result_path = tmp_path / f"rank{rank}.result"
+        assert result_path.exists(), f"rank {rank} produced no result file"
+        contents = result_path.read_text()
+        assert contents.startswith("PASS"), (
+            f"rank {rank} failed under policy={policy}:\n{contents}")
+
+
 if __name__ == "__main__":
     # Allow standalone invocation: python -m pytest <this file> -v
     sys.exit(pytest.main([__file__, "-v", "-s"]))

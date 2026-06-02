@@ -16,6 +16,69 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
     LayerSplitOwnership, LayerSplitRuntimeState)
+
+
+def _layersplit_compute_active_block_ids(metadata):
+    """M5e: compute the unique block ids touched by THIS step's scatter.
+
+    Given the DSA attention metadata, return the int64 GPU tensor of
+    unique block ids that were (or are about to be) written by the
+    indexer-K scatter for the current batch. The LayerSplit hook gathers
+    those blocks into a send buffer, broadcasts owner -> peers, and
+    scatters back — broadcasting only the active blocks rather than the
+    full per-layer pool slot cuts the bytes on the wire by 100×-1000×
+    at typical batch / context sizes.
+
+    For request ``i`` the new tokens span positions
+    ``[kv_lens[i] - seq_lens[i], kv_lens[i])`` so the block range is
+    ``[(kv_lens[i] - seq_lens[i]) // tokens_per_block,
+       (kv_lens[i] - 1) // tokens_per_block]`` inclusive. We materialize
+    the union of these ranges per request via vectorized masking against
+    the request's ``block_table`` row, then ``torch.unique`` over the
+    concatenated block ids.
+
+    Returns ``None`` on any path that can't compute the set (no
+    block_table, no kv_lens, num_seqs=0, missing kv_cache_manager) so
+    the hook's broadcast helper short-circuits to a no-op rather than
+    publishing garbage.
+    """
+    if metadata is None:
+        return None
+    kv_lens = getattr(metadata, "kv_lens", None)
+    seq_lens = getattr(metadata, "seq_lens", None)
+    block_table = getattr(metadata, "block_table", None)
+    num_seqs = getattr(metadata, "num_seqs", 0)
+    kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+    if (kv_lens is None or seq_lens is None or block_table is None
+            or num_seqs <= 0 or kv_cache_manager is None):
+        return None
+    tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", None)
+    if tokens_per_block is None or tokens_per_block <= 0:
+        return None
+
+    # Per-request block index ranges, on the same device as block_table.
+    device = block_table.device
+    kv_lens_slice = kv_lens[:num_seqs].to(device=device, dtype=torch.int64)
+    seq_lens_slice = seq_lens[:num_seqs].to(device=device, dtype=torch.int64)
+    end_block_in_seq = (kv_lens_slice - 1) // tokens_per_block  # (num_seqs,)
+    start_block_in_seq = (kv_lens_slice - seq_lens_slice) // tokens_per_block
+    # Clamp negatives that arise when seq_lens > kv_lens (shouldn't happen
+    # in well-formed metadata but be defensive — a negative start would
+    # silently include extra blocks).
+    start_block_in_seq = torch.clamp_min(start_block_in_seq, 0)
+
+    max_blocks_per_seq = block_table.shape[1]
+    block_arange = torch.arange(max_blocks_per_seq,
+                                device=device,
+                                dtype=torch.int64).unsqueeze(0)  # (1, B)
+    mask = ((block_arange >= start_block_in_seq.unsqueeze(1)) &
+            (block_arange <= end_block_in_seq.unsqueeze(1)))  # (S, B)
+    table_slice = block_table[:num_seqs].to(dtype=torch.int64)
+    selected = table_slice[mask]  # 1-D, may include -1 padding
+    selected = selected[selected >= 0]
+    if selected.numel() == 0:
+        return None
+    return torch.unique(selected)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -3190,22 +3253,20 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        # LayerSplit (M5d): the owner CP rank for layer L publishes the
-        # current contents of its indexer-K cache slot to all peer CP
-        # ranks just before the indexer reads it, in line with z.ai
-        # "Scaling Pain" §4 Figure 4(b). The payload is the live cache
-        # slot — receivers overwrite their own copy in place, so the
-        # downstream sparse_attn_indexer reads the owner's authoritative
-        # bytes via the existing get_indexer_k_cache_buffers path.
+        # LayerSplit (M5e): the owner CP rank for layer L publishes ONLY
+        # the cache blocks touched by THIS STEP's scatter — not the
+        # whole pool slot. Matches z.ai "Scaling Pain" §4 Figure 4(b)
+        # but at production-realistic bytes-on-the-wire (~2 MB / layer
+        # at decode batch=256 vs the M5d shipment's ~870 MB / layer at
+        # V3.2 long context, a ~400× wire reduction).
         #
-        # The broadcast is synchronous on the default stream — the M9
-        # bench established that overlap modes (M6 single-channel, M8b
-        # 2-channel) only add side-stream + CUDA-event overhead at every
-        # measured payload size (16 B – 64 MB / layer) because realistic
-        # compute hides the broadcast on NVLink. Overlap-mode methods
-        # stay on the runtime state for future regimes (very small
-        # compute windows, multi-MB-and-shrinking M5e active-KV slices)
-        # but are no longer invoked from the production hook.
+        # Active block ids = the set of block_ids referenced by the
+        # current step's batch within the per-layer slice they each
+        # actively wrote. For decode that's one block per request
+        # (the block holding the new token); for prefill chunked, that's
+        # ceil(chunk / tokens_per_block) blocks per request. All ranks
+        # see the same metadata, so they compute identical active sets
+        # — required for the NCCL broadcast to agree on buffer shape.
         #
         # All paths are no-ops on the LayerSplit-off / cp_size=1 / no
         # process-group / no-CUDA branches so this is safe to drop in
@@ -3216,14 +3277,14 @@ class Indexer(nn.Module):
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
+            active_block_ids = _layersplit_compute_active_block_ids(metadata)
             cache_slot = kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
-            layersplit_state.maybe_broadcast_for_layer(
+            layersplit_state.maybe_broadcast_active_blocks(
                 layer_idx=self.layer_idx,
-                payload=cache_slot,
+                cache_slot=cache_slot,
+                active_block_ids=active_block_ids,
                 cp_group=layersplit_state.cp_group,
-                async_op=False,
-                channel="kv",
             )
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(

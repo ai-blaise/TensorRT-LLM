@@ -371,6 +371,66 @@ class LayerSplitRuntimeState:
         """
         self._prefetched_events.clear()
 
+    def maybe_broadcast_active_blocks(
+            self,
+            layer_idx: int,
+            cache_slot: Optional[Any],
+            active_block_ids: Optional[Any],
+            cp_group: Optional[Any] = None) -> bool:
+        """M5e: gather, broadcast, and scatter back the *active* blocks of
+        layer L's cache pool — strictly stronger than M5d's
+        broadcast-the-whole-pool-slot because it cuts the bytes-on-the-wire
+        from the full per-layer pool size (~870 MB / layer at V3.2 long
+        context) down to just the blocks touched by the current step's
+        scatter (~2 MB / layer at decode batch=256).
+
+        Owner-side:
+        - Gathers ``cache_slot[active_block_ids]`` into a contiguous send
+          buffer (one ``torch.index_select`` — vectorized GPU op, no host
+          sync).
+        - Calls ``dist.broadcast`` with ``src=owner_rank``; the buffer
+          content is published to every peer in the cp_group.
+        - Scatters the send buffer back into ``cache_slot[active_block_ids]``
+          — a no-op write of the same bytes for the owner.
+
+        Receiver-side:
+        - Gathers ``cache_slot[active_block_ids]`` into a contiguous send
+          buffer (the receiver's own stale content).
+        - Calls ``dist.broadcast`` — the buffer is OVERWRITTEN in place
+          with the owner's content.
+        - Scatters the overwritten buffer back into
+          ``cache_slot[active_block_ids]`` — this is the cache update.
+
+        Returns True iff the broadcast was issued. No-ops on the disabled
+        / cp_size=1 / no-group / no-CUDA / dist-not-initialized / None-args
+        branches so this is safe to drop in unconditionally.
+        """
+        if not self.enabled or self.ownership is None:
+            return False
+        if self.cp_size <= 1 or cp_group is None:
+            return False
+        if cache_slot is None or active_block_ids is None:
+            return False
+        if torch is None or not torch.cuda.is_available():
+            return False
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return False
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+        if active_block_ids.numel() == 0:
+            return False
+
+        src_rank = self.ownership.owner_of(layer_idx)
+        send_buffer = cache_slot.index_select(0, active_block_ids).contiguous()
+        dist.broadcast(send_buffer,
+                       src=src_rank,
+                       group=cp_group,
+                       async_op=False)
+        cache_slot.index_copy_(0, active_block_ids, send_buffer)
+        return True
+
     @classmethod
     def disabled(cls) -> "LayerSplitRuntimeState":
         """Inert state for the LayerSplit-off path."""
