@@ -1,0 +1,17 @@
+{
+  "name": "warpdecode_tensorcore_decode_round5_contract",
+  "kind": "czs_contract",
+  "variant": "tensor_core",
+  "round": 5,
+  "source": "tests/scripts/cute_dsl_kernels/moe_as_dense_gemm/run_moe_as_dense_gemm_fc1.py (Sm100 persistent blockscaled GEMM + SwiGLU, NVFP4)",
+  "config": {"mma_tiler_mn": [256, 64], "cluster_shape_mn": [2, 1], "use_2cta_instrs": true, "use_prefetch": false},
+  "decode_shape": {"m": 128, "n": 65536, "k": 7168, "local_experts": 16, "fc1_weight_bytes_MB": 235},
+  "shared_index_contract": "docs/proofs/warpdecode_tensorcore_gather_grouped_gemm_decode_czs_contract.json (moe_sort index obligations: group/mn_limit-cumulative/gather/inverse-perm/padded-count/saturation -- VERIFIED ALL_PASS at ntok in {16,32,64} via czs_verify_tensorcore.py; index contract is config-independent)",
+  "obligations": [
+    {"label": "config implementable", "claim": "mma_tiler=(256,64) cluster=(2,1) prefetch=false satisfies can_implement for the decode weight shape and builds/runs", "status": "VERIFIED (kernel compiled and executed)"},
+    {"label": "numerical correctness", "claim": "tensor-core output matches dequant FP32 reference (ref-check / cosine obligation)", "status": "PASS"},
+    {"label": "measured latency", "claim": "FC1 latency at the decode weight shape (cold L2, 50 iters)", "status": "119.3 us = 29% of 6.8 TB/s peak"},
+    {"label": "index contract", "claim": "moe_sort tile/gather/scale index obligations hold (config-independent)", "status": "VERIFIED ALL_PASS (shared contract)"}
+  ],
+  "verdict": "much worse (2-CTA, narrow N tile)"
+}
