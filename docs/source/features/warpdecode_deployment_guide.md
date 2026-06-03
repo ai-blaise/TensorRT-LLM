@@ -173,8 +173,27 @@ autotune and are the most capture-clean.
 | moe_sort (routing) | 6.2 µs | separable overhead |
 | FC1+FC2 | 76.1 µs | (~3% overlap) |
 
-The 68%→80% headroom is **not** launch overhead (graph removes that) — it is the
-gather kernel's intrinsic cost. The concrete unexplored targets: the FC2 finalize
-combine epilogue (62%), the 6.2 µs `moe_sort` the native runner fuses internally, and
-the near-zero FC1/FC2 overlap (a TMEM-fused FC1→FC2 megakernel would recover the
-intermediate GMEM round-trip).
+The remaining headroom is **not** launch overhead (graph removes that) and **not** HBM
+bandwidth (a parallel-stream test reads 705 MB at 9.6 TB/s — large spare bandwidth). A
+four-target parallel investigation (every variant cosine ≥ 0.999, CZS-verified,
+graph-captured, peak fixed at 6.8) found the decode kernels are **~95%
+fixed-overhead-bound**: FC1 ≈ 49 µs fixed + 0.056 µs/token, FC2 ≈ 27 µs fixed +
+0.047 µs/token (4× the tokens adds ~1 µs). It is pipeline-ramp / occupancy bound, and
+the easy levers are already exhausted in production:
+
+- **moe_sort** is already PDL-overlapped with FC1
+  (`cudaTriggerProgrammaticLaunchCompletion` ↔ `griddepcontrol_wait`); removable
+  latency ≈ 0 at decode (NTOK ≥ 8).
+- **M-padding** is already masked — the FC1 producer predicates padded A/SF-A loads on
+  `mn_limit` (no global read); the kernel is weight-floor-bound and UMMA M-granularity
+  is 128 (no smaller tile).
+- **FC2** is wave-starved: efficiency rises with wave count (LE=16 → 60%, LE=64 → 76%);
+  the deficit is the per-grid ramp/drain amortized over too few waves (FC2's 117 MB
+  weight is half FC1's, K is 3.5× shorter) — intrinsic to the shapes, not config.
+
+The **one genuine remaining win** is a **fused FC1→SwiGLU→FC2 persistent megakernel**
+that pays the pipeline ramp **once** (streaming w13→w2, overlapping w2's TMA with FC1's
+compute tail): ceiling ≈ **76 → 63 µs (~17%)**. The win is ramp amortization, *not* the
+intermediate (the `h` round-trip is only ~0.74 µs). It is a large dual-GEMM TMEM-chain
+rewrite of the gather kernels (highest effort / highest risk) and is the scoped next
+step — the four-agent sweep confirmed no smaller lever substitutes for it.
