@@ -1,0 +1,49 @@
+# Generation (decode) config — KV-transfer settings mirror production; MoE->stock CUTLASS.
+tensor_parallel_size: 2
+moe_expert_parallel_size: 2
+enable_attention_dp: true
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 0
+  timeout_iters: 60
+trust_remote_code: true
+allreduce_strategy: AUTO
+max_batch_size: 64
+max_num_tokens: 8192
+max_seq_len: 132096
+print_iter_log: false
+stream_interval: 50
+num_postprocess_workers: 8
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64]
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+  tokens_per_block: 64
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 131072
+moe_config:
+  backend: CUTLASS
+  use_low_precision_moe_combine: true
+nvfp4_gemm_config:
+  allowed_backends: [cutedsl, cublaslt, cutlass, cuda_core]
+sparse_attention_config:
+  algorithm: dsa
+  indexer_mode: indexcache-hisa
+  index_n_heads: 64
+  index_head_dim: 128
+  index_topk: 1024
+  index_topk_pattern: FSSS
+  index_topk_freq: 4
+  indexer_k_dtype: fp4
+  enable_nvfp4_hisa: true
+  hisa_block_size: 128
+  hisa_block_topk: 64
+  hisa_compression_ratio: 4.0
+  hisa_min_seq_len: 65536
+  hisa_execution_mode: optimized
+  use_cute_dsl_topk: true
+  use_cute_dsl_paged_mqa_logits: true
