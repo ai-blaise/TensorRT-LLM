@@ -153,6 +153,55 @@ class SMCResourceManager(BaseResourceManager):
                 weights[selected_particle].clamp_min(1e-30))
         return selected_particle, ess
 
+    def select_particles_batched(
+        self, request_ids: list[int], logprob_diffs: torch.Tensor
+    ) -> tuple[list[int], torch.Tensor]:
+        """Vectorized batch equivalent of ``select_particle``.
+
+        Folds the whole decode batch into a single GPU computation plus a
+        single device->host transfer, replacing the per-request
+        ``argmax(...).item()`` + ``(ess < thr).item()`` syncs (3 per request)
+        that otherwise serialize the verification loop and starve the decode
+        pipeline under the overlap scheduler.
+
+        ``logprob_diffs`` is ``[B, n_particles]`` (row i for ``request_ids[i]``)
+        and lives on device. State mutation of ``log_weights[gid]`` matches
+        ``select_particle`` exactly. Returns host-resident selected particles
+        and the device-resident per-row ESS.
+        """
+        if not request_ids:
+            empty = torch.empty((0,), dtype=torch.float32, device="cuda")
+            return [], empty
+        for request_id in request_ids:
+            self._ensure_request(request_id)
+        # Gather accumulated weights into a contiguous [B, P] tensor, add this
+        # step's diffs, then write the accumulated rows back so per-group state
+        # stays in lockstep with the per-request path.
+        device = self.log_weights[request_ids[0]].device
+        log_weights = torch.stack(
+            [self.log_weights[request_id] for request_id in request_ids], dim=0)
+        log_weights.add_(logprob_diffs.to(device=device, dtype=torch.float32))
+        weights = torch.softmax(log_weights, dim=1)
+        ess = torch.reciprocal((weights * weights).sum(dim=1))
+        selected = torch.argmax(weights, dim=1)
+        resample = ess < (self.n_particles * self.resample_threshold)
+        # Resample-reset rows: zero everything except the selected slot, which
+        # holds log(weight[selected]); identical to the scalar branch.
+        selected_weight = weights.gather(1, selected.unsqueeze(1)).squeeze(1)
+        reset_rows = torch.zeros_like(log_weights)
+        reset_rows.scatter_(
+            1, selected.unsqueeze(1),
+            torch.log(selected_weight.clamp_min(1e-30)).unsqueeze(1))
+        log_weights = torch.where(resample.unsqueeze(1), reset_rows,
+                                  log_weights)
+        # Single d2h: all selected-particle decisions at once.
+        selected_host = selected.tolist()
+        for request_id, particle, row in zip(request_ids, selected_host,
+                                             log_weights):
+            self.log_weights[request_id].copy_(row)
+            self.selected_particles[request_id] = particle
+        return selected_host, ess
+
     def effective_sample_size(self, request_id: int) -> torch.Tensor:
         self._ensure_request(request_id)
         weights = torch.softmax(self.log_weights[request_id], dim=0)
@@ -214,12 +263,60 @@ class SMCSampler(TorchSampler):
                                         for particle in range(n_particles)]
         self._particle_index_cache: dict[torch.device,
                                          tuple[torch.Tensor, torch.Tensor]] = {}
+        # Per-step cache of batched particle selection, keyed by SMC group id.
+        # Populated by the pre-pass in update_requests so the per-request
+        # process_draft_tokens path consumes host scalars without per-request
+        # device->host syncs. Values: (selected_particle:int, ess:Tensor).
+        self._batched_selection: dict[int, tuple[int, torch.Tensor]] = {}
 
     def should_provide_draft_probs(self, request) -> bool:
         return True
 
     def _can_use_fast_greedy_path(self, requests) -> bool:
         return False
+
+    def update_requests(self, state, resource_manager=None) -> None:
+        """Run a batched particle-selection pre-pass, then defer to the base
+        per-request update loop.
+
+        The base loop calls ``process_draft_tokens`` once per request; for SMC
+        that otherwise costs three device->host syncs per request
+        (argmax(logprob_diffs), argmax(weights), ess<thr). The pre-pass folds
+        the whole decode batch into one vectorized GPU computation plus a single
+        transfer; ``process_draft_tokens`` then reads cached host scalars.
+        """
+        self._batched_selection = {}
+        spec_manager = None
+        if resource_manager is not None:
+            spec_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if isinstance(spec_manager, SMCResourceManager) and state.requests:
+            group_ids: list[int] = []
+            diff_rows: list[torch.Tensor] = []
+            for request in state.requests:
+                if request.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                draft_tokens = request.py_draft_tokens
+                if not draft_tokens:
+                    continue
+                if getattr(request, "py_target_probs", None) is None:
+                    continue
+                if getattr(request, "py_smc_draft_token_log_probs",
+                           None) is None:
+                    continue
+                group_ids.append(
+                    int(getattr(request, "py_smc_group_id",
+                                request.py_request_id)))
+                diff_rows.append(self._compute_particle_logprob_diffs(request))
+            if group_ids:
+                logprob_diffs = torch.stack(diff_rows, dim=0)
+                selected, ess = spec_manager.select_particles_batched(
+                    group_ids, logprob_diffs)
+                for idx, group_id in enumerate(group_ids):
+                    self._batched_selection[group_id] = (selected[idx],
+                                                         ess[idx])
+        super().update_requests(state, resource_manager)
+        self._batched_selection = {}
 
     def process_draft_tokens(
         self,
@@ -240,18 +337,28 @@ class SMCSampler(TorchSampler):
             raise RuntimeError(
                 "SMC-SD requires selected draft token log probabilities.")
 
-        logprob_diffs = self._compute_particle_logprob_diffs(request)
-        selected_particle = int(torch.argmax(logprob_diffs).item())
-        if resource_manager is not None:
-            spec_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if isinstance(spec_manager, SMCResourceManager):
-                group_id = int(getattr(
-                    request, "py_smc_group_id", request.py_request_id))
-                selected_particle, ess = spec_manager.select_particle(
-                    group_id, logprob_diffs)
-                setattr(request, "py_smc_effective_sample_size", ess)
-                setattr(request, "py_smc_selected_particle", selected_particle)
+        group_id = int(getattr(request, "py_smc_group_id",
+                               request.py_request_id))
+        cached = getattr(self, "_batched_selection", {}).get(group_id)
+        if cached is not None:
+            # Batched pre-pass already advanced particle state and resolved the
+            # selection on device; consume the cached host scalar (no sync).
+            selected_particle, ess = cached
+            setattr(request, "py_smc_effective_sample_size", ess)
+            setattr(request, "py_smc_selected_particle", selected_particle)
+        else:
+            # Fallback (e.g. no SMC resource manager): per-request path.
+            logprob_diffs = self._compute_particle_logprob_diffs(request)
+            selected_particle = int(torch.argmax(logprob_diffs).item())
+            if resource_manager is not None:
+                spec_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                if isinstance(spec_manager, SMCResourceManager):
+                    selected_particle, ess = spec_manager.select_particle(
+                        group_id, logprob_diffs)
+                    setattr(request, "py_smc_effective_sample_size", ess)
+                    setattr(request, "py_smc_selected_particle",
+                            selected_particle)
 
         num_accepted = self._accept_selected_particle(
             request=request,
