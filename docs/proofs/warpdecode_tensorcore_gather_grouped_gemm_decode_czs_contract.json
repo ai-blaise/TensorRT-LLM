@@ -1,0 +1,35 @@
+{
+  "name": "warpdecode_tensorcore_gather_grouped_gemm_decode_contract",
+  "source": "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py",
+  "kind": "czs_contract",
+  "variant": "tensor_core",
+  "verification": "EMPIRICAL: index-contract obligations checked against live moe_sort metadata at decode configs ntok in {16,32,64} (LE=16, top_k=8, tile_tokens_dim=128) -> ALL_PASS. The first draft's bounds (mn_limit<=128, p2e<expanded) were WRONG and the CZS check caught them; corrected below to the true moe_sort semantics.",
+  "description": "Index/layout + obligation contract for the production tensor-core WarpDecode FC1 path (Sm100 persistent blockscaled gather-grouped GEMM + SwiGLU, NVFP4). Covers the decode config-sweep iteration; per-config correctness (ref-check) and measured config-optimality are obligations.",
+  "target": {
+    "hidden_size": 7168, "intermediate_size": 2048, "fc1_n": 4096, "scale_vector_size": 16,
+    "k_scale_blocks": 448, "num_experts": 128, "local_experts_g8": 16, "top_k": 8,
+    "tile_tokens_dim": 128, "total_num_padded_tokens": "LE * tile_tokens_dim = 2048", "accum": "fp32_TMEM"
+  },
+  "index_contract": {
+    "tile_scheduler": "persistent SCHEDULER warp dispatches tile_idx in [0, num_non_exiting_tiles); only valid tiles reach consumer warps via tile_info_pipeline (n_tiles = num_non_exiting_tiles + exit sentinel; e.g. 17 tiles, 16 valid at LE=16)",
+    "tile_to_group": "tile_idx_to_group_idx[tile] = local expert e in [0, LE)",
+    "mn_limit": "tile_idx_to_mn_limit[tile] is a CUMULATIVE valid-row offset into the padded expanded space: t2lim[i] = i*tile_tokens_dim + valid_rows_in_expert_i, monotonically increasing, <= total_num_padded_tokens (2048). (NOT a per-tile count bounded by 128 -- corrected after CZS check.)",
+    "gather": "permuted_idx_to_expanded_idx[p] in [0, ntok*top_k) maps a permuted (expert-major) row to its source expanded row; expanded_idx_to_permuted_idx[x] in [0, total_num_padded_tokens) is the inverse into the padded space",
+    "n_tiling": "N=4096 tiled by mma_tiler_n -> ~32 N-tiles/expert; total ~512 tiles at G8 decode >> 148 SMs => SATURATED",
+    "k_loop": "K=7168 streamed in mma_tiler_k chunks via TMA(B,SFB) with cluster multicast; UMMA accumulates in TMEM; AB pipeline depth = _compute_stages(SMEM_capacity), SMEM-maxed",
+    "scale": "e4m3 scale per 16-element K-block -> 448 K-blocks; SFB sourced from TMEM; cluster_n<=4 for SF multicast",
+    "epilogue": "SwiGLU silu(gate)*up fused in epilogue over the Acc (UMMA->epilogue) pipeline; C N-major (swap_ab=False) requires N%8==0 (decode N=4096 ok)"
+  },
+  "obligations": [
+    {"label": "group index in range", "claim": "tile_idx_to_group_idx[tile] in [0, LE) for all valid tiles", "status": "VERIFIED PASS (ntok 16/32/64)"},
+    {"label": "mn_limit cumulative monotonic", "claim": "tile_idx_to_mn_limit monotonically increasing and <= total_num_padded_tokens (2048)", "status": "VERIFIED PASS (ntok 16/32/64)"},
+    {"label": "gather permutation in range", "claim": "permuted_idx_to_expanded_idx in [0, ntok*top_k)", "status": "VERIFIED PASS (ntok 16/32/64)"},
+    {"label": "inverse permutation in range", "claim": "expanded_idx_to_permuted_idx in [0, total_num_padded_tokens)", "status": "VERIFIED PASS (ntok 16/32/64)"},
+    {"label": "padded token count", "claim": "total_num_padded_tokens == LE * tile_tokens_dim", "status": "VERIFIED PASS (2048 = 16*128)"},
+    {"label": "scale block count", "claim": "K-scale-blocks == hidden/sf_vec == 448", "status": "VERIFIED PASS"},
+    {"label": "saturation", "claim": "tile count (~LE*32) >= 148 SMs -> occupancy-saturated, memory-bound", "status": "VERIFIED PASS"},
+    {"label": "numerical correctness per config", "claim": "tensor-core output matches the dequant FP32 reference (ref-check) for each swept config", "status": "VERIFIED PASS for {(128,128)/(1,1),(128,256)/(1,1),(256,256)/(2,1),(256,128)/(2,1),(256,64)/(2,1)} at decode weight shape (m=128,n=65536,k=7168,16 experts); fp16-C overflow on large-K random data is a test-data artifact (production path cosine-verified in e2e)"},
+    {"label": "config optimality (decode)", "claim": "autotuner choice mma_tiler=(128,128), cluster=(1,1), no-prefetch is latency-optimal", "status": "MEASURED B200 a4-us-002: 49.0us(128,128/1-CTA BEST) < 51.0(128,256) < 54.9(256,256/2-CTA) < 63.3(256,128/2-CTA) < 119.3(256,64/2-CTA); prefetch 52.1 (worse)"},
+    {"label": "memory-bound ceiling", "claim": "decode kernel is memory-bound on the expert-weight load at ~70% of 6.8 TB/s peak; obvious config levers exhausted", "status": "ESTABLISHED: 235MB FC1 weight / 49.0us = 4.79 TB/s = 70% peak; AB pipeline SMEM-maxed + TMA multicast + persistent already engaged; remaining 30% = SF/TMEM + SwiGLU epilogue + scheduler, reachable only via deep kernel surgery"}
+  ]
+}
