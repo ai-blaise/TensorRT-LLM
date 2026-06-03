@@ -334,10 +334,12 @@ def test_layer_mask_round_robin_rank_0_owns_every_8th_layer():
     # Balanced layer_mask (M5d-tight-v2): length = ceil(61/8)*8 = 64.
     # Rank 0 owns the 8 real layers 0,8,...,56; the 3 phantom slots
     # (61, 62, 63) are False because rank 0 already hits target=8.
+    # The trimmed mask is only produced under owner_local_alloc=True.
     mask = build_layersplit_layer_mask(
         num_layers=61,
         sparse_attn_config=_sparse_cfg(
-            layersplit_owner_assignment="round_robin"),
+            layersplit_owner_assignment="round_robin",
+            layersplit_owner_local_alloc=True),
         cp_size=8,
         cp_rank=0,
     )
@@ -355,7 +357,7 @@ def test_layer_mask_round_robin_rank_5_owns_layers_5_13_21_etc():
     # 63 stay False (already at target).
     mask = build_layersplit_layer_mask(
         num_layers=61,
-        sparse_attn_config=_sparse_cfg(),
+        sparse_attn_config=_sparse_cfg(layersplit_owner_local_alloc=True),
         cp_size=8,
         cp_rank=5,
     )
@@ -375,7 +377,8 @@ def test_layer_mask_contiguous_rank_3_owns_block():
     mask = build_layersplit_layer_mask(
         num_layers=61,
         sparse_attn_config=_sparse_cfg(
-            layersplit_owner_assignment="contiguous"),
+            layersplit_owner_assignment="contiguous",
+            layersplit_owner_local_alloc=True),
         cp_size=8,
         cp_rank=3,
     )
@@ -384,6 +387,22 @@ def test_layer_mask_contiguous_rank_3_owns_block():
                                                                 False]
     assert mask == expected
     assert sum(mask) == 8
+
+
+def test_layer_mask_none_when_owner_local_alloc_off():
+    # Default (replicated) posture: even with LayerSplit enabled + cp_size>1,
+    # the mask is None so every CP rank keeps the full pool. This is the
+    # correctness-first prefill posture that lets the dense-MLA C++ attention
+    # path resolve a pool slot for every layer (layer_offsets stays complete).
+    for policy in ("round_robin", "contiguous"):
+        mask = build_layersplit_layer_mask(
+            num_layers=61,
+            sparse_attn_config=_sparse_cfg(
+                layersplit_owner_assignment=policy),  # owner_local_alloc unset
+            cp_size=8,
+            cp_rank=0,
+        )
+        assert mask is None, policy
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +672,8 @@ def test_layer_mask_sum_across_ranks_covers_every_layer_exactly_once():
             build_layersplit_layer_mask(
                 num_layers=num_layers,
                 sparse_attn_config=_sparse_cfg(
-                    layersplit_owner_assignment=policy),
+                    layersplit_owner_assignment=policy,
+                    layersplit_owner_local_alloc=True),
                 cp_size=cp_size,
                 cp_rank=rank,
             ) for rank in range(cp_size)
@@ -688,7 +708,7 @@ def test_balanced_layer_mask_keeps_num_layers_divisible_case_unpadded():
     # because target_per_rank * cp_size == num_layers).
     mask = build_layersplit_layer_mask(
         num_layers=8,
-        sparse_attn_config=_sparse_cfg(),
+        sparse_attn_config=_sparse_cfg(layersplit_owner_local_alloc=True),
         cp_size=4,
         cp_rank=2,
     )
@@ -704,7 +724,7 @@ def test_balanced_layer_mask_extreme_cp_greater_than_num_layers():
     # a phantom slot (so the C++ pool size is consistent).
     mask = build_layersplit_layer_mask(
         num_layers=2,
-        sparse_attn_config=_sparse_cfg(),
+        sparse_attn_config=_sparse_cfg(layersplit_owner_local_alloc=True),
         cp_size=4,
         cp_rank=3,
     )

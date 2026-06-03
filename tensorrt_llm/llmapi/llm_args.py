@@ -410,6 +410,17 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Require every CP rank to participate in LayerSplit cache transfer.")
+    layersplit_owner_local_alloc: bool = Field(
+        default=False,
+        description=
+        "Trim each CP rank's DSA KV/indexer pools to its owned layers and "
+        "route non-owned layers through a shared broadcast scratch (the "
+        "M5d-tight memory-savings posture). Keep False (replicated pools on "
+        "every rank) for the dense-MLA attention path: that path resolves KV "
+        "through the C++ pool pointer, which cannot read the scratch, so a "
+        "trimmed non-owned layer would have no readable KV slot. Set True only "
+        "once the dense-attention path can source KV from the broadcast "
+        "scratch.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):

@@ -14,7 +14,8 @@
 #include <cutlass/bfloat16.h>
 #include <stdexcept>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 namespace
 {
@@ -267,4 +268,5 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
     smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combineParams);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

@@ -117,6 +117,13 @@ struct MlaParams
     // for Helix parallelism: whether the current rank is inactive, shape [b]
     // (the current query tokens are not appended to this rank's KV cache)
     bool const* helix_is_inactive_rank{nullptr};
+
+    // NVFP4 dense KV: parallel block-scale pool (one E4M3 scale per 16 elems of
+    // the 576-wide latent, 36 bytes/token). Only populated when
+    // cache_type == KvCacheDataType::NVFP4; shares the data pool's block-offset
+    // table. The decode-time generation write fills it alongside the packed
+    // E2M1 data pool.
+    KVBlockArray kv_scale_cache;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -134,10 +141,10 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
     float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
 
 template <typename T, typename TCache>
-void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* latent_cache_ptr, int const num_requests,
-    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
-    float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
-    float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_scale_cache, T* q_ptr,
+    T* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
+    int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
+    int lora_size, float const* kv_scale_orig_quant_ptr, KvCacheDataType cache_type, cudaStream_t stream);
 
 // Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
 // leaving the first nope_dim elements untouched.

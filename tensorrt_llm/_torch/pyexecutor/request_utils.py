@@ -243,6 +243,21 @@ def partition_context_for_helix(
 ) -> Tuple[List[int], List[int], int, int]:
     """Partition context for Helix CP.
 
+    Helix round-robin block assignment requires at least one KV block per CP
+    rank (rank ``r`` owns blocks ``{r, r+cp_size, ...}``). A prompt short enough
+    that ``ceil(input_len / tokens_per_block) < cp_size`` (e.g. a sub-128-token
+    request at ``tokens_per_block=64, cp_size=2``) would otherwise leave the
+    high CP ranks with zero blocks. Rather than rejecting the request (which
+    crashes the gen-server MPI worker on any short prompt — chat/coding-agent
+    turns and benchmark warmups routinely send them), the global block grid is
+    padded up to exactly ``cp_size`` blocks so every rank owns one. The extra
+    blocks beyond the real tokens are pure right-padding; their KV is written
+    but never attended to as queries (the real ``prompt_len`` / causal masking
+    bound the live tokens), so the partial-attention combine is unchanged. This
+    mirrors the existing single-partial-block padding below and the warmup path
+    in ``KVCacheManager.add_dummy_requests`` (which already clamps helix dummy
+    token counts up so short sequences are legal).
+
     Args:
         input_token_ids: List of input token IDs.
         cp_rank: Current CP rank.
@@ -251,28 +266,23 @@ def partition_context_for_helix(
 
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
-
-    Raises:
-        ValueError: If there aren't enough tokens for at least one block per CP rank.
     """
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
-    num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
-    if num_total_blocks < cp_size:
-        raise ValueError(
-            f"There aren't enough tokens to get at least one block per CP rank. "
-            f"num_total_blocks {num_total_blocks} < num_cp_ranks {cp_size}. "
-            f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
-        )
-
-    # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
-    padding_len = 0
-    if input_len % tokens_per_block != 0:
-        padding_len = tokens_per_block - (input_len % tokens_per_block)
+    # Pad so the global block grid holds exactly one block per CP rank at the
+    # minimum (short prompt) and otherwise rounds the final partial block up.
+    # padding_len is the total right-padding; it always lands in the global last
+    # block(s), keeping the single-strip invariant below intact for the common
+    # case and extending it to the short-prompt case via padded_total_len.
+    num_real_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
+    num_total_blocks = max(num_real_blocks, cp_size)
+    padded_total_len = num_total_blocks * tokens_per_block
+    padding_len = padded_total_len - input_len
+    if padding_len > 0:
         padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
         all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
-    all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
+    all_position_ids = torch.arange(0, padded_total_len, dtype=torch.int64).unsqueeze(0)
 
     # Round-robin block assignment across CP ranks: rank r owns blocks {r, r+cp_size, r+2*cp_size, ...}.
     # This must agree with the C++ KV cache split kernels (cacheSplitConcat.cu) so that the input
@@ -285,12 +295,23 @@ def partition_context_for_helix(
         torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
     )
 
-    # The (single) padded block is the global last block; under round-robin it is owned by rank
-    # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
-    last_block_owner = (num_total_blocks - 1) % cp_size
-    if cp_rank == last_block_owner and padding_len > 0:
-        input_ids_this_rank = input_ids_this_rank[:-padding_len]
-        position_ids_this_rank = position_ids_this_rank[:-padding_len]
+    # All padding is contiguous at the tail, so it occupies the final
+    # (num_total_blocks - num_real_blocks_with_data) blocks plus the trailing
+    # part of the last data block. Strip every padded token from each rank that
+    # owns any tail-padded block. A block global index b holds padding iff
+    # b * tokens_per_block + (token offset) >= input_len; equivalently the last
+    # real token sits in block (input_len - 1) // tokens_per_block, so any block
+    # strictly after it is all-padding and any token position >= input_len in
+    # its owning block is padding. Trim by absolute position to stay correct for
+    # both the single-partial-block case and the short-prompt all-padding-block
+    # case (where high ranks own a wholly-padded block).
+    if padding_len > 0:
+        kept_input, kept_pos = [], []
+        for tok, pos in zip(input_ids_this_rank, position_ids_this_rank):
+            if pos < input_len:
+                kept_input.append(tok)
+                kept_pos.append(pos)
+        input_ids_this_rank, position_ids_this_rank = kept_input, kept_pos
 
     return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
 

@@ -170,6 +170,18 @@ class LayerSplitRuntimeState:
     all_cp_ranks_transfer: bool
     cp_size: int
     cp_rank: int
+    # When True, the C++ KV/indexer pools are trimmed to this rank's owned
+    # layers (the M5d-tight memory-savings posture) and the DSACacheManager
+    # routes non-owned layers through a shared scratch buffer. When False
+    # (the default, correctness-first posture for prefill bring-up), every
+    # CP rank allocates the full per-layer pool and the per-layer broadcast
+    # writes the owner's active blocks straight into the real pool slot that
+    # the dense-MLA C++ attention kernels read. The trimmed posture is only
+    # correct once the dense-MLA path can read its KV from the broadcast
+    # scratch instead of the C++ pool pointer (an attention-backend refactor
+    # still pending), so it stays opt-in. See ``build_layersplit_layer_mask``
+    # and ``DSACacheManager._maybe_alloc_layersplit_scratch``.
+    owner_local_alloc: bool = False
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
     cp_group_ranks: Optional[Tuple[int, ...]] = field(default=None, repr=False)
@@ -551,6 +563,7 @@ class LayerSplitRuntimeState:
             all_cp_ranks_transfer=True,
             cp_size=1,
             cp_rank=0,
+            owner_local_alloc=False,
             comm_stream=None,
         )
 
@@ -589,6 +602,8 @@ class LayerSplitRuntimeState:
         all_cp_ranks_transfer = bool(
             getattr(sparse_attn_config, "layersplit_all_cp_ranks_transfer",
                     True))
+        owner_local_alloc = bool(
+            getattr(sparse_attn_config, "layersplit_owner_local_alloc", False))
         if transfer_backend not in _VALID_TRANSFER_BACKENDS:
             raise ValueError(
                 f"unknown layersplit_transfer_backend {transfer_backend!r}; "
@@ -622,6 +637,7 @@ class LayerSplitRuntimeState:
             all_cp_ranks_transfer=all_cp_ranks_transfer,
             cp_size=cp_size,
             cp_rank=cp_rank,
+            owner_local_alloc=owner_local_alloc,
             comm_stream=comm_stream,
             indexer_comm_stream=indexer_comm_stream,
         )
@@ -821,6 +837,19 @@ def build_layersplit_layer_mask(
     if not bool(getattr(sparse_attn_config, "layersplit_enabled", False)):
         return None
     if cp_size <= 1:
+        return None
+    # Pool trimming (and the per-rank memory savings it buys) is only safe
+    # in the owner-local-alloc posture: it removes non-owned layers from the
+    # C++ pool, which makes layer_offsets miss those layers and forces the
+    # DSACacheManager scratch dispatch. The dense-MLA C++ attention kernels
+    # read KV via the pool pointer, not the scratch, so they cannot serve a
+    # non-owned layer whose slot was trimmed. In the default (replicated)
+    # posture every rank keeps the full pool so every layer_offsets lookup
+    # resolves and the per-layer broadcast lands in the real pool slot the
+    # kernels read. Returning None here selects the regular all-layers
+    # allocation path.
+    if not bool(getattr(sparse_attn_config, "layersplit_owner_local_alloc",
+                        False)):
         return None
     policy = str(
         getattr(sparse_attn_config, "layersplit_owner_assignment",

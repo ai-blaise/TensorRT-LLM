@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,6 +71,8 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
+    // NVFP4 dense KV: parallel block-scale pool buffer (empty for non-NVFP4).
+    tk::KVBlockArray kv_scale_cache_buffer;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -111,6 +113,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.host_bmm1_scale = args.host_bmm1_scale;
     mla_params.helix_position_offsets = args.helix_position_offsets_ptr;
     mla_params.helix_is_inactive_rank = args.helix_is_inactive_rank_ptr;
+    mla_params.kv_scale_cache = args.kv_scale_cache_buffer;
 
     tk::invokeMLARopeGeneration<T>(mla_params, kv_cache_buffer, stream);
 }
@@ -144,7 +147,15 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     auto stream = at::cuda::getCurrentCUDAStream(fused_q.get_device());
     auto const kv_cache_quant_mode = tc::QuantMode(uint32_t(quant_mode));
     bool const use_gen_flash_mla = tc::getSMVersion() == 90 && tokens_per_block == 64;
-    TLLM_CHECK_WITH_INFO(!kv_cache_quant_mode.hasFp4KvCache(), "FP4 KV cache is not supported for MLA generation.");
+    // NVFP4 dense MLA KV: the generation kernel quantizes the 576-wide latent on
+    // write into the data + block-scale pools (read back by the FlashMLA NVFP4
+    // sparse-decode kernel). The SM90 gen-flash-mla path stays non-NVFP4.
+    if (kv_cache_quant_mode.hasFp4KvCache())
+    {
+        TLLM_CHECK_WITH_INFO(!use_gen_flash_mla,
+            "NVFP4 KV cache is not supported on the SM90 gen-flash-mla MLA generation path.");
+        TLLM_CHECK_WITH_INFO(tokens_per_block == 64, "NVFP4 dense MLA KV cache requires tokens_per_block == 64.");
+    }
     TLLM_CHECK_WITH_INFO(
         host_kv_cache_pool_mapping.has_value(), "KV cache pool mapping is required for MLA generation.");
 
@@ -197,11 +208,13 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     bool const fp8_context_fmha = kv_cache_quant_mode.hasFp8KvCache();
     int32_t const batch_beam = beam_width * num_generations;
 
-    auto kv_cache_buffer = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
+    auto kv_cache_buffers = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
         host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam,
         tokens_per_block, num_kv_heads, head_size, attention_window_size, attention_window_size, beam_width, seq_offset,
-        true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()))
-                               .kvCacheBuffer;
+        true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()));
+    auto kv_cache_buffer = kv_cache_buffers.kvCacheBuffer;
+    // NVFP4: the parallel E4M3 block-scale pool (empty for non-NVFP4).
+    auto kv_scale_cache_buffer = kv_cache_buffers.kvScaleCacheBuffer;
 
     tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 
@@ -225,12 +238,12 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         ? static_cast<int*>(block_ids_per_seq->data_ptr())
         : nullptr;
 
-    // Currently NVFP4 KV cache is not supported for MLA
     MlaRopeGenArgs args{q_pe_ld, q_pe_stride, rotary_cos_sin_ptr, num_generations, num_gen_tokens,
         static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, max_context_q_len,
         block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
         mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr, kv_scale_orig_quant_ptr,
-        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr};
+        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr,
+        kv_scale_cache_buffer};
 
     auto const input_dtype = fused_q.scalar_type();
     if (input_dtype == torch::kFloat16)

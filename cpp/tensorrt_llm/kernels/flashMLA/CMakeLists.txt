@@ -17,6 +17,9 @@
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
+# NVFP4 sparse sources are built by the dedicated flash_mla_nvfp4_sparse_src
+# target (SM100f + its own include dirs); exclude them from this SM90 glob.
+list(FILTER SRC_CU EXCLUDE REGEX "nvfp4")
 
 add_library(flash_mla_src OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET flash_mla_src PROPERTY POSITION_INDEPENDENT_CODE ON)

@@ -2472,6 +2472,86 @@ class MLA(nn.Module):
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
+    def _sparse_mla_decode_nvfp4(
+        self,
+        fused_q: torch.Tensor,
+        attn_metadata: "DSAtrtllmAttentionMetadata",
+        topk_indices: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Sparse MLA decode against an NVFP4 dense KV cache (SM100/B200).
+
+        ``fused_q`` is ``[num_tokens, num_heads_tp * (kv_lora_rank +
+        qk_rope_head_dim)]`` with rope already applied to the trailing
+        qk_rope_head_dim of each head (the latent K was quantized to NVFP4 on
+        write). Builds the packed-byte ``kv`` and ``kv_scales`` page views from
+        the dense data/block-scale pools, converts the per-request topk indices
+        to global token indices (shared layout with the data pool), runs
+        ``sparse_mla_decode_nvfp4`` (h_q hard-padded to 128, d_v=512), and
+        returns ``[num_tokens, num_heads_tp_cp * kv_lora_rank]`` to feed the
+        existing v_b_proj BMM tail.
+        """
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        tokens_per_block = kv_cache_manager.tokens_per_block
+        assert tokens_per_block == 64, (
+            "sparse_mla_decode_nvfp4 hard-requires tokens_per_block == 64, "
+            f"got {tokens_per_block}")
+        head_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 576
+
+        # q_concat: [num_tokens, 128, 576]; the kernel requires exactly 128 q
+        # heads, so pad with zeros when TP shards heads below 128.
+        q_concat = fused_q.view([num_tokens, self.num_heads_tp, head_dim])
+        padding = 128
+        assert self.num_heads_tp <= padding, (
+            f"sparse_mla_decode_nvfp4 supports up to {padding} heads, got "
+            f"{self.num_heads_tp}")
+        if self.num_heads_tp != padding:
+            q_padded = q_concat.new_zeros((num_tokens, padding, head_dim))
+            q_padded[:, :self.num_heads_tp, :] = q_concat
+            q_concat = q_padded
+        # [num_tokens, 128, 576] -> [batch, s_q, 128, 576]
+        num_seqs = attn_metadata.num_seqs
+        assert num_tokens % num_seqs == 0, (
+            "sparse MLA decode requires a uniform number of query tokens per "
+            f"sequence (num_tokens={num_tokens}, num_seqs={num_seqs})")
+        s_q = num_tokens // num_seqs
+        q_concat = q_concat.view([num_seqs, s_q, padding, head_dim])
+
+        # Dense NVFP4 data + block-scale pools, flattened over (block, layer,
+        # token) just like the bf16 FlashMLA path so the same global token
+        # indices address both. The data pool stores 288 packed bytes/token,
+        # the scale pool 36 E4M3 bytes/token (one scale per 16 elements).
+        data_pool = kv_cache_manager.get_unique_primary_pool()
+        num_blocks, num_layers = data_pool.shape[0], data_pool.shape[1]
+        kv = data_pool.reshape(num_blocks * num_layers, tokens_per_block, 1,
+                               head_dim // 2)
+        scale_pool = kv_cache_manager.get_dense_block_scale_pool()
+        kv_scales = scale_pool.reshape(num_blocks * num_layers,
+                                       tokens_per_block, 1, head_dim // 16)
+
+        topk_indices_pool, _ = transform_local_topk_and_prepare_pool_view(
+            topk_indices,
+            attn_metadata,
+            layer_idx=self.layer_idx,
+            is_generation=True,
+        )
+        # [num_tokens, topk] -> [batch, s_q, topk]
+        indices = topk_indices_pool.view(num_seqs, s_q, -1).contiguous()
+
+        out = torch.ops.trtllm.sparse_mla_decode_nvfp4(
+            q_concat,
+            kv,
+            kv_scales,
+            indices,
+            d_v=self.kv_lora_rank,
+            sm_scale=self.softmax_scale,
+        )[0]
+        # out: [batch, s_q, 128, kv_lora_rank] -> drop head padding.
+        out = out.view([num_tokens, padding, self.kv_lora_rank])
+        out = out[:, :self.num_heads_tp_cp, :]
+        return out.reshape(
+            [num_tokens, self.num_heads_tp_cp * self.kv_lora_rank])
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -2502,6 +2582,13 @@ class MLA(nn.Module):
                                              device=q.device)
         has_fp8_kv_cache = self.mqa.has_fp8_kv_cache if hasattr(
             self.mqa, 'has_fp8_kv_cache') else False
+        # NVFP4 dense MLA KV: the K write below quantizes the 576-wide latent to
+        # NVFP4 (288 data bytes + 36 E4M3 scale bytes per token); the decode
+        # read is served by the dedicated sparse_mla_decode_nvfp4 FlashMLA
+        # kernel rather than the trtllm attention op (which only handles bf16/
+        # fp8 MLA KV here). The kernel hard-requires tokens_per_block == 64.
+        has_nvfp4_kv_cache = self.mqa.has_fp4_kv_cache if hasattr(
+            self.mqa, 'has_fp4_kv_cache') else False
 
         mla_bmm1_scale = None
         mla_bmm2_scale = None
@@ -2592,34 +2679,36 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-        fused_q = fused_q.view([
-            num_tokens,
-            self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
-        ])
+        if has_nvfp4_kv_cache:
+            # The K write inside mla_rope_generation has already quantized the
+            # 576-wide latent into the NVFP4 data + block-scale pools. Read it
+            # back with the dedicated FlashMLA NVFP4 sparse-decode kernel.
+            attn_out_latent = self._sparse_mla_decode_nvfp4(
+                fused_q, attn_metadata, topk_indices, num_tokens)
+        else:
+            # Use generation_only for generation phase and context_only for context phase in DSA attention
+            attention_input_type = AttentionInputType.generation_only
 
-        # Use generation_only for generation phase and context_only for context phase in DSA attention
-        attention_input_type = AttentionInputType.generation_only
-
-        attn_out_latent = self._attn_forward_gen(
-            self.mqa,
-            fused_q,
-            None,
-            None,
-            position_ids,
-            attn_metadata,
-            attention_input_type=attention_input_type,
-            out_scale=self.out_scale,
-            latent_cache=latent_cache,  # kvcache and k_pe
-            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-            topk_indices=topk_indices,  # used by DSA attention
-            cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
-            cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
-            fmha_scheduler_counter=
-            fmha_scheduler_counter,  # used by `mlaGeneration`
-            mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
-            mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
-            quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-        )
+            attn_out_latent = self._attn_forward_gen(
+                self.mqa,
+                fused_q,
+                None,
+                None,
+                position_ids,
+                attn_metadata,
+                attention_input_type=attention_input_type,
+                out_scale=self.out_scale,
+                latent_cache=latent_cache,  # kvcache and k_pe
+                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+                topk_indices=topk_indices,  # used by DSA attention
+                cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
+                cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
+                fmha_scheduler_counter=
+                fmha_scheduler_counter,  # used by `mlaGeneration`
+                mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
+                mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
+                quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+            )
         fused_q = None
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp

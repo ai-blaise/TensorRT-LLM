@@ -8,7 +8,10 @@
 #include <cuda_runtime_api.h>
 #include <cstdint>
 
-namespace tensorrt_llm::kernels
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 struct SparseMlaDecodeNvfp4Params
@@ -69,4 +72,5 @@ int32_t getSparseMlaDecodeNvfp4TotalSplits(int32_t b, int32_t numSmParts);
 
 void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

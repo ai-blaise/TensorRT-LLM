@@ -617,6 +617,21 @@ def create_py_executor(
         )
         llm_args.disable_overlap_scheduler = True
 
+    # SMC-SD verifies draft tokens with particle weights derived from the target
+    # token probabilities (SMCSampler.process_draft_tokens uses py_target_probs).
+    # The overlap scheduler computes the next token one step ahead and the
+    # two-model overlap path falls back to greedy rejection sampling, which
+    # bypasses SMC particle weighting and corrupts acceptance/quality. The draft
+    # attention backend does not reliably force this off (draft_attention_backend
+    # "triton"/"fa3" are not yet distinct attention backends and fall back to
+    # TRTLLM, which would leave overlap enabled), so force it off for SMC.
+    if spec_config is not None and spec_config.spec_dec_mode.is_smc(
+    ) and not llm_args.disable_overlap_scheduler:
+        logger.warning(
+            "Disabling overlap scheduler for SMC-SD: particle-weighted "
+            "verification is incompatible with the overlap greedy fallback.")
+        llm_args.disable_overlap_scheduler = True
+
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len

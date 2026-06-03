@@ -863,7 +863,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                       spec_metadata,
                                       spec_tree_manager,
                                       num_contexts=num_contexts)
-        self.max_draft_tokens = max_draft_len
+        # DSA's decode buffers (kv_lens_cuda_2d, kv_lens_expanded_cuda,
+        # block_table_expanded, heuristic scratch) and the DSL paged-MQA-logits
+        # next_n / atom-split are all sized as `1 + self.max_draft_tokens`, i.e.
+        # the per-request verified-token width. That width is the number of
+        # draft-tree NODES (max_total_draft_tokens), not the tree DEPTH
+        # (max_draft_len). For linear-tree / MTP / parallel-draft these are equal,
+        # so this is a no-op there. For SMC the tree is n_particles*gamma nodes
+        # (e.g. 24) at depth gamma (e.g. 6); sizing by max_draft_len undersizes the
+        # buffers vs the decode q buffer (which carries 1 + max_total_draft_tokens
+        # positions/req) and crashes the DSL atom-split reshape.
+        self.max_draft_tokens = max_total_draft_tokens
         capture_graph = self.is_cuda_graph
         if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
@@ -3056,9 +3066,16 @@ class Indexer(nn.Module):
 
                 pre_idx = None
                 heuristic_scratch = None
-                if self._enable_heuristic_topk:
-                    local_layer = metadata.kv_cache_manager.layer_offsets[
-                        self.layer_idx]
+                # heuristic_prev_topk is sized to the number of local (owned)
+                # layers and indexed by the local pool offset. Under LayerSplit
+                # owner-local alloc a non-owned layer has no offset and no row,
+                # so skip the temporal hint for it (its KV arrives via the
+                # owner broadcast; the hint is a perf accelerator, not a
+                # correctness input). layer_offsets always contains the layer
+                # in the replicated posture, so this is a no-op there.
+                local_layer = metadata.kv_cache_manager.layer_offsets.get(
+                    self.layer_idx) if self._enable_heuristic_topk else None
+                if local_layer is not None:
                     # Pass prev_topk directly; the +1 temporal offset is
                     # handled inside the C++ kernel (preIdxOffset += 1).
                     pre_idx = metadata.heuristic_prev_topk[
@@ -3139,13 +3156,18 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
 
             if self._enable_heuristic_topk:
-                local_layer = metadata.kv_cache_manager.layer_offsets[
-                    self.layer_idx]
-                decode_topk = topk_indices_buffer[
-                    num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
-                last_mtp_topk = decode_topk[next_n - 1::next_n]
-                metadata.heuristic_prev_topk[
-                    local_layer, :num_generations].copy_(last_mtp_topk)
+                # Mirror the read-side guard: a non-owned LayerSplit layer has
+                # no heuristic_prev_topk row, so there is nothing to feed back.
+                # layer_offsets always contains the layer in the replicated
+                # posture, so this is a no-op there.
+                local_layer = metadata.kv_cache_manager.layer_offsets.get(
+                    self.layer_idx)
+                if local_layer is not None:
+                    decode_topk = topk_indices_buffer[
+                        num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+                    last_mtp_topk = decode_topk[next_n - 1::next_n]
+                    metadata.heuristic_prev_topk[
+                        local_layer, :num_generations].copy_(last_mtp_topk)
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
@@ -3309,6 +3331,30 @@ class Indexer(nn.Module):
                     active_block_ids=active_block_ids,
                     cp_group=layersplit_state.cp_group,
                 )
+
+            # M5f-scale: under NVFP4 the dense KV has a sibling block-scale pool
+            # whose non-owned-layer scratch slot the dense-MLA kernel also reads
+            # (via the augmented pool pointers' scale column). Broadcast the
+            # active blocks' scales alongside the data so the non-owner has both
+            # halves; no-op when there is no dense scale scratch (non-NVFP4 /
+            # replicated / owner-only). Owners share the same block-offset table
+            # for data and scale, so active_block_ids index both consistently.
+            get_scale_slot = getattr(kv_cache_manager, "get_dense_scale_slot",
+                                     None)
+            if get_scale_slot is not None:
+                try:
+                    dense_scale_slot = get_scale_slot(self.layer_idx)
+                except (AttributeError, IndexError, KeyError, RuntimeError):
+                    dense_scale_slot = None
+                if dense_scale_slot is not None:
+                    flat_scale = dense_scale_slot.reshape(
+                        dense_scale_slot.shape[0], -1)
+                    layersplit_state.maybe_broadcast_active_blocks(
+                        layer_idx=self.layer_idx,
+                        cache_slot=flat_scale,
+                        active_block_ids=active_block_ids,
+                        cp_group=layersplit_state.cp_group,
+                    )
 
             # M5g (system-level fusion) tested and measured to be
             # 0.77x slower than the separate path at V3.2 production
@@ -3612,8 +3658,18 @@ class DSACacheManager(KVCacheManager):
         # chain correctly.
         self._layersplit_indexer_k_scratch = None
         self._layersplit_dense_kv_scratch = None
+        self._layersplit_hisa_pagerep_scratch = None
+        self._layersplit_hisa_pagecount_scratch = None
+        # Only allocate the non-owned-layer scratch in the owner-local-alloc
+        # posture. In the default (replicated) posture every layer has a real
+        # pool slot, so the accessors must return the pool slot (not scratch)
+        # and the per-layer broadcast lands directly in the slot the dense-MLA
+        # C++ kernels read. Leaving the scratch tensors None makes
+        # get_indexer_k_cache_buffers / get_buffers / get_indexer_hisa_page_
+        # rep_buffers fall through to the pool-backed path for every layer.
         if (self.layersplit_state.enabled
-                and self.layersplit_state.cp_size > 1):
+                and self.layersplit_state.cp_size > 1
+                and self.layersplit_state.owner_local_alloc):
             owned = self.layersplit_state.ownership.owned_layers(
                 self.layersplit_state.cp_rank)
             if owned:
@@ -3633,12 +3689,40 @@ class DSACacheManager(KVCacheManager):
                     # None cache_slot).
                     pass
                 try:
-                    dense_template = super().get_buffers(first_owned)
+                    # The dense scratch must mirror the *raw* per-layer pool
+                    # slot that the dense-MLA C++ attention reads through the
+                    # pool pointer (get_primary_pool_data is a view of one C++
+                    # pool slot: [num_blocks, kv_factor, block_size]). Under
+                    # NVFP4 the base get_buffers() NHD reshape uses the logical
+                    # latent width, which does not match the packed pool bytes,
+                    # so always mirror the raw pool row. The scratch gets its
+                    # OWN storage (torch.empty_like, not a pool view) so its
+                    # .data_ptr() can be handed to the C++ attention as a
+                    # standalone single-layer pool for non-owned layers. See
+                    # _build_layersplit_dense_scratch_pool below.
+                    first_owned_offset = self.layer_offsets[first_owned]
+                    dense_template = self.impl.get_primary_pool_data(
+                        first_owned_offset)
                     if dense_template is not None:
                         self._layersplit_dense_kv_scratch = torch.empty_like(
                             dense_template)
-                except (KeyError, IndexError, AttributeError):
+                except (KeyError, IndexError, AttributeError, RuntimeError):
                     pass
+                if self.enable_hisa_page_reps:
+                    # Non-owned layers recompute HISA page reps locally from
+                    # the broadcast indexer-K scratch, so they need their own
+                    # shared page-rep/count scratch (one slot, reused per layer
+                    # like the indexer-K scratch above).
+                    try:
+                        pr_tmpl, pc_tmpl = (
+                            self._get_indexer_hisa_page_rep_buffers_owned(
+                                first_owned))
+                        self._layersplit_hisa_pagerep_scratch = torch.empty_like(
+                            pr_tmpl)
+                        self._layersplit_hisa_pagecount_scratch = (
+                            torch.empty_like(pc_tmpl))
+                    except (KeyError, IndexError, AttributeError):
+                        pass
                 if self._layersplit_indexer_k_scratch is not None:
                     total_layers = self.layersplit_state.ownership.num_layers
                     logger.info(
@@ -3652,6 +3736,187 @@ class DSACacheManager(KVCacheManager):
                         else "n/a",
                         100.0 * (1.0 - len(owned) / total_layers),
                     )
+        # Wire the dense scratch into the C++ dense-MLA attention as a real
+        # single-layer pool the kernel can address (the owner-local-alloc
+        # memory-saving read path). See _build_layersplit_dense_scratch_pool.
+        self._layersplit_dense_scratch_pool_index = None
+        self._layersplit_kv_cache_pool_pointers_ls = None
+        self._layersplit_kv_cache_pool_mapping_ls = None
+        self._layersplit_nonowned_layer_rows = {}
+        if (self.layersplit_state.enabled
+                and self.layersplit_state.cp_size > 1
+                and self.layersplit_state.owner_local_alloc
+                and self._layersplit_dense_kv_scratch is not None):
+            self._build_layersplit_dense_scratch_pool()
+
+    def _build_layersplit_dense_scratch_pool(self) -> None:
+        """Expose the non-owned-layer dense scratch as a real C++-addressable pool.
+
+        Under ``owner_local_alloc=True`` each CP rank trims its dense KV pool
+        to the layers it owns, so a non-owned layer has no pool slot. The
+        dense-MLA C++ attention op resolves its KV byte address purely from
+        ``(host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+        kv_cache_block_offsets, local_layer_idx)`` — it never reads the Python
+        ``get_buffers()`` accessor — so returning a separate Python scratch
+        tensor from ``get_buffers`` (the M5d-tight scaffold) does NOT feed the
+        dense kernel. To make non-owned layers correct we append the dense
+        scratch as one extra *single-layer* pool:
+
+        * ``kv_cache_pool_pointers``: append a row holding the scratch
+          ``data_ptr`` (and, under NVFP4, the scratch block-scale ``data_ptr``)
+          with the same ``[primary, secondary]`` / ``[..., data, scale]`` shape
+          as the real rows. The scratch pool is primary-only (secondary = 0).
+        * ``kv_cache_pool_mapping``: append one row per non-owned layer, each
+          mapping to ``(scratch_pool_index, layer_idx_in_pool=0)`` so the C++
+          ``intra_pool_offset`` is 0 (the scratch is single-layer). Each
+          non-owned layer gets a *distinct* mapping row index (its
+          ``local_layer_idx``) so the C++ attention op's per-layer config cache
+          key stays unique, while all rows point at the same scratch storage.
+        * ``kv_cache_block_offsets``: the scratch pool's per-step block table is
+          re-encoded from pool 0's (decode the global block id, re-encode with
+          the single-layer stride). Handled in the metadata prepare via
+          :meth:`fill_layersplit_scratch_block_offsets`; the scratch tensor row
+          ``b`` holds global block ``b`` so the offset value is the global block
+          id (kv_factor=1 for SELFKONLY).
+
+        The owner-layer rows of both pointers and mapping are unchanged, so
+        owned layers keep reading their real trimmed-pool slots. The indexer-K
+        path is unaffected (it uses the Python pool list + scratch, not these
+        C++ pool pointers).
+        """
+        owned = self.layersplit_state.ownership.owned_layers(
+            self.layersplit_state.cp_rank)
+        owned_set = set(owned)
+        total_layers = self.layersplit_state.ownership.num_layers
+        non_owned = [l for l in range(total_layers) if l not in owned_set]
+        if not non_owned:
+            return
+
+        base_pointers = self.kv_cache_pool_pointers
+        base_mapping = self.kv_cache_pool_mapping
+        if base_pointers is None or base_mapping is None:
+            return
+
+        # --- Augmented pool pointers: one extra single-layer scratch pool. ---
+        # base_pointers shape is [num_pools, 2] (primary, secondary) or
+        # [num_pools, 2, 2] (primary/secondary x data/scale) under NVFP4.
+        scratch_primary = int(self._layersplit_dense_kv_scratch.data_ptr())
+        if base_pointers.dim() == 3:
+            # NVFP4: [num_pools, 2, 2]; columns are (data, scale).
+            scratch_scale = 0
+            if self.dtype == DataType.NVFP4:
+                try:
+                    # Mirror the dense block-scale pool row for the scratch so
+                    # the kernel reads matching E4M3 scales for the broadcast
+                    # latent. One shared scratch scale slot, reused per layer.
+                    scale_pool = self.get_dense_block_scale_pool()
+                    first_owned_offset = self.layer_offsets[owned[0]]
+                    scale_template = scale_pool.index_select(
+                        0 if scale_pool.shape[0] == self.num_blocks else 1,
+                        torch.tensor([0], device=scale_pool.device))
+                    self._layersplit_dense_scale_scratch = torch.empty(
+                        (self.num_blocks, ) +
+                        tuple(self._dense_scale_row_shape(scale_pool)),
+                        dtype=scale_pool.dtype,
+                        device=scale_pool.device)
+                    scratch_scale = int(
+                        self._layersplit_dense_scale_scratch.data_ptr())
+                except (KeyError, IndexError, AttributeError, RuntimeError,
+                        AssertionError):
+                    self._layersplit_dense_scale_scratch = None
+            scratch_row = torch.tensor(
+                [[[scratch_primary, scratch_scale], [0, 0]]],
+                dtype=base_pointers.dtype,
+                device=base_pointers.device)
+        else:
+            scratch_row = torch.tensor([[scratch_primary, 0]],
+                                       dtype=base_pointers.dtype,
+                                       device=base_pointers.device)
+        self._layersplit_dense_scratch_pool_index = int(base_pointers.shape[0])
+        self._layersplit_kv_cache_pool_pointers_ls = torch.cat(
+            [base_pointers, scratch_row], dim=0).contiguous()
+
+        # --- Augmented pool mapping: one row per non-owned layer. ---
+        # base_mapping is a CPU int32 tensor [num_local_layers, 2].
+        scratch_pool_idx = self._layersplit_dense_scratch_pool_index
+        extra_rows = []
+        next_row = int(base_mapping.shape[0])
+        for layer_idx in non_owned:
+            self._layersplit_nonowned_layer_rows[layer_idx] = next_row
+            extra_rows.append([scratch_pool_idx, 0])
+            next_row += 1
+        extra = torch.tensor(extra_rows,
+                             dtype=base_mapping.dtype,
+                             device=base_mapping.device)
+        self._layersplit_kv_cache_pool_mapping_ls = torch.cat(
+            [base_mapping, extra], dim=0).contiguous()
+
+        # The scratch pool needs a per-step block table row appended to
+        # host/device kv_cache_block_offsets. Grow the host tensor by one pool
+        # row (the metadata sizes its device tensor from the host tensor's pool
+        # dim, and copy_batch_block_offsets loops over every host pool row). The
+        # indexer path keeps using the real num_pools via num_local_layers and
+        # only ever reads pool 0, so the extra row is inert for it.
+        old_host = self.host_kv_cache_block_offsets
+        grown = torch.zeros((old_host.shape[0] + 1, ) + tuple(old_host.shape[1:]),
+                            dtype=old_host.dtype,
+                            pin_memory=old_host.is_pinned(),
+                            device=old_host.device)
+        grown[:old_host.shape[0]].copy_(old_host)
+        self.host_kv_cache_block_offsets = grown
+        logger.info(
+            "LayerSplit owner-local dense read path: scratch pool index=%d, "
+            "%d non-owned layers routed to mapping rows %d..%d (shared single "
+            "scratch slot).", scratch_pool_idx, len(non_owned),
+            int(base_mapping.shape[0]), next_row - 1)
+
+    @staticmethod
+    def _dense_scale_row_shape(scale_pool: torch.Tensor) -> Tuple[int, ...]:
+        """Per-block row shape of a dense block-scale pool slot.
+
+        The block-scale pool mirrors the data pool geometry
+        ``[num_blocks, num_layers, kv_factor, ...]`` (block-first), so one
+        layer's per-block row is everything after the (block, layer) axes.
+        """
+        # Drop the leading block axis and the layer axis.
+        return tuple(scale_pool.shape[2:])
+
+    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
+                                 request_ids, beam_width: int,
+                                 num_context: int, num_seqs: int):
+        """Fill block-offset tables, including the LayerSplit dense scratch pool.
+
+        The base implementation fills the real (trimmed) pools' rows in
+        ``self.host_kv_cache_block_offsets`` from the C++ block manager and
+        copies every host pool row into ``dst_tensor``. Under owner-local alloc
+        we first populate the appended scratch-pool row so it is copied in the
+        same loop: the single-layer scratch pool's offset value for a logical
+        block is that block's global memory-pool index. Pool 0 encodes
+        ``global_block_id * num_local_layers`` (block-first layout, see
+        BlockManager::setOffsets), so dividing pool 0's freshly-filled row by
+        ``num_local_layers`` recovers the global block id (the scratch tensor
+        row ``b`` holds global block ``b``; kv_factor=1 for SELFKONLY). When the
+        scratch pool is inactive this is exactly the base behavior.
+        """
+        scratch_idx = self._layersplit_dense_scratch_pool_index
+        host = self.host_kv_cache_block_offsets
+        if scratch_idx is not None and host.shape[0] > scratch_idx:
+            # The C++ copy below only writes the real pools; fill the real
+            # pools first by reusing the base host-fill, then derive scratch.
+            self.impl.copy_batch_block_offsets(host, request_ids[:num_context],
+                                               1, 0)
+            self.impl.copy_batch_block_offsets(host,
+                                               request_ids[num_context:],
+                                               beam_width, num_context)
+            num_local_layers = max(1, self.num_local_layers)
+            host[scratch_idx, :num_seqs].copy_(
+                host[0, :num_seqs] // num_local_layers)
+            for pool_idx in range(host.shape[0]):
+                dst_tensor[pool_idx, :num_seqs].copy_(host[pool_idx, :num_seqs],
+                                                      non_blocking=True)
+            return
+        super().copy_batch_block_offsets(dst_tensor, request_ids, beam_width,
+                                         num_context, num_seqs)
 
     def _get_indexer_k_cache_buffers_owned(self, layer_idx: int):
         """Pool-backed accessor for layers this CP rank owns.
@@ -3701,13 +3966,74 @@ class DSACacheManager(KVCacheManager):
             return self._layersplit_dense_kv_scratch
         return super().get_buffers(layer_idx, kv_layout=kv_layout)
 
-    def get_indexer_hisa_page_rep_buffers(self, layer_idx: int):
-        """Get maintained HISA page representatives for a local layer."""
-        if not self.enable_hisa_page_reps:
-            raise RuntimeError("HISA page representatives are not enabled")
+    def get_dense_block_scale_pool(self) -> torch.Tensor:
+        """All-layer NVFP4 block-scale pool, matching the dense data pool shape.
+
+        The dense KV data pool (``get_unique_primary_pool``) carries the packed
+        E2M1 latent (288 bytes/token); under NVFP4 there is a sibling
+        block-scale pool with one E4M3 scale per 16 elements (36 bytes/token).
+        The base V1 ``KVCacheManager`` exposes only the data pool, while the C++
+        block-scale pool (a parallel set of ``KVCacheBlockPool`` entries sharing
+        the data pool's block-offset table and num_blocks x num_layers geometry)
+        is reachable through ``get_block_scale_pool``. It is returned with the
+        same ``[num_blocks, num_layers, kv_factor, ...]`` layout as
+        ``get_unique_primary_pool`` (Float8_e4m3fn storage), so flattening it
+        over the leading (block, layer, token) axes lets the same global token
+        indices (from ``convert_req_index_to_global``) address both pools.
+        """
+        assert self.dtype == DataType.NVFP4, \
+            "Dense block-scale pool is only present for NVFP4 KV cache"
+        # KV data pool index 0 = the single dense MLA window.
+        return self.impl.get_block_scale_pool(0)
+
+    def get_dense_scale_slot(self, layer_idx: int):
+        """Per-layer dense block-scale slot for the LayerSplit broadcast.
+
+        Returns the ``[num_blocks, scale_row...]`` block-scale rows for
+        ``layer_idx``: a view of the C++ scale pool slot for an owned layer, or
+        the shared scale scratch (whose ``data_ptr`` the augmented pool pointers
+        expose to the dense-MLA kernel) for a non-owned layer. Returns None when
+        the dense scratch scale pool is not active (non-NVFP4 or replicated).
+        """
+        scale_scratch = getattr(self, "_layersplit_dense_scale_scratch", None)
+        if scale_scratch is None or self.dtype != DataType.NVFP4:
+            return None
+        if not self.layersplit_state.is_owner(layer_idx):
+            return scale_scratch
+        scale_pool = self.get_dense_block_scale_pool()
+        layer_offset = self.layer_offsets[layer_idx]
+        # Block-first layout [num_blocks, num_layers, kv_factor, scale...].
+        return scale_pool[:, layer_offset]
+
+    def _get_indexer_hisa_page_rep_buffers_owned(self, layer_idx: int):
+        """Pool-backed HISA page-rep accessor for layers this CP rank owns.
+
+        Bypasses the LayerSplit M5d-tight dispatch in
+        :meth:`get_indexer_hisa_page_rep_buffers`; intended for the scratch
+        allocator and for callers that have already verified ownership.
+        """
         layer_offset = self.layer_offsets[layer_idx]
         return (self.indexer_hisa_page_reps_per_layer[layer_offset],
                 self.indexer_hisa_page_counts_per_layer[layer_offset])
+
+    def get_indexer_hisa_page_rep_buffers(self, layer_idx: int):
+        """Get maintained HISA page representatives for a layer.
+
+        M5d-tight dispatch (mirrors :meth:`get_indexer_k_cache_buffers`):
+        under LayerSplit the page-rep/count pools are sized to ``num_local_
+        layers`` (owned only), so a non-owned ``layer_idx`` is absent from
+        ``layer_offsets`` and would KeyError. Non-owned layers instead use a
+        shared scratch, recomputed in place from that layer's broadcast
+        indexer-K scratch by ``indexer_hisa_update_page_reps_nvfp4`` — the
+        same one-slot-reused-per-layer scheme the indexer-K scratch uses.
+        """
+        if not self.enable_hisa_page_reps:
+            raise RuntimeError("HISA page representatives are not enabled")
+        if (self._layersplit_hisa_pagerep_scratch is not None
+                and not self.layersplit_state.is_owner(layer_idx)):
+            return (self._layersplit_hisa_pagerep_scratch,
+                    self._layersplit_hisa_pagecount_scratch)
+        return self._get_indexer_hisa_page_rep_buffers_owned(layer_idx)
 
     def shutdown(self):
         """Release indexer cache pool references before C++ buffer cleanup."""
@@ -3733,48 +4059,84 @@ class DSACacheManager(KVCacheManager):
         use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
         indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
-        # get kv cache dtype bytes
-        mem_per_token = 2
-        quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
-
-        # get head dim
+        # get head dim (the dense MLA latent: kv_lora_rank + qk_rope_head_dim)
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        mem_per_token *= num_attention_layers * head_dim
 
-        # 1 for K, others for indexer K cache
-        head_dim_factor = (indexer_data_dim +
-                           index_head_dim // quant_block_size * 4) / head_dim
-        kv_factor = 1 + head_dim_factor
-        mem_per_token *= kv_factor
+        # The indexer K cache is a separate, already-packed payload; its
+        # per-token footprint is a fixed byte count (indexer data bytes + int32
+        # scale bytes per kv head). It must be added as raw bytes rather than
+        # folded into the dense element count — under NVFP4 the dense path packs
+        # two codes per byte and feeds a scale-factor sizer that requires a
+        # 16-divisible element count (head_dim=576 is, head_dim+surcharge is
+        # not).
+        indexer_bytes_per_token = (indexer_data_dim +
+                                   index_head_dim // quant_block_size * 4)
+
+        quant_config = model_config.quant_config
+        quant_mode = quant_config.quant_mode if quant_config is not None else None
+        if quant_mode is not None and quant_mode.has_fp4_kv_cache():
+            # Dense latent stored as NVFP4 data (4 bits/elem) + one E4M3 scale
+            # per 16 elements.
+            dense_bytes = get_size_in_bytes(head_dim, DataType.NVFP4)
+            dense_bytes += KVCacheManager.calculate_scaling_factor_size_bytes(
+                head_dim,
+                quant_vector_size=16,
+                scaling_factor_dtype=DataType.FP8)
+            mem_per_token = num_attention_layers * (dense_bytes +
+                                                    indexer_bytes_per_token)
+            return mem_per_token
+
+        # get kv cache dtype bytes (1 for FP8, 2 otherwise)
+        mem_per_token = 2
+        if quant_mode is not None and quant_mode.has_fp8_kv_cache():
+            mem_per_token = 1
+        mem_per_token *= num_attention_layers * (head_dim +
+                                                 indexer_bytes_per_token)
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         """Compute actual cache bytes per token from instance configuration."""
-        # self.kv_factor for K, others for indexer K cache.
+        # The dense MLA latent (self.kv_factor * head_dim, i.e. the 512+64=576
+        # kv_lora_rank + qk_rope_head_dim payload) is the part that is stored in
+        # the configured KV dtype. The indexer K cache is a separate,
+        # already-packed payload whose per-token footprint is a fixed byte
+        # count (indexer data bytes + int32 scale bytes); it must NOT be folded
+        # into the dense element count, otherwise an NVFP4 KV dtype both
+        # mis-sizes those bytes (E2M1 packs two codes per byte) and feeds a
+        # non-16-divisible element count into the scale-factor sizer (the dense
+        # 576 latent is 16-divisible, but 576 + indexer surcharge is not).
         # Under FP4 the indexer data portion is halved (two E2M1 codes per
-        # byte); scale bytes are unchanged.
-        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
-        head_dim_factor = (indexer_data_dim + self.index_head_dim //
-                           self.quant_block_size * 4) / self.head_dim
-        kv_factor = self.kv_factor + head_dim_factor
-        cache_size_per_token = math.ceil(
-            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
-
+        # byte); the int32 scale bytes are unchanged.
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
             raise ValueError(f'Cannot support {self.dtype} KV cache.')
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       self.dtype)
+        num_kv_heads = sum(self.num_kv_heads_per_layer)
+        dense_size_per_token = self.kv_factor * num_kv_heads * self.head_dim
+
+        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        indexer_bytes_per_token = (
+            indexer_data_dim +
+            self.index_head_dim // self.quant_block_size * 4) * num_kv_heads
+
         if self.dtype == DataType.NVFP4:
+            # Size only the dense 576-wide latent through the NVFP4 data + scale
+            # sizers (dense_size_per_token is 16-divisible); add the indexer K
+            # bytes as raw bytes.
+            dense_size_per_token = math.ceil(dense_size_per_token)
+            cache_size_bytes_per_token = get_size_in_bytes(
+                dense_size_per_token, self.dtype)
             cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
-                cache_size_per_token,
+                dense_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+            cache_size_bytes_per_token += indexer_bytes_per_token
+        else:
+            cache_size_per_token = math.ceil(dense_size_per_token +
+                                             indexer_bytes_per_token)
+            cache_size_bytes_per_token = get_size_in_bytes(
+                cache_size_per_token, self.dtype)
         return cache_size_bytes_per_token

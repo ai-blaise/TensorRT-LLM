@@ -205,15 +205,36 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def host_kv_cache_pool_pointers(self) -> Optional[torch.Tensor]:
         """
         Returns the host KV cache pool pointers from the KV cache manager if KV cache manager is not None.
+
+        Under LayerSplit owner-local alloc, return the augmented pointers that
+        append the shared dense scratch pool (the read path for non-owned
+        layers); the dense-MLA C++ attention resolves non-owned KV through this
+        extra pool. None / replicated posture returns the unaugmented pointers.
         """
-        return self.kv_cache_manager.kv_cache_pool_pointers if self.kv_cache_manager is not None else None
+        if self.kv_cache_manager is None:
+            return None
+        augmented = getattr(self.kv_cache_manager,
+                            "_layersplit_kv_cache_pool_pointers_ls", None)
+        if augmented is not None:
+            return augmented
+        return self.kv_cache_manager.kv_cache_pool_pointers
 
     @property
     def host_kv_cache_pool_mapping(self) -> Optional[torch.Tensor]:
         """
         Returns the host KV cache pool mapping from the KV cache manager if KV cache manager is not None.
+
+        Under LayerSplit owner-local alloc, return the augmented mapping that
+        adds one row per non-owned layer pointing at the shared dense scratch
+        pool. None / replicated posture returns the unaugmented mapping.
         """
-        return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
+        if self.kv_cache_manager is None:
+            return None
+        augmented = getattr(self.kv_cache_manager,
+                            "_layersplit_kv_cache_pool_mapping_ls", None)
+        if augmented is not None:
+            return augmented
+        return self.kv_cache_manager.kv_cache_pool_mapping
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -287,10 +308,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is not None:
+            # Size the device block-offset tensor from the host tensor's pool
+            # dimension so it tracks any extra pools the manager adds beyond
+            # num_pools (LayerSplit owner-local alloc appends one dense scratch
+            # pool whose block table is filled per-step by copy_batch_block_
+            # offsets). Falls back to num_pools when no host tensor exists yet.
+            host_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
+            num_offset_pools = (host_offsets.shape[0]
+                                if host_offsets is not None else
+                                self.kv_cache_manager.num_pools)
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    num_offset_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
@@ -1157,8 +1187,33 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if metadata.kv_cache_manager is None:
             # Uncached: recomputed each call until a cache manager appears.
             return self.layer_idx
-        self.local_layer_idx = metadata.kv_cache_manager.layer_offsets[
-            self.layer_idx]
+        layer_offsets = metadata.kv_cache_manager.layer_offsets
+        if self.layer_idx not in layer_offsets:
+            # Under LayerSplit context-parallelism every CP rank runs the full
+            # layer loop, but in the owner-local-alloc posture the C++ KV pool
+            # is trimmed to this rank's owned layers, so a layer this rank does
+            # not own is absent from layer_offsets. The dense-MLA attention
+            # kernel resolves KV through the pool pointer indexed by this local
+            # layer id, so it needs a real pool slot for the non-owned layer.
+            # DSACacheManager appends a single shared *scratch* pool (filled by
+            # the per-layer owner broadcast) and maps each non-owned layer to a
+            # distinct row of the augmented pool mapping; return that row here.
+            # See DSACacheManager._build_layersplit_dense_scratch_pool. If no
+            # scratch routing exists (e.g. replicated posture should always
+            # resolve, or the scratch could not be allocated), surface the gap
+            # as a clear error instead of silently reading the wrong KV.
+            nonowned_rows = getattr(metadata.kv_cache_manager,
+                                    "_layersplit_nonowned_layer_rows", None)
+            if nonowned_rows and self.layer_idx in nonowned_rows:
+                self.local_layer_idx = nonowned_rows[self.layer_idx]
+                return self.local_layer_idx
+            raise KeyError(
+                f"LayerSplit: layer {self.layer_idx} has no local KV pool "
+                f"slot on this CP rank (owned offsets: "
+                f"{sorted(layer_offsets)}) and no scratch routing. Run "
+                f"LayerSplit with layersplit_owner_local_alloc=False "
+                f"(replicated pools) for the dense-attention path.")
+        self.local_layer_idx = layer_offsets[self.layer_idx]
         return self.local_layer_idx
 
     def use_nvfp4_output(

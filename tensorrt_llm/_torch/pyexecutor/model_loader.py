@@ -75,11 +75,13 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
         has_mla = hasattr(pretrained_config, "kv_lora_rank") and hasattr(
             pretrained_config, "qk_rope_head_dim")
         if model_type in ("deepseek_v3", "deepseek_v32") and has_mla:
-            raise NotImplementedError(
-                "Dense NVFP4 KV cache is not supported for DeepSeek MLA in "
-                "the current TensorRT-LLM torch path. Use fp8 dense KV; "
-                "NVFP4 IndexCache+HISA is configured separately via the "
-                "sparse attention/indexer config.")
+            # Blaise: enable dense NVFP4 MLA KV via the ported FlashMLA NVFP4 bridge.
+            # The KV cache manager allocates DataType.NVFP4 (see _util.py) and the
+            # sparse MLA decode (sparse_mla_decode_nvfp4) reads the NVFP4 latent.
+            # Overrides the model's native (fp8) dense KV per the deployment goal.
+            logger.warning(
+                "Dense NVFP4 KV cache for DeepSeek MLA enabled (Blaise FlashMLA "
+                "NVFP4 bridge); native fp8 dense KV overridden.")
 
     # If we're letting the checkpoint dictate the quant with auto, simply
     # return and do not modify the checkpoint.

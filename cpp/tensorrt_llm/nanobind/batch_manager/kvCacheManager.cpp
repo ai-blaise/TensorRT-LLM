@@ -529,6 +529,24 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_block_scale_pool",
+            [](tbk::BaseKVCacheManager& self, SizeType32 kv_pool_idx) -> at::Tensor
+            {
+                // NVFP4 block-scale pools mirror the KV data pools: they share
+                // the same block-offset table and num_blocks x num_layers
+                // geometry but carry one E4M3 scale per 16 elements. They are
+                // appended after the KV data pools in pool order, so the scale
+                // pool for KV data pool `kv_pool_idx` sits at
+                // numKVPools + kv_pool_idx. Returns the full all-layer pool
+                // (no per-layer slicing) so it can be flattened the same way as
+                // get_unique_primary_pool.
+                auto const& blockManager = self.getBlockManager();
+                auto const numKvPools = blockManager.getNumPools(
+                    /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+                return tr::Torch::tensor(blockManager.getPrimaryPool(numKvPools + kv_pool_idx));
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_recurrent_states_pool",
             [](tbk::BaseKVCacheManager& self) -> at::Tensor
             {

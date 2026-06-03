@@ -100,31 +100,51 @@ class Glm4WeightLoader:
                     name = ".".join(names)
 
                 if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights(".".join(names[:-1] + [new_name]), weights)
-                        if new_name in ["k_proj", "v_proj"]:
-                            num_kv_heads_list = (
-                                [num_kv_heads] * len(fw)
-                                if isinstance(num_kv_heads, int)
-                                else num_kv_heads
-                            )
-                            fw = {
-                                k: duplicate_kv_weight(
-                                    weight=v[:],
-                                    num_kv_heads=num_kv_heads_list[i],
-                                    tensor_parallel_size=tp_size,
+                    # Pre-fused gate_up_proj checkpoints (e.g. GLM-4-9B-0414, the SMC-SD
+                    # draft) store ONE fused gate_up_proj weight instead of separate
+                    # gate_proj/up_proj. Split it (+ FP8 block scale / bias) into halves
+                    # for the standard fuse helper.
+                    fused_gu = (filter_weights(name, weights)
+                                if names[-1] == "gate_up_proj" else {})
+                    if "weight" in fused_gu:
+                        hw = fused_gu["weight"].shape[0] // 2
+                        gate_w = {"weight": fused_gu["weight"][:hw]}
+                        up_w = {"weight": fused_gu["weight"][hw:]}
+                        for sk in ("weight_scale_inv", "weight_scale", "bias"):
+                            if sk in fused_gu:
+                                hs = fused_gu[sk].shape[0] // 2
+                                gate_w[sk] = fused_gu[sk][:hs]
+                                up_w[sk] = fused_gu[sk][hs:]
+                        module.load_weights(weights=[gate_w, up_w])
+                        if can_mark_consumed:
+                            weights.mark_consumed(name)
+                    else:
+                        module_weights = []
+                        for new_name in params_map[names[-1]]:
+                            fw = filter_weights(".".join(names[:-1] + [new_name]), weights)
+                            if new_name in ["k_proj", "v_proj"]:
+                                num_kv_heads_list = (
+                                    [num_kv_heads] * len(fw)
+                                    if isinstance(num_kv_heads, int)
+                                    else num_kv_heads
                                 )
-                                if k in ["weight", "bias"]
-                                else v
-                                for i, (k, v) in enumerate(fw.items())
-                            }
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                    # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
-                    if can_mark_consumed:
-                        for src_name in params_map[names[-1]]:
-                            weights.mark_consumed(".".join(names[:-1] + [src_name]))
+                                fw = {
+                                    k: duplicate_kv_weight(
+                                        weight=v[:],
+                                        num_kv_heads=num_kv_heads_list[i],
+                                        tensor_parallel_size=tp_size,
+                                    )
+                                    if k in ["weight", "bias"]
+                                    else v
+                                    for i, (k, v) in enumerate(fw.items())
+                                }
+                            module_weights.append(fw)
+                        module.load_weights(weights=module_weights)
+                        # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
+                        if can_mark_consumed:
+                            for src_name in params_map[names[-1]]:
+                                weights.mark_consumed(".".join(names[:-1] +
+                                                               [src_name]))
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(
@@ -490,10 +510,12 @@ class Glm4DecoderLayer(DecoderLayer):
         config = self.config
 
         self.hidden_size = config.hidden_size
-        self.moe_intermediate_size = config.moe_intermediate_size
-        self.num_experts = config.n_routed_experts
-        self.num_shared_experts = config.n_shared_experts
-        self.top_k = config.num_experts_per_tok
+        # Dense GLM-4 (Glm4ForCausalLM) checkpoints omit the MoE fields; default to
+        # None so the dense GatedMLP branch below is taken.
+        self.moe_intermediate_size = getattr(config, "moe_intermediate_size", None)
+        self.num_experts = getattr(config, "n_routed_experts", None)
+        self.num_shared_experts = getattr(config, "n_shared_experts", None)
+        self.top_k = getattr(config, "num_experts_per_tok", None)
 
         self.mapping = model_config.mapping
         mapping = self.mapping
@@ -530,7 +552,8 @@ class Glm4DecoderLayer(DecoderLayer):
         )
         self.moe_allreduce = MoEAllReduce(self.mapping)
 
-        if config.n_routed_experts is not None and layer_idx >= config.first_k_dense_replace:
+        if getattr(config, "n_routed_experts", None) is not None and layer_idx >= getattr(
+                config, "first_k_dense_replace", 0):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
@@ -581,6 +604,27 @@ class Glm4DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
+
+        # Dense GLM-4-0414 (the SMC-SD draft, Glm4ForCausalLM) uses a sandwich-norm
+        # block: a post-norm on the attention output AND on the MLP output, each
+        # applied *before* the residual add (HF Glm4DecoderLayer). GLM-4.5/4.6 MoE
+        # (Glm4MoeForCausalLM) and the DeepSeek-V3 target do NOT have these. Detect
+        # by the absence of routed experts (1:1 with the dense GatedMLP branch) so
+        # the MoE/MTP fused path is byte-identical. When present the layer runs the
+        # explicit (non-fused) sandwich forward below; otherwise the standard
+        # residual-fused path is used.
+        self.has_sandwich_norm = getattr(config, "n_routed_experts", None) is None
+        if self.has_sandwich_norm:
+            self.post_self_attn_layernorm = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.post_mlp_layernorm = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
         self.layer_idx = layer_idx
         self.next_layer_layernorm: RMSNorm = None
 
@@ -647,6 +691,15 @@ class Glm4DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.has_sandwich_norm:
+            # Dense GLM-4-0414 sandwich-norm block (self-contained, non-fused).
+            return self.forward_sandwich(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -676,6 +729,48 @@ class Glm4DecoderLayer(DecoderLayer):
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+
+    def forward_sandwich(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Dense GLM-4-0414 (Glm4ForCausalLM) sandwich-norm decoder layer.
+
+        Matches HF Glm4DecoderLayer: a post-norm is applied to the attention
+        output and to the MLP output, each *before* the residual add. This is
+        self-contained (it owns input_layernorm) and does not use the residual-
+        fused all-reduce path; it returns ``residual=None`` so the next layer
+        applies its own input_layernorm and the model applies the final norm.
+        """
+        assert isinstance(self.mlp, GatedMLP)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce),
+            **kwargs,
+        )
+        hidden_states = self.post_self_attn_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.fusion_config.POST_MLP_FUSION
+                                      or self.mlp_tp_size == 1)),
+        )
+        hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, None
 
     def forward_MoE(
         self,
@@ -1011,6 +1106,13 @@ class Glm4Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
+        # Dense GLM-4-0414 sandwich-norm layers carry no residual and do not fold
+        # the final norm into next_layer_layernorm, so apply it here. The standard
+        # (fused) path already applied self.norm via the last layer's
+        # next_layer_layernorm, leaving residual populated.
+        if self.layers[0].has_sandwich_norm:
+            hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 
@@ -1080,3 +1182,12 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
+
+
+@register_auto_model("Glm4ForCausalLM")
+class Glm4ForCausalLM(Glm4MoeForCausalLM):
+    """Dense GLM-4 (e.g. GLM-4-9B-0414). Reuses the MoE variant's engine; the shared
+    Glm4DecoderLayer takes the dense GatedMLP branch when MoE config fields are absent
+    (n_routed_experts / moe_intermediate_size). Used as the SMC-SD draft model
+    (BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP)."""
+    pass
