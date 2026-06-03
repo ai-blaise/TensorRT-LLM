@@ -153,3 +153,28 @@ per-rank load is overhead-limited at ~70%. The AutoTuner-selected
 
 Backend selection is covered by the unit test
 `tests/unittest/_torch/modules/moe/test_moe_backend.py::test_warpdecode_backend_selection`.
+
+### CUDA graph is mandatory
+
+The cute_dsl path carries ~264 µs of host dispatch per call (`moe_sort` + two JIT'd
+ops + AutoTuner lookup + tvm-ffi marshaling). Eager that dominates — **15% of peak**;
+under CUDA-graph capture (which TRT-LLM applies to the decode forward via
+`cuda_graph_runner`, and the path is graph-compatible) it is **68% — a 4.47× cliff**.
+With `tile_mode="autotune"` the AutoTuner host work must complete during the graph
+runner's warmup before capture; the forced `decode_1cta`/`prefill_2cta` modes skip
+autotune and are the most capture-clean.
+
+### Where the remaining gap is (graph-captured decomposition, 8-GPU decode)
+
+| component | latency | % of 6.8 |
+|---|---|---|
+| FC1 (gather + SwiGLU) | 50.9 µs | 68% |
+| FC2 (finalize / combine) | 27.9 µs | **62%** (weakest) |
+| moe_sort (routing) | 6.2 µs | separable overhead |
+| FC1+FC2 | 76.1 µs | (~3% overlap) |
+
+The 68%→80% headroom is **not** launch overhead (graph removes that) — it is the
+gather kernel's intrinsic cost. The concrete unexplored targets: the FC2 finalize
+combine epilogue (62%), the 6.2 µs `moe_sort` the native runner fuses internally, and
+the near-zero FC1/FC2 overlap (a TMEM-fused FC1→FC2 megakernel would recover the
+intermediate GMEM round-trip).
