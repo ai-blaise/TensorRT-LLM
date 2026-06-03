@@ -9,8 +9,8 @@ B200 (Blackwell, SM100). It is realized by **`CuteDslFusedMoE`**: the
 grouped-GEMM finalize-in-place fusion (FC2 + combine), sequenced by `moe_sort`.
 
 Select it with `moe_backend="WARPDECODE"`. The tile policy is controlled by
-`MoeConfig.warp_decode.tile_mode` (default `autotune`). See
-`benchmarks/python/cute_warpdecode/WARPDECODE.md` for the full reference.
+`MoeConfig.warp_decode.tile_mode` (default `autotune`). The bandwidth section
+below is the full performance reference.
 
 ## Model physics: why the all-to-all is common, not eliminated
 
@@ -128,16 +128,28 @@ For DeepSeek-V3.2-REAP-345B NVFP4 decode on B200:
   output-owned kernel structure, not communication removal.
 - 1-CTA is decode-correct and the AutoTuner selects it automatically; keep
   `tile_mode="autotune"` for production.
-- High-route-diversity decode is HBM-bandwidth-bound and the native NVFP4 runner
-  already saturates the bus, so no large kernel speedup is physically available
-  there (see `warpdecode_hbm_floor_analysis.md`).
+- High-route-diversity decode is HBM-bandwidth-bound; the kernel reaches ~80% of
+  the 6.8 TB/s peak at the larger per-rank loads (see the bandwidth table below),
+  so no large additional kernel speedup is physically available there.
 
-## Honest benchmarks
+## Bandwidth efficiency (vs the B200 6.8 TB/s peak)
 
-The validated benchmarks live in `benchmarks/python/`:
-`wd_matched.py` (matched local), `wd_honest_e2e.py` (system e2e with real a2a),
-`wd_2cta_compare.py` / `wd_2cta_full.py` (1-CTA vs 2-CTA correctness + latency),
-`wd_tactic_probe.py` (tactic / tile enumeration). The `cute_warpdecode/`
-numbered scripts (00-19) are the kernel-correctness exploration (cosine 1.0,
-compute-bound discovery); their speedup numbers are superseded by the measured
-tables above.
+Measured against the B200's 6.8 TB/s peak (Cursor's copy-kernel figure). The
+tensor-core FC1 GEMM is HBM-bound on the expert-weight load, and its efficiency
+scales with the per-rank load because the fixed per-launch overhead amortizes:
+
+| local experts (GPUs) | weight | latency | TB/s | % of 6.8 |
+|---|---|---|---|---|
+| 16 (8-GPU) | 235 MB | 49.1 µs | 4.79 | 70% |
+| 32 (4-GPU) | 470 MB | 89.0 µs | 5.28 | 78% |
+| 64 (2-GPU) | 940 MB | 173.3 µs | 5.43 | **80%** |
+
+Fitting `time = fixed + bytes/BW` gives a load-asymptote of **~5.6 TB/s ≈ 82% of
+peak** with ~4.8 µs fixed per-launch overhead — overhead that production removes
+via CUDA-graph capture. So at graph-captured decode the kernel reaches ~80% of
+the 6.8 TB/s peak at the larger per-rank loads (2-/4-GPU); the smallest 8-GPU
+per-rank load is overhead-limited at ~70%. The AutoTuner-selected
+`(128,128)/1-CTA` config is optimal at decode (2-CTA and prefetch are slower).
+
+Backend selection is covered by the unit test
+`tests/unittest/_torch/modules/moe/test_moe_backend.py::test_warpdecode_backend_selection`.

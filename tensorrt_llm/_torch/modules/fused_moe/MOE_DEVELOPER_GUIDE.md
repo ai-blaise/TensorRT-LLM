@@ -192,7 +192,7 @@ explicit `moe_backend="WARPDECODE"` alias that `create_moe.get_moe_cls` resolves
 to **`CuteDslFusedMoE`** (the output-owned `cute_dsl` gather-grouped-GEMM +
 SwiGLU / grouped-GEMM-finalize path), with explicit logging and a tile-mode
 policy. Full reference:
-`benchmarks/python/cute_warpdecode/WARPDECODE.md`.
+`docs/source/features/warpdecode_deployment_guide.md`.
 
 ### Configuration
 
@@ -236,8 +236,7 @@ NVFP4: **~1.0-1.13× local, ~1.05× system**. Forced 2-CTA is correct (cosine
 1-CTA. **The all-to-all is common to both paths** — the 196.6 GB model does not
 fit on one 179 GB B200, so experts are expert-parallel sharded on both and both
 pay the same a2a. Do not benchmark WarpDecode with zero a2a vs a native path that
-pays full a2a. See `docs/source/features/warpdecode_deployment_guide.md` and
-`warpdecode_hbm_floor_analysis.md`.
+pays full a2a. See `docs/source/features/warpdecode_deployment_guide.md`.
 
 ### Legacy overlay (`warp_decode.py`)
 
