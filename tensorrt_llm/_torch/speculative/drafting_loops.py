@@ -546,19 +546,60 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
         padded_gather_ids = torch.cat((gather_ids, pad_ids), dim=0)
         return logits[padded_gather_ids]
 
+    @staticmethod
+    def _host_draft_layout(spec_tree_manager: SpecTreeManager):
+        """Host-side per-layer draft-token layout, memoized on the manager.
+
+        Returns ``(offsets, repeats_per_layer)`` where ``offsets`` is the
+        host-side prefix sum of per-layer draft-token counts (identical to the
+        device tensor ``draft_tokens_indices_cumsum``) and
+        ``repeats_per_layer[layer]`` is the per-parent child-count list for that
+        layer. Both are plain Python ints, so reading them never triggers a
+        device->host sync. The values are static for the lifetime of the static
+        spec tree, hence computed once and cached.
+        """
+        cache = getattr(spec_tree_manager, "_record_logprob_host_layout", None)
+        if cache is not None:
+            return cache
+        repeats_per_layer = [[int(r) for r in tk.tolist()]
+                             for tk in spec_tree_manager.top_k_list]
+        offsets = spec_tree_manager.draft_tokens_indices_cumsum.tolist()
+        offsets = [int(o) for o in offsets]
+        # The device prefix sum and the host re-sum of top_k_list must agree;
+        # they index the same draft_tokens_buffer columns elsewhere.
+        assert offsets[0] == 0
+        for layer_idx, repeats in enumerate(repeats_per_layer):
+            assert offsets[layer_idx + 1] - offsets[layer_idx] == sum(repeats)
+        cache = (offsets, repeats_per_layer)
+        spec_tree_manager._record_logprob_host_layout = cache
+        return cache
+
+    # Opt-in: collapse the per-parent logsumexp+gather into a single batched op
+    # when the layer is uniform (every parent has exactly one child). This saves
+    # n_particles-1 kernel launches per draft layer but the batched logsumexp
+    # reduces a *contiguous* tensor whereas the per-parent path reduces
+    # non-contiguous slices, so PyTorch may pick a different reduction tiling and
+    # the normalizer can differ by up to 1 ULP (~4.77e-7) from the scalar path.
+    # Off by default so the recorded draft log-probs stay bit-for-bit identical
+    # to the reference; flip on the spec_tree_manager when that ULP is
+    # acceptable. See test_smc_record_logprobs_equiv.py.
+    smc_vectorize_logprob_record: bool = False
+
     def _record_layer_draft_log_probs(self, draft_log_prob_buffer: torch.Tensor,
                                       logits: torch.Tensor, batch_size: int,
                                       cur_draft_idx: int,
                                       spec_tree_manager: SpecTreeManager) -> None:
-        start = 0
-        for layer_idx in range(cur_draft_idx):
-            start += sum(int(repeat) for repeat in
-                         spec_tree_manager.top_k_list[layer_idx].tolist())
-        repeats = [int(repeat) for repeat in
-                   spec_tree_manager.top_k_list[cur_draft_idx].tolist()]
-        end = start + sum(repeats)
+        # Host-side, sync-free offsets and per-parent child counts. Replaces the
+        # former O(cur_draft_idx) loop that re-summed top_k_list[*].tolist()
+        # (one device->host sync per layer) on every call: per decode step the
+        # offset bookkeeping drops from O(gamma^2) device->host syncs to O(1)
+        # (a one-time cache build), with bit-for-bit identical results.
+        offsets, repeats_per_layer = self._host_draft_layout(spec_tree_manager)
+        start = offsets[cur_draft_idx]
+        end = offsets[cur_draft_idx + 1]
         if start == end:
             return
+        repeats = repeats_per_layer[cur_draft_idx]
 
         if cur_draft_idx == 0:
             parent_logits = logits.reshape(batch_size,
@@ -571,6 +612,25 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
                 logits.shape[-1]).index_select(1, parent_indices)
 
         child_tokens = self.draft_tokens_buffer[:batch_size, start:end].long()
+
+        num_parents = parent_logits.shape[1]
+        vectorize = getattr(spec_tree_manager,
+                            "smc_vectorize_logprob_record",
+                            self.smc_vectorize_logprob_record)
+        # Uniform fast path (opt-in): every parent has exactly one child, so the
+        # layer collapses to one batched logsumexp + one batched gather. The
+        # gather is bit-exact; the batched logsumexp is within 1 ULP of the
+        # per-parent reduction (see the note on smc_vectorize_logprob_record).
+        if vectorize and num_parents == (end - start):
+            parents = parent_logits.float()
+            normalizer = torch.logsumexp(parents, dim=-1)
+            selected = parents.gather(
+                -1, child_tokens.unsqueeze(-1)).squeeze(-1)
+            draft_log_prob_buffer[:, start:end] = selected - normalizer
+            return
+
+        # Default path: per-parent logsumexp+gather, bit-for-bit identical to
+        # the original implementation. Only the sync-free offsets above changed.
         cursor = 0
         for parent_idx, repeat in enumerate(repeats):
             parent = parent_logits[:, parent_idx, :].float()
