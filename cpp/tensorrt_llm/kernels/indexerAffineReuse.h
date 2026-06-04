@@ -16,11 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -39,4 +42,5 @@ void invokeIndexerAffineReuse(
     int32_t const* gFglobal, int32_t* out, int64_t numElems, int32_t delta, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/indexerAffineReuse.h"
+#include "indexerAffineReuse.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -50,4 +50,5 @@ void invokeIndexerAffineReuse(
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END
