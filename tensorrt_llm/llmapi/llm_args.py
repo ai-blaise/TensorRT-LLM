@@ -527,8 +527,23 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """Whether to capture separate CUDA graphs for short and long sequences.
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
+
+        The short-graph band caps the decode logits buffer width (the indexer
+        topk dispatch keys on it; see _indexer_logits_width in dsa.py): a
+        smaller short cap that still sits above the indexer-skip threshold
+        (index_topk) lets kv in (index_topk, seq_len_threshold] decodes run
+        the indexer on the cheaper insertion-launch instead of the radix/DSL
+        launch the static max_model_len width would force. When the operator
+        leaves seq_len_threshold unset it defaults to index_topk, which makes
+        the short band coincide with the skip band -> byte-identical to the
+        pre-r13 behavior (the indexer never runs in the short graph). Setting
+        seq_len_threshold above index_topk (e.g. to the production decode kv
+        ceiling, <= 12288 to hit the insertion launch) opts into the
+        width-correct topk win. The skip threshold itself is unaffected (it
+        keys on num_sparse_topk == index_topk in dsa.prepare).
         """
-        self.seq_len_threshold = self.index_topk
+        if self.seq_len_threshold is None:
+            self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
 

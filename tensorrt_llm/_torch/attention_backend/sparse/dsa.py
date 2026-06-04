@@ -221,6 +221,51 @@ _DSL_TOPK_MIN_KV_LEN = 32768
 _DSL_TOPK_MIN_COLS = 12288
 
 
+# Width-correct the decode logits buffer so main's _DSL_TOPK_MIN_COLS gate
+# (above) picks the cheaper C++ insertion top-k for short kv. The DSL
+# paged-MQA-logits op allocates its output to exactly the column count it is
+# passed (CuteDSLFP4PagedMQALogitsRunner.forward); passing the static
+# max_model_len makes logits_decode.shape[1] == max_seq_len >= 12288 every
+# step, which forces topk onto the DSL/radix path even when the live kv is
+# short. Sizing the logits width to a power-of-2 bucket of the real max-kv
+# (clamped to the hard cap) keeps the kernel's valid [0,kv) output
+# byte-identical (it only writes columns < kv, gated by context_lens) while
+# dropping shape[1] below _DSL_TOPK_MIN_COLS so the topk dispatch falls to the
+# fast insertion launch. The bucket is a captured constant under CUDA graphs:
+# at capture max_gen_kv_len equals the per-graph warmup kv (the upper bound of
+# that graph's short/long seq-len band), so every replay's real kv <= the
+# captured width and the topk seq_lens mask the [kv, width) tail. Power-of-2
+# bucketing keeps the captured-width set small and stable across batches.
+
+
+def _indexer_logits_width(max_gen_kv_len: int, hard_cap: int) -> int:
+    """Power-of-2 bucket of the live max-kv for the decode logits buffer,
+    clamped to ``hard_cap`` (== kv_cache_manager.max_seq_len).
+
+    Graph-safety upper-bound guarantee. Under CUDA graphs this value is
+    frozen at capture, where ``max_gen_kv_len`` equals the per-graph warmup
+    kv. A warmup request reserves a few fewer tokens than the band ceiling
+    (``max_seq_len - 1 - num_extra_kv_tokens - draft``), so a live replay at
+    the true ceiling can exceed the warmup kv by that small epsilon. To keep
+    the captured width a safe upper bound for every replay we collapse to
+    ``hard_cap`` for any kv in the top bucket band (``> hard_cap // 2``);
+    the long-sequence graph (warmup kv ~= hard_cap) therefore always keeps
+    its full max_model_len width (no narrowing, no regression, no tail
+    miss). Only genuinely short bands (kv <= hard_cap // 2) are narrowed,
+    where the next-pow2 bucket strictly exceeds max_gen_kv_len and thus
+    bounds the whole band. The < 12288 (_DSL_TOPK_MIN_COLS) insertion-launch
+    boundary is hit by any pow2 bucket <= 8192.
+    """
+    if max_gen_kv_len <= 0 or hard_cap <= 0:
+        return hard_cap
+    if max_gen_kv_len > hard_cap // 2:
+        return hard_cap
+    bucket = 1
+    while bucket < max_gen_kv_len:
+        bucket <<= 1
+    return bucket if bucket < hard_cap else hard_cap
+
+
 def _pick_dsl_expand(
     next_n: int,
     num_sms: int,
@@ -3324,6 +3369,14 @@ class Indexer(nn.Module):
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
+            # Width-correct the decode logits buffer to a graph-safe bucket of
+            # the live max-kv so the downstream topk dispatch (gated on
+            # logits_decode.shape[1] vs _DSL_TOPK_MIN_COLS) takes its cheaper
+            # insertion launch for short kv (see _indexer_logits_width).
+            # max_gen_kv_len is the captured constant under CUDA graphs
+            # (== per-graph warmup kv).
+            logits_width = _indexer_logits_width(metadata.max_gen_kv_len,
+                                                 max_seq_len)
             # The all-generation-requests-share-one-decode-length invariant
             # (needed because the paged MQA logits + topk kernels assume no
             # padding) is asserted once per step in metadata.prepare(); no
@@ -3455,7 +3508,7 @@ class Indexer(nn.Module):
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q, decode_q_scale, k_cache, weights_decode,
                         dsl_context_lens, dsl_block_table, dsl_schedule_meta,
-                        max_seq_len)
+                        logits_width)
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
                     # Apply wave-aware atom-split when the picker decided to
@@ -3479,7 +3532,7 @@ class Indexer(nn.Module):
                             metadata.scheduler_metadata_buffer_expanded)
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q, k_cache, weights_decode, fp8_ctx_lens,
-                        fp8_block_table, fp8_schedule_meta, max_seq_len)
+                        fp8_block_table, fp8_schedule_meta, logits_width)
             elif pre_hisa_topk is None:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
@@ -3492,7 +3545,7 @@ class Indexer(nn.Module):
                         q_decode.shape[0], q_decode.shape[1], self.n_heads)
                 logits_decode = self._call_paged_mqa_logits(
                     q_decode, k_cache, weights_decode, context_lens,
-                    block_table, scheduler_metadata_buffer, max_seq_len,
+                    block_table, scheduler_metadata_buffer, logits_width,
                     decode_q_scale)
 
             if use_custom_topk:
@@ -3589,7 +3642,8 @@ class Indexer(nn.Module):
             else:
                 # padded
                 positions = torch.arange(
-                    max_seq_len, device=q_decode.device).unsqueeze(0).expand(
+                    logits_decode.shape[-1],
+                    device=q_decode.device).unsqueeze(0).expand(
                         num_gen_tokens, -1)
                 row_indices = torch.arange(num_gen_tokens,
                                            device=q_decode.device) // next_n
