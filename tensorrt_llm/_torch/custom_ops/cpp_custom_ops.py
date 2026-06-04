@@ -220,6 +220,11 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
+    def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
+        # In-place patch; returns the same cached_topk tensor.
+        return torch.empty_like(cached_topk)
+
     @torch.library.register_fake("trtllm::indexer_hisa_mean_pool_nvfp4")
     def _(k_cache, block_table, kv_lens, max_blocks):
         return k_cache.new_empty((block_table.shape[0], max_blocks, 128),

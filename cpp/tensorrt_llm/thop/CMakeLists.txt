@@ -99,6 +99,7 @@ add_library(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   SparseMlaDecodeNvfp4Op.cpp
+  indexerXstepRecencyPatchOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
