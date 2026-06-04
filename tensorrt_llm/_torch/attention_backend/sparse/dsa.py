@@ -1748,6 +1748,32 @@ class Indexer(nn.Module):
                                        "index_topk_freq", None)
         self.index_topk_pattern = getattr(sparse_attention_config,
                                           "index_topk_pattern", None)
+        # Cross-STEP TopK reuse: the DSA Top-K block selection is stable across
+        # consecutive decode steps, so recompute the full logits MQA + Top-K
+        # only every `index_topk_step_freq` decode steps and reuse the cached
+        # selection in between (patching in the newly appended KV position(s) so
+        # recency is exact). This runs in sparse_attn_indexer, which executes in
+        # the trtllm::mla_dsa_attn_inplace custom op -- explicitly EXCLUDED from
+        # CUDA graph capture -- so a Python step counter gating the reuse is
+        # safe (no graph break). None / <=1 disables it (no behavior change).
+        self.index_topk_step_freq = getattr(sparse_attention_config,
+                                            "index_topk_step_freq", None)
+        self._xstep_enabled = (self.index_topk_step_freq is not None
+                               and self.index_topk_step_freq > 1)
+        # Recency patch trades extra launches for guaranteed inclusion of the
+        # newest positions on reuse steps. It is launch-bound (~20 tiny ops) and
+        # can cost more than the kernels it replaces, so default to frozen reuse
+        # (no patch) -- the win comes from skipping the logits MQA + Top-K.
+        self._xstep_recency_patch = bool(
+            getattr(sparse_attention_config, "index_topk_step_recency_patch",
+                    False))
+        # Per-layer cross-step state (this module is per-layer). Populated on a
+        # refresh step and reused on the following (freq-1) steps.
+        self._xstep_counter = 0
+        self._xstep_cache: Optional[torch.Tensor] = None
+        self._xstep_refresh_kvlen: Optional[torch.Tensor] = None
+        self._xstep_batch_tokens = 0
+        self._xstep_idx_cache: Dict[Tuple, Dict] = {}
         self.enable_nvfp4_hisa = getattr(sparse_attention_config,
                                          "enable_nvfp4_hisa", False)
         self.hisa_block_size = getattr(sparse_attention_config,
@@ -1882,6 +1908,112 @@ class Indexer(nn.Module):
             return
         if not self.skip_topk:
             metadata._blaise_indexcache_topk = topk_indices_buffer
+
+    # --- Cross-step Top-K reuse (decode only) ---------------------------------
+    # sparse_attn_indexer runs in trtllm::mla_dsa_attn_inplace, which is excluded
+    # from CUDA graph capture, so the Python step counter below is evaluated
+    # eagerly every decode step and does not bake a stale decision into a graph.
+
+    def _xstep_reuse_active(self, num_contexts: int,
+                            num_generations: int) -> bool:
+        """True when this step should reuse the cached cross-step Top-K.
+
+        Only pure-decode steps (no prefill in the batch) participate; mixing in
+        a prefill changes num_tokens / buffer shape and is rare, so we refresh
+        on those. The decision is purely a function of the per-layer step
+        counter modulo the configured stride.
+        """
+        if not self._xstep_enabled:
+            return False
+        if num_contexts != 0 or num_generations <= 0:
+            return False
+        if self._xstep_cache is None or self._xstep_refresh_kvlen is None:
+            return False
+        # counter==0 is a refresh step; 1..freq-1 reuse.
+        return (self._xstep_counter % self.index_topk_step_freq) != 0
+
+    def _xstep_reuse_decode(self, metadata: DSAtrtllmAttentionMetadata,
+                            num_gen_tokens: int, num_contexts: int,
+                            num_generations: int,
+                            next_n: int) -> Optional[torch.Tensor]:
+        """Zero-copy cross-step reuse for a pure-decode step.
+
+        Returns the per-layer cached Top-K tensor directly (no fresh buffer, no
+        full copy), after an in-place recency patch of only its trailing columns
+        for the positions appended since the last refresh. The cache window is
+        short, so the patch touches at most (freq-1)*next_n columns -- a handful
+        of writes vs the ~24us logits MQA + Top-K kernels it replaces. Returns
+        None if the cache shape no longer matches (caller recomputes).
+        """
+        cached = self._xstep_cache
+        if (cached is None or cached.shape[0] != num_gen_tokens
+                or cached.shape[1] != self.index_topk
+                or self._xstep_batch_tokens != num_gen_tokens):
+            return None
+
+        if not self._xstep_recency_patch:
+            # Frozen reuse: return the cached selection unchanged (0 extra
+            # launches). The newest <=(freq-1)*next_n positions may be absent;
+            # at the short strides used in practice this is within the same
+            # approximation budget as cross-layer FSSS reuse.
+            return cached
+
+        # Recency patch: overwrite the trailing `delta` columns with the newly
+        # appended absolute positions so every new token is selectable. NOTE:
+        # this path issues ~20 dependent tiny launches and is launch-bound (it
+        # can cost MORE than the logits+Top-K kernels it replaces); the patch
+        # index tensors below are cached per shape to cut launches. Prefer the
+        # frozen path (above) unless recency is measured to matter.
+        key = (cached.device, num_gen_tokens, next_n)
+        idx = self._xstep_idx_cache.get(key)
+        if idx is None:
+            max_delta = min(
+                max(int((self.index_topk_step_freq - 1) * next_n), next_n),
+                self.index_topk)
+            rows = torch.arange(num_gen_tokens, device=cached.device)
+            idx = {
+                "row_indices": rows // next_n,
+                "next_n_offset": rows % next_n,
+                "col_off": torch.arange(max_delta, device=cached.device),
+                "max_delta": max_delta,
+            }
+            self._xstep_idx_cache[key] = idx
+        max_delta = idx["max_delta"]
+        gen_kv = metadata.kv_lens_cuda_runtime[
+            num_contexts:num_contexts + num_generations]
+        cur_end = (gen_kv[idx["row_indices"]] - next_n + idx["next_n_offset"]
+                   + 1).to(torch.int32)
+        refresh_end = self._xstep_refresh_kvlen
+        delta = (cur_end - refresh_end).clamp_min(0).clamp_max(max_delta)
+        col_off = idx["col_off"]
+        new_pos = (refresh_end.unsqueeze(1) + delta.unsqueeze(1) - 1
+                   - col_off.unsqueeze(0)).to(torch.int32)
+        tail = cached[:, self.index_topk - max_delta:]
+        valid = col_off.unsqueeze(0) < delta.unsqueeze(1)
+        cached[:, self.index_topk - max_delta:] = torch.where(
+            valid, new_pos, tail)
+        return cached
+
+    def _xstep_store_decode(self, metadata: DSAtrtllmAttentionMetadata,
+                            topk_indices_buffer: torch.Tensor,
+                            num_ctx_tokens: int, num_gen_tokens: int,
+                            num_contexts: int, num_generations: int,
+                            next_n: int) -> None:
+        """Snapshot the freshly computed decode Top-K + the per-row refresh end
+        position so subsequent reuse steps can patch recency."""
+        if not self._xstep_enabled:
+            return
+        gen_slice = slice(num_ctx_tokens, num_ctx_tokens + num_gen_tokens)
+        self._xstep_cache = topk_indices_buffer[gen_slice, :].clone()
+        gen_kv = metadata.kv_lens_cuda_runtime[
+            num_contexts:num_contexts + num_generations]
+        row_indices = (torch.arange(num_gen_tokens, device=gen_kv.device)
+                       // next_n)
+        next_n_offset = (torch.arange(num_gen_tokens, device=gen_kv.device)
+                         % next_n)
+        self._xstep_refresh_kvlen = (
+            gen_kv[row_indices] - next_n + next_n_offset + 1).to(torch.int32)
+        self._xstep_batch_tokens = num_gen_tokens
 
     def _hisa_block_topk(self, num_blocks: int) -> int:
         min_blocks = math.ceil(self.index_topk / self.hisa_block_size)
@@ -3041,6 +3173,23 @@ class Indexer(nn.Module):
         has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
 
+        # Cross-step reuse fast path (pure decode only). The K cache was already
+        # appended above, so the logits MQA + Top-K can be skipped: return the
+        # per-layer cached selection directly (zero-copy) with a tiny in-place
+        # recency patch. Runs in the non-graph-captured mla_dsa_attn_inplace op,
+        # so this Python branch is eager and safe. The counter still advances
+        # below via the unified increment.
+        if (self._xstep_reuse_active(num_contexts, num_generations)
+                and not has_prefill):
+            next_n = num_gen_tokens // num_generations
+            reused = self._xstep_reuse_decode(metadata, num_gen_tokens,
+                                              num_contexts, num_generations,
+                                              next_n)
+            if reused is not None:
+                self._xstep_counter += 1
+                self._maybe_store_indexcache_topk(metadata, reused)
+                return reused
+
         topk_indices_buffer = torch.empty(
             (hidden_states.shape[0], self.index_topk),
             dtype=torch.int32,
@@ -3194,6 +3343,7 @@ class Indexer(nn.Module):
                              ...]
             batch_size = num_generations
             next_n = num_gen_tokens // num_generations
+
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
@@ -3492,10 +3642,24 @@ class Indexer(nn.Module):
                     metadata.heuristic_prev_topk[
                         local_layer, :num_generations].copy_(last_mtp_topk)
 
+            # Refresh step: snapshot the freshly computed decode Top-K so the
+            # next (freq-1) steps can reuse it. Only runs on the compute path.
+            self._xstep_store_decode(metadata, topk_indices_buffer,
+                                     num_ctx_tokens, num_gen_tokens,
+                                     num_contexts, num_generations, next_n)
+
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+
+        # Advance the per-layer cross-step counter once per decode step. A pure
+        # prefill / skip step does not advance it (the cache stays valid for the
+        # next decode). Done after both reuse and compute so step 0 computes.
+        if self._xstep_enabled and has_decode \
+                and not metadata.skip_indexer_for_gen_reqs:
+            self._xstep_counter += 1
+
         self._maybe_store_indexcache_topk(metadata, topk_indices_buffer)
         return topk_indices_buffer
 

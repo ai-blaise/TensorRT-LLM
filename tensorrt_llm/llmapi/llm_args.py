@@ -326,6 +326,27 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     index_topk_pattern: Optional[str] = Field(
         default=None,
         description="Per-layer F/S IndexCache TopK reuse pattern.")
+    index_topk_step_freq: Optional[int] = Field(
+        default=None,
+        description=
+        "Cross-STEP DSA Top-K reuse stride (EXPERIMENTAL, opt-in). Recompute the "
+        "full logits MQA + Top-K only every `index_topk_step_freq` decode steps "
+        "and reuse the cached selection in between. Runs in the non-graph-"
+        "captured mla_dsa_attn_inplace op, so the per-step decision is eager-"
+        "safe; the reuse step skips the logits+Top-K kernels (measured -39%/-60%/"
+        "-68% amortized indexer decode cost at stride 2/4/8 on B200). ACCURACY "
+        "DEPENDS on real-activation Top-K stability across steps and MUST be "
+        "validated end-to-end before enabling in production -- by default the "
+        "reuse freezes the selection (drops the newest <(freq-1)*next_n KV "
+        "positions during the window). None or 1 disables it (default).")
+    index_topk_step_recency_patch: bool = Field(
+        default=False,
+        description=
+        "When cross-step reuse is on, patch the newly appended KV positions back "
+        "into the reused Top-K each step for exact recency. Currently launch-"
+        "bound in PyTorch (a net latency loss vs the kernels it replaces -- "
+        "needs a fused kernel), so off by default. The reuse otherwise freezes "
+        "the selection for the stride window.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
     skip_indexer_for_short_seqs: bool = Field(
@@ -462,6 +483,9 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                         f"for non-Blackwell GPUs.")
         if self.index_topk_freq is not None and self.index_topk_freq < 1:
             raise ValueError("index_topk_freq must be at least 1.")
+        if (self.index_topk_step_freq is not None
+                and self.index_topk_step_freq < 1):
+            raise ValueError("index_topk_step_freq must be at least 1.")
         if self.index_topk_pattern is not None:
             self.index_topk_pattern = self.index_topk_pattern.upper()
             if any(role not in ("F", "S")

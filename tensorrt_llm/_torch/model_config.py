@@ -100,6 +100,10 @@ def _get_blaise_indexer_overrides(
                                  indexcache.get("index_topk_pattern"))
         if pattern is not None:
             overrides["index_topk_pattern"] = str(pattern).upper()
+        step_freq = indexcache.get("step_freq",
+                                   indexcache.get("index_topk_step_freq"))
+        if step_freq is not None:
+            overrides["index_topk_step_freq"] = int(step_freq)
 
     hisa = _as_dict(indexer_quant.get("hisa"))
     if hisa is not None and bool(hisa.get("enabled", False)):
@@ -714,6 +718,9 @@ class ModelConfig(Generic[TConfig]):
                                                "indexer_mode", "vanilla")
                         index_topk_freq = getattr(sparse_attention_config,
                                                   "index_topk_freq", None)
+                        index_topk_step_freq = getattr(
+                            sparse_attention_config, "index_topk_step_freq",
+                            None)
                         index_topk_pattern = getattr(sparse_attention_config,
                                                      "index_topk_pattern",
                                                      None)
@@ -758,6 +765,9 @@ class ModelConfig(Generic[TConfig]):
                             if index_topk_freq is None:
                                 index_topk_freq = model_overrides.get(
                                     "index_topk_freq")
+                            if index_topk_step_freq is None:
+                                index_topk_step_freq = model_overrides.get(
+                                    "index_topk_step_freq")
                             if index_topk_pattern is None:
                                 index_topk_pattern = model_overrides.get(
                                     "index_topk_pattern")
@@ -790,6 +800,8 @@ class ModelConfig(Generic[TConfig]):
                             "indexer_mode", "vanilla")
                         index_topk_freq = model_overrides.get(
                             "index_topk_freq")
+                        index_topk_step_freq = model_overrides.get(
+                            "index_topk_step_freq")
                         index_topk_pattern = model_overrides.get(
                             "index_topk_pattern")
                         enable_nvfp4_hisa = model_overrides.get(
@@ -848,6 +860,7 @@ class ModelConfig(Generic[TConfig]):
                             index_head_dim=index_head_dim,
                             index_topk=index_topk,
                             index_topk_freq=index_topk_freq,
+                            index_topk_step_freq=index_topk_step_freq,
                             index_topk_pattern=index_topk_pattern,
                             indexer_max_chunk_size=indexer_max_chunk_size,
                             skip_indexer_for_short_seqs=
