@@ -274,8 +274,18 @@ int main(int argc, char** argv) {
     printf("=== KVarN in-kernel dequant microbench (B200) ===\n");
     printf("dims: group=%d ckv=%d k_pe=%d  ckv_bits=%d pe_bits=%d\n",
            GROUP, DCKV, DPE, CKV_BITS, PE_BITS);
-    printf("packed bytes/block=%d  fp16 bytes/block=%d  fp8 bytes/block=%d\n",
-           L.total, 2 * GROUP * (DCKV + DPE), GROUP * (DCKV + DPE));
+    int fp16_bpb = 2 * GROUP * (DCKV + DPE);
+    int fp8_bpb  = GROUP * (DCKV + DPE);
+    int nvfp4_bpb = GROUP * (DCKV + DPE) / 2 + GROUP * (DCKV + DPE) / 16 * 1; // E2M1 + E4M3 sf
+    printf("packed bytes/block=%d  fp16 bytes/block=%d  fp8 bytes/block=%d  nvfp4 bytes/block=%d\n",
+           L.total, fp16_bpb, fp8_bpb, nvfp4_bpb);
+    printf("--- KV memory / capacity (MLA latent, group=%d) ---\n", GROUP);
+    printf("fp16 : %5d B/block  1.00x cap   bpe=16.00\n", fp16_bpb);
+    printf("fp8  : %5d B/block  %.2fx cap   bpe=8.00\n", fp8_bpb, (double)fp16_bpb/fp8_bpb);
+    printf("nvfp4: %5d B/block  %.2fx cap   bpe=%.2f\n", nvfp4_bpb, (double)fp16_bpb/nvfp4_bpb, nvfp4_bpb*8.0/(GROUP*(DCKV+DPE)));
+    printf("kvarn: %5d B/block  %.2fx cap   bpe=%.2f   (vs fp8: %.2fx, vs nvfp4: %.2fx)\n",
+           L.total, (double)fp16_bpb/L.total, L.total*8.0/(GROUP*(DCKV+DPE)),
+           (double)fp8_bpb/L.total, (double)nvfp4_bpb/L.total);
     printf("N (blocks restored/step) = %d, pool=%d blocks\n\n", N, NUM_BLOCKS);
 
     // when fixture present, restore the FIRST N blocks in order (ids 0..N-1) so we
@@ -283,10 +293,19 @@ int main(int argc, char** argv) {
     std::vector<int> h_ids(N);
     for (int i = 0; i < N; i++) h_ids[i] = have_fixture ? i : (i * 7) % NUM_BLOCKS;
 
+    // For the N-sweep we need a pool of >=1024 blocks. If the fixture is small,
+    // tile it up so high-N timing is valid (correctness still uses ids 0..31).
+    int POOL = std::max(NUM_BLOCKS, 1024);
+    std::vector<uint8_t> h_pool((size_t)POOL * L.total);
+    for (int b = 0; b < POOL; b++)
+        memcpy(h_pool.data() + (size_t)b * L.total,
+               h_store.data() + (size_t)(b % NUM_BLOCKS) * L.total, L.total);
+    NUM_BLOCKS = POOL;
+
     uint8_t* d_store; int* d_ids;
     __half *d_ckv, *d_kpe;
-    CK(cudaMalloc(&d_store, h_store.size()));
-    CK(cudaMemcpy(d_store, h_store.data(), h_store.size(), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_store, h_pool.size()));
+    CK(cudaMemcpy(d_store, h_pool.data(), h_pool.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_ids, N * sizeof(int)));
     CK(cudaMemcpy(d_ids, h_ids.data(), N * sizeof(int), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_ckv, (size_t)N * GROUP * DCKV * sizeof(__half)));
@@ -361,6 +380,38 @@ int main(int argc, char** argv) {
     printf("\n--- vs round-4 decode budget (~%.0f us/layer/tok) ---\n", budget_us);
     printf("KVarN in-kernel  : %.1f us = %.1f%% of budget\n", t_kvarn*1e3, t_kvarn*1e3/budget_us*100);
     printf("python staged b32: 808.4 us = 237.1%% of budget  (round-4 logged)\n");
+
+    // ---- N-sweep: per-step cost across batch (blocks restored/step) ----
+    // Reuse the store pool; launch more CTAs against strided ids. This mirrors the
+    // round-4 sweep rows (sparse topK=32 blocks/req; b1/b8/b32 grow N=32/256/1024).
+    printf("\n--- N-sweep: in-kernel vs python-staged vs budget ---\n");
+    printf("  N   inkernel_us  us/blk  fp8_us  pyStaged_us(*)  inkernel_%%budget\n");
+    int sweepN[] = {1, 8, 32, 64, 128, 256, 512, 1024};
+    // python-staged batched_dequant rows from system_decode_overhead.log (us/block):
+    // N=1:158.85 8:19.64 32:4.47 64:2.44 128:1.44 256:1.23 (interp/hold past 256)
+    // plus the per-step sparse_us TOTAL (incl scatter) at b1/b8/b32 = 172.5/316.1/808.4.
+    for (int sn : sweepN) {
+        if (sn > NUM_BLOCKS) continue;
+        int* d_ids_s; std::vector<int> ids_s(sn);
+        for (int i=0;i<sn;i++) ids_s[i] = (i*7) % NUM_BLOCKS;
+        CK(cudaMalloc(&d_ids_s, sn*sizeof(int)));
+        CK(cudaMemcpy(d_ids_s, ids_s.data(), sn*sizeof(int), cudaMemcpyHostToDevice));
+        __half *o_ckv, *o_kpe;
+        CK(cudaMalloc(&o_ckv, (size_t)sn*GROUP*DCKV*sizeof(__half)));
+        CK(cudaMalloc(&o_kpe, (size_t)sn*GROUP*DPE*sizeof(__half)));
+        auto run = [&](){ kvarn_dequant_kernel<<<sn, threads, smem>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
+        run(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        float t = time_ms(run, iters, warmup);
+        __half *f8o; CK(cudaMalloc(&f8o,(size_t)sn*GROUP*(DCKV+DPE)*sizeof(__half)));
+        auto runf8=[&](){ fp8_dequant_kernel<<<sn,threads>>>(d_fp8,d_ids_s,f8o,1.0f); };
+        runf8(); CK(cudaDeviceSynchronize()); float tf8=time_ms(runf8,iters,warmup);
+        // python staged total per-step ~ (sparse path): use logged rows where available
+        double py = (sn<=1)?172.5:(sn<=8)?316.1:(sn<=32)?808.4:(808.4*sn/32.0);
+        printf("%5d   %9.2f  %6.3f  %6.2f   %12.1f   %6.1f%%\n",
+               sn, t*1e3, t*1e3/sn, tf8*1e3, py, t*1e3/budget_us*100);
+        CK(cudaFree(d_ids_s)); CK(cudaFree(o_ckv)); CK(cudaFree(o_kpe)); CK(cudaFree(f8o));
+    }
+    printf("(*) pyStaged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.\n");
 
     CK(cudaFree(d_store)); CK(cudaFree(d_ids)); CK(cudaFree(d_ckv)); CK(cudaFree(d_kpe));
     CK(cudaFree(d_fp8)); CK(cudaFree(d_fp8out)); CK(cudaFree(d_fp16)); CK(cudaFree(d_fp16out));
