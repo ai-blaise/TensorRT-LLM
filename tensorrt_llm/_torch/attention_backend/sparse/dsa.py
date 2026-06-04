@@ -1,5 +1,6 @@
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1494,6 +1495,9 @@ class Indexer(nn.Module):
         self.head_dim = sparse_attention_config.index_head_dim  # 128
         self.index_topk = sparse_attention_config.index_topk  # 2048
         self.layer_idx = layer_idx
+        # block_id -> commit_gen last reconstructed into this layer's fp16
+        # main pool (amortized KVarN decode restore). Empty when amortize off.
+        self._kvarn_restored_gen = {}
         self.indexer_mode = getattr(sparse_attention_config, "indexer_mode",
                                     "vanilla")
         self.index_topk_freq = getattr(sparse_attention_config,
@@ -3592,16 +3596,27 @@ class DSATrtllmAttention(TrtllmAttention):
                                       k_pe.to(torch.float16))
 
     def kvarn_restore_for_decode(self, metadata):
-        """Reconstruct committed blocks back into the main-pool fp16 slot so the
-        C++ decode kernel reads correct latent values, using the BATCHED
-        restore primitive (one pool.load_blocks() for the whole step; ~1.2-2.4
-        us/block vs ~277 us/block per-block, see system_decode_overhead.log).
+        """Reconstruct committed blocks into the main-pool fp16 slot so the C++
+        decode kernel reads correct latent values, using the BATCHED restore
+        primitive (one pool.load_blocks() for the step; ~1.2-2.4 us/block).
 
-        Production policy note: this restores every committed block referenced
-        by the generation batch. For long context the per-step cost should be
-        bounded to the indexer-selected sparse top-K set (flat in context);
-        that scoping + the zero-round-trip fold both live in the C++ decode
-        kernel (the end-state). Kept full here for Stage-a correctness."""
+        AMORTIZATION (kvarn_amortize_restore, default ON when KVarN is enabled):
+        committed full blocks are immutable -- their packed KVarN bytes never
+        change until the block-id is recycled and re-committed (pool.commit_gen
+        bumps then). During steady decode the only main-pool write is to the
+        in-progress TAIL block (not yet committed, stays fp16); committed-block
+        fp16 slots are never overwritten. So once a block is reconstructed into
+        its fp16 slot it stays correct, and we only re-dequant blocks whose
+        restored epoch lags commit_gen -- the per-step CHURN (one fresh block
+        per request per 64 decode steps), not the full B*32 working set.
+
+        Microbench (kvarn_inkernel, B200): batch=32 un-amortized full restore
+        481 us = 141% of the 341 us/layer/tok budget; amortized fill-step (all
+        32 reqs commit a fresh block the SAME step) 71.7 us = 21% budget (6.7x);
+        steady-state 1.12 us = 0.33% budget. cos_ckv=cos_kpe=1.000000.
+
+        Set kvarn_amortize_restore=False (or the AMORTIZE flag off) to fall back
+        to the always-correct full per-step restore."""
         mgr = self._kvarn_mgr(metadata)
         if mgr is None:
             return
@@ -3610,15 +3625,25 @@ class DSATrtllmAttention(TrtllmAttention):
         bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime
         lo, hi = self._kvarn_seq_range(metadata, True)
-        # Gather the unique committed block ids to restore this step.
+        amortize = bool(getattr(mgr, "kvarn_amortize_restore", False))
+        # Per-(layer) epoch of the block content last reconstructed into the
+        # fp16 pool. block_id -> commit_gen at restore time.
+        restored_gen = self._kvarn_restored_gen if amortize else None
+        # Gather the committed block ids referenced this step; under amortize,
+        # keep only the ones whose fp16 slot is stale (never restored, or the
+        # block-id was recycled+re-committed since we last restored it).
         valid_host = pool.valid.to("cpu")
+        commit_gen = pool.commit_gen
         to_restore = []
         for i in range(lo, hi):
             n_full = int(kv_lens[i]) // tpb
             for b in range(n_full):
                 block_id = int(bt[i, b])
-                if block_id >= 0 and bool(valid_host[block_id]):
-                    to_restore.append(block_id)
+                if block_id < 0 or not bool(valid_host[block_id]):
+                    continue
+                if amortize and restored_gen.get(block_id) == commit_gen[block_id]:
+                    continue  # fp16 slot already holds this block's content
+                to_restore.append(block_id)
         if not to_restore:
             return
         block_ids = sorted(set(to_restore))
@@ -3629,6 +3654,9 @@ class DSATrtllmAttention(TrtllmAttention):
         # scatter the reconstructed latent back: blk[:, :Dckv]=ckv, [:, Dckv:]=k_pe
         buf[ids, 0, :, 0, :Dckv] = ckv_d.to(buf.dtype)
         buf[ids, 0, :, 0, Dckv:] = kpe_d.to(buf.dtype)
+        if amortize:
+            for bid in block_ids:
+                restored_gen[bid] = commit_gen[bid]
 
     def mla_rope_generation(
         self,
@@ -3829,6 +3857,14 @@ class DSACacheManager(KVCacheManager):
             qk_rope_head_dim=getattr(sparse_attn_config, "qk_rope_head_dim",
                                      None),
         )
+        # AMORTIZED restore (default OFF for safety / clean main default).
+        # When on, kvarn_restore_for_decode only re-dequants blocks whose fp16
+        # main-pool slot is stale vs pool.commit_gen (the per-step churn), not
+        # the full B*32 working set. Toggle via mla_latent_kv_amortize on the
+        # sparse-attn config or the TRTLLM_KVARN_AMORTIZE env var.
+        self.kvarn_amortize_restore = bool(
+            getattr(sparse_attn_config, "mla_latent_kv_amortize", False)
+            or os.environ.get("TRTLLM_KVARN_AMORTIZE", "") in ("1", "true", "True"))
         self.kvarn_latent_pool_per_layer = []
         if self.kvarn_cfg is not None:
             dev = self.indexer_k_cache_pool_per_layer[0].device \
