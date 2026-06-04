@@ -16,6 +16,7 @@ from tensorrt_llm.mapping import Mapping
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import (register_add_norm,
+                                         register_add_norm_fp4_quant,
                                          register_add_norm_quant)
 from .piecewise_optimizer import piecewise_optimizer
 from .recover_pass import recover_pass
@@ -83,6 +84,11 @@ class Backend:
                 cls._custom_pass_instances.append(PatternMatcherPass())
                 register_add_norm(cls._custom_pass_instances[-1])
             else:
+                # NVFP4 add+norm+quant fusion (DeepSeek-V3.2 NVFP4 MoE input):
+                # collapse add + rmsnorm + fp4_quantize into one kernel. Try
+                # before the FP8 and bf16 patterns since it is the most specific.
+                register_add_norm_fp4_quant(cls._custom_pass_instances[-1])
+                cls._custom_pass_instances.append(PatternMatcherPass())
                 # Add fp8 quant pattern before fp16/bf16 pattern
                 register_add_norm_quant(cls._custom_pass_instances[-1])
                 cls._custom_pass_instances.append(PatternMatcherPass())
