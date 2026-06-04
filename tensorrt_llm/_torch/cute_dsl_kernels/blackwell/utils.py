@@ -206,10 +206,13 @@ def fmin(a: Union[float, cutlass.Float32],
          nan=False,
          loc=None,
          ip=None) -> cutlass.Float32:
+    a_ir = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
+    b_ir = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
     return cutlass.Float32(
         nvvm.fmin(
-            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            a_ir.type,
+            a_ir,
+            b_ir,
             nan=nan,
             loc=loc,
             ip=ip,
