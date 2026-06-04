@@ -368,6 +368,109 @@ def transform_local_topk_and_prepare_pool_view(
     return global_indices, attn_metadata._cached_pool_view
 
 
+# JIT fallback for trtllm::indexer_affine_reuse. The AOT C++ op
+# (cpp/tensorrt_llm/thop/indexerAffineReuseOp.cpp) is the production path; when
+# the loaded .so predates that op we register an equivalent load_inline kernel
+# under the same qualified name so the reuse path runs without a rebuild. Both
+# compute out = (g < 0) ? -1 : g + delta elementwise.
+_AFFINE_REUSE_READY = False
+_AFFINE_REUSE_LOCK = threading.Lock()
+
+
+def _ensure_indexer_affine_reuse_op():
+    global _AFFINE_REUSE_READY
+    if _AFFINE_REUSE_READY:
+        return
+    with _AFFINE_REUSE_LOCK:
+        if _AFFINE_REUSE_READY:
+            return
+        if hasattr(torch.ops.trtllm, "indexer_affine_reuse"):
+            _AFFINE_REUSE_READY = True
+            return
+        from torch.utils.cpp_extension import load_inline
+        cuda_src = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+__global__ void _idx_affine_reuse_k(const int* __restrict__ g, int* __restrict__ o,
+                                    long n, int delta) {
+    long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int v = g[i];
+    o[i] = (v < 0) ? -1 : v + delta;
+}
+torch::Tensor indexer_affine_reuse(torch::Tensor g, int64_t delta) {
+    auto o = torch::empty_like(g);
+    long n = g.numel();
+    if (n > 0) {
+        int t = 256; long b = (n + t - 1) / t;
+        _idx_affine_reuse_k<<<b, t, 0, at::cuda::getCurrentCUDAStream()>>>(
+            g.data_ptr<int>(), o.data_ptr<int>(), n, (int)delta);
+    }
+    return o;
+}
+"""
+        cpp_src = "torch::Tensor indexer_affine_reuse(torch::Tensor g, int64_t delta);"
+        mod = load_inline(name="trtllm_indexer_affine_reuse_jit",
+                          cpp_sources=cpp_src, cuda_sources=cuda_src,
+                          functions=["indexer_affine_reuse"], verbose=False)
+        torch.library.define(
+            "trtllm::indexer_affine_reuse",
+            "(Tensor global_indices_f, int delta) -> Tensor")
+        torch.library.impl(
+            "trtllm::indexer_affine_reuse", "CUDA",
+            lambda g, delta: mod.indexer_affine_reuse(g, delta))
+
+        @torch.library.register_fake("trtllm::indexer_affine_reuse")
+        def _(g, delta):
+            return torch.empty_like(g)
+
+        _AFFINE_REUSE_READY = True
+
+
+def transform_local_topk_reuse_or_compute(
+    topk_indices: torch.Tensor,
+    attn_metadata: "DSAtrtllmAttentionMetadata",
+    layer_idx: int,
+    skip_topk: bool,
+    is_generation: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Local->global TopK remap with FSSS reuse-layer short-circuit.
+
+    On an owning ("F") indexer layer (``skip_topk`` False) this runs the full
+    convert_req_index_to_global gather and caches the resulting global indices
+    plus this layer's index. On a reuse ("S") layer (``skip_topk`` True) the
+    local TopK is identical to the owning layer's, so the global indices are
+    the cached F-layer globals plus the constant per-layer offset
+    ``(layer_idx - cached_layer_idx) * tokens_per_block`` (with -1 preserved);
+    a single fused elementwise op replaces the gather. ``skip_topk`` is a static
+    per-layer property so this branch is constant under CUDA-graph capture.
+    """
+    attn_metadata._ensure_pool_view_cached()
+    block_size = attn_metadata._cached_tokens_per_block
+    cached_global = getattr(attn_metadata, "_blaise_global_idx_cache", None)
+    cached_layer = getattr(attn_metadata, "_blaise_global_idx_layer", None)
+    cached_gen = getattr(attn_metadata, "_blaise_global_idx_is_gen", None)
+
+    if (skip_topk and cached_global is not None
+            and cached_gen == is_generation
+            and cached_global.shape == topk_indices.shape):
+        _ensure_indexer_affine_reuse_op()
+        delta = (layer_idx - cached_layer) * block_size
+        global_indices = torch.ops.trtllm.indexer_affine_reuse(
+            cached_global, delta)
+        return global_indices, attn_metadata._cached_pool_view
+
+    global_indices, pool_view = transform_local_topk_and_prepare_pool_view(
+        topk_indices, attn_metadata, layer_idx, is_generation)
+    if not skip_topk:
+        # Owning layer: publish its global indices for the reuse layers that
+        # follow it in the same step (the local TopK they reuse is identical).
+        attn_metadata._blaise_global_idx_cache = global_indices
+        attn_metadata._blaise_global_idx_layer = layer_idx
+        attn_metadata._blaise_global_idx_is_gen = is_generation
+    return global_indices, pool_view
+
+
 def split_prefill_chunks(
     seq_lens: torch.Tensor,
     max_chunk_size: int,
@@ -3515,9 +3618,10 @@ class DSATrtllmAttention(TrtllmAttention):
         # Transform the local topk indices to global topk indices in paged kv cache
         is_generation = (forward_args.attention_input_type ==
                          AttentionInputType.generation_only)
-        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
+        topk_indices_global, _ = transform_local_topk_reuse_or_compute(
             forward_args.topk_indices, metadata,
-            self.get_local_layer_idx(metadata), is_generation)
+            self.get_local_layer_idx(metadata), self.indexer.skip_topk,
+            is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)

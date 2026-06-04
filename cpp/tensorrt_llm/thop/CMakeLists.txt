@@ -121,6 +121,7 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
+  indexerAffineReuseOp.cpp
   trtllmGenQKVProcessOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(

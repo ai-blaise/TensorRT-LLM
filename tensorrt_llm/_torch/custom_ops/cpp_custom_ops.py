@@ -1206,6 +1206,10 @@ def _register_fake():
           stride_factor: int, layer_id: int) -> torch.Tensor:
         return torch.empty_like(token_indices)
 
+    @torch.library.register_fake("trtllm::indexer_affine_reuse")
+    def _(global_indices_f: torch.Tensor, delta: int) -> torch.Tensor:
+        return torch.empty_like(global_indices_f)
+
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
           slot_mapping_scale: torch.Tensor, k_token_start: int, num_tokens: int,
