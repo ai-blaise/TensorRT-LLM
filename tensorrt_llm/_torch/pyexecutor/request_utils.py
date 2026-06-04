@@ -243,26 +243,29 @@ def partition_context_for_helix(
 ) -> Tuple[List[int], List[int], int, int]:
     """Partition context for Helix CP.
 
-    Helix round-robin block assignment requires at least one KV block per CP
-    rank (rank ``r`` owns blocks ``{r, r+cp_size, ...}``). A prompt short enough
-    that ``ceil(input_len / tokens_per_block) < cp_size`` (e.g. a sub-128-token
-    request at ``tokens_per_block=64, cp_size=2``) would otherwise leave the
-    high CP ranks with zero blocks. Rather than rejecting the request (which
-    crashes the gen-server MPI worker on any short prompt — chat/coding-agent
-    turns and benchmark warmups routinely send them), the global block grid is
-    padded up to exactly ``cp_size`` blocks so every rank owns one. The extra
-    blocks beyond the real tokens are pure right-padding; their KV is written
-    but never attended to as queries (the real ``prompt_len`` / causal masking
-    bound the live tokens), so the partial-attention combine is unchanged. This
-    mirrors the existing single-partial-block padding below and the warmup path
-    in ``KVCacheManager.add_dummy_requests`` (which already clamps helix dummy
-    token counts up so short sequences are legal).
-
     Args:
         input_token_ids: List of input token IDs.
         cp_rank: Current CP rank.
         cp_size: Total number of CP ranks.
         tokens_per_block: Number of tokens per block.
+
+    Helix round-robin block assignment requires at least one KV block per CP
+    rank (rank ``r`` owns blocks ``{r, r+cp_size, ...}``). A prompt short enough
+    that ``ceil(input_len / tokens_per_block) < cp_size`` (e.g. a sub-128-token
+    request at ``tokens_per_block=64, cp_size=2``) would otherwise leave the
+    high CP ranks with zero blocks. Rather than rejecting the request (which
+    crashes the gen-server MPI worker on any short prompt -- chat/coding-agent
+    turns and benchmark warmups routinely send them), the global block grid is
+    padded up to exactly ``cp_size`` blocks so every rank owns one. The extra
+    blocks beyond the real tokens are pure right-padding; their KV is written
+    but never attended to as queries (the real ``prompt_len`` / causal masking
+    bound the live tokens), so the partial-attention combine is unchanged.
+
+    A rank that owns only wholly-padded blocks therefore returns an empty token
+    list (``seqlen_this_rank_cp == 0``). That rank holds no real KV for the
+    sequence and must be treated as a persistently inactive helix rank by the
+    caller (see ``merge_helix_requests``); the decode/KV path cannot index a
+    zero-length sequence.
 
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
@@ -273,8 +276,7 @@ def partition_context_for_helix(
     # Pad so the global block grid holds exactly one block per CP rank at the
     # minimum (short prompt) and otherwise rounds the final partial block up.
     # padding_len is the total right-padding; it always lands in the global last
-    # block(s), keeping the single-strip invariant below intact for the common
-    # case and extending it to the short-prompt case via padded_total_len.
+    # block(s), so all padding is contiguous at the tail.
     num_real_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
     num_total_blocks = max(num_real_blocks, cp_size)
     padded_total_len = num_total_blocks * tokens_per_block
@@ -295,16 +297,12 @@ def partition_context_for_helix(
         torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
     )
 
-    # All padding is contiguous at the tail, so it occupies the final
-    # (num_total_blocks - num_real_blocks_with_data) blocks plus the trailing
-    # part of the last data block. Strip every padded token from each rank that
-    # owns any tail-padded block. A block global index b holds padding iff
-    # b * tokens_per_block + (token offset) >= input_len; equivalently the last
-    # real token sits in block (input_len - 1) // tokens_per_block, so any block
-    # strictly after it is all-padding and any token position >= input_len in
-    # its owning block is padding. Trim by absolute position to stay correct for
-    # both the single-partial-block case and the short-prompt all-padding-block
-    # case (where high ranks own a wholly-padded block).
+    # All padding is contiguous at the tail, so a token is padding iff its global
+    # position is >= input_len. Strip by absolute position so the result is
+    # correct for both the single-partial-block case and the short-prompt
+    # all-padding-block case (where high ranks own a wholly-padded block and end
+    # up with an empty list). Keying on the position id matches the global block
+    # index the C++ reassembly (cacheSplitConcat.cu) uses to place each shard.
     if padding_len > 0:
         kept_input, kept_pos = [], []
         for tok, pos in zip(input_ids_this_rank, position_ids_this_rank):
@@ -368,6 +366,24 @@ def merge_helix_requests(
             req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
         )
 
+        # A prompt shorter than ``cp_size`` blocks leaves the high CP ranks with
+        # only wholly-padded blocks, i.e. zero real tokens. A zero-length
+        # sequence is illegal in the C++ KV-cache / attention path -- on the
+        # first decode forward it reaches a nanobind-bound std::vector<int> fill
+        # constructor whose ``count`` underflows from a ``len - 1`` arithmetic and
+        # segfaults the gen-server worker. Such a rank holds no real KV for the
+        # sequence, so it is a (persistently) inactive helix rank: give it a
+        # single padding token of KV so the block table is well-formed and mark
+        # it inactive so the partial-attention combine ignores its contribution.
+        # The padding token sits at the global last position (>= input_len) and
+        # is never attended to as a query (causal masking + per-rank kv_lens
+        # bound the live tokens), matching how the warmup path in
+        # ``KVCacheManager.add_dummy_requests`` clamps helix dummy lengths up.
+        is_empty_helix_rank = len(input_ids_this_rank) == 0
+        if is_empty_helix_rank:
+            input_ids_this_rank = [0]
+            position_ids_this_rank = [input_len]
+
         req = executor_request_to_llm_request(
             req_id=req_item.id,
             executor_request=req_item.request,
@@ -378,6 +394,8 @@ def merge_helix_requests(
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        if is_empty_helix_rank:
+            req.py_helix_is_inactive_rank = True
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)

@@ -154,19 +154,20 @@ def test_merge_helix_requests_without_padding():
             assert llm_request.get_tokens(0) == [5, 6, 7, 8]
 
 
-def test_merge_helix_requests_short_prompt_padded():
-    """Test merge_helix_requests pads short prompts up to one block per CP rank.
+def test_merge_helix_requests_short_prompt_inactive_high_ranks():
+    """A prompt with fewer real blocks than CP ranks no longer raises; the high
+    ranks that own only padding become inactive single-token requests.
 
-    A prompt with fewer blocks than CP ranks (here 12 tokens -> 3 blocks at
-    tokens_per_block=4, fewer than 4 CP ranks) must NOT crash the gen-server
-    worker. The global block grid is padded up to exactly cp_size blocks so
-    every rank owns one; the real tokens land round-robin on the low ranks and
-    the high rank(s) own a wholly-padded block (empty after the padding strip).
-    See partition_context_for_helix.
+    12 tokens at tokens_per_block=4 is 3 real blocks; padded up to cp_size=4
+    blocks. Round-robin block ownership:
+      rank 0 -> block 0 -> tokens [1,2,3,4]   (active)
+      rank 1 -> block 1 -> tokens [5,6,7,8]   (active)
+      rank 2 -> block 2 -> tokens [9,10,11,12] (active)
+      rank 3 -> block 3 -> all padding -> empty -> 1 padding token, inactive
     """
-    tokens_per_block = 4
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
-    # 12 tokens => 3 real blocks; padded up to 4 blocks for 4 CP ranks.
+    tokens_per_block = 4
     executor_request = trtllm.Request(
         input_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         max_tokens=12,
@@ -174,24 +175,12 @@ def test_merge_helix_requests_short_prompt_padded():
         sampling_config=trtllm.SamplingConfig(),
         output_config=trtllm.OutputConfig(),
     )
-    request_item = RequestQueueItem(
-        id=1,
-        request=executor_request,
-    )
+    request_item = RequestQueueItem(id=1, request=executor_request)
 
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-
-    # Round-robin block distribution across 4 CP ranks (4 blocks total after
-    # padding, 4 tokens/block):
-    #   rank 0 owns block {0} -> tokens [1,2,3,4]
-    #   rank 1 owns block {1} -> tokens [5,6,7,8]
-    #   rank 2 owns block {2} -> tokens [9,10,11,12]
-    #   rank 3 owns block {3} -> [] (wholly-padded block; all padding stripped)
-    expected = {
+    expected_active_tokens = {
         0: [1, 2, 3, 4],
         1: [5, 6, 7, 8],
         2: [9, 10, 11, 12],
-        3: [],
     }
     for rank in range(4):
         result = merge_helix_requests(
@@ -204,11 +193,17 @@ def test_merge_helix_requests_short_prompt_padded():
         assert len(result) == 1
         llm_request = result[0]
         assert isinstance(llm_request, LlmRequest)
-        assert llm_request.request_id == 1
-        assert llm_request.get_tokens(0) == expected[rank]
-        # total_input_len_cp tracks the full (real) prompt length on every rank,
-        # so the global sequence length is preserved despite the per-rank split.
+        # total_input_len_cp is always the full (global) prompt length.
         assert llm_request.total_input_len_cp == 12
+        if rank in expected_active_tokens:
+            assert llm_request.get_tokens(0) == expected_active_tokens[rank]
+            assert llm_request.seqlen_this_rank_cp == 4
+            assert llm_request.py_helix_is_inactive_rank is False
+        else:
+            # Wholly-padded rank: one padding token, marked inactive so it never
+            # indexes a zero-length sequence in the C++ KV/attention path.
+            assert llm_request.seqlen_this_rank_cp == 1
+            assert llm_request.py_helix_is_inactive_rank is True
 
 
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
