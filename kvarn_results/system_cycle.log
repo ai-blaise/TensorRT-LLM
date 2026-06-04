@@ -1,0 +1,19 @@
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc17
+[load] extracted patched methods: ['_kvarn_block_table_host', '_kvarn_latent_block_view', '_kvarn_mgr', '_kvarn_seq_range', 'kvarn_commit_full_blocks', 'kvarn_restore_for_decode']
+[store] committed [12, 13]; sink [10, 11] + tail 14 fp16  OK
+[store] idempotent  OK
+
+ block   role  cos_ckv  cos_kpe
+    10   sink  1.00000  1.00000
+    11   sink  1.00000  1.00000
+    12  kvarn  0.99328  0.99662
+    13  kvarn  0.99380  0.99609
+    14   tail  1.00000  1.00000
+
+[restore] sink/tail bit-exact; KVarN restored cos>=0.99328
+[layers] per-layer pool isolation  OK
+
+KVARN-CYCLE-OK

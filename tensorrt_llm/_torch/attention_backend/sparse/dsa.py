@@ -3552,12 +3552,19 @@ class DSATrtllmAttention(TrtllmAttention):
         k_pe = blk[:, mgr.kvarn_cfg.kv_lora_rank:]
         return blk, ckv, k_pe
 
-    def _kvarn_seq_block_table(self, metadata, is_generation):
-        """(num_seqs, block_offsets[:, slot]) consistent with the append op."""
-        if is_generation:
-            return (metadata.num_generations,
-                    metadata.kv_cache_block_offsets[:, metadata.num_contexts:])
-        return (metadata.num_contexts, metadata.kv_cache_block_offsets)
+    def _kvarn_seq_range(self, metadata, is_generation):
+        """(start, stop) global sequence indices for this phase. Context seqs
+        occupy rows 0..num_contexts of block_table / kv_lens_runtime;
+        generation seqs occupy num_contexts..num_seqs."""
+        nc = int(metadata.num_contexts)
+        ns = nc + int(metadata.num_generations)
+        return (nc, ns) if is_generation else (0, nc)
+
+    def _kvarn_block_table_host(self, metadata):
+        """metadata.block_table is the DECODED pool block index per (seq, slot)
+        (padding = -1; see _get_pool_block_indices). Pull to host once."""
+        bt = metadata.block_table
+        return bt.to("cpu") if bt.is_cuda else bt
 
     def kvarn_commit_full_blocks(self, metadata, is_generation):
         """KVarN-store every newly-FULL latent block (skip the sink + the
@@ -3568,16 +3575,15 @@ class DSATrtllmAttention(TrtllmAttention):
         tpb = mgr.tokens_per_block
         sink_blocks = mgr.kvarn_cfg.sink_tokens // tpb
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
-        num_seqs, block_off = self._kvarn_seq_block_table(metadata,
-                                                          is_generation)
+        bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime  # host, per (all) seqs
-        base = 0 if not is_generation else metadata.num_contexts
-        for i in range(int(num_seqs)):
-            klen = int(kv_lens[base + i])
+        lo, hi = self._kvarn_seq_range(metadata, is_generation)
+        for i in range(lo, hi):
+            klen = int(kv_lens[i])
             n_full = klen // tpb            # number of FULL blocks for this seq
             for b in range(sink_blocks, n_full):
-                block_id = int(block_off[i, b])
-                if bool(pool.valid[block_id]):
+                block_id = int(bt[i, b])
+                if block_id < 0 or bool(pool.valid[block_id]):
                     continue
                 _, ckv, k_pe = self._kvarn_latent_block_view(mgr, metadata,
                                                              block_id)
@@ -3594,15 +3600,15 @@ class DSATrtllmAttention(TrtllmAttention):
             return
         tpb = mgr.tokens_per_block
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
-        num_seqs, block_off = self._kvarn_seq_block_table(metadata, True)
+        bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime
-        base = metadata.num_contexts
-        for i in range(int(num_seqs)):
-            klen = int(kv_lens[base + i])
+        lo, hi = self._kvarn_seq_range(metadata, True)
+        for i in range(lo, hi):
+            klen = int(kv_lens[i])
             n_full = klen // tpb
             for b in range(n_full):
-                block_id = int(block_off[i, b])
-                if not bool(pool.valid[block_id]):
+                block_id = int(bt[i, b])
+                if block_id < 0 or not bool(pool.valid[block_id]):
                     continue
                 ckv_d, kpe_d = pool.load_block(block_id)
                 blk, ckv, k_pe = self._kvarn_latent_block_view(
