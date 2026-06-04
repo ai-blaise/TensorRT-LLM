@@ -84,3 +84,39 @@ This lands on top of the R4 indexer-consolidation stack (op-trt-idx-consol-r4:
 HISA-preamble skip + width topk gate + lever-2 affine reuse) and is orthogonal:
 R4 cut logits+topk+remap; this cuts the proj-quant. Applies to all N_F=15
 recompute-F layers at prod (reuse-S layers skip pre_indexer_proj entirely).
+
+## Combined aggregate with the R4 stack
+
+R4 profiled `sparse_attn_indexer` internals (logits + topk + kcache + remap) and
+cut A_F 36.92 -> 16.43 us (-43.5% indexer-TPOT). The proj/RoPE/cat lives in
+`pre_indexer_proj`, an UPSTREAM step R4 did not profile. This fusion cuts that
+proj-quant ~8.2 -> ~4.1 us per F-layer, i.e. ~+4 us/F-layer that stacks on R4.
+
+  per recompute-F layer (graphed, prod shape, B=8):
+    R4 sparse_attn_indexer A_F                 16.43 us
+    pre_indexer_proj rope+quant  (MAIN)         8.2  us   -> 4.1 us (this fusion)
+  Across N_F=15 recompute-F layers: ~ -4 us * 15 = ~ -60 us/token added on top
+  of R4's -256.7 us/token. Reuse-S layers skip pre_indexer_proj entirely
+  (skip_topk early-return), so the proj saving applies only to the 15 F-layers,
+  exactly where it is computed.
+
+## Re-challenge of the R4 candidate dispositions (this session)
+
+Per directive ("do not stop until each is at its proven floor"), re-examined:
+
+  [1] cute_dsl logits retile/fuse: CONFIRMED FLOOR. The DSL paged-MQA-logits
+      tile is fixed by the kernel warpgroup structure (SPLIT_KV=256 = compute
+      tile 128 x 2 math warp groups -> block_kv=64 forced; see dsa.py:174-182).
+      Not a free knob. Fusing logits+topk needs a streaming-topk rewrite inside
+      the DeepGEMM CuTe kernel for ~1-2 us launch/BW (528 KB fp32 logits) -- high
+      risk, low yield vs the proj win just landed. Logits stays at 6.17 us.
+  [2] multi-stream overlap indexer<->MLA/MoE: CONFIRMED INFEASIBLE across ops
+      (topk_indices feeds the same layer forward_dsa_attn; strict serial chain).
+      But WITHIN the indexer, q||k multi-stream is real and is exactly what this
+      fusion exploits (fused_q || fused_k on aux_stream).
+  [3] in-graph metadata: unchanged (near-zero; hidden by overlap scheduler).
+  [4][6] lever-2 affine reuse + IndexCache reuse: unchanged (maximal).
+  [5] HISA activation: unchanged (structural net-negative at prod prefix 4608).
+
+  NEW lever found this session: the proj-path RoPE+cat+quant fusion (above),
+  which the R4 floor analysis did not cover. ~3.2-4.1 us/F-layer, bit-exact.
