@@ -1137,8 +1137,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.max_ctx_seq_len = 0
 
         if self.num_generations > 0:
-            self.max_gen_seq_len = self.seq_lens[self.num_contexts:self.
-                                                 num_seqs].max().item()
+            # seq_lens is a host (CPU) tensor, so these are host reads, not
+            # d2h syncs. Compute the decode-length stats once per step here
+            # rather than per recompute-F indexer layer in
+            # sparse_attn_indexer. All generation requests must share a
+            # single decode length (the paged MQA logits + topk kernels
+            # assume no padding); assert that step-level invariant once.
+            gen_seq_lens = self.seq_lens[self.num_contexts:self.num_seqs]
+            self.max_gen_seq_len = gen_seq_lens.max().item()
+            assert self.max_gen_seq_len == gen_seq_lens.min().item(), \
+                "generation seq_lens are non-uniform; decode requires padding"
             # generation cached token indptr
             torch.cumsum(
                 cached_token_lens[self.num_contexts:self.num_seqs],
@@ -2886,12 +2894,10 @@ class Indexer(nn.Module):
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
-            # Get decode lengths per request (from seq_lens) for validation
-            gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
-                                             num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
+            # The all-generation-requests-share-one-decode-length invariant
+            # (needed because the paged MQA logits + topk kernels assume no
+            # padding) is asserted once per step in metadata.prepare(); no
+            # per-layer host read here.
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
