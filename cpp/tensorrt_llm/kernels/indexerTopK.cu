@@ -365,7 +365,7 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
 
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
-    bool mergeBlocks = false, typename InputT = float>
+    bool mergeBlocks = false, typename InputT = float, bool kAdaptiveFinalSort = false>
 static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
     int* outIndices, float* outLogits, int stride1, int topK)
 {
@@ -375,7 +375,8 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
     static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
     // The class to sort the elements during the final pass.
     using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
-    using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+    using FinalSortTempStorage
+        = std::conditional_t<(useRadixSort || kAdaptiveFinalSort), typename FinalSort::TempStorage, int>;
     // The class to compute the inclusive prefix-sum over the histogram.
     using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -494,7 +495,15 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
         // The histogram did not proceed to the final 10 bits, therefore we need to
         // sort the final items The logits of the elements to be sorted in the final
         // pass.
-        if constexpr (useRadixSort)
+        // Adaptive mode (decode): pick the cheaper insertion final-sort for short
+        // rows at RUNTIME from the on-device scanned length, independent of the
+        // host-side scheme chosen from numColumns. Mirrors host
+        // kSortingAlgorithmThreshold so a radix-launched kernel behaves like the
+        // insertion path whenever the real kv is short (the prod-common case).
+        constexpr int kRowLenRadixThreshold = 12288;
+        bool const useRadixFinalSort
+            = kAdaptiveFinalSort ? (rowLen >= kRowLenRadixThreshold) : useRadixSort;
+        if (useRadixFinalSort)
         {
             // Sorting with radix sort
             float finalLogits[kNumFinalItemsPerThread];
@@ -627,7 +636,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 }
 
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-    typename InputT = float>
+    typename InputT = float, bool kAdaptiveFinalSort = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
     int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
     int const numBlocksToMerge = 0, int const* indices = nullptr)
@@ -667,8 +676,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     }
     logits += static_cast<int64_t>(rowIdx) * stride0;
 
-    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, multipleBlocksPerRow, mergeBlocks>(
-        indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, multipleBlocksPerRow, mergeBlocks, InputT,
+        kAdaptiveFinalSort>(indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -858,8 +867,11 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
-        // From this threshold, use radix sort instead
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, true>;
+        // From this threshold, use radix sort instead. Adaptive final-sort lets
+        // each row fall back to insertion at runtime when its real kv is short
+        // (rowLen < kSortingAlgorithmThreshold), which is the prod-common case
+        // since numColumns is the static max_model_len, not the live kv.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, true, false, false, float, true>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
