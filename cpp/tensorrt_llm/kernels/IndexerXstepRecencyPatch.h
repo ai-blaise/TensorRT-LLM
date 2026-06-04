@@ -17,7 +17,9 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/common/cudaUtils.h"
+
+#include <cstdint>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
