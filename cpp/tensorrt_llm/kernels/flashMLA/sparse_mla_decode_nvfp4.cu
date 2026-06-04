@@ -248,30 +248,51 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
         sm100::decode::head64_nvfp4::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>(curParams);
     };
 
-    if (kNumHeadSplits <= 1)
+    auto checkCuda = [](cudaError_t st, char const* what)
     {
-        launchHeadSplit(0, stream);
-    }
-    else
-    {
-        auto checkCuda = [](cudaError_t st, char const* what)
+        if (st != cudaSuccess)
         {
-            if (st != cudaSuccess)
-            {
-                throw std::runtime_error(std::string("sparse MLA NVFP4 decode head-split: ") + what);
-            }
-        };
-        // Lazily create one persistent side stream + fork/join events per
-        // host thread. Reused across calls to avoid per-decode allocation.
-        static thread_local cudaStream_t sSideStream = nullptr;
-        static thread_local cudaEvent_t sForkEvent = nullptr;
-        static thread_local cudaEvent_t sJoinEvent = nullptr;
-        if (sSideStream == nullptr)
+            throw std::runtime_error(std::string("sparse MLA NVFP4 decode head-split: ") + what);
+        }
+    };
+
+    // Multi-stream head-split is used only when (a) there is more than one head
+    // half and (b) we are not currently capturing a CUDA graph with the side
+    // stream/events still uncreated. Stream/event creation is illegal during
+    // capture; TRT-LLM warms up eagerly before capturing so the lazy-init below
+    // lands in eager mode, and once created the event fork/join replays safely
+    // under graph capture (same pattern as the module-level aux_stream). If we
+    // would have to create resources mid-capture, fall back to serial launches
+    // on the main stream. Either way control falls through to the combine kernel.
+    static thread_local cudaStream_t sSideStream = nullptr;
+    static thread_local cudaEvent_t sForkEvent = nullptr;
+    static thread_local cudaEvent_t sJoinEvent = nullptr;
+    bool useMultiStream = (kNumHeadSplits > 1);
+    if (useMultiStream && sSideStream == nullptr)
+    {
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        checkCuda(cudaStreamIsCapturing(stream, &captureStatus), "query capture");
+        if (captureStatus != cudaStreamCaptureStatusNone)
+        {
+            useMultiStream = false;
+        }
+        else
         {
             checkCuda(cudaStreamCreateWithFlags(&sSideStream, cudaStreamNonBlocking), "stream create");
             checkCuda(cudaEventCreateWithFlags(&sForkEvent, cudaEventDisableTiming), "fork event create");
             checkCuda(cudaEventCreateWithFlags(&sJoinEvent, cudaEventDisableTiming), "join event create");
         }
+    }
+
+    if (!useMultiStream)
+    {
+        for (int startHeadIdx = 0; startHeadIdx < kHeadQ; startHeadIdx += kHeadSplit)
+        {
+            launchHeadSplit(startHeadIdx, stream);
+        }
+    }
+    else
+    {
         // Fork: side stream waits for everything enqueued on the main stream so
         // far (q/k preprocessing + scheduler metadata) before its head half runs.
         checkCuda(cudaEventRecord(sForkEvent, stream), "fork record");
