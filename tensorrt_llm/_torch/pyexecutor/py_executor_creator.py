@@ -585,6 +585,15 @@ def create_py_executor(
                 draft_llm_args.kv_cache_config.dtype = draft_kv_cache_dtype
                 if spec_config.draft_attention_backend == "trtllm_mha":
                     draft_llm_args.attn_backend = "TRTLLM"
+                else:
+                    # The GLM draft is dense GQA (e.g. 32 q / 2 kv heads, head
+                    # dim 128). SM100 trtllm-gen has no fused kernel for that
+                    # shape (any dtype), so the TRTLLM backend silently drops to
+                    # an unfused MHA that allocates a per-batch O(num_q*max_kv)
+                    # score scratch -> hundreds of GiB at max_seq_len during the
+                    # generation CUDA-graph warmup. FlashInfer has a fused GQA
+                    # decode kernel for this shape, so route the draft there.
+                    draft_llm_args.attn_backend = "FLASHINFER"
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
