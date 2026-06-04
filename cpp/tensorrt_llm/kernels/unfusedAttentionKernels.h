@@ -66,7 +66,13 @@ enum class KvCacheDataType
     BASE = 0,
     INT8,
     FP8,
-    NVFP4
+    NVFP4,
+    // KVarN/BDR: block-diagonal Hadamard rotation + per-token asymmetric INT4 RTN
+    // on the dense MLA latent (compressed_kv + k_pe). The rotation is folded into
+    // k_b_proj_trans (Q-correction) so dequant-on-read is unpack+(q*scale+zp) with
+    // no inverse rotation and no per-channel scale gather. See mlaKernels.cu
+    // quantCopyKVarN / dequantCopyKVarN and kvarn_inkernel/bdr_inkernel_bench.cu.
+    KVARN
 };
 
 inline KvCacheDataType cacheTypeFromQuantMode(common::QuantMode quantMode)

@@ -225,6 +225,87 @@ inline __device__ void dequantCopy(
     }
 }
 
+// ============================ KVarN / BDR ============================
+// Block-diagonal-Hadamard + per-token-INT4 dense MLA latent KV (KvCacheDataType::KVARN).
+//
+// Design (validated: kvarn_inkernel/bdr_inkernel_bench.cu, bdr_vs_kvarn_verdict.log):
+//   * order-128 block-diagonal Hadamard on the 512-d compressed_kv (4 sub-blocks)
+//     and a single 64-wide Hadamard on k_pe. The rotation is the only decorrelator
+//     (no Sinkhorn s_col): rotation alone recovers >=0.993 cos at INT4, matching the
+//     full Sinkhorn variant (SAW-INT4 arXiv:2604.19157 Table 2/3, confirmed here).
+//   * per-token asymmetric INT4 RTN (scale, zp); per-head scale array isolates
+//     outlier head-groups (longctx verdict: cos 0.92->0.96 @128K).
+//   * READ stores ckv in the ROTATED frame: dequant-on-read is unpack+(q*scale+zp),
+//     NO inverse Hadamard, NO per-channel gather. The matching H is folded into
+//     k_b_proj_trans (Q-correction): (q@(W_UK H)) @ (H k)^T == (q@W_UK)@k^T. This is
+//     why the read is ~fp8-cost (16.4us vs 11.3us @ N=32) not the 64-71us a Sinkhorn
+//     inverse-rotate read costs.
+
+// In-warp block-diagonal FWHT-128 over one token's data held across consecutive
+// lanes (each lane owns ELTS channels). Intra-lane butterfly for the low stages,
+// __shfl_xor_sync for the high (cross-lane) stages; 128/ELTS lanes per sub-block.
+template <typename T, int ELTS>
+inline __device__ void bdRotate128InWarp(float (&reg)[ELTS], int laneInBlock, unsigned mask)
+{
+#pragma unroll
+    for (int len = 1; len < ELTS; len <<= 1)
+    {
+#pragma unroll
+        for (int i = 0; i < ELTS; ++i)
+        {
+            int partner = i ^ len;
+            if (i < partner)
+            {
+                float u = reg[i], v = reg[partner];
+                reg[i] = u + v;
+                reg[partner] = u - v;
+            }
+        }
+    }
+    int kLanesPerBlock = 128 / ELTS;
+#pragma unroll
+    for (int span = 1; span < 32; span <<= 1)
+    {
+        if (span >= kLanesPerBlock)
+            break;
+        bool low = ((laneInBlock & span) == 0);
+#pragma unroll
+        for (int i = 0; i < ELTS; ++i)
+        {
+            float other = __shfl_xor_sync(mask, reg[i], span);
+            reg[i] = low ? (reg[i] + other) : (other - reg[i]);
+        }
+    }
+    constexpr float kInvSqrt128 = 0.088388347648318f;
+#pragma unroll
+    for (int i = 0; i < ELTS; ++i)
+        reg[i] *= kInvSqrt128;
+}
+
+// KVarN dequant-on-read: unpack ELTS INT4 codes from the 4-byte vec slot and apply
+// the per-token (scale, zp). Output is the ROTATED-frame value (Q-side fold
+// un-rotates downstream). Drop-in alongside dequantCopy at the read site.
+template <typename DstType, int ELTS>
+inline __device__ void dequantCopyKVarN(
+    DstType* dst_global_ptr, uint8_t const* packed4, float scale, float zp)
+{
+    static_assert(ELTS % 2 == 0, "ELTS must be even for INT4 packing");
+    using DstVecType = typename VecType<DstType>::Type;
+    DstVecType frag;
+    DstType* fragElts = reinterpret_cast<DstType*>(&frag);
+#pragma unroll
+    for (int i = 0; i < ELTS / 2; ++i)
+    {
+        uint8_t b = packed4[i];
+        int q0 = b & 0xF;
+        int q1 = (b >> 4) & 0xF;
+        fragElts[2 * i + 0] = cuda_cast<DstType>(static_cast<float>(q0) * scale + zp);
+        fragElts[2 * i + 1] = cuda_cast<DstType>(static_cast<float>(q1) * scale + zp);
+    }
+    *reinterpret_cast<DstVecType*>(dst_global_ptr) = frag;
+}
+// =====================================================================
+
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
