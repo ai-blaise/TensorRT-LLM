@@ -1190,4 +1190,22 @@ class Glm4ForCausalLM(Glm4MoeForCausalLM):
     Glm4DecoderLayer takes the dense GatedMLP branch when MoE config fields are absent
     (n_routed_experts / moe_intermediate_size). Used as the SMC-SD draft model
     (BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP)."""
-    pass
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        # The GLM-4-9B-0414-FP8 checkpoint declares dtype=float32 in its
+        # config.json, but it is an FP8 block-scaled checkpoint whose GEMM
+        # kernels require bf16 activations (linear.py asserts
+        # input.dtype == bfloat16). fp32 activations would crash at the first
+        # FP8 linear. Coerce the activation dtype to bf16 for any FP8-quantized
+        # dense GLM before the layers are built. Non-FP8 dense GLM keeps its
+        # declared dtype.
+        pretrained_config = model_config.pretrained_config
+        is_fp8 = model_config.quant_config.quant_algo in (
+            QuantAlgo.FP8,
+            QuantAlgo.FP8_BLOCK_SCALES,
+        )
+        declared_dtype = pretrained_config.torch_dtype
+        is_float32 = declared_dtype in (torch.float32, "float32", "torch.float32")
+        if is_fp8 and is_float32:
+            pretrained_config.torch_dtype = torch.bfloat16
+        super().__init__(model_config)
