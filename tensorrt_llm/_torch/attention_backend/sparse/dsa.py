@@ -3228,7 +3228,21 @@ class Indexer(nn.Module):
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
                 hisa_topk = pre_hisa_topk
-                if hisa_topk is None and logits_decode.shape[0] == num_gen_tokens:
+                # The HISA-from-logits decode path is statically gated by
+                # _should_use_hisa_logits (currently always False -- HISA at
+                # decode runs from the NVFP4 cache via pre_hisa_topk, not from
+                # dense logits). Building row_indices / row_starts / row_ends
+                # to feed _hisa_topk_from_logits is then dead work: four extra
+                # device ops captured into the decode graph per F-layer whose
+                # result is discarded (the function returns None). Gate the
+                # whole preamble on the same cheap, capture-safe predicate the
+                # callee uses (max_kv_len = logits column count needs no .item()
+                # / host sync), so the non-HISA-logits prod path skips it
+                # entirely and only the genuinely-enabled path pays for it.
+                if (hisa_topk is None
+                        and logits_decode.shape[0] == num_gen_tokens
+                        and self._should_use_hisa_logits(
+                            logits_decode.shape[1])):
                     row_indices = torch.arange(
                         num_gen_tokens, device=logits_decode.device) // next_n
                     next_n_offset = torch.arange(
