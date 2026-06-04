@@ -43,10 +43,13 @@ a correctness signal — see "Validation philosophy" below).
 | 17 | LayerSplit: per-layer CP KV/indexer-K split | [../source/features/layersplit.md](../source/features/layersplit.md) | 21× broadcast latency @ scale | opt-in (`layersplit_enabled`) |
 | 18 | Topology + deploy: DP2/TP4 disaggregated decode | [topology_deploy.md](topology_deploy.md) | DP2/TP4 best (64/49/41/40) | deployment choice |
 
-> Pieces 12 (WarpDecode) and 17 (LayerSplit) keep their canonical long-form
-> docs under `docs/source/features/`. This index links them so the campaign
-> picture is complete in one place; the per-piece docs here cover the Indexer,
-> Sparse-MLA, KVarN, NVFP4-fusion, SMC-SD, and topology work.
+> LayerSplit (17) has its canonical long-form doc at
+> `docs/source/features/layersplit.md` (already on `op-trt-ls`); WarpDecode
+> (12) has its canonical doc + deployment guide under `docs/source/features/`
+> that land with the WarpDecode kernel branch. The `docs/blaise/` pages here
+> are self-contained campaign-context entries (figures + file map +
+> composition) and additionally cover the Indexer, Sparse-MLA, KVarN,
+> NVFP4-fusion, SMC-SD, and topology work in full.
 
 ## Reading order
 

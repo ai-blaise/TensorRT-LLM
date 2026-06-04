@@ -1,12 +1,12 @@
 # WarpDecode (MoE decode fast path) — campaign summary
 
-> The **canonical, long-form WarpDecode reference** is
-> [`docs/source/features/warpdecode.md`](../source/features/warpdecode.md) and
-> the deployment guide is
-> [`docs/source/features/warpdecode_deployment_guide.md`](../source/features/warpdecode_deployment_guide.md).
-> This page is the one-paragraph campaign-context entry so the decode picture is
-> complete in one place; read the canonical doc for the full kernel design,
-> tactic tables, and the rejected-bridge log.
+> The **canonical, long-form WarpDecode reference** (`docs/source/features/warpdecode.md`
+> + `docs/source/features/warpdecode_deployment_guide.md`) lands with the
+> WarpDecode kernel branch, not with this docs branch, so the full kernel
+> design / tactic tables / rejected-bridge log live there once that branch
+> merges to `op-trt-ls`. This page is the self-contained campaign-context entry
+> (figures + file map + composition) so the decode picture is complete in one
+> place even before that merge.
 
 WarpDecode is an **opt-in decode-only MoE fast path** for the Blaise
 DeepSeek-V3.2 NVFP4 target shape (`hidden=7168`, `intermediate=2048`,
