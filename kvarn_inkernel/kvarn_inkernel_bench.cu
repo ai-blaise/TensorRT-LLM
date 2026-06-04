@@ -186,6 +186,93 @@ __global__ void kvarn_dequant_kernel(
     }
 }
 
+// In-shared-memory FWHT over fp16-resident rows (butterfly arithmetic in fp32,
+// stored back as __half). Halves smem vs the fp32 version -> 2 CTAs/SM.
+__device__ inline void fwht_rows_h(__half* sm, int rows, int n, int tid, int nthreads) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int idx = tid; idx < rows * (n / 2); idx += nthreads) {
+            int row = idx / (n / 2);
+            int k = idx % (n / 2);
+            int blk = (k / len) * (2 * len);
+            int j = k % len;
+            int a = blk + j, b = a + len;
+            __half* r = sm + row * n;
+            float u = __half2float(r[a]), v = __half2float(r[b]);
+            r[a] = __float2half(u + v);
+            r[b] = __float2half(u - v);
+        }
+        __syncthreads();
+    }
+}
+
+// ===================================================================
+// Optimized: fp16-smem KVarN dequant. Same math, working set in __half ->
+// 72KB smem -> 2 CTAs/SM, ~2x the high-N throughput. Butterfly math stays fp32.
+// ===================================================================
+__global__ void kvarn_dequant_kernel_h(
+    uint8_t const* __restrict__ store, int const* __restrict__ block_ids,
+    __half* __restrict__ ckv_out, __half* __restrict__ kpe_out, int total_bytes)
+{
+    BlockOffsets L = layout();
+    int n = blockIdx.x;
+    int bid = block_ids[n];
+    uint8_t const* slot = store + (size_t)bid * total_bytes;
+    int tid = threadIdx.x, nth = blockDim.x;
+
+    extern __shared__ __half smh[];
+    __half* sm_ckv = smh;                 // GROUP*DCKV halves
+    __half* sm_pe  = smh + GROUP * DCKV;  // DPE*GROUP halves
+
+    uint8_t const* ckv_q   = slot + L.ckv_q;
+    __half const*  ckv_srow= reinterpret_cast<__half const*>(slot + L.ckv_srow);
+    __half const*  ckv_zp  = reinterpret_cast<__half const*>(slot + L.ckv_zp);
+    __half const*  ckv_scol= reinterpret_cast<__half const*>(slot + L.ckv_scol);
+    uint8_t const* pe_q    = slot + L.pe_q;
+    __half const*  pe_srow = reinterpret_cast<__half const*>(slot + L.pe_srow);
+    __half const*  pe_zp   = reinterpret_cast<__half const*>(slot + L.pe_zp);
+    __half const*  pe_scol = reinterpret_cast<__half const*>(slot + L.pe_scol);
+
+    for (int idx = tid; idx < GROUP * DCKV; idx += nth) {
+        int tok = idx / DCKV, ch = idx % DCKV;
+        uint8_t packed = ckv_q[tok * (DCKV / CKV_PACK) + ch / CKV_PACK];
+        int q = (packed >> ((ch % CKV_PACK) * CKV_BITS)) & ((1 << CKV_BITS) - 1);
+        float v = ((float)q * __half2float(ckv_srow[tok]) + __half2float(ckv_zp[tok]))
+                  * __half2float(ckv_scol[ch]);
+        sm_ckv[idx] = __float2half(v);
+    }
+    for (int idx = tid; idx < DPE * GROUP; idx += nth) {
+        int ch = idx / GROUP, tok = idx % GROUP;
+        uint8_t packed = pe_q[ch * (GROUP / PE_PACK) + tok / PE_PACK];
+        int q = (packed >> ((tok % PE_PACK) * PE_BITS)) & ((1 << PE_BITS) - 1);
+        float v = ((float)q * __half2float(pe_srow[ch]) + __half2float(pe_zp[ch]))
+                  * __half2float(pe_scol[tok]);
+        sm_pe[idx] = __float2half(v);
+    }
+    __syncthreads();
+
+    fwht_rows_h(sm_ckv, GROUP, DCKV, tid, nth);
+    for (int len = 1; len < DPE; len <<= 1) {
+        for (int idx = tid; idx < GROUP * (DPE / 2); idx += nth) {
+            int tok = idx / (DPE / 2), k = idx % (DPE / 2);
+            int blk = (k / len) * (2 * len), j = k % len;
+            int a = blk + j, b = a + len;
+            float u = __half2float(sm_pe[a * GROUP + tok]);
+            float v = __half2float(sm_pe[b * GROUP + tok]);
+            sm_pe[a * GROUP + tok] = __float2half(u + v);
+            sm_pe[b * GROUP + tok] = __float2half(u - v);
+        }
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < GROUP * DCKV; idx += nth)
+        ckv_out[(size_t)n * GROUP * DCKV + idx] = __float2half(__half2float(sm_ckv[idx]) * INV_SQRT_DCKV);
+    for (int idx = tid; idx < GROUP * DPE; idx += nth) {
+        int ch = idx / GROUP, tok = idx % GROUP;
+        kpe_out[(size_t)n * GROUP * DPE + tok * DPE + ch] =
+            __float2half(__half2float(sm_pe[idx]) * INV_SQRT_DPE);
+    }
+}
+
 // ===================================================================
 // Baseline A: fp8 dequantCopy cost (native fp8 latent read, 1 byte/elem,
 // single global scale). Mirrors mlaKernels.cu dequantCopy: load fp8, *scale,
@@ -317,6 +404,10 @@ int main(int argc, char** argv) {
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     printf("kvarn kernel smem = %zu bytes (%.1f KB), threads=%d\n\n", smem, smem/1024.0, threads);
 
+    size_t smem_h = ((size_t)GROUP * DCKV + (size_t)DPE * GROUP) * sizeof(__half);
+    CK(cudaFuncSetAttribute(kvarn_dequant_kernel_h,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_h));
+
     auto run_kvarn = [&]() {
         kvarn_dequant_kernel<<<N, threads, smem>>>(d_store, d_ids, d_ckv, d_kpe, L.total);
     };
@@ -341,8 +432,19 @@ int main(int argc, char** argv) {
         for (size_t i=0;i<out_ckv.size();i++)
             maxerr = std::max(maxerr, fabs((double)__half2float(out_ckv[i]) - (double)__half2float(ref_ckv[i])));
         printf("--- correctness vs python dequant_latent_block ---\n");
-        printf("cos_ckv (in-kernel FWHT vs python matmul-Hadamard) = %.6f\n", cos_ckv);
-        printf("cos_kpe = %.6f   ckv_max_abs_err = %.4g\n\n", cos_kpe, maxerr);
+        printf("[fp32-smem] cos_ckv (FWHT vs python matmul-Hadamard) = %.6f\n", cos_ckv);
+        printf("[fp32-smem] cos_kpe = %.6f   ckv_max_abs_err = %.4g\n", cos_kpe, maxerr);
+        // fp16-smem variant correctness
+        kvarn_dequant_kernel_h<<<N, threads, smem_h>>>(d_store, d_ids, d_ckv, d_kpe, L.total);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(out_ckv.data(), d_ckv, out_ckv.size()*sizeof(__half), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(out_kpe.data(), d_kpe, out_kpe.size()*sizeof(__half), cudaMemcpyDeviceToHost));
+        double cos_ckv_h = cos(out_ckv.data(), ref_ckv, out_ckv.size());
+        double cos_kpe_h = cos(out_kpe.data(), ref_kpe, out_kpe.size());
+        printf("[fp16-smem] cos_ckv = %.6f   cos_kpe = %.6f\n\n", cos_ckv_h, cos_kpe_h);
+        // restore fp32 output for any later use
+        kvarn_dequant_kernel<<<N, threads, smem>>>(d_store, d_ids, d_ckv, d_kpe, L.total);
+        CK(cudaDeviceSynchronize());
     }
 
     float t_kvarn = time_ms(run_kvarn, iters, warmup);
@@ -384,12 +486,9 @@ int main(int argc, char** argv) {
     // ---- N-sweep: per-step cost across batch (blocks restored/step) ----
     // Reuse the store pool; launch more CTAs against strided ids. This mirrors the
     // round-4 sweep rows (sparse topK=32 blocks/req; b1/b8/b32 grow N=32/256/1024).
-    printf("\n--- N-sweep: in-kernel vs python-staged vs budget ---\n");
-    printf("  N   inkernel_us  us/blk  fp8_us  pyStaged_us(*)  inkernel_%%budget\n");
+    printf("\n--- N-sweep: in-kernel (fp32-smem | fp16-smem) vs python-staged vs budget ---\n");
+    printf("  N   fp32sm_us  fp16sm_us  fp16/blk  fp8_us  pyStaged_us(*)  fp16sm_%%budget\n");
     int sweepN[] = {1, 8, 32, 64, 128, 256, 512, 1024};
-    // python-staged batched_dequant rows from system_decode_overhead.log (us/block):
-    // N=1:158.85 8:19.64 32:4.47 64:2.44 128:1.44 256:1.23 (interp/hold past 256)
-    // plus the per-step sparse_us TOTAL (incl scatter) at b1/b8/b32 = 172.5/316.1/808.4.
     for (int sn : sweepN) {
         if (sn > NUM_BLOCKS) continue;
         int* d_ids_s; std::vector<int> ids_s(sn);
@@ -399,16 +498,17 @@ int main(int argc, char** argv) {
         __half *o_ckv, *o_kpe;
         CK(cudaMalloc(&o_ckv, (size_t)sn*GROUP*DCKV*sizeof(__half)));
         CK(cudaMalloc(&o_kpe, (size_t)sn*GROUP*DPE*sizeof(__half)));
-        auto run = [&](){ kvarn_dequant_kernel<<<sn, threads, smem>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
-        run(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-        float t = time_ms(run, iters, warmup);
+        auto run32 = [&](){ kvarn_dequant_kernel<<<sn, threads, smem>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
+        auto run16 = [&](){ kvarn_dequant_kernel_h<<<sn, threads, smem_h>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
+        run32(); run16(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        float t32 = time_ms(run32, iters, warmup);
+        float t16 = time_ms(run16, iters, warmup);
         __half *f8o; CK(cudaMalloc(&f8o,(size_t)sn*GROUP*(DCKV+DPE)*sizeof(__half)));
         auto runf8=[&](){ fp8_dequant_kernel<<<sn,threads>>>(d_fp8,d_ids_s,f8o,1.0f); };
         runf8(); CK(cudaDeviceSynchronize()); float tf8=time_ms(runf8,iters,warmup);
-        // python staged total per-step ~ (sparse path): use logged rows where available
         double py = (sn<=1)?172.5:(sn<=8)?316.1:(sn<=32)?808.4:(808.4*sn/32.0);
-        printf("%5d   %9.2f  %6.3f  %6.2f   %12.1f   %6.1f%%\n",
-               sn, t*1e3, t*1e3/sn, tf8*1e3, py, t*1e3/budget_us*100);
+        printf("%5d   %8.2f   %8.2f  %7.3f  %6.2f   %12.1f   %6.1f%%\n",
+               sn, t32*1e3, t16*1e3, t16*1e3/sn, tf8*1e3, py, t16*1e3/budget_us*100);
         CK(cudaFree(d_ids_s)); CK(cudaFree(o_ckv)); CK(cudaFree(o_kpe)); CK(cudaFree(f8o));
     }
     printf("(*) pyStaged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.\n");
