@@ -3593,8 +3593,15 @@ class DSATrtllmAttention(TrtllmAttention):
 
     def kvarn_restore_for_decode(self, metadata):
         """Reconstruct committed blocks back into the main-pool fp16 slot so the
-        C++ decode kernel reads correct latent values. Restores all committed
-        blocks referenced by the current generation batch."""
+        C++ decode kernel reads correct latent values, using the BATCHED
+        restore primitive (one pool.load_blocks() for the whole step; ~1.2-2.4
+        us/block vs ~277 us/block per-block, see system_decode_overhead.log).
+
+        Production policy note: this restores every committed block referenced
+        by the generation batch. For long context the per-step cost should be
+        bounded to the indexer-selected sparse top-K set (flat in context);
+        that scoping + the zero-round-trip fold both live in the C++ decode
+        kernel (the end-state). Kept full here for Stage-a correctness."""
         mgr = self._kvarn_mgr(metadata)
         if mgr is None:
             return
@@ -3603,18 +3610,25 @@ class DSATrtllmAttention(TrtllmAttention):
         bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime
         lo, hi = self._kvarn_seq_range(metadata, True)
+        # Gather the unique committed block ids to restore this step.
+        valid_host = pool.valid.to("cpu")
+        to_restore = []
         for i in range(lo, hi):
-            klen = int(kv_lens[i])
-            n_full = klen // tpb
+            n_full = int(kv_lens[i]) // tpb
             for b in range(n_full):
                 block_id = int(bt[i, b])
-                if block_id < 0 or not bool(pool.valid[block_id]):
-                    continue
-                ckv_d, kpe_d = pool.load_block(block_id)
-                blk, ckv, k_pe = self._kvarn_latent_block_view(
-                    mgr, metadata, block_id)
-                ckv.copy_(ckv_d.to(ckv.dtype))
-                k_pe.copy_(kpe_d.to(k_pe.dtype))
+                if block_id >= 0 and bool(valid_host[block_id]):
+                    to_restore.append(block_id)
+        if not to_restore:
+            return
+        block_ids = sorted(set(to_restore))
+        ckv_d, kpe_d = pool.load_blocks(block_ids)  # [N,G,Dckv] / [N,G,Dpe]
+        buf = mgr.get_buffers(self.layer_idx, kv_layout="NHD")  # [P,1,tpb,1,D]
+        Dckv = mgr.kvarn_cfg.kv_lora_rank
+        ids = torch.as_tensor(block_ids, device=buf.device, dtype=torch.long)
+        # scatter the reconstructed latent back: blk[:, :Dckv]=ckv, [:, Dckv:]=k_pe
+        buf[ids, 0, :, 0, :Dckv] = ckv_d.to(buf.dtype)
+        buf[ids, 0, :, 0, Dckv:] = kpe_d.to(buf.dtype)
 
     def mla_rope_generation(
         self,

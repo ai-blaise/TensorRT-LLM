@@ -55,6 +55,7 @@ try:
     )
     from tensorrt_llm._torch.attention_backend.sparse.kvarn_core import (
         hadamard_matrix,
+        kvarn_dequant_rows,
     )
 except ImportError:  # standalone / unit-test
     from kvarn_mla import (  # noqa: F401
@@ -62,7 +63,7 @@ except ImportError:  # standalone / unit-test
         packed_bytes_per_block,
         quant_latent_block,
     )
-    from kvarn_core import hadamard_matrix  # noqa: F401
+    from kvarn_core import hadamard_matrix, kvarn_dequant_rows  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +284,54 @@ class KVarNLatentPool:
     def load_block(self, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct (ckv [group, Dckv], k_pe [group, Dpe]) fp16."""
         return dequant_latent_block(self._deserialize(block_id))
+
+    def load_blocks(self, block_ids) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batched restore of N committed blocks in ONE dequant call each for
+        ckv/k_pe -> (ckv [N, group, Dckv], k_pe [N, group, Dpe]) fp16.
+
+        This is the production restore primitive: the per-block python-loop
+        load is ~277 us/block, while this batched path is ~1.2-2.4 us/block at
+        N>=32 (see system_decode_overhead.log). Restore the indexer-selected
+        (sparse top-K) blocks per step, not the full context.
+        """
+        cfg = self.cfg
+        Dckv, Dpe, G = cfg.kv_lora_rank, cfg.qk_rope_head_dim, self.group
+        ckv_pack, pe_pack = 8 // cfg.ckv_bits, 8 // cfg.pe_bits
+        ids = torch.as_tensor(block_ids, dtype=torch.long, device=self.device)
+        N = ids.numel()
+        if N == 0:
+            z = torch.empty(0, G, 0, device=self.device, dtype=torch.float16)
+            return (z.reshape(0, G, Dckv), z.reshape(0, G, Dpe))
+        L = self._layout
+        slots = self.store[ids]  # [N, bytes_per_block]
+
+        def gu8(field, shape):
+            b0, b1 = L[field]
+            return slots[:, b0:b1].reshape(shape)
+
+        def gf16(field, shape):
+            b0, b1 = L[field]
+            return slots[:, b0:b1].view(torch.float16).reshape(shape)
+
+        ckv_rec = {
+            "q_packed": gu8("ckv_q", (N, G, Dckv // ckv_pack)),
+            "s_row_abs": gf16("ckv_srow", (N, G)),
+            "zp_abs": gf16("ckv_zp", (N, G)),
+            "s_col": gf16("ckv_scol", (N, Dckv)),
+        }
+        pe_rec = {
+            "q_packed": gu8("pe_q", (N, Dpe, G // pe_pack)),
+            "s_row_abs": gf16("pe_srow", (N, Dpe)),
+            "zp_abs": gf16("pe_zp", (N, Dpe)),
+            "s_col": gf16("pe_scol", (N, G)),
+        }
+        # ckv: rotated-frame dequant [N,G,Dckv] then un-rotate channels.
+        ckv_rot = kvarn_dequant_rows(ckv_rec, cfg.ckv_bits, Dckv)
+        ckv = (ckv_rot @ self.H_ckv).to(torch.float16)            # [N, G, Dckv]
+        # k_pe: K-orient [N,Dpe,G] then un-rotate + transpose back to [N,G,Dpe].
+        pe_rot = kvarn_dequant_rows(pe_rec, cfg.pe_bits, G)        # [N, Dpe, G]
+        k_pe = (pe_rot.transpose(1, 2) @ self.H_pe).to(torch.float16)
+        return ckv, k_pe
 
 
 # ---------------------------------------------------------------------------
