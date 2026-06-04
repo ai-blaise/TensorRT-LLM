@@ -570,11 +570,19 @@ def create_py_executor(
                 if draft_kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
                     draft_kv_cache_dtype = "fp8"
                 elif draft_kv_cache_dtype == "bfloat16":
+                    # "auto" follows the draft checkpoint metadata (GLM is bf16).
                     draft_kv_cache_dtype = "auto"
-                if draft_kv_cache_dtype != "auto":
-                    draft_llm_args.kv_cache_config = copy.copy(
-                        llm_args.kv_cache_config)
-                    draft_llm_args.kv_cache_config.dtype = draft_kv_cache_dtype
+                # Always give the draft its OWN kv_cache_config. draft_llm_args is
+                # a shallow copy of the target's llm_args, so its kv_cache_config
+                # is the SAME object as the target's (e.g. dtype="fp8"). Without a
+                # fresh copy + explicit dtype, "auto" would silently inherit the
+                # target's fp8 KV. A bf16 draft would then run fp8 attention, for
+                # which SM100 trtllm-gen has no fused kernel; the unfused-MHA
+                # fallback allocates an O(num_q_tokens * max_kv_len) scratch that
+                # explodes to hundreds of GiB at max_seq_len during warmup (OOM).
+                draft_llm_args.kv_cache_config = copy.copy(
+                    llm_args.kv_cache_config)
+                draft_llm_args.kv_cache_config.dtype = draft_kv_cache_dtype
                 if spec_config.draft_attention_backend == "trtllm_mha":
                     draft_llm_args.attn_backend = "TRTLLM"
             if spec_config.load_format == "dummy":
