@@ -31,7 +31,7 @@ a correctness signal — see "Validation philosophy" below).
 | 5 | Indexer: in-graph metadata / sync-free decode | [indexer.md](indexer.md#in-graph-metadata--sync-free-decode) | −48 % decode TPOT (consolidated) | on |
 | 6 | Indexer: native C++ / CuTe-DSL top-k dispatch | [indexer.md](indexer.md#native-c--cute-dsl-top-k-dispatch) | net-win ≤ b32; floor proven | auto by kv_len |
 | 7 | Sparse-MLA: MSA 2-stream head-split | [sparse_mla.md](sparse_mla.md#msa-2-stream-head-split) | −14.5…−19.5 % @ b1–4 | on @ small batch |
-| 8 | Sparse-MLA: `get_decoding_sched_meta` parallelize | [sparse_mla.md](sparse_mla.md#get_decoding_sched_meta-parallelization) | 2.5–3.8× the meta kernel | on |
+| 8 | Sparse-MLA: `get_decoding_sched_meta` parallelize | [sparse_mla.md](sparse_mla.md#get_decoding_sched_meta-parallelization) | 2.5–3.3× the meta kernel | on |
 | 9 | Sparse-MLA: AB-swapped index-scoring (MSA #3) | [sparse_mla.md](sparse_mla.md#ab-swapped-index-scoring) | already-optimal on tcgen05 | on (tcgen05 path) |
 | 10 | KVarN: variance-normalized latent KV quant | [kvarn.md](kvarn.md) | ~2.3 bits @ FP16 accuracy, 3–5× capacity | opt-in (flag) |
 | 11 | KVarN: BDR fold (in-kernel dequant-on-read) | [kvarn.md](kvarn.md#bdr-fold-in-kernel-dequant-on-read) | amortized restore under budget | opt-in |
