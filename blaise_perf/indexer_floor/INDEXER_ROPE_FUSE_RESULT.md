@@ -120,3 +120,48 @@ Per directive ("do not stop until each is at its proven floor"), re-examined:
 
   NEW lever found this session: the proj-path RoPE+cat+quant fusion (above),
   which the R4 floor analysis did not cover. ~3.2-4.1 us/F-layer, bit-exact.
+
+## Resume session (2026-06-04 PM): in-tree build fix + re-grounded correctness
+
+### Build break caught + fixed (lever-2 affine kernel namespace)
+The prior bundling pass verified only standalone-nvcc + the JIT load_inline
+fallback, which do not include config.h. A real in-tree object compile against
+the op-trt source (/repo in megamoe_dev: torch 2.11 / CUDA 13.1 / TRT headers,
+sm_100a) exposed that indexerAffineReuse.{h,cu} hardcoded
+"namespace tensorrt_llm { namespace kernels" while the build wraps kernel
+symbols in the ABI inline namespace (TRTLLM_NAMESPACE_BEGIN/END ->
+tensorrt_llm::_v1::kernels). The thop op (includes opUtils.h) therefore
+referenced tensorrt_llm::_v1::kernels::invokeIndexerAffineReuse while the .cu
+defined tensorrt_llm::kernels::invokeIndexerAffineReuse:
+  - compile: "reference to 'kernels' is ambiguous" in indexerAffineReuseOp.cpp
+  - link:    undefined reference to tensorrt_llm::_v1::kernels::invoke... in th_common
+Fix: switch both affine files to the sibling convertReqIndexToGlobal.{h,cu}
+pattern (config.h + cudaUtils.h includes, TRTLLM_NAMESPACE_BEGIN/END). The
+fusedRopeCatFp4.{h,cu} files were already correct (used the macro).
+
+Verified in-tree (EXIT 0) for all 7 C++ TUs of the rope-fuse stack:
+  nvcc sm_100a: indexerAffineReuse.cu, fusedRopeCatFp4.cu
+  g++ (torch+TRT): indexerAffineReuseOp.cpp, fusedRopeCatFp4Op.cpp,
+                   + sibling convertReqIndexToGlobalOp.cpp (control, clean)
+  nm: .cu exports T tensorrt_llm::_v1::kernels::invokeIndexerAffineReuse,
+      matching the op TU's U reference (links).
+Commit 3b704d6f (rope-fuse) / cherry-picked 72ee47b7 (consol-r4). Kernel logic
+unchanged; namespace/linkage only.
+
+### Re-grounded rope-fuse correctness (this session, GPU0, JIT fallback path)
+Reference now built from the PRODUCTION RotaryEmbedding module (is_neox,
+rope_dim=64) + a standalone kernel-exact cat_fp4 (byte-identical qFp4/UE8M0):
+
+  pos=0 (RoPE == identity) -> fused == standalone cat_fp4([pe||nope]):
+    N=1/8/32: packed 0/64, 0/512, 0/2048  scale 0/1, 0/8, 0/32  -> BIT-IDENTICAL.
+    Proves the cat + FP4/UE8M0 quant path is exact.
+
+  pos!=0 -> fused == (real rotary_emb rotation -> kernel-exact cat_fp4):
+    N=1: 0/64 ; N=8: 1/512 ; N=32: 7/2048 packed nibble diffs; scales 0 diffs.
+    The <=0.34% nibble diffs are FP4 bucket-boundary flips from a sub-ULP bf16
+    rounding difference between the fused in-register RoPE (round-to-bf16 once)
+    and rotary_emb's rotation; they vanish when both paths share one bf16
+    intermediate (the prior-session bit-identical-vs-fused_cat_fp4 result).
+
+  CUDA graph capture+replay: result == eager; replay after an in-place pos
+    change == fresh eager. Decode-replay safe (re-confirmed this session).
