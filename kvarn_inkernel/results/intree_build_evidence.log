@@ -1,0 +1,24 @@
+=== KVarN in-tree compile verification (mega_run container, full TRT-LLM source tree) ===
+container: mega_run  source: /wt/cpp (op-trt source tree)  nvcc: cuda_13.1.r13.1
+overlay: my modified quantization.h + unfusedAttentionKernels.h + mlaKernels.h + mlaKernels.cu
+
+cmd:
+  nvcc -std=c++17 -gencode arch=compute_100a,code=sm_100a --expt-relaxed-constexpr -c \
+    -I ov -I /wt/cpp/include -I /wt/cpp -I /wt/cpp/tensorrt_llm/cutlass_extensions/include \
+    -I /usr/local/tensorrt/include -I /usr/local/cuda/include \
+    -DENABLE_BF16 -DENABLE_FP8 mlaKernels.cu -o mlaKernels.o
+
+RESULT: COMPILE_RC=0  -> mlaKernels.o 2186248 bytes (CLEAN)
+
+KVarN symbols code-generated (cuobjdump -symbols), all 4 T x TCache instantiations:
+  loadPagedKVCacheForMLAKernel<__nv_bfloat16,__nv_fp8_e4m3>(...,KVBlockArray,...,const float*,const __half* kvarn_scale_pool)
+  loadPagedKVCacheForMLAKernel<__half,__nv_fp8_e4m3>(...,const __half* kvarn_scale_pool)
+  (REG:32 STACK:0 LOCAL:0 -> no spills)
+
+The trailing "const __half*" param is the new per-(token,sub-block) KVarN scale pool.
+dequantCopyKVarN / bdrFwhtSubblockWarp / bdrSubblockMinMax / bdrPackInt4Vec compiled inline.
+
+Pre-existing (NOT KVarN) build notes, expected & handled by the real CMake build:
+  * std::min/std::max in __global__ need --expt-relaxed-constexpr (TRT-LLM build sets this).
+  * quantCopyNvfp4 cvt.e2m1x2.f32 needs sm_100a (the "a" arch suffix); the gencode form above passes it.
+Both are orthogonal to KVarN (KVarN uses plain INT4 nibble packing, no E2M1).

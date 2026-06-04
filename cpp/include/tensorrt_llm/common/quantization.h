@@ -89,6 +89,16 @@ public:
         return QuantMode(BaseType(1u) << 7);
     }
 
+    // KVarN/BDR: block-diagonal Hadamard rotation + per-(token,sub-block) INT4 RTN
+    // on the dense MLA latent. Bit 18 -- matches tensorrt_llm/quantization/mode.py
+    // QuantMode.KVARN_KV_CACHE auto() position (W4A16_MXFP4 occupies bit 17 in the
+    // python enum; C++ w4a16Mxfp4 is bit 16, so 17 is skipped here to keep the
+    // python<->C++ KV-cache bit in sync, which is what cacheTypeFromQuantMode reads).
+    static constexpr QuantMode kvarnKvCache() noexcept
+    {
+        return QuantMode(BaseType(1u) << 18);
+    }
+
     static constexpr QuantMode fp8Qdq() noexcept
     {
         return QuantMode(BaseType(1u) << 8);
@@ -194,6 +204,11 @@ public:
         return isSet(fp4KvCache());
     }
 
+    constexpr bool hasKvarnKvCache() const noexcept
+    {
+        return isSet(kvarnKvCache());
+    }
+
     constexpr bool hasFp8Qdq() const noexcept
     {
         return isSet(fp8Qdq());
@@ -226,7 +241,7 @@ public:
 
     constexpr bool hasKvCacheQuant() const noexcept
     {
-        return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache();
+        return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache() || hasKvarnKvCache();
     }
 
     static constexpr QuantMode fromDescription(bool quantizeWeights, bool quantizeActivations, bool perToken,

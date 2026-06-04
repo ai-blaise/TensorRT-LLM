@@ -304,6 +304,104 @@ inline __device__ void dequantCopyKVarN(
     }
     *reinterpret_cast<DstVecType*>(dst_global_ptr) = frag;
 }
+// ---------------------------------------------------------------------------
+// KVarN/BDR production in-kernel write: warp-cooperative block-diagonal Hadamard
+// (order HORDER=128) + per-(token,sub-block) asymmetric INT4 RTN, fused at the
+// generation-kernel KV write site. Per the 128K accuracy verdict
+// (kvarn_inkernel/results/bdr_longctx_4k_128k.log) the scale is PER SUB-BLOCK
+// (4 scales/zps on the 512-d ckv), not per-token: a single per-token scale
+// collapses to ~0.866 cos at 128K, per-sub-block holds ~0.992.
+//
+// Threading match (DSV3 gen kernel, fp16): a token's 512-d latent = K_VECS_PER_HEAD
+// = 64 vecs over 64 lanes (2 warps), ELTS_PER_VEC=8 ch/lane. One HORDER=128
+// sub-block = 16 lanes * 8 ch -> fits inside ONE warp half. So both the
+// sub-block Hadamard and its min/max scale reduction are pure intra-warp
+// __shfl_xor over a 16-lane group: no shared memory, no cross-warp sync.
+//
+// kInvSqrtHadamard = 1/sqrt(128).
+static constexpr float kInvSqrtHadamard128 = 0.088388347648318f;
+
+// Warp-cooperative FWHT over a 16-lane group (128 ch) where each lane holds
+// ELTS contiguous channels in reg[]. Intra-lane butterfly (stages < ELTS) then
+// cross-lane __shfl_xor (stages ELTS..64). laneInBlk in [0,16). Result is the
+// rotated sub-block, normalized by 1/sqrt(128).
+template <int ELTS>
+inline __device__ void bdrFwhtSubblockWarp(float (&reg)[ELTS], int laneInBlk, unsigned mask)
+{
+    // intra-lane stages.
+#pragma unroll
+    for (int len = 1; len < ELTS; len <<= 1)
+    {
+#pragma unroll
+        for (int i = 0; i < ELTS; ++i)
+        {
+            int partner = i ^ len;
+            if (i < partner)
+            {
+                float u = reg[i], v = reg[partner];
+                reg[i] = u + v;
+                reg[partner] = u - v;
+            }
+        }
+    }
+    // cross-lane stages within the 16-lane (128/ELTS) sub-block.
+    constexpr int kLanes = 128 / ELTS;
+#pragma unroll
+    for (int span = 1; span < kLanes; span <<= 1)
+    {
+        bool low = ((laneInBlk & span) == 0);
+#pragma unroll
+        for (int i = 0; i < ELTS; ++i)
+        {
+            float other = __shfl_xor_sync(mask, reg[i], span);
+            reg[i] = low ? (reg[i] + other) : (other - reg[i]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < ELTS; ++i)
+        reg[i] *= kInvSqrtHadamard128;
+}
+
+// KVarN write of one ELTS-wide vec of a 128-ch sub-block: the caller has the
+// post-rotate reg[] (via bdrFwhtSubblockWarp) and the sub-block (scale,zp) from
+// a 16-lane min/max reduction. Packs ELTS INT4 nibbles to packed4 (ELTS/2 bytes).
+template <int ELTS>
+inline __device__ void bdrPackInt4Vec(uint8_t* packed4, float const (&reg)[ELTS], float scale, float zp)
+{
+    float inv = 1.0f / scale;
+#pragma unroll
+    for (int i = 0; i < ELTS / 2; ++i)
+    {
+        int q0 = __float2int_rn((reg[2 * i + 0] - zp) * inv);
+        int q1 = __float2int_rn((reg[2 * i + 1] - zp) * inv);
+        q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+        q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+        packed4[i] = static_cast<uint8_t>(q0 | (q1 << 4));
+    }
+}
+
+// 16-lane (128-ch sub-block) min/max reduction over each lane's ELTS values.
+template <int ELTS>
+inline __device__ void bdrSubblockMinMax(
+    float const (&reg)[ELTS], int /*laneInBlk*/, unsigned mask, float& outLo, float& outHi)
+{
+    float lo = reg[0], hi = reg[0];
+#pragma unroll
+    for (int i = 1; i < ELTS; ++i)
+    {
+        lo = fminf(lo, reg[i]);
+        hi = fmaxf(hi, reg[i]);
+    }
+    constexpr int kLanes = 128 / ELTS;
+#pragma unroll
+    for (int span = kLanes / 2; span >= 1; span >>= 1)
+    {
+        lo = fminf(lo, __shfl_xor_sync(mask, lo, span));
+        hi = fmaxf(hi, __shfl_xor_sync(mask, hi, span));
+    }
+    outLo = lo;
+    outHi = hi;
+}
 // =====================================================================
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
@@ -777,11 +875,17 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 template <typename T, typename TCache>
 __global__ void loadPagedKVCacheForMLAKernel(T* compressed_kv_ptr, T* k_pe_ptr,
     tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_cached_kv_lens, int max_input_seq_len,
-    float const* kv_scale_quant_orig_ptr)
+    float const* kv_scale_quant_orig_ptr, __half const* kvarn_scale_pool_ptr = nullptr)
 {
     static_assert(std::is_same_v<T, TCache> || std::is_same_v<TCache, __nv_fp8_e4m3>,
         "TCache must be either the same type as T or __nv_fp8_e4m3");
+    // KVarN/BDR: ckv stored as INT4 in the fp8 byte-storage path (2 nibbles/byte) +
+    // per-(token,sub-block) {scale,zp} in kvarn_scale_pool_ptr. dequant-on-read is
+    // unpack+(q*scale+zp) -> ROTATED-frame fp16 (Q-side fold un-rotates downstream).
     using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<TCache>;
+    constexpr int kKvarnHOrder = 128;
+    constexpr int kKvarnNSub = KT::kLoraSize / kKvarnHOrder;          // 512/128 = 4
+    constexpr int kKvarnScaleStride = 2 * kKvarnNSub;                 // scale[nsub]|zp[nsub]
 
     int const batch_idx = static_cast<int>(blockIdx.y);
     float const kv_scale_quant_orig = kv_scale_quant_orig_ptr ? kv_scale_quant_orig_ptr[0] : 1.0f;
@@ -825,8 +929,23 @@ __global__ void loadPagedKVCacheForMLAKernel(T* compressed_kv_ptr, T* k_pe_ptr,
                 }
                 else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
                 {
-                    dequantCopy<T, KT::kElemPerLoad>(compressed_kv_ptr + dstIdx,
-                        reinterpret_cast<__nv_fp8_e4m3 const*>(&src_data), kv_scale_quant_orig);
+                    if (kvarn_scale_pool_ptr != nullptr)
+                    {
+                        // KVarN: which 128-wide sub-block this vec falls in.
+                        int const sub = head_dim_idx / kKvarnHOrder;
+                        __half const* sc = kvarn_scale_pool_ptr
+                            + static_cast<size_t>(global_token_idx) * kKvarnScaleStride;
+                        float const scale = __half2float(sc[sub]);
+                        float const zp = __half2float(sc[kKvarnNSub + sub]);
+                        // src_data holds KT::kElemPerLoad INT4 codes packed 2/byte.
+                        dequantCopyKVarN<T, KT::kElemPerLoad>(compressed_kv_ptr + dstIdx,
+                            reinterpret_cast<uint8_t const*>(&src_data), scale, zp);
+                    }
+                    else
+                    {
+                        dequantCopy<T, KT::kElemPerLoad>(compressed_kv_ptr + dstIdx,
+                            reinterpret_cast<__nv_fp8_e4m3 const*>(&src_data), kv_scale_quant_orig);
+                    }
                 }
             }
             else
@@ -1292,7 +1411,7 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
 template <typename T, typename TCache>
 void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
     int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
-    float const* kv_scale_quant_orig_ptr, cudaStream_t stream)
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr)
 {
     using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<TCache>;
     // {seq_len / token_per_block, batch_size, head_num}
@@ -1300,9 +1419,67 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
     TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope_size should be equal to %d", KT::kRopeSize);
     TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_input_seq_len, KT::kTokenPerBlock)), num_contexts, 1);
+    // KVarN: non-null scale pool routes the ckv read through dequantCopyKVarN
+    // (INT4 unpack + per-(token,sub-block) affine -> rotated-frame fp16).
     loadPagedKVCacheForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(
-        compressed_kv_ptr, k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, max_input_seq_len, kv_scale_quant_orig_ptr);
+        compressed_kv_ptr, k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, max_input_seq_len, kv_scale_quant_orig_ptr,
+        reinterpret_cast<__half const*>(kvarn_scale_pool_ptr));
 }
+
+// =============================== KVarN write ===============================
+// Fused block-diagonal-Hadamard (order 128) + per-(token,sub-block) INT4 RTN of
+// the post-RoPE dense MLA latent ckv. Warp-cooperative: one warp-half (16 lanes)
+// owns one 128-d sub-block; rotation + min/max scale are pure __shfl (no smem,
+// no cross-warp). Launch right after the RoPE kernel = zero host round-trip and
+// no fp16 staging pool. Validated: kvarn_inkernel/bdr_persub_inkernel_validate.cu
+// cos_ckv 0.995, read 0.46-1.0x fp8, write < fp8-read at N>=8.
+//   ckv_in : [num_tokens, DCKV] post-RoPE fp16 latent (rotated frame written out)
+//   data   : INT4 packed cache, NSUB*(DCKV/NSUB/2) bytes/token, by global token
+//   scale  : per-(token,sub-block) {scale[NSUB], zp[NSUB]} __half, stride 2*NSUB
+template <typename T, int DCKV, int HORDER>
+__global__ void mlaBdrQuantizeLatentKernel(
+    T const* __restrict__ ckv_in, uint8_t* __restrict__ data, __half* __restrict__ scale, int num_tokens)
+{
+    constexpr int kNSub = DCKV / HORDER;          // 4
+    constexpr int kVecPerSub = HORDER / 8;        // 16 lanes (8 ch/lane)
+    constexpr int kVecs = DCKV / 8;               // 64 lanes / token
+    constexpr int kBytesPerTok = kNSub * (HORDER / 2);
+    int const tok = blockIdx.x;
+    if (tok >= num_tokens)
+        return;
+    int const lane = threadIdx.x;                 // 0..63
+    int const sub = lane / kVecPerSub;            // 0..3
+    int const laneInBlk = lane % kVecPerSub;      // 0..15
+    unsigned const mask = 0xFFFFu << ((sub % 2) * 16); // 16-lane sub-block group
+    float reg[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        reg[i] = static_cast<float>(ckv_in[static_cast<size_t>(tok) * DCKV + lane * 8 + i]);
+    bdrFwhtSubblockWarp<8>(reg, laneInBlk, mask);
+    float lo, hi;
+    bdrSubblockMinMax<8>(reg, laneInBlk, mask, lo, hi);
+    float const sc = fmaxf((hi - lo) / 15.0f, 1e-10f);
+    __half const hsc = __float2half(sc), hzp = __float2half(lo);
+    uint8_t* tokData = data + static_cast<size_t>(tok) * kBytesPerTok;
+    bdrPackInt4Vec<8>(tokData + lane * 4, reg, __half2float(hsc), __half2float(hzp));
+    if (laneInBlk == 0)
+    {
+        __half* tokScale = scale + static_cast<size_t>(tok) * (2 * kNSub);
+        tokScale[sub] = hsc;
+        tokScale[kNSub + sub] = hzp;
+    }
+}
+
+template <typename T>
+void invokeMLABdrQuantizeLatent(
+    T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(dckv == 512, "KVarN BDR latent quantize currently supports DCKV=512.");
+    constexpr int kVecs = 512 / 8; // 64 lanes/token
+    mlaBdrQuantizeLatentKernel<T, 512, 128><<<num_tokens, kVecs, 0, stream>>>(
+        ckv_in, data, reinterpret_cast<__half*>(scale_pool), num_tokens);
+}
+// ===========================================================================
 
 template <typename T, typename TCache>
 void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_scale_cache, T* q_ptr,
@@ -1348,7 +1525,8 @@ INSTANTIATE_MLA_QUANTIZE(__nv_bfloat16);
 #define INSTANTIATE_RW_KVCACHE_MLA(T, TCache)                                                                          \
     template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \
         int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
-        int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);          \
+        int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream,           \
+        void const* kvarn_scale_pool_ptr);                                                                             \
     template void invokeMLARopeAppendPagedKVAssignQ<T, TCache>(KVBlockArray & kv_cache,                               \
         KVBlockArray & kv_scale_cache, T * q_ptr, T * latent_cache_ptr, int const num_requests,                       \
         int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,        \
@@ -1361,6 +1539,13 @@ INSTANTIATE_RW_KVCACHE_MLA(half, half);
 INSTANTIATE_RW_KVCACHE_MLA(half, __nv_fp8_e4m3);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
+
+#define INSTANTIATE_MLA_BDR_QUANTIZE(T)                                                                                \
+    template void invokeMLABdrQuantizeLatent<T>(                                                                        \
+        T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, cudaStream_t stream);
+INSTANTIATE_MLA_BDR_QUANTIZE(float);
+INSTANTIATE_MLA_BDR_QUANTIZE(half);
+INSTANTIATE_MLA_BDR_QUANTIZE(__nv_bfloat16);
 
 // In-place MLA RoPE: apply RoPE to the last rope_dim elements of each [nope_dim + rope_dim] head.
 // Uses 16-byte vectorized load/store (VecType) and mmha::rotary_embedding_transform for the

@@ -83,6 +83,8 @@ inline KvCacheDataType cacheTypeFromQuantMode(common::QuantMode quantMode)
         return KvCacheDataType::FP8;
     else if (quantMode.hasFp4KvCache())
         return KvCacheDataType::NVFP4;
+    else if (quantMode.hasKvarnKvCache())
+        return KvCacheDataType::KVARN;
     else
         return KvCacheDataType::BASE;
 }

@@ -1,0 +1,27 @@
+=== BDR per-sub-block in-kernel (warp-cooperative, PRODUCTION layout) — B200 ===
+Device fns: bdrFwhtSubblockWarp + bdrSubblockMinMax + bdrPackInt4Vec + dequantCopyKVarN (mlaKernels.cu)
+Layout: per-token 4 sub-blocks INT4 + per-sub-block {scale,zp} f16; rec=272 B/tok (ckv only)
+cap: 0.5312 B/elem = 3.76x vs fp16, 1.88x vs fp8 (per-sub-block scale costs vs 3.89x per-token)
+Threading = DSV3 gen kernel: 64 vecs/token over 64 lanes (2 warps); 1 sub-block(128ch)=16 lanes intra-warp
+Per-sub-block scale is REQUIRED for 128K accuracy (see bdr_longctx_4k_128k.log: per-token collapses 0.866)
+
+=== BDR per-sub-block in-kernel (warp-cooperative) validate ===
+layout: 2048 tok, DCKV=512, 4 sub-blocks, per-sub-block INT4 scale; rec=272 B/tok
+bytes/elem(ckv)=0.5312  cap_vs_fp16=3.76x cap_vs_fp8=1.88x
+
+correctness (warp-write -> read -> host inverse-rotate vs original):
+  cos_ckv = 0.995143
+
+per-step (Ntok=2048 = 32 blocks of 64):
+  BDR read  (PROD dequant)  :     4.11 us
+  BDR write (warp-coop)     :     4.49 us
+  fp8 read  (baseline)      :     6.19 us
+
+--- N-sweep: BDR-read vs BDR-write vs fp8-read (us/step) ---
+ blocks  bdr_read  bdr_write  fp8_read  read/fp8   cos_ckv
+     1      2.95       4.05      4.01    0.74x   0.995239
+     8      3.34       3.95      4.11    0.81x   0.995025
+    32      4.12       4.38      6.17    0.67x   0.995143
+    64      5.14       6.16     10.43    0.49x   0.995075
+   128      7.19       8.22     15.78    0.46x   0.995077
+   256     12.26      14.36     25.91    0.47x   0.995024

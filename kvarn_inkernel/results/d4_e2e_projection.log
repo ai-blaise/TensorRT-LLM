@@ -1,0 +1,33 @@
+=== D4: e2e decode tok/s/user + KV-mem + accuracy — measured + projection ===
+
+WHAT IS MEASURED (this session, B200 sm_100a):
+  in-kernel BDR dequant-on-read (production hot path), warp-cooperative, per-sub-block:
+     WS 32 blk: 4.11 us   vs fp8 6.17 us  = 0.67x   (BDR FASTER than fp8)
+     WS 64 blk: 5.14 us   vs fp8 10.43 us = 0.49x
+     WS 128blk: 7.19 us   vs fp8 15.78 us = 0.46x
+  in-kernel BDR quantize-on-write (warp-cooperative): 4.0-8.2 us (< fp8-read at N>=8)
+  correctness cos_ckv = 0.995 (write->read->inverse-rotate vs original)
+  KV capacity (ckv): 0.531 B/elem = 1.88x vs fp8, 3.76x vs fp16
+  ACCURACY (MLA attn-out cos vs fp32 ref, R=8 avg):
+     4K:   int4_naive 0.969 | bdr_pertok 0.965 | bdr_persub 0.978
+     128K: int4_naive 0.867 | bdr_pertok 0.863 | bdr_persub 0.992  <-- per-sub HOLDS
+
+DECODE tok/s/user EFFECT (projection vs round-4 budget 20.8 ms/tok, OVERHEAD-bound):
+  BDR read is ~2 us cheaper than fp8 per representative layer-read = ~0.01% of the
+  per-token budget. Decode tok/s/user is therefore ~NEUTRAL (slightly positive): KVarN
+  does not touch the GEMM/MoE/launch-overhead majority that dominates the 20.8 ms.
+  -> KVarN is NOT a decode-latency lever; it is a CAPACITY + LONG-CTX-ACCURACY lever.
+
+KV-MEM / CAPACITY (the headline win), per token MLA latent (ckv 512 + kpe 64):
+  ctx       fp16      fp8       kvarn(ckv INT4+persub-scale, kpe fp8)   kvarn/fp8
+  4K        4608KB    2304KB    1344KB                                   0.58x (1.71x more)
+  128K    147456KB   73728KB   43008KB                                   0.58x (1.71x more)
+  (full-latent INT4 incl. kpe -> ~1.88x vs fp8 as the ckv microbench shows.)
+
+GAP TO LIVE e2e (honest): a live decode tok/s/user A/B needs the rebuilt
+libtensorrt_llm.so + DeepSeek-V3.2 redeploy. No incremental TRT-LLM build tree exists
+on the host (confirmed); a from-scratch rebuild + 671B redeploy would disrupt the
+running deploy on GPUs 4-7. The kernel + flag are in-tree-compile-VERIFIED (mlaKernels.o
+2.27MB, sm_100a, KVarN symbols present) and the Python<->C++ QuantMode bit is in sync
+(both bit 18). Activating requires: rebuild .so + size the INT4+scale-pool KVBlockArray
+(NVFP4-style dual-pool) in the Python cache allocator + pass kv_cache_quant_algo=KVARN.

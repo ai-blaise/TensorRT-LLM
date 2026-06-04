@@ -1,0 +1,28 @@
+=== BDR long-context attention-output accuracy (host fp64 ref) ===
+metric: cos of MLA-absorbed attn out o=softmax(scaled qKc^T)Kc vs fp32-accum unquant ref
+latent: heavy-tailed per-token mag + rare 8x outlier sub-block (1/53 tokens)
+logits normalized to std=2.5 (realistic soft attention regime)
+
+--- context T=4096  (avg over R=8 queries, fixed latent prefix) ---
+  int4_naive  fp16acc        cos=0.968777
+  int4_naive  fp32acc        cos=0.968779
+  bdr_pertok  fp16acc        cos=0.964753
+  bdr_pertok  fp32acc        cos=0.964751
+  bdr_persub  fp16acc        cos=0.977789
+  bdr_persub  fp32acc        cos=0.977790
+--- context T=131072  (avg over R=8 queries, fixed latent prefix) ---
+  int4_naive  fp16acc        cos=0.866816
+  int4_naive  fp32acc        cos=0.866812
+  bdr_pertok  fp16acc        cos=0.862735
+  bdr_pertok  fp32acc        cos=0.862732
+  bdr_persub  fp16acc        cos=0.992097
+  bdr_persub  fp32acc        cos=0.992097
+
+Verdict (measured, R=8 avg):
+  At 128K, naive-INT4 AND bdr-with-a-single-per-token-scale COLLAPSE (~0.866 cos);
+  bdr_persub (per-sub-block scale ARRAY) HOLDS at ~0.992 -> the per-sub-block scale,
+  NOT the accumulator dtype, is the load-bearing long-context lever. More outlier
+  sub-blocks appear across 128K tokens; one shared per-token scale is dominated by
+  the worst sub-block and crushes the other 3 sub-blocks' INT4 resolution.
+  fp16acc vs fp32acc is negligible here (fp16-V softmax-weighted avg stays well-scaled);
+  2-level FP32 accum is kept as cheap insurance but is not the fix for this collapse.
