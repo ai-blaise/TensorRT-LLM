@@ -1,0 +1,41 @@
+[fixture loaded] 32 blocks, total_bytes/block=19072
+=== KVarN in-kernel dequant microbench (B200) ===
+dims: group=64 ckv=512 k_pe=64  ckv_bits=4 pe_bits=2
+packed bytes/block=19072  fp16 bytes/block=73728  fp8 bytes/block=36864  nvfp4 bytes/block=20736
+--- KV memory / capacity (MLA latent, group=64) ---
+fp16 : 73728 B/block  1.00x cap   bpe=16.00
+fp8  : 36864 B/block  2.00x cap   bpe=8.00
+nvfp4: 20736 B/block  3.56x cap   bpe=4.50
+kvarn: 19072 B/block  3.87x cap   bpe=4.14   (vs fp8: 1.93x, vs nvfp4: 1.09x)
+N (blocks restored/step) = 32, pool=32 blocks
+
+kvarn kernel smem = 147456 bytes (144.0 KB), threads=256
+
+--- correctness vs python dequant_latent_block ---
+[fp32-smem] cos_ckv (FWHT vs python matmul-Hadamard) = 1.000000
+[fp32-smem] cos_kpe = 1.000000   ckv_max_abs_err = 0.001953
+[fp16-smem] cos_ckv = 1.000000   cos_kpe = 1.000000
+
+--- per-step latency (N=32 blocks) ---
+KVarN in-kernel dequant :    64.80 us   ( 2.025 us/block)
+fp8 dequantCopy read    :    11.29 us   ( 0.353 us/block)
+fp16 plain copy (floor) :    10.26 us   ( 0.321 us/block)
+
+KVarN / fp16-floor = 6.31x   KVarN / fp8 = 5.74x
+
+--- vs round-4 decode budget (~341 us/layer/tok) ---
+KVarN in-kernel  : 64.8 us = 19.0% of budget
+python staged b32: 808.4 us = 237.1% of budget  (round-4 logged)
+
+--- N-sweep: writeout vs FUSED(no-write) vs read-floor vs staged ---
+  N  writeout_us  FUSED_us  readfloor_us  fp8_us  staged_us(*)  FUSED_%budget  staged_%budget
+    1       63.97     65.53        16.41   10.61         172.5      19.2%      50.6%
+    8       64.17     67.58        18.44   11.01         316.1      19.8%      92.7%
+   32       64.91     71.38        21.33   11.29         808.4      20.9%     237.1%
+   64       65.52     77.76        28.43   11.89        1616.8      22.8%     474.1%
+  128       65.58     91.70        41.95   12.30        3233.6      26.9%     948.3%
+  256      127.20    161.60        69.36   12.30        6467.2      47.4%    1896.5%
+  512      250.14    284.16       124.59   16.41       12934.4      83.3%    3793.1%
+ 1024      505.78    489.14       234.69   33.84       25868.8     143.4%    7586.2%
+(*) staged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.
+FUSED = dequant+FWHT consumed in smem (no fp16 global write) = production end-state cost.

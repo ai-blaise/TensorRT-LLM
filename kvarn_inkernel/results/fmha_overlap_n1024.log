@@ -1,0 +1,2 @@
+FMHA-equivalent (QK+softmax+PV) over T=65536 tok, Hq=128: 131.6 us/step
+  -> the FUSED KVarN dequant (489us at N=1024) would OVERLAP this attention compute

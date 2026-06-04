@@ -1,0 +1,22 @@
+[fixture loaded] 32 blocks, total_bytes/block=19072
+=== KVarN in-kernel dequant microbench (B200) ===
+dims: group=64 ckv=512 k_pe=64  ckv_bits=4 pe_bits=2
+packed bytes/block=19072  fp16 bytes/block=73728  fp8 bytes/block=36864
+N (blocks restored/step) = 32, pool=32 blocks
+
+kvarn kernel smem = 147456 bytes (144.0 KB), threads=256
+
+--- correctness vs python dequant_latent_block ---
+cos_ckv (in-kernel FWHT vs python matmul-Hadamard) = 1.000000
+cos_kpe = 1.000000   ckv_max_abs_err = 0.001953
+
+--- per-step latency (N=32 blocks) ---
+KVarN in-kernel dequant :    64.85 us   ( 2.027 us/block)
+fp8 dequantCopy read    :    11.44 us   ( 0.357 us/block)
+fp16 plain copy (floor) :    10.26 us   ( 0.321 us/block)
+
+KVarN / fp16-floor = 6.32x   KVarN / fp8 = 5.67x
+
+--- vs round-4 decode budget (~341 us/layer/tok) ---
+KVarN in-kernel  : 64.8 us = 19.0% of budget
+python staged b32: 808.4 us = 237.1% of budget  (round-4 logged)
