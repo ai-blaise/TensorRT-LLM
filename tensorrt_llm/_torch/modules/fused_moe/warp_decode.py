@@ -62,21 +62,26 @@ _NVFP4_CURSOR_GRAPH_BUCKETS = (1, 2, 4, 8, 16, 32)
 _NVFP4_CURSOR_WARPS_PER_CTA = 8
 _TRTLLM_GEN_DEEPSEEK_V3_ROUTING = 2
 _TRTLLM_GEN_SWIGLU = 0
-# Hand-enumerated [tile, tactic] pairs for the trtllm_gen FP4BlockScaleMoERunner,
-# one per decode token bucket. These are an OPTIONAL explicitly-selected mode for
-# the legacy overlay only; they are NOT used by default. The default overlay path
-# (and the canonical WARPDECODE backend) lets the runner / AutoTuner pick the
-# tactic automatically (tactic=[-1, -1]). The values below were chosen by a local
-# get_valid_tactics() enumeration on the target shape; treat them as a frozen,
-# shape-specific override, not a measured-speedup claim. See WARPDECODE.md for the
-# honest measured performance of the canonical path.
+# Per-bucket [tile_tokens_dim, tactic] for the trtllm_gen FP4BlockScaleMoERunner,
+# RE-TUNED for the production TP/dense-E decode regime (DP2/TP4: 128 experts
+# present, intermediate_size sharded to I=2048/4=512, topk=8, H=7168, REAP-128).
+# Selected by warpdecode_tactic_retune.py: enumerate get_valid_configs() per bucket
+# at the TP4 shape, graph + time each, pick the fastest whose output is numerically
+# identical to the AutoTuner-picked tactic (cos=1.0 vs autotuned, validated against
+# run_moe_reference_fp4). These REPLACE the prior EP-rank-tuned values, which ran
+# 1.08-1.28x slower at this regime (bs1 18.47us vs old 20.52us; bs32 26.71us vs
+# old 31.32us). They are graph-safe: a fixed tactic means no host AutoTuner call
+# inside the captured decode region. Used when TRTLLM_WARP_DECODE_FIXED_TACTIC=1;
+# the default overlay path still passes tactic=[-1,-1] (AutoTuner), which lands on
+# the same tactic after warmup. TP8 (I=256) alt-topology table is in
+# tests/scripts/cute_dsl_kernels/RESULTS_trtllm_gen_fp4.md.
 _NVFP4_TARGET_TACTICS = {
-    1: [8, 26],
-    2: [8, 75],
-    4: [8, 53],
-    8: [8, 53],
+    1: [8, 81],
+    2: [8, 81],
+    4: [8, 81],
+    8: [8, 70],
     16: [16, 52],
-    32: [32, 36],
+    32: [32, 52],
 }
 
 
