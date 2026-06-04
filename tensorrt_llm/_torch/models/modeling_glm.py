@@ -134,7 +134,20 @@ class Glm4WeightLoader:
                                         num_kv_heads=num_kv_heads_list[i],
                                         tensor_parallel_size=tp_size,
                                     )
-                                    if k in ["weight", "bias"]
+                                    # When tp_size > num_kv_heads (GLM-4-9B has 2
+                                    # KV heads served at tp4), the KV head is
+                                    # replicated across ranks. The FP8 block scale
+                                    # (weight_scale_inv / weight_scale) is
+                                    # per-KV-head structured just like the weight,
+                                    # so it must be duplicated too; otherwise the
+                                    # scale shard is empty (shape [0, *]) on the
+                                    # surplus ranks while the weight shard is
+                                    # [1, *], and copy_weight_shard raises a
+                                    # broadcast-shape error.
+                                    if k in [
+                                        "weight", "bias", "weight_scale_inv",
+                                        "weight_scale"
+                                    ]
                                     else v
                                     for i, (k, v) in enumerate(fw.items())
                                 }
