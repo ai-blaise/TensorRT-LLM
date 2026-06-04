@@ -1773,7 +1773,7 @@ class Indexer(nn.Module):
         self._xstep_cache: Optional[torch.Tensor] = None
         self._xstep_refresh_kvlen: Optional[torch.Tensor] = None
         self._xstep_batch_tokens = 0
-        self._xstep_idx_cache: Dict[Tuple, Dict] = {}
+        self._xstep_idx_cache: Dict[Tuple, int] = {}
         self.enable_nvfp4_hisa = getattr(sparse_attention_config,
                                          "enable_nvfp4_hisa", False)
         self.hisa_block_size = getattr(sparse_attention_config,
@@ -1959,39 +1959,29 @@ class Indexer(nn.Module):
             return cached
 
         # Recency patch: overwrite the trailing `delta` columns with the newly
-        # appended absolute positions so every new token is selectable. NOTE:
-        # this path issues ~20 dependent tiny launches and is launch-bound (it
-        # can cost MORE than the logits+Top-K kernels it replaces); the patch
-        # index tensors below are cached per shape to cut launches. Prefer the
-        # frozen path (above) unless recency is measured to matter.
+        # appended absolute positions so every new token is selectable. The
+        # previous PyTorch implementation issued ~20 dependent tiny launches
+        # (~125us, a NET LOSS vs the ~21us logits+Top-K it replaces). It is now a
+        # single fused kernel launch (trtllm::indexer_xstep_recency_patch): one
+        # block per cached row computes delta = clamp(cur_end - refresh_end, 0,
+        # max_delta) and writes refresh_end + delta - 1 - col_off into the last
+        # max_delta columns where col_off < delta, leaving the rest untouched
+        # (element-wise identical to the old block; verified jaccard=1.0). Only
+        # the scalar max_delta is cached per shape.
         key = (cached.device, num_gen_tokens, next_n)
-        idx = self._xstep_idx_cache.get(key)
-        if idx is None:
+        max_delta = self._xstep_idx_cache.get(key)
+        if max_delta is None:
             max_delta = min(
                 max(int((self.index_topk_step_freq - 1) * next_n), next_n),
                 self.index_topk)
-            rows = torch.arange(num_gen_tokens, device=cached.device)
-            idx = {
-                "row_indices": rows // next_n,
-                "next_n_offset": rows % next_n,
-                "col_off": torch.arange(max_delta, device=cached.device),
-                "max_delta": max_delta,
-            }
-            self._xstep_idx_cache[key] = idx
-        max_delta = idx["max_delta"]
+            self._xstep_idx_cache[key] = max_delta
         gen_kv = metadata.kv_lens_cuda_runtime[
             num_contexts:num_contexts + num_generations]
-        cur_end = (gen_kv[idx["row_indices"]] - next_n + idx["next_n_offset"]
-                   + 1).to(torch.int32)
-        refresh_end = self._xstep_refresh_kvlen
-        delta = (cur_end - refresh_end).clamp_min(0).clamp_max(max_delta)
-        col_off = idx["col_off"]
-        new_pos = (refresh_end.unsqueeze(1) + delta.unsqueeze(1) - 1
-                   - col_off.unsqueeze(0)).to(torch.int32)
-        tail = cached[:, self.index_topk - max_delta:]
-        valid = col_off.unsqueeze(0) < delta.unsqueeze(1)
-        cached[:, self.index_topk - max_delta:] = torch.where(
-            valid, new_pos, tail)
+        if gen_kv.dtype != torch.int32:
+            gen_kv = gen_kv.to(torch.int32)
+        gen_kv = gen_kv.contiguous()
+        torch.ops.trtllm.indexer_xstep_recency_patch(
+            cached, self._xstep_refresh_kvlen, gen_kv, next_n, max_delta)
         return cached
 
     def _xstep_store_decode(self, metadata: DSAtrtllmAttentionMetadata,
