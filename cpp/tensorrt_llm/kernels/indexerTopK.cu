@@ -505,6 +505,13 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
             = kAdaptiveFinalSort ? (rowLen >= kRowLenRadixThreshold) : useRadixSort;
         if (useRadixFinalSort)
         {
+            // FinalSortTempStorage is FinalSort::TempStorage only when (useRadixSort ||
+            // kAdaptiveFinalSort); for the insertion-only instantiation it is int, so the
+            // FinalSort(smemFinal.finalSort) below would fail to type-check. useRadixFinalSort
+            // is always false in that instantiation, so guard the radix body with if constexpr
+            // to keep it out of that instantiation (no runtime/behaviour change).
+            if constexpr (useRadixSort || kAdaptiveFinalSort)
+            {
             // Sorting with radix sort
             float finalLogits[kNumFinalItemsPerThread];
             // The indices of the elements to be sorted in the final pass.
@@ -551,6 +558,7 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
                     }
                 }
             }
+            } // if constexpr (useRadixSort || kAdaptiveFinalSort)
         }
         else
         {
