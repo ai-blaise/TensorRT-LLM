@@ -2738,6 +2738,19 @@ class Indexer(nn.Module):
                                                 hidden_states.shape[0])
         if cached_topk is not None:
             return cached_topk
+        # A reuse ("S") layer that misses the indexcache would fall through
+        # to the compute path below, but pre_indexer_proj returns
+        # uninitialized q/k buffers on reuse layers, so that path would
+        # score garbage. The owning ("F") layer for each reuse group runs
+        # earlier in the same step (FSSS layer 0 is always "F"; no PP split
+        # at prod) and stores a same-shape cache, so the hit above is
+        # guaranteed at prod. Fail loudly if that invariant is ever broken
+        # (e.g. an unexpected layer pattern or pipeline split) rather than
+        # silently emitting wrong TopK.
+        assert not self.skip_topk, (
+            f"indexer layer {self.layer_idx}: skip_topk reuse layer missed "
+            "the indexcache; pre_indexer_proj projections are not computed "
+            "on reuse layers so the compute path cannot run")
 
         # Update the indexer k cache before prefill chunks gather from it.
         self._update_k_cache(k_fp8, k_scale, metadata)
@@ -3232,6 +3245,42 @@ class Indexer(nn.Module):
         ignores it. It is returned unconditionally so the two-op CUDA graph
         split in MLA.forward_dsa_proj sees a stable signature.
         """
+        # FSSS / index_topk_freq reuse: on a TopK-reuse ("S") layer the
+        # downstream sparse_attn_indexer returns the cached TopK from the
+        # owning ("F") layer and never reads these projections, so computing
+        # them is dead work (~32us/layer of wq_b + fused wk/wp GEMMs and the
+        # fused_cat_fp4 quantize at decode batch). skip_topk is a static
+        # per-layer property, so this branch is constant for a given layer
+        # object and stays straight-line under CUDA graph capture. Return
+        # uninitialized buffers matching the _mla_dsa_proj_fake contract
+        # (shape + dtype) so the graph-captured signature is unchanged; the
+        # values are never consumed on the reuse path.
+        if self.skip_topk:
+            num_tokens = hidden_states.shape[0]
+            if self.use_fp4:
+                q_fp8 = hidden_states.new_empty(
+                    (num_tokens, self.n_heads, self.head_dim // 2),
+                    dtype=torch.int8)
+                k_fp8 = hidden_states.new_empty(
+                    (num_tokens, self.head_dim // 2), dtype=torch.int8)
+                k_scale = hidden_states.new_empty((num_tokens, 1),
+                                                  dtype=torch.int32)
+                q_scale = hidden_states.new_empty(
+                    (num_tokens, self.n_heads, 1), dtype=torch.int32)
+            else:
+                q_fp8 = hidden_states.new_empty(
+                    (num_tokens, self.n_heads, self.head_dim),
+                    dtype=torch.float8_e4m3fn)
+                k_fp8 = hidden_states.new_empty((num_tokens, self.head_dim),
+                                                dtype=torch.float8_e4m3fn)
+                k_scale = hidden_states.new_empty((num_tokens, 1),
+                                                  dtype=torch.float32)
+                q_scale = hidden_states.new_empty(
+                    (num_tokens, self.n_heads, 1), dtype=torch.float32)
+            weights = hidden_states.new_empty((num_tokens, self.n_heads),
+                                              dtype=torch.float32)
+            return q_fp8, k_fp8, k_scale, weights, q_scale
+
         if self._fused_wk_wp_weight is not None:
             hidden_float = _to_float(hidden_states)
             with _tf32_matmul_enabled():
