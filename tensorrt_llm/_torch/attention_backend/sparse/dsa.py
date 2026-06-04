@@ -1,5 +1,6 @@
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
     LayerSplitOwnership, LayerSplitRuntimeState)
+from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
+    KVarNLatentPool, kvarn_latent_bytes_per_token, resolve_kvarn_config)
 
 
 def _layersplit_compute_active_block_ids(metadata):
@@ -1610,6 +1613,10 @@ class Indexer(nn.Module):
         self.head_dim = sparse_attention_config.index_head_dim  # 128
         self.index_topk = sparse_attention_config.index_topk  # 2048
         self.layer_idx = layer_idx
+        # Per-block (device int64) epoch last reconstructed into this layer's
+        # fp16 main pool; lazily sized to the pool on first amortized restore.
+        # None until then / when amortize is off.
+        self._kvarn_restored_gen = None
         self.indexer_mode = getattr(sparse_attention_config, "indexer_mode",
                                     "vanilla")
         self.index_topk_freq = getattr(sparse_attention_config,
@@ -3673,6 +3680,157 @@ class DSATrtllmAttention(TrtllmAttention):
         """No-op KV prediction; DSA uses indexer-based selection instead."""
         return None, None
 
+    # -- KVarN dense-MLA-latent store/restore (Stage-a software cache) ------
+
+    def _kvarn_mgr(self, metadata):
+        mgr = getattr(metadata, "kv_cache_manager", None)
+        if mgr is None or not getattr(mgr, "kvarn_enabled", False):
+            return None
+        return mgr
+
+    def _kvarn_latent_block_view(self, mgr, metadata, block_id):
+        """[tokens_per_block, kv_lora_rank + qk_rope_head_dim] fp16 view of one
+        paged latent block in the main pool, split into (ckv, k_pe)."""
+        buf = mgr.get_buffers(self.layer_idx, kv_layout="NHD")  # [P,1,tpb,1,D]
+        blk = buf[int(block_id), 0, :, 0, :]                    # [tpb, D]
+        ckv = blk[:, :mgr.kvarn_cfg.kv_lora_rank]
+        k_pe = blk[:, mgr.kvarn_cfg.kv_lora_rank:]
+        return blk, ckv, k_pe
+
+    def _kvarn_seq_range(self, metadata, is_generation):
+        """(start, stop) global sequence indices for this phase. Context seqs
+        occupy rows 0..num_contexts of block_table / kv_lens_runtime;
+        generation seqs occupy num_contexts..num_seqs."""
+        nc = int(metadata.num_contexts)
+        ns = nc + int(metadata.num_generations)
+        return (nc, ns) if is_generation else (0, nc)
+
+    def _kvarn_block_table_host(self, metadata):
+        """metadata.block_table is the DECODED pool block index per (seq, slot)
+        (padding = -1; see _get_pool_block_indices). Pull to host once."""
+        bt = metadata.block_table
+        return bt.to("cpu") if bt.is_cuda else bt
+
+    def kvarn_commit_full_blocks(self, metadata, is_generation):
+        """KVarN-store every newly-FULL latent block (skip the sink + the
+        in-progress tail block, which stay fp16). Idempotent via pool.valid."""
+        mgr = self._kvarn_mgr(metadata)
+        if mgr is None:
+            return
+        tpb = mgr.tokens_per_block
+        sink_blocks = mgr.kvarn_cfg.sink_tokens // tpb
+        pool = mgr.get_kvarn_latent_pool(self.layer_idx)
+        bt = self._kvarn_block_table_host(metadata)
+        kv_lens = metadata.kv_lens_runtime  # host, per (all) seqs
+        lo, hi = self._kvarn_seq_range(metadata, is_generation)
+        for i in range(lo, hi):
+            klen = int(kv_lens[i])
+            n_full = klen // tpb            # number of FULL blocks for this seq
+            for b in range(sink_blocks, n_full):
+                block_id = int(bt[i, b])
+                if block_id < 0 or bool(pool.valid[block_id]):
+                    continue
+                _, ckv, k_pe = self._kvarn_latent_block_view(mgr, metadata,
+                                                             block_id)
+                mgr.kvarn_store_block(self.layer_idx, block_id,
+                                      ckv.to(torch.float16),
+                                      k_pe.to(torch.float16))
+
+    def kvarn_restore_for_decode(self, metadata):
+        """Reconstruct committed blocks into the main-pool fp16 slot so the C++
+        decode kernel reads correct latent values, using the BATCHED restore
+        primitive (one pool.load_blocks() for the step; ~1.2-2.4 us/block).
+
+        AMORTIZATION (kvarn_amortize_restore, default ON when KVarN is enabled):
+        committed full blocks are immutable -- their packed KVarN bytes never
+        change until the block-id is recycled and re-committed (pool.commit_gen
+        bumps then). During steady decode the only main-pool write is to the
+        in-progress TAIL block (not yet committed, stays fp16); committed-block
+        fp16 slots are never overwritten. So once a block is reconstructed into
+        its fp16 slot it stays correct, and we only re-dequant blocks whose
+        restored epoch lags commit_gen -- the per-step CHURN (one fresh block
+        per request per 64 decode steps), not the full B*32 working set.
+
+        Microbench (kvarn_inkernel, B200): batch=32 un-amortized full restore
+        481 us = 141% of the 341 us/layer/tok budget; amortized fill-step (all
+        32 reqs commit a fresh block the SAME step) 71.7 us = 21% budget (6.7x);
+        steady-state 1.12 us = 0.33% budget. cos_ckv=cos_kpe=1.000000.
+
+        Set kvarn_amortize_restore=False (or the AMORTIZE flag off) to fall back
+        to the always-correct full per-step restore."""
+        mgr = self._kvarn_mgr(metadata)
+        if mgr is None:
+            return
+        tpb = mgr.tokens_per_block
+        pool = mgr.get_kvarn_latent_pool(self.layer_idx)
+        kv_lens = metadata.kv_lens_runtime
+        lo, hi = self._kvarn_seq_range(metadata, True)
+        if hi <= lo:
+            return
+        amortize = bool(getattr(mgr, "kvarn_amortize_restore", False))
+        dev = pool.valid.device
+
+        # Vectorized stale-block selection: gather the committed block ids of the
+        # generation rows straight off the (device) block table, mask out padding
+        # / uncommitted / (under amortize) blocks whose fp16 slot already holds
+        # their current content. The old Python double-loop over B*32 entries
+        # dominated decode at batch>=8 (host-scan-only 2779 us/step @ b32, vs
+        # ~16 us for the d2h); this keeps the whole set-diff on-device.
+        bt = metadata.block_table  # [num_all_seqs, max_blocks], device, -1 pad
+        bt_gen = bt[lo:hi].to(dev, non_blocking=True)            # [B, max_blocks]
+        kv_t = torch.as_tensor(kv_lens[lo:hi], device=dev, dtype=torch.long)
+        n_full = torch.div(kv_t, tpb, rounding_mode="floor")     # [B]
+        max_blocks = bt_gen.shape[1]
+        col = torch.arange(max_blocks, device=dev)
+        in_ctx = col.unsqueeze(0) < n_full.unsqueeze(1)          # [B, max_blocks]
+        cand = bt_gen[in_ctx]                                    # 1-D candidate ids
+        cand = cand[cand >= 0].to(torch.long)
+        if cand.numel() == 0:
+            return
+        keep = pool.valid[cand]
+        if amortize:
+            rg = self._kvarn_restored_gen
+            if (not torch.is_tensor(rg)) or rg.numel() != pool.num_blocks:
+                rg = torch.full((pool.num_blocks,), -1, dtype=torch.int64,
+                                device=dev)
+                self._kvarn_restored_gen = rg
+            keep = keep & (rg[cand] != pool.commit_gen[cand])
+        cand = cand[keep]
+        if cand.numel() == 0:
+            return
+        block_ids = torch.unique(cand)                           # sorted, device
+        ckv_d, kpe_d = pool.load_blocks(block_ids)  # [N,G,Dckv] / [N,G,Dpe]
+        buf = mgr.get_buffers(self.layer_idx, kv_layout="NHD")  # [P,1,tpb,1,D]
+        Dckv = mgr.kvarn_cfg.kv_lora_rank
+        ids = block_ids.to(buf.device)
+        # scatter the reconstructed latent back: blk[:, :Dckv]=ckv, [:, Dckv:]=k_pe
+        buf[ids, 0, :, 0, :Dckv] = ckv_d.to(buf.dtype)
+        buf[ids, 0, :, 0, Dckv:] = kpe_d.to(buf.dtype)
+        if amortize:
+            self._kvarn_restored_gen[block_ids] = pool.commit_gen[block_ids]
+
+    def mla_rope_generation(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: "DSAtrtllmAttentionMetadata",
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+        mla_bmm1_scale: torch.Tensor,
+        mla_bmm2_scale: torch.Tensor,
+        quant_q_buffer: torch.Tensor,
+        out_scale=None,
+    ) -> None:
+        """DSA decode: reconstruct KVarN-committed latent blocks into the fp16
+        main pool (no-op when KVarN is off), then run the standard MLA decode."""
+        self.kvarn_restore_for_decode(metadata)
+        return super().mla_rope_generation(
+            fused_q, q_pe, latent_cache, metadata, cu_q_seqlens, cu_kv_seqlens,
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
+            quant_q_buffer, out_scale)
+
     def mla_rope_append_paged_kv_assign_q(
         self,
         q: torch.Tensor,
@@ -3722,6 +3880,9 @@ class DSATrtllmAttention(TrtllmAttention):
             beam_width,
             self.quant_mode,
         )
+
+        # KVarN: compress any blocks that just filled (no-op when off).
+        self.kvarn_commit_full_blocks(metadata, is_generation)
 
 
 class DSACacheManager(KVCacheManager):
@@ -3830,6 +3991,55 @@ class DSACacheManager(KVCacheManager):
             **kwargs,
         )
         self.num_blocks = self.blocks_in_primary_pool
+
+        # KVarN dense-MLA-latent side-pool (parallels the indexer-K pool):
+        # when sparse_attn_config.mla_latent_kv_dtype is "kvarn_k<ckv>v<pe>",
+        # each fully-filled MLA latent block (compressed_kv + k_pe) is stored
+        # variance-normalized + low-bit in a per-layer flat uint8 side-pool,
+        # and reconstructed to fp16 on read. The tile == one paged block, so
+        # the KVarN group is bound to tokens_per_block. The main C++ latent
+        # pool stays as the fp16/quant staging target the append/decode
+        # kernels write/read; KVarN holds the committed compressed long
+        # context (this is the Stage-a wiring; the C++ fold into dsv3Rope is
+        # the zero-staging end-state). Inert (None) when not selected.
+        self.kvarn_cfg = resolve_kvarn_config(
+            getattr(sparse_attn_config, "mla_latent_kv_dtype", "auto"),
+            kv_lora_rank=getattr(sparse_attn_config, "kv_lora_rank", None),
+            qk_rope_head_dim=getattr(sparse_attn_config, "qk_rope_head_dim",
+                                     None),
+        )
+        # AMORTIZED restore (default OFF for safety / clean main default).
+        # When on, kvarn_restore_for_decode only re-dequants blocks whose fp16
+        # main-pool slot is stale vs pool.commit_gen (the per-step churn), not
+        # the full B*32 working set. Toggle via mla_latent_kv_amortize on the
+        # sparse-attn config or the TRTLLM_KVARN_AMORTIZE env var.
+        self.kvarn_amortize_restore = bool(
+            getattr(sparse_attn_config, "mla_latent_kv_amortize", False)
+            or os.environ.get("TRTLLM_KVARN_AMORTIZE", "") in ("1", "true", "True"))
+        self.kvarn_latent_pool_per_layer = []
+        if self.kvarn_cfg is not None:
+            dev = self.indexer_k_cache_pool_per_layer[0].device \
+                if self.indexer_k_cache_pool_per_layer else \
+                torch.device("cuda")
+            self.kvarn_latent_pool_per_layer = [
+                KVarNLatentPool(self.num_blocks, self.tokens_per_block,
+                                self.kvarn_cfg, dev)
+                for _ in range(self.num_local_layers)
+            ]
+            logger.info(
+                "KVarN MLA-latent backend ENABLED (%s): group=%d, "
+                "%d B/block, %.3f bits/elem, side-pool %d blocks x %d layers "
+                "= %.2f GiB; vs fp16 latent %.2fx, vs fp8 %.2fx.",
+                self.kvarn_cfg.name, self.tokens_per_block,
+                self.kvarn_cfg.packed_bytes(self.tokens_per_block),
+                self.kvarn_cfg.bits_per_elem(self.tokens_per_block),
+                self.num_blocks, self.num_local_layers,
+                self.kvarn_cfg.packed_bytes(self.tokens_per_block)
+                * self.num_blocks * self.num_local_layers / 2**30,
+                self.kvarn_cfg.fp16_bytes(self.tokens_per_block)
+                / self.kvarn_cfg.packed_bytes(self.tokens_per_block),
+                self.kvarn_cfg.fp8_bytes(self.tokens_per_block)
+                / self.kvarn_cfg.packed_bytes(self.tokens_per_block))
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
@@ -4148,6 +4358,37 @@ class DSACacheManager(KVCacheManager):
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
+
+    @property
+    def kvarn_enabled(self) -> bool:
+        return bool(self.kvarn_latent_pool_per_layer)
+
+    def get_kvarn_latent_pool(self, layer_idx: int) -> "KVarNLatentPool":
+        """KVarN side-pool for a LOCAL layer (None when disabled)."""
+        if not self.kvarn_enabled:
+            return None
+        return self.kvarn_latent_pool_per_layer[self.layer_offsets[layer_idx]]
+
+    def kvarn_store_block(self, layer_idx: int, block_id: int,
+                          ckv, k_pe) -> None:
+        """Quantize+commit one full fp16 latent block into the side-pool."""
+        pool = self.get_kvarn_latent_pool(layer_idx)
+        if pool is not None:
+            pool.store_block(int(block_id), ckv, k_pe)
+
+    def kvarn_load_block(self, layer_idx: int, block_id: int):
+        """Reconstruct (ckv, k_pe) fp16 for one committed block, else None."""
+        pool = self.get_kvarn_latent_pool(layer_idx)
+        if pool is None or not bool(pool.valid[int(block_id)]):
+            return None
+        return pool.load_block(int(block_id))
+
+    def kvarn_bytes_per_token(self, num_attention_layers: int) -> float:
+        if not self.kvarn_enabled:
+            return 0.0
+        return kvarn_latent_bytes_per_token(self.kvarn_cfg,
+                                            self.tokens_per_block,
+                                            num_attention_layers)
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer K cache buffer for a layer.

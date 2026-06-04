@@ -367,6 +367,17 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "index_head_dim=128, and can halve the indexer K cache per-token "
         "footprint from 132 B to 68 B.",
     )
+    mla_latent_kv_dtype: str = Field(
+        default="auto",
+        description=
+        "Data type for the dense MLA latent KV cache (compressed_kv + k_pe). "
+        "auto follows the model quant_config (fp8/nvfp4/fp16). A "
+        "kvarn_k<ckv>v<pe> string (e.g. kvarn_k4v4) selects the Blaise "
+        "KVarN variance-normalized backend: per-block Hadamard + log-domain "
+        "Sinkhorn var-norm + asymmetric RTN at <ckv> bits on the 512-d "
+        "content latent and <pe> bits on the 64-d RoPE key, ~2.3-4.4 "
+        "bits/elem at FP16-accuracy. Requires the DSA MLA path; group is "
+        "bound to tokens_per_block.")
     enable_nvfp4_hisa: bool = Field(
         default=False,
         description=

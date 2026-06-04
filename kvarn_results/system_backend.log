@@ -1,0 +1,30 @@
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc17
+[1] dtype parse + env resolve OK
+
+     dtype group  cos_ckv cos_Knope   cos_V  cos_kpe pool==adapter
+kvarn_k4v2    64  0.99376   0.99376 0.99374  0.92028          True
+kvarn_k4v4    64  0.99376   0.99376 0.99374  0.99643          True
+kvarn_k2v2    64  0.86455   0.86441 0.86519  0.91865          True
+kvarn_k4v2   128  0.99340   0.99339 0.99341  0.89890          True
+kvarn_k4v4   128  0.99340   0.99339 0.99341  0.99512          True
+kvarn_k2v2   128  0.86701   0.86694 0.86717  0.89941          True
+
+     dtype group   B/blk    bpe  B/tok/L  vs_fp16  vs_fp8  vs_nvfp4
+kvarn_k4v2    64   19072  4.139    298.0    3.87x   1.93x     1.21x
+kvarn_k4v4    64   20096  4.361    314.0    3.67x   1.83x     1.15x
+kvarn_k2v2    64   10880  2.361    170.0    6.78x   3.39x     2.12x
+kvarn_k4v2   128   36864  4.000    288.0    4.00x   2.00x     1.25x
+kvarn_k4v4   128   38912  4.222    304.0    3.79x   1.89x     1.18x
+kvarn_k2v2   128   20480  2.222    160.0    7.20x   3.60x     2.25x
+
+Whole MLA latent cache (61 layers, group=64), kvarn_k4v2:
+  KVarN     17.75 KiB/token
+  fp8       34.31 KiB/token   (1.93x KVarN)
+  fp16      68.62 KiB/token   (3.87x KVarN)
+  @  32768 ctx/seq: KVarN 0.555 GiB  fp8 1.072 GiB  fp16 2.145 GiB
+  @ 131072 ctx/seq: KVarN 2.219 GiB  fp8 4.289 GiB  fp16 8.578 GiB
+
+KVARN-BACKEND-OK

@@ -1,0 +1,14 @@
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc17
+=== Intel-correctness: KVarN vs fp8 vs NVFP4 (same MLA latent) ===
+    scheme bytes/tok cap_vs_fp16 cos_vs_fp16
+      fp16      1152        1.00x     1.00000
+  fp8-e4m3       576        2.00x     0.99965
+     nvfp4       324        3.56x     0.99581
+kvarn-k4v4       314        3.67x     0.99418
+
+kvarn k4v4 detail: cos_ckv=0.99390 cos_kpe=0.99582
+
+INTEL-CORRECTNESS-OK
