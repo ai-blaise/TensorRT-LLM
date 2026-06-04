@@ -1832,6 +1832,12 @@ class Indexer(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
+        # indexer_k_dtype controls both Q and K precision. DeepGEMM's
+        # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only dispatch
+        # to FP4xFP4 or FP8xFP8 (no mixed-precision variant). The DeepGEMM
+        # kernel asserts SM100 + head_dim=128 at launch time under FP4.
+        # Must precede _rope_cat_fuse_ok below, which reads self.use_fp4.
+        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
         # Fused RoPE+cat+FP4-quant eligibility: the fused kernel folds the
         # standalone flashinfer RoPE launch (+ its BF16 q_pe/k_pe write-back
         # and reload) into fused_cat_fp4. It requires neox RoPE, head_dim 128,
@@ -1845,11 +1851,6 @@ class Indexer(nn.Module):
         self._rope_cat_cos_sin = None
         # TODO: make it configurable from hf config
         self.scale_fmt = "ue8m0"
-        # indexer_k_dtype controls both Q and K precision. DeepGEMM's
-        # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only dispatch
-        # to FP4xFP4 or FP8xFP8 (no mixed-precision variant). The DeepGEMM
-        # kernel asserts SM100 + head_dim=128 at launch time under FP4.
-        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
