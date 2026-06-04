@@ -342,6 +342,90 @@ __global__ void kvarn_dequant_kernel_h(
 }
 
 // ===================================================================
+// AMORTIZED restore: dequant only the NEWLY-SELECTED blocks and scatter them
+// into a persistent fp16 main-pool cache at their PHYSICAL block-id slot. This
+// is the production end-state of kvarn_restore_for_decode: once a committed
+// block's latent has been reconstructed into the fp16 pool, it is immutable
+// (the packed KVarN bytes never change after commit), so subsequent decode
+// steps that re-select it pay NOTHING -- the FMHA just reads the fp16 slot it
+// already paid for in the attention budget.
+//
+//   block_ids[n] : physical block-id of the n-th NEW block to restore this step
+//   pool_ckv/kpe : persistent fp16 cache, indexed by physical block-id (NOT n)
+//
+// Grid = num_new_blocks (the churn), not the full working set. The whole win
+// is that this grid shrinks from B*32 to ~B (one fresh block per request per
+// 64 decode steps -> amortizes well below 1/req in steady state).
+// ===================================================================
+__global__ void kvarn_dequant_amortized_kernel(
+    uint8_t const* __restrict__ store, int const* __restrict__ block_ids,
+    __half* __restrict__ pool_ckv,   // [num_blocks, GROUP, DCKV] persistent
+    __half* __restrict__ pool_kpe,   // [num_blocks, GROUP, DPE]  persistent
+    int total_bytes)
+{
+    BlockOffsets L = layout();
+    int n = blockIdx.x;
+    int bid = block_ids[n];              // scatter target = physical block-id
+    uint8_t const* slot = store + (size_t)bid * total_bytes;
+    int tid = threadIdx.x, nth = blockDim.x;
+
+    extern __shared__ __half smh[];
+    __half* sm_ckv = smh;
+    __half* sm_pe  = smh + GROUP * DCKV;
+
+    uint8_t const* ckv_q   = slot + L.ckv_q;
+    __half const*  ckv_srow= reinterpret_cast<__half const*>(slot + L.ckv_srow);
+    __half const*  ckv_zp  = reinterpret_cast<__half const*>(slot + L.ckv_zp);
+    __half const*  ckv_scol= reinterpret_cast<__half const*>(slot + L.ckv_scol);
+    uint8_t const* pe_q    = slot + L.pe_q;
+    __half const*  pe_srow = reinterpret_cast<__half const*>(slot + L.pe_srow);
+    __half const*  pe_zp   = reinterpret_cast<__half const*>(slot + L.pe_zp);
+    __half const*  pe_scol = reinterpret_cast<__half const*>(slot + L.pe_scol);
+
+    for (int idx = tid; idx < GROUP * DCKV; idx += nth) {
+        int tok = idx / DCKV, ch = idx % DCKV;
+        uint8_t packed = ckv_q[tok * (DCKV / CKV_PACK) + ch / CKV_PACK];
+        int q = (packed >> ((ch % CKV_PACK) * CKV_BITS)) & ((1 << CKV_BITS) - 1);
+        float v = ((float)q * __half2float(ckv_srow[tok]) + __half2float(ckv_zp[tok]))
+                  * __half2float(ckv_scol[ch]);
+        sm_ckv[idx] = __float2half(v);
+    }
+    for (int idx = tid; idx < DPE * GROUP; idx += nth) {
+        int ch = idx / GROUP, tok = idx % GROUP;
+        uint8_t packed = pe_q[ch * (GROUP / PE_PACK) + tok / PE_PACK];
+        int q = (packed >> ((tok % PE_PACK) * PE_BITS)) & ((1 << PE_BITS) - 1);
+        float v = ((float)q * __half2float(pe_srow[ch]) + __half2float(pe_zp[ch]))
+                  * __half2float(pe_scol[tok]);
+        sm_pe[idx] = __float2half(v);
+    }
+    __syncthreads();
+
+    fwht_rows_h(sm_ckv, GROUP, DCKV, tid, nth);
+    for (int len = 1; len < DPE; len <<= 1) {
+        for (int idx = tid; idx < GROUP * (DPE / 2); idx += nth) {
+            int tok = idx / (DPE / 2), k = idx % (DPE / 2);
+            int blk = (k / len) * (2 * len), j = k % len;
+            int a = blk + j, b = a + len;
+            float u = __half2float(sm_pe[a * GROUP + tok]);
+            float v = __half2float(sm_pe[b * GROUP + tok]);
+            sm_pe[a * GROUP + tok] = __float2half(u + v);
+            sm_pe[b * GROUP + tok] = __float2half(u - v);
+        }
+        __syncthreads();
+    }
+
+    // scatter into persistent pool at PHYSICAL block-id (immutable after this)
+    for (int idx = tid; idx < GROUP * DCKV; idx += nth)
+        pool_ckv[(size_t)bid * GROUP * DCKV + idx] =
+            __float2half(__half2float(sm_ckv[idx]) * INV_SQRT_DCKV);
+    for (int idx = tid; idx < GROUP * DPE; idx += nth) {
+        int ch = idx / GROUP, tok = idx % GROUP;
+        pool_kpe[(size_t)bid * GROUP * DPE + tok * DPE + ch] =
+            __float2half(__half2float(sm_pe[idx]) * INV_SQRT_DPE);
+    }
+}
+
+// ===================================================================
 // Baseline A: fp8 dequantCopy cost (native fp8 latent read, 1 byte/elem,
 // single global scale). Mirrors mlaKernels.cu dequantCopy: load fp8, *scale,
 // store fp16. This is the "fp8 dense KV read" the directive compares against.
@@ -585,6 +669,99 @@ int main(int argc, char** argv) {
     }
     printf("(*) staged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.\n");
     printf("FUSED = dequant+FWHT consumed in smem (no fp16 global write) = production end-state cost.\n");
+
+    // ================================================================
+    // AMORTIZED restore sweep: the whole point of round-5.
+    //
+    // DSA selects index_topk=2048 tokens = 2048/64 = 32 BLOCKS per request.
+    // Committed full blocks are IMMUTABLE (packed KVarN bytes fixed at commit),
+    // so once a block is reconstructed into the fp16 main pool it never needs
+    // re-dequanting. A request only ADDS a new committed block once every 64
+    // decode steps (one block = 64 tokens); between fills the selected block
+    // set is byte-identical. So per-step the kernel only dequants the CHURN:
+    //   - block-fill step (worst case): B new blocks (one per request) at once
+    //   - steady state: amortized 1/64 block/req -> rounds to 0 most steps
+    //
+    // We report the per-step dequant cost as a function of churn (new blocks),
+    // and the AMORTIZED average over a 64-step block cycle:
+    //   avg = (1 fill-step costing dequant(B) + 63 steps costing 0) / 64
+    // The stable blocks already in the fp16 pool are read by the FMHA at the
+    // read-floor cost already inside the attention budget (not re-counted).
+    // ================================================================
+    CK(cudaFuncSetAttribute(kvarn_dequant_amortized_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_h));
+    // persistent fp16 pool sized to the whole working set (== main pool slots).
+    __half *d_pool_ckv, *d_pool_kpe;
+    CK(cudaMalloc(&d_pool_ckv, (size_t)NUM_BLOCKS * GROUP * DCKV * sizeof(__half)));
+    CK(cudaMalloc(&d_pool_kpe, (size_t)NUM_BLOCKS * GROUP * DPE  * sizeof(__half)));
+
+    // correctness: amortized kernel scatters into pool[bid]; must bit-match the
+    // compacted writeout kernel for the same block. Validate against fixture.
+    if (have_fixture) {
+        // dequant ids 0..N-1 via amortized (scatter to pool[bid]) and gather back.
+        std::vector<int> idc(N); for (int i=0;i<N;i++) idc[i]=i;
+        int* d_idc; CK(cudaMalloc(&d_idc, N*sizeof(int)));
+        CK(cudaMemcpy(d_idc, idc.data(), N*sizeof(int), cudaMemcpyHostToDevice));
+        kvarn_dequant_amortized_kernel<<<N, threads, smem_h>>>(d_store, d_idc, d_pool_ckv, d_pool_kpe, L.total);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        std::vector<__half> pc((size_t)N*GROUP*DCKV), pk((size_t)N*GROUP*DPE);
+        // pool is indexed by bid==i for i<N, contiguous, so copy first N blocks.
+        CK(cudaMemcpy(pc.data(), d_pool_ckv, pc.size()*sizeof(__half), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(pk.data(), d_pool_kpe, pk.size()*sizeof(__half), cudaMemcpyDeviceToHost));
+        __half const* rc = reinterpret_cast<__half const*>(h_ref_ckv_u8.data());
+        __half const* rk = reinterpret_cast<__half const*>(h_ref_kpe_u8.data());
+        auto cosf = [](__half const* a, __half const* b, size_t n){ double d=0,na=0,nb=0;
+            for(size_t i=0;i<n;i++){double x=__half2float(a[i]),y=__half2float(b[i]); d+=x*y; na+=x*x; nb+=y*y;}
+            return d/(sqrt(na)*sqrt(nb)+1e-12); };
+        printf("\n[amortized-kernel correctness] cos_ckv=%.6f  cos_kpe=%.6f  (scatter-to-pool path)\n",
+               cosf(pc.data(),rc,pc.size()), cosf(pk.data(),rk,pk.size()));
+        CK(cudaFree(d_idc));
+    }
+
+    printf("\n--- AMORTIZED restore: full-restore vs per-step churn dequant, B reqs ---\n");
+    printf("  Model: DSA index_topk=2048 tok = 32 BLOCKS/req. Committed blocks are immutable,\n");
+    printf("  so once reconstructed into the fp16 pool a block is never re-dequanted. A req adds\n");
+    printf("  one new committed block every 64 decode steps; between fills the set is identical.\n\n");
+    printf("batch workingN fullFUSED_us  fillStep(churn=B)_us  fill_%%budget  steadyAvg_us(/64)  steady_%%budget  fullFUSED_%%budget  fill_speedup\n");
+    int batches[] = {1, 4, 8, 16, 32};
+    for (int B : batches) {
+        int workingN = B * 32;                 // total selected blocks (B reqs x 32)
+        if (workingN > NUM_BLOCKS) continue;
+        // (a) un-amortized full restore of the whole working set (FUSED path).
+        std::vector<int> ids_full(workingN);
+        for (int i=0;i<workingN;i++) ids_full[i] = (i*7) % NUM_BLOCKS;
+        int* d_idf; CK(cudaMalloc(&d_idf, workingN*sizeof(int)));
+        CK(cudaMemcpy(d_idf, ids_full.data(), workingN*sizeof(int), cudaMemcpyHostToDevice));
+        auto runFull = [&](){ kvarn_dequant_fused_kernel<<<workingN, threads, smem>>>(d_store, d_idf, d_sink, L.total); };
+        runFull(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        float tFull = time_ms(runFull, iters, warmup) * 1e3;
+
+        // (b) fill-step worst case: ALL B requests fill a new block on the SAME step
+        //     -> churn = B blocks dequanted+scattered into the persistent pool.
+        int churn = B;
+        std::vector<int> ids_new(churn);
+        for (int i=0;i<churn;i++) ids_new[i] = (i*53) % NUM_BLOCKS;  // scattered block-ids
+        int* d_idn; CK(cudaMalloc(&d_idn, churn*sizeof(int)));
+        CK(cudaMemcpy(d_idn, ids_new.data(), churn*sizeof(int), cudaMemcpyHostToDevice));
+        auto runNew = [&](){ kvarn_dequant_amortized_kernel<<<churn, threads, smem_h>>>(d_store, d_idn, d_pool_ckv, d_pool_kpe, L.total); };
+        runNew(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        float tFill = time_ms(runNew, iters, warmup) * 1e3;   // fill-step cost
+
+        // steady-state average: fills spread over the 64-step block cycle.
+        float steadyAvg = tFill / 64.0f;
+
+        printf("%5d %8d %12.2f %21.2f %12.2f%% %17.3f %14.2f%% %16.1f%% %11.1fx\n",
+               B, workingN, tFull, tFill, tFill/budget_us*100,
+               steadyAvg, steadyAvg/budget_us*100, tFull/budget_us*100,
+               tFull/std::max(tFill,1e-6f));
+        CK(cudaFree(d_idf)); CK(cudaFree(d_idn));
+    }
+    printf("\nfillStep   = worst case: every req fills a fresh block the SAME step (churn=B blocks).\n");
+    printf("steadyAvg  = fillStep/64 (fills spread over the block cycle); stable blocks read by\n");
+    printf("             the FMHA at fp16 read-floor cost already inside the attention budget.\n");
+    printf("fullFUSED  = round-4 end-state cost WITHOUT amortization (re-dequant whole working set).\n");
+
+    CK(cudaFree(d_pool_ckv)); CK(cudaFree(d_pool_kpe));
     CK(cudaFree(d_sink));
 
     CK(cudaFree(d_store)); CK(cudaFree(d_ids)); CK(cudaFree(d_ckv)); CK(cudaFree(d_kpe));

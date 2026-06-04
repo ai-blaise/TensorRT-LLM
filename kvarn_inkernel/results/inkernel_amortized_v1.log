@@ -1,0 +1,60 @@
+[fixture loaded] 32 blocks, total_bytes/block=19072
+=== KVarN in-kernel dequant microbench (B200) ===
+dims: group=64 ckv=512 k_pe=64  ckv_bits=4 pe_bits=2
+packed bytes/block=19072  fp16 bytes/block=73728  fp8 bytes/block=36864  nvfp4 bytes/block=20736
+--- KV memory / capacity (MLA latent, group=64) ---
+fp16 : 73728 B/block  1.00x cap   bpe=16.00
+fp8  : 36864 B/block  2.00x cap   bpe=8.00
+nvfp4: 20736 B/block  3.56x cap   bpe=4.50
+kvarn: 19072 B/block  3.87x cap   bpe=4.14   (vs fp8: 1.93x, vs nvfp4: 1.09x)
+N (blocks restored/step) = 32, pool=32 blocks
+
+kvarn kernel smem = 147456 bytes (144.0 KB), threads=256
+
+--- correctness vs python dequant_latent_block ---
+[fp32-smem] cos_ckv (FWHT vs python matmul-Hadamard) = 1.000000
+[fp32-smem] cos_kpe = 1.000000   ckv_max_abs_err = 0.001953
+[fp16-smem] cos_ckv = 1.000000   cos_kpe = 1.000000
+
+--- per-step latency (N=32 blocks) ---
+KVarN in-kernel dequant :    73.71 us   ( 2.304 us/block)
+fp8 dequantCopy read    :    11.31 us   ( 0.353 us/block)
+fp16 plain copy (floor) :    10.26 us   ( 0.320 us/block)
+
+KVarN / fp16-floor = 7.19x   KVarN / fp8 = 6.52x
+
+--- vs round-4 decode budget (~341 us/layer/tok) ---
+KVarN in-kernel  : 73.7 us = 21.6% of budget
+python staged b32: 808.4 us = 237.1% of budget  (round-4 logged)
+
+--- N-sweep: writeout vs FUSED(no-write) vs read-floor vs staged ---
+  N  writeout_us  FUSED_us  readfloor_us  fp8_us  staged_us(*)  FUSED_%budget  staged_%budget
+    1       73.01     64.33        16.40   11.04         172.5      18.9%      50.6%
+    8       73.42     65.59        18.44   11.26         316.1      19.2%      92.7%
+   32       73.68     69.75        22.54   11.34         808.4      20.5%     237.1%
+   64       73.73     76.03        28.14   12.13        1616.8      22.3%     474.1%
+  128       73.78     90.44        41.90   12.30        3233.6      26.5%     948.3%
+  256      143.50    159.65        69.26   12.31        6467.2      46.8%    1896.5%
+  512      282.75    279.98       124.45   16.40       12934.4      82.1%    3793.1%
+ 1024      617.78    481.35       234.31   33.89       25868.8     141.2%    7586.2%
+(*) staged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.
+FUSED = dequant+FWHT consumed in smem (no fp16 global write) = production end-state cost.
+
+[amortized-kernel correctness] cos_ckv=1.000000  cos_kpe=1.000000  (scatter-to-pool path)
+
+--- AMORTIZED restore: full-restore vs per-step churn dequant, B reqs ---
+  Model: DSA index_topk=2048 tok = 32 BLOCKS/req. Committed blocks are immutable,
+  so once reconstructed into the fp16 pool a block is never re-dequanted. A req adds
+  one new committed block every 64 decode steps; between fills the set is identical.
+
+batch workingN fullFUSED_us  fillStep(churn=B)_us  fill_%budget  steadyAvg_us(/64)  steady_%budget  fullFUSED_%budget  fill_speedup
+    1       32        69.72                 71.67        21.02%             1.120           0.33%             20.4%         1.0x
+    4      128        90.49                 71.68        21.02%             1.120           0.33%             26.5%         1.3x
+    8      256       159.73                 71.68        21.02%             1.120           0.33%             46.8%         2.2x
+   16      512       279.86                 71.68        21.02%             1.120           0.33%             82.1%         3.9x
+   32     1024       481.43                 71.72        21.03%             1.121           0.33%            141.2%         6.7x
+
+fillStep   = worst case: every req fills a fresh block the SAME step (churn=B blocks).
+steadyAvg  = fillStep/64 (fills spread over the block cycle); stable blocks read by
+             the FMHA at fp16 read-floor cost already inside the attention budget.
+fullFUSED  = round-4 end-state cost WITHOUT amortization (re-dequant whole working set).
