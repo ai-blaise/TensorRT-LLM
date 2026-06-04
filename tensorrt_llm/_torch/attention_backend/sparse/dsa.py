@@ -193,6 +193,15 @@ _DG_SCHEDULE_BLOCK_KV = 64
 # small block-count shapes; larger contexts use the DeepGEMM FP4 scorer.
 _HISA_FUSED_BLOCK_SCORE_MAX_BLOCKS = 64
 
+# Decode top-k kernel crossover on max KV length (B200, index_topk=1024, fp32
+# logits, microbenchmarked across batch 1..256). The CuTe DSL kernel runs a
+# kv-parallel select whose latency is ~flat in kv_len, while the C++ Scheme X
+# kernel walks a per-row histogram whose latency grows ~linearly in kv_len.
+# Measured: C++ wins by 3.7x at kv_len=4608 and 1.6x at 16384; the paths are
+# even near 32768; DSL wins by ~1.3-1.4x at 65536-131072. Both produce
+# identical selected sets (Jaccard=1.0). Below this threshold prefer C++.
+_DSL_TOPK_MIN_KV_LEN = 32768
+
 
 def _pick_dsl_expand(
     next_n: int,
@@ -1147,6 +1156,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.max_gen_seq_len = gen_seq_lens.max().item()
             assert self.max_gen_seq_len == gen_seq_lens.min().item(), \
                 "generation seq_lens are non-uniform; decode requires padding"
+            # Longest total kv length over the decode batch (host int; kv_lens
+            # is a CPU tensor so this is sync-free). Used to pick the decode
+            # top-k kernel; see _DSL_TOPK_MIN_KV_LEN.
+            self.max_gen_kv_len = int(
+                kv_lens[self.num_contexts:self.num_seqs].max().item())
             # generation cached token indptr
             torch.cumsum(
                 cached_token_lens[self.num_contexts:self.num_seqs],
@@ -1168,6 +1182,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 non_blocking=True)
         else:
             self.max_gen_seq_len = 0
+            self.max_gen_kv_len = 0
 
         # Because the fp8_paged_mqa_logits only supports seq_len == 1/2/4 (i.e., max_draft_tokens == 0/1/3) on sm100, and
         # seq_len == 1/2 (i.e., max_draft_tokens == 0/1) on sm90, for other cases, we need to flatten the q tensor and
@@ -1420,6 +1435,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
         self.max_gen_seq_len = 1
+        self.max_gen_kv_len = 0
 
         # device
         self.on_update_kv_lens()
@@ -3125,7 +3141,13 @@ class Indexer(nn.Module):
                 if hisa_topk is not None:
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
-                elif self.use_cute_dsl_topk and num_gen_tokens <= 256:
+                elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
+                      and metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN):
+                    # DSL allocates O(num_gen_tokens * kv_len) scratch, so it is
+                    # capped at 256 tokens. It only beats the C++ kernel once
+                    # kv_len is long enough to amortize that scratch (see
+                    # _DSL_TOPK_MIN_KV_LEN); shorter contexts fall through to the
+                    # 3.7x-faster C++ path below.
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
