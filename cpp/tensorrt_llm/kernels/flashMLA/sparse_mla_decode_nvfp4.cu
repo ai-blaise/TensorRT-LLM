@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cutlass/bfloat16.h>
 #include <stdexcept>
+#include <string>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 namespace kernels
@@ -221,9 +223,18 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
     decodeParams.stride_o_accum_s_q = params.strideOAccumSQ;
     decodeParams.stride_o_accum_h_q = params.strideOAccumHQ;
 
-    for (int startHeadIdx = 0; startHeadIdx < kHeadQ; startHeadIdx += kHeadSplit)
+    // The kHeadQ=128 query heads are processed as kHeadQ/kHeadSplit independent
+    // 64-head launches: disjoint output head ranges (q/out/lse/*_accum offset by
+    // startHeadIdx), shared read-only KV + tile-scheduler metadata. Each launch
+    // is a grid of params.numSmParts CTAs and the kernel pins 1 CTA/SM (~230KB
+    // SMEM), so at low batch a single 64-head launch leaves most B200 SMs idle.
+    // Fork the head halves onto separate streams (joined before combine) so the
+    // second half fills the idle SMs concurrently instead of serializing.
+    constexpr int kNumHeadSplits = kHeadQ / kHeadSplit;
+    auto launchHeadSplit = [&](int startHeadIdx, cudaStream_t headStream)
     {
         SparseAttnDecodeParams curParams = decodeParams;
+        curParams.stream = headStream;
         curParams.q += startHeadIdx * params.strideQHQ;
         if (curParams.attn_sink != nullptr)
         {
@@ -235,6 +246,41 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
         curParams.o_accum += startHeadIdx * params.strideOAccumHQ;
         curParams.h_q = kHeadSplit;
         sm100::decode::head64_nvfp4::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>(curParams);
+    };
+
+    if (kNumHeadSplits <= 1)
+    {
+        launchHeadSplit(0, stream);
+    }
+    else
+    {
+        auto checkCuda = [](cudaError_t st, char const* what)
+        {
+            if (st != cudaSuccess)
+            {
+                throw std::runtime_error(std::string("sparse MLA NVFP4 decode head-split: ") + what);
+            }
+        };
+        // Lazily create one persistent side stream + fork/join events per
+        // host thread. Reused across calls to avoid per-decode allocation.
+        static thread_local cudaStream_t sSideStream = nullptr;
+        static thread_local cudaEvent_t sForkEvent = nullptr;
+        static thread_local cudaEvent_t sJoinEvent = nullptr;
+        if (sSideStream == nullptr)
+        {
+            checkCuda(cudaStreamCreateWithFlags(&sSideStream, cudaStreamNonBlocking), "stream create");
+            checkCuda(cudaEventCreateWithFlags(&sForkEvent, cudaEventDisableTiming), "fork event create");
+            checkCuda(cudaEventCreateWithFlags(&sJoinEvent, cudaEventDisableTiming), "join event create");
+        }
+        // Fork: side stream waits for everything enqueued on the main stream so
+        // far (q/k preprocessing + scheduler metadata) before its head half runs.
+        checkCuda(cudaEventRecord(sForkEvent, stream), "fork record");
+        checkCuda(cudaStreamWaitEvent(sSideStream, sForkEvent, 0), "fork wait");
+        launchHeadSplit(0, stream);
+        launchHeadSplit(kHeadSplit, sSideStream);
+        // Join: the main stream (where combine runs) waits for the side half.
+        checkCuda(cudaEventRecord(sJoinEvent, sSideStream), "join record");
+        checkCuda(cudaStreamWaitEvent(stream, sJoinEvent, 0), "join wait");
     }
 
     CombineParams combineParams{
