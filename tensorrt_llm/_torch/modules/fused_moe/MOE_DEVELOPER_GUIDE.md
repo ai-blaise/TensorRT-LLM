@@ -247,9 +247,12 @@ trtllm_gen `FP4BlockScaleMoERunner` at the scheduler dispatch point when
 its tactic automatically (`tactic=[-1, -1]`, matching the autotune-default
 policy), and logs `WarpDecode SELECTED (overlay): ...` / `WarpDecode FALLBACK ...
 (reason=...)`. Prefer the `WARPDECODE` backend; keep the overlay disabled unless
-you specifically need the trtllm_gen fast path. Its hand-enumerated tactic tables
-are an opt-in override only (`TRTLLM_WARP_DECODE_FIXED_TACTIC=1`) and imply no
-measured speedup.
+you specifically need the trtllm_gen fast path. When the overlay IS active its
+hand-enumerated, retuned tactic tables are now used by default for the covered
+decode buckets (1,2,4,8,16,32): validated cos=1.0 vs the AutoTuner pick and
+graph-safe (no in-graph host AutoTuner call). Set `TRTLLM_WARP_DECODE_FIXED_TACTIC=0`
+to force the pure `tactic=[-1,-1]` AutoTuner path. Uncovered shapes (padded 48/64)
+always fall back to the AutoTuner automatically.
 
 ## Backend Capability Matrix
 

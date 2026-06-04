@@ -543,7 +543,23 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         keys on num_sparse_topk == index_topk in dsa.prepare).
         """
         if self.seq_len_threshold is None:
-            self.seq_len_threshold = self.index_topk
+            # Default to the width-correct optimal: the largest power-of-2 short
+            # band that still lands the decode Top-K on the cheaper insertion
+            # launch (bucket < _DSL_TOPK_MIN_COLS == 12288 in dsa.py). 8192 is
+            # that bucket. We only adopt it when it sits strictly ABOVE the
+            # indexer-skip threshold (index_topk), so the (index_topk, 8192]
+            # band is non-empty and the win is real; when index_topk >= 8192
+            # the short band would be empty (or collapse onto the skip band) so
+            # we fall back to index_topk -> byte-identical pre-r13 behavior and
+            # zero regression. The long graph keeps full max_model_len width
+            # (see _indexer_logits_width: any kv > hard_cap//2 collapses to
+            # hard_cap), so this never narrows the long-context path.
+            _WIDTH_CORRECT_SHORT_BAND = 8192
+            if (self.index_topk is not None
+                    and self.index_topk < _WIDTH_CORRECT_SHORT_BAND):
+                self.seq_len_threshold = _WIDTH_CORRECT_SHORT_BAND
+            else:
+                self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
 

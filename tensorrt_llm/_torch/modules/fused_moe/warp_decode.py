@@ -274,15 +274,32 @@ def _required_nvfp4_ops_available() -> bool:
 _TRTLLM_GEN_AUTO_TACTIC = [-1, -1]
 
 
+def _shape_has_fixed_tactic(num_tokens: int) -> bool:
+    """Whether ``_NVFP4_TARGET_TACTICS`` covers this decode token count.
+
+    The retuned table is keyed by the cursor graph buckets (1,2,4,8,16,32).
+    Token counts above the largest bucket (e.g. padded decode batches 48/64)
+    have no validated entry, so we must not pin a tactic for them.
+    """
+    return 0 < num_tokens <= _NVFP4_CURSOR_GRAPH_BUCKETS[-1]
+
+
 def _use_fixed_overlay_tactic() -> bool:
     """Whether the overlay should pin a hand-enumerated [tile, tactic] pair.
 
-    Default is False: the overlay lets the trtllm_gen runner choose its config
-    automatically (``tactic=[-1, -1]``), matching the autotune-default policy of
-    the canonical WARPDECODE backend. Set ``TRTLLM_WARP_DECODE_FIXED_TACTIC=1``
-    to opt into the frozen ``_NVFP4_TARGET_TACTICS`` table for the target shape.
+    Default is True (optimal-on): the frozen ``_NVFP4_TARGET_TACTICS`` table is
+    the warpdecode_tactic_retune.py output for the production TP/dense-E decode
+    regime, validated cos=1.0 against the AutoTuner-picked tactic, and is
+    graph-safe (a fixed tactic means no host AutoTuner call inside the captured
+    decode region, removing warmup-order variance). The AutoTuner converges to
+    the same tactic after warmup, so pinning is numerically identical while
+    avoiding the in-graph host call. Set ``TRTLLM_WARP_DECODE_FIXED_TACTIC=0``
+    to opt back out to the pure ``tactic=[-1,-1]`` AutoTuner path. Shapes the
+    table does not cover always fall back to AutoTuner (see
+    ``_nvfp4_overlay_tactic``), so this default never errors on uncovered
+    (e.g. padded 48/64) buckets.
     """
-    return os.environ.get("TRTLLM_WARP_DECODE_FIXED_TACTIC", "0") == "1"
+    return os.environ.get("TRTLLM_WARP_DECODE_FIXED_TACTIC", "1") == "1"
 
 
 def _nvfp4_target_tactic(num_tokens: int) -> List[int]:
@@ -291,8 +308,17 @@ def _nvfp4_target_tactic(num_tokens: int) -> List[int]:
 
 
 def _nvfp4_overlay_tactic(num_tokens: int) -> List[int]:
-    """Tactic for the overlay runner: auto by default, fixed table only on opt-in."""
-    if _use_fixed_overlay_tactic():
+    """Tactic for the overlay runner: pinned retuned tactic by default for
+    covered decode buckets, AutoTuner otherwise.
+
+    The fixed table is used only when (a) it is not explicitly disabled via
+    TRTLLM_WARP_DECODE_FIXED_TACTIC=0 and (b) the token count is covered by the
+    retuned buckets. Uncovered shapes (padded 48/64 decode, or any prefill-ish
+    count above the largest bucket) fall back to tactic=[-1,-1] so the overlay
+    never raises on an unmapped bucket -- the AutoTuner picks the same family
+    of configs there.
+    """
+    if _use_fixed_overlay_tactic() and _shape_has_fixed_tactic(num_tokens):
         return _nvfp4_target_tactic(num_tokens)
     return list(_TRTLLM_GEN_AUTO_TACTIC)
 
