@@ -93,6 +93,7 @@ add_library(
   noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
+  fusedRopeCatFp4Op.cpp
   IndexerHisaNvfp4Op.cpp
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp

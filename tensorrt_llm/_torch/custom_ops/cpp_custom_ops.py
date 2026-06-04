@@ -684,6 +684,17 @@ def _register_fake():
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
 
+    @torch.library.register_fake("trtllm::fused_rope_cat_fp4")
+    def _(pe: torch.Tensor, nope: torch.Tensor, cos_sin: torch.Tensor,
+          pos: torch.Tensor):
+        pe_dim = pe.shape[-1]
+        nope_dim = nope.shape[-1]
+        head_dim = pe_dim + nope_dim
+        M = pe.numel() // pe_dim
+        packed = pe.new_empty((M, head_dim // 2), dtype=torch.int8)
+        scale = pe.new_empty((M, 1), dtype=torch.int32)
+        return packed, scale
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,

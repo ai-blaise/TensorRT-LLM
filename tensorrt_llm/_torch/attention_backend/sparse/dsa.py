@@ -386,6 +386,131 @@ def transform_local_topk_and_prepare_pool_view(
     return global_indices, attn_metadata._cached_pool_view
 
 
+# JIT fallback for trtllm::fused_rope_cat_fp4. The AOT C++ op
+# (cpp/tensorrt_llm/thop/fusedRopeCatFp4Op.cpp + kernels/fusedRopeCatFp4.cu) is
+# the production path; when the loaded .so predates it we register an equivalent
+# load_inline kernel under the same qualified name so the fused RoPE+cat+FP4
+# proj path runs without a rebuild. Output is bit-identical to flashinfer RoPE
+# followed by fused_cat_fp4.
+_FUSED_ROPE_CAT_FP4_READY = False
+_FUSED_ROPE_CAT_FP4_LOCK = threading.Lock()
+
+
+def _ensure_fused_rope_cat_fp4_op():
+    global _FUSED_ROPE_CAT_FP4_READY
+    if _FUSED_ROPE_CAT_FP4_READY:
+        return
+    with _FUSED_ROPE_CAT_FP4_LOCK:
+        if _FUSED_ROPE_CAT_FP4_READY:
+            return
+        if hasattr(torch.ops.trtllm, "fused_rope_cat_fp4"):
+            _FUSED_ROPE_CAT_FP4_READY = True
+            return
+        from torch.utils.cpp_extension import load_inline
+        cuda_src = r'''
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+namespace {
+constexpr int HEAD_DIM=128; constexpr int WARP_SIZE=32; constexpr int ELEMS_PER_THREAD=4;
+constexpr int ROWS_PER_BLOCK=8; constexpr float INV_FP4_E2M1_MAX=1.0f/6.0f; constexpr float MIN_AMAX=1.0e-12f;
+union BF16x4 { int2 vec; __nv_bfloat162 bf16x2[2]; };
+__device__ __forceinline__ uint32_t qFp4(float scaled){
+  float ax=fminf(fabsf(scaled),6.0f);
+  uint32_t idx=(uint32_t)((ax>0.25f)+(ax>0.75f)+(ax>1.25f)+(ax>1.75f)+(ax>2.5f)+(ax>3.5f)+(ax>5.0f));
+  uint32_t code=idx&0x7u; uint32_t sign=(scaled<0.0f&&idx!=0u)?1u:0u; return code|(sign<<3);
+}
+__global__ __launch_bounds__(WARP_SIZE*ROWS_PER_BLOCK)
+void frcKernel(int8_t* __restrict__ packed_out,int32_t* __restrict__ scale_out,
+  __nv_bfloat16 const* __restrict__ pe,__nv_bfloat16 const* __restrict__ nope,
+  float const* __restrict__ cos_sin,int32_t const* __restrict__ pos,
+  int32_t M,int32_t pe_dim,int32_t nope_dim,int32_t pe_rs,int32_t nope_rs,int32_t cs_s){
+  int w=threadIdx.x/WARP_SIZE,lane=threadIdx.x%WARP_SIZE,row=blockIdx.x*ROWS_PER_BLOCK+w;
+  if(row>=M) return;
+  int rope_half=pe_dim>>1, plo=rope_half/ELEMS_PER_THREAD, base=lane*ELEMS_PER_THREAD;
+  float v0,v1,v2,v3;
+  bool from_pe=(base<pe_dim);
+  if(from_pe){
+    __nv_bfloat16 const* pr=pe+(int64_t)row*pe_rs;
+    BF16x4 sl; sl.vec=*reinterpret_cast<int2 const*>(pr+base);
+    float2 s0=__bfloat1622float2(sl.bf16x2[0]),s1=__bfloat1622float2(sl.bf16x2[1]);
+    float a0=s0.x,a1=s0.y,a2=s1.x,a3=s1.y;
+    bool lower=(base<rope_half); int pl=lower?(lane+plo):(lane-plo);
+    unsigned pe_mask=(1u<<(pe_dim/ELEMS_PER_THREAD))-1u;
+    float p0=__shfl_sync(pe_mask,a0,pl),p1=__shfl_sync(pe_mask,a1,pl),
+          p2=__shfl_sync(pe_mask,a2,pl),p3=__shfl_sync(pe_mask,a3,pl);
+    float const* cs=cos_sin+(int64_t)pos[row]*cs_s; int ci=lower?base:(base-rope_half);
+    float c0=cs[ci],c1=cs[ci+1],c2=cs[ci+2],c3=cs[ci+3];
+    float n0=cs[rope_half+ci],n1=cs[rope_half+ci+1],n2=cs[rope_half+ci+2],n3=cs[rope_half+ci+3];
+    float sg=lower?-1.0f:1.0f;
+    v0=a0*c0+sg*p0*n0; v1=a1*c1+sg*p1*n1; v2=a2*c2+sg*p2*n2; v3=a3*c3+sg*p3*n3;
+    v0=__bfloat162float(__float2bfloat16(v0)); v1=__bfloat162float(__float2bfloat16(v1));
+    v2=__bfloat162float(__float2bfloat16(v2)); v3=__bfloat162float(__float2bfloat16(v3));
+  } else {
+    __nv_bfloat16 const* nr=nope+(int64_t)row*nope_rs; int col=base-pe_dim;
+    BF16x4 ld; ld.vec=*reinterpret_cast<int2 const*>(nr+col);
+    float2 f0=__bfloat1622float2(ld.bf16x2[0]),f1=__bfloat1622float2(ld.bf16x2[1]);
+    v0=f0.x;v1=f0.y;v2=f1.x;v3=f1.y;
+  }
+  float lm=fmaxf(fmaxf(fabsf(v0),fabsf(v1)),fmaxf(fabsf(v2),fabsf(v3)));
+  float amax=lm;
+  amax=fmaxf(amax,__shfl_xor_sync(0xFFFFFFFFu,amax,1));
+  amax=fmaxf(amax,__shfl_xor_sync(0xFFFFFFFFu,amax,2));
+  amax=fmaxf(amax,__shfl_xor_sync(0xFFFFFFFFu,amax,4));
+  amax=fmaxf(amax,MIN_AMAX);
+  float ratio=amax*INV_FP4_E2M1_MAX; uint32_t bits=__float_as_uint(ratio);
+  uint32_t eb=bits&0x7F800000u; if((bits&0x007FFFFFu)!=0u) eb+=0x00800000u;
+  float scale=__uint_as_float(eb);
+  uint32_t c0=qFp4(v0/scale),c1=qFp4(v1/scale),c2=qFp4(v2/scale),c3=qFp4(v3/scale);
+  uint8_t b0=(uint8_t)(c0|(c1<<4)),b1=(uint8_t)(c2|(c3<<4));
+  int bo=row*(HEAD_DIM/2)+lane*2; packed_out[bo]=(int8_t)b0; packed_out[bo+1]=(int8_t)b1;
+  uint32_t me=(__float_as_uint(scale)>>23)&0xFFu;
+  uint32_t e0=__shfl_sync(0xFFFFFFFFu,me,0),e1=__shfl_sync(0xFFFFFFFFu,me,8),
+           e2=__shfl_sync(0xFFFFFFFFu,me,16),e3=__shfl_sync(0xFFFFFFFFu,me,24);
+  if(lane==0) scale_out[row]=(int32_t)(e0|(e1<<8)|(e2<<16)|(e3<<24));
+}
+}
+std::tuple<at::Tensor,at::Tensor> fused_rope_cat_fp4(at::Tensor const& pe, at::Tensor const& nope,
+    at::Tensor const& cos_sin, at::Tensor const& pos){
+  c10::cuda::CUDAGuard g{pe.device()};
+  auto pd=(int32_t)pe.size(-1), nd=(int32_t)nope.size(-1); auto M=(int32_t)(pe.numel()/pd);
+  auto packed=at::empty({M,(pd+nd)/2}, pe.options().dtype(at::kChar));
+  auto scale=at::empty({M,1}, pe.options().dtype(at::kInt));
+  auto st=at::cuda::getCurrentCUDAStream(pe.get_device());
+  int nb=(M+ROWS_PER_BLOCK-1)/ROWS_PER_BLOCK;
+  frcKernel<<<nb,WARP_SIZE*ROWS_PER_BLOCK,0,st>>>(
+    reinterpret_cast<int8_t*>(packed.data_ptr()),reinterpret_cast<int32_t*>(scale.data_ptr()),
+    reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()),reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()),
+    cos_sin.data_ptr<float>(),pos.data_ptr<int32_t>(),M,pd,nd,(int32_t)pe.stride(-2),(int32_t)nope.stride(-2),(int32_t)cos_sin.stride(0));
+  C10_CUDA_CHECK(cudaGetLastError());
+  return {packed,scale};
+}
+'''
+        cpp_src = '#include <torch/extension.h>\n#include <tuple>\nstd::tuple<at::Tensor,at::Tensor> fused_rope_cat_fp4(at::Tensor const&,at::Tensor const&,at::Tensor const&,at::Tensor const&);\n'
+        mod = load_inline(name="trtllm_fused_rope_cat_fp4_jit",
+                          cpp_sources=cpp_src, cuda_sources=cuda_src,
+                          functions=["fused_rope_cat_fp4"],
+                          extra_cuda_cflags=["-O3"], verbose=False)
+        torch.library.define(
+            "trtllm::fused_rope_cat_fp4",
+            "(Tensor pe, Tensor nope, Tensor cos_sin, Tensor pos) -> (Tensor, Tensor)")
+        torch.library.impl(
+            "trtllm::fused_rope_cat_fp4", "CUDA",
+            lambda pe, nope, cos_sin, pos: mod.fused_rope_cat_fp4(pe, nope, cos_sin, pos))
+
+        @torch.library.register_fake("trtllm::fused_rope_cat_fp4")
+        def _(pe, nope, cos_sin, pos):
+            pe_dim = pe.shape[-1]
+            head_dim = pe_dim + nope.shape[-1]
+            M = pe.numel() // pe_dim
+            return (pe.new_empty((M, head_dim // 2), dtype=torch.int8),
+                    pe.new_empty((M, 1), dtype=torch.int32))
+
+        _FUSED_ROPE_CAT_FP4_READY = True
+
+
 # JIT fallback for trtllm::indexer_affine_reuse. The AOT C++ op
 # (cpp/tensorrt_llm/thop/indexerAffineReuseOp.cpp) is the production path; when
 # the loaded .so predates that op we register an equivalent load_inline kernel
@@ -1681,6 +1806,17 @@ class Indexer(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
+        # Fused RoPE+cat+FP4-quant eligibility: the fused kernel folds the
+        # standalone flashinfer RoPE launch (+ its BF16 q_pe/k_pe write-back
+        # and reload) into fused_cat_fp4. It requires neox RoPE, head_dim 128,
+        # an even rope_dim whose half is a multiple of 4, and the
+        # flashinfer-compatible cos/sin cache (cos first half, sin second).
+        self._rope_cat_fuse_ok = bool(
+            self.use_fp4 and self.head_dim == 128 and self.rope_dim == 64
+            and (self.rope_dim % 4 == 0) and ((self.rope_dim // 2) % 4 == 0)
+            and not indexer_rope_interleave
+            and getattr(self.rotary_emb, 'rotary_cos_sin', None) is not None)
+        self._rope_cat_cos_sin = None
         # TODO: make it configurable from hf config
         self.scale_fmt = "ue8m0"
         # indexer_k_dtype controls both Q and K precision. DeepGEMM's
@@ -3383,6 +3519,22 @@ class Indexer(nn.Module):
         k_pe = k_pe[:, 0, :]
         return q_pe, q_nope, k_pe, k_nope
 
+    def _qk_projection_no_rope(self, qr: torch.Tensor,
+                               indexer_k: torch.Tensor):
+        """Project Q/K and split pe/nope WITHOUT applying RoPE.
+
+        Used by the fused RoPE+cat+FP4-quant path, which folds RoPE into the
+        quantize kernel and so needs the pre-RoPE pe slices.
+        """
+        q = self.wq_b(qr)
+        k = self.k_norm(indexer_k)
+        q = q.view(-1, self.n_heads, self.head_dim)
+        q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
+                               dim=-1)
+        k_pe, k_nope = k.split([self.rope_dim, self.head_dim - self.rope_dim],
+                               dim=-1)
+        return q_pe, q_nope, k_pe, k_nope
+
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate and quantize for Q or K.
 
@@ -3466,17 +3618,47 @@ class Indexer(nn.Module):
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
         indexer_k = indexer_k.to(hidden_states.dtype)
 
-        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
-            qr, indexer_k, position_ids)
-        q, k = maybe_execute_in_parallel(
-            lambda: self._prep_q_or_k(q_pe, q_nope),
-            lambda: self._prep_q_or_k(k_pe, k_nope),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        q_fp8, q_scale = q
-        k_fp8, k_scale = k
+        if self._rope_cat_fuse_ok:
+            _ensure_fused_rope_cat_fp4_op()
+            # Fused RoPE+cat+FP4-quant: project (no RoPE), then fold RoPE into
+            # the quantize kernel for Q and K in parallel. Bit-identical to
+            # rotary_emb -> _prep_q_or_k, but removes the RoPE kernel launch
+            # and the BF16 q_pe/k_pe round-trip (~3-4 us/F-layer, graphed).
+            q_pe, q_nope, k_pe, k_nope = self._qk_projection_no_rope(
+                qr, indexer_k)
+            if self._rope_cat_cos_sin is None:
+                self._rope_cat_cos_sin = self.rotary_emb.rotary_cos_sin.view(
+                    self.rotary_emb.max_positions, -1).to(torch.float32)
+            cos_sin = self._rope_cat_cos_sin
+            pos = position_ids.view(-1).to(torch.int32)
+            num_tokens = pos.shape[0]
+            pos_q = pos.repeat_interleave(self.n_heads)
+            q_pe_2d = q_pe.reshape(num_tokens * self.n_heads, self.rope_dim)
+            q_nope_2d = q_nope.reshape(num_tokens * self.n_heads,
+                                       self.head_dim - self.rope_dim)
+            q, k = maybe_execute_in_parallel(
+                lambda: torch.ops.trtllm.fused_rope_cat_fp4(
+                    q_pe_2d, q_nope_2d, cos_sin, pos_q),
+                lambda: torch.ops.trtllm.fused_rope_cat_fp4(
+                    k_pe, k_nope, cos_sin, pos),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+            q_fp8, q_scale = q
+            k_fp8, k_scale = k
+        else:
+            q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
+                qr, indexer_k, position_ids)
+            q, k = maybe_execute_in_parallel(
+                lambda: self._prep_q_or_k(q_pe, q_nope),
+                lambda: self._prep_q_or_k(k_pe, k_nope),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+            q_fp8, q_scale = q
+            k_fp8, k_scale = k
         if self.use_fp4:
             # FP4 packs two codes per byte, so the trailing dim is head_dim // 2.
             # fused_cat_fp4 flattens the leading dims to M=N*n_heads; restore
