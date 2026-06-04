@@ -206,6 +206,74 @@ __device__ inline void fwht_rows_h(__half* sm, int rows, int n, int tid, int nth
 }
 
 // ===================================================================
+// FUSED model: dequant + FWHT into smem, then CONSUME in-place (reduce to a
+// checksum) instead of writing the fp16 result to a global pool. This models
+// the production end-state where the FMHA reads the dequantized ckv/k_pe
+// straight out of smem for its QK^T/PV MMAs -- no extra HBM round-trip. The
+// delta vs kvarn_dequant_kernel (which writes fp16 out) is exactly the global
+// write of the dequantized latent the staged path also pays.
+// ===================================================================
+__global__ void kvarn_dequant_fused_kernel(
+    uint8_t const* __restrict__ store, int const* __restrict__ block_ids,
+    float* __restrict__ sink, int total_bytes)
+{
+    BlockOffsets L = layout();
+    int n = blockIdx.x, bid = block_ids[n];
+    uint8_t const* slot = store + (size_t)bid * total_bytes;
+    int tid = threadIdx.x, nth = blockDim.x;
+    extern __shared__ float sm[];
+    float* sm_ckv = sm; float* sm_pe = sm + GROUP * DCKV;
+    uint8_t const* ckv_q = slot + L.ckv_q;
+    __half const* ckv_srow=reinterpret_cast<__half const*>(slot+L.ckv_srow);
+    __half const* ckv_zp  =reinterpret_cast<__half const*>(slot+L.ckv_zp);
+    __half const* ckv_scol=reinterpret_cast<__half const*>(slot+L.ckv_scol);
+    uint8_t const* pe_q = slot + L.pe_q;
+    __half const* pe_srow=reinterpret_cast<__half const*>(slot+L.pe_srow);
+    __half const* pe_zp  =reinterpret_cast<__half const*>(slot+L.pe_zp);
+    __half const* pe_scol=reinterpret_cast<__half const*>(slot+L.pe_scol);
+    for (int idx=tid; idx<GROUP*DCKV; idx+=nth) {
+        int tok=idx/DCKV, ch=idx%DCKV;
+        uint8_t p=ckv_q[tok*(DCKV/CKV_PACK)+ch/CKV_PACK];
+        int q=(p>>((ch%CKV_PACK)*CKV_BITS))&((1<<CKV_BITS)-1);
+        sm_ckv[idx]=((float)q*__half2float(ckv_srow[tok])+__half2float(ckv_zp[tok]))*__half2float(ckv_scol[ch]);
+    }
+    for (int idx=tid; idx<DPE*GROUP; idx+=nth) {
+        int ch=idx/GROUP, tok=idx%GROUP;
+        uint8_t p=pe_q[ch*(GROUP/PE_PACK)+tok/PE_PACK];
+        int q=(p>>((tok%PE_PACK)*PE_BITS))&((1<<PE_BITS)-1);
+        sm_pe[idx]=((float)q*__half2float(pe_srow[ch])+__half2float(pe_zp[ch]))*__half2float(pe_scol[tok]);
+    }
+    __syncthreads();
+    fwht_rows(sm_ckv, GROUP, DCKV, tid, nth);
+    for (int len=1; len<DPE; len<<=1){
+        for(int idx=tid; idx<GROUP*(DPE/2); idx+=nth){
+            int tok=idx/(DPE/2), k=idx%(DPE/2); int blk=(k/len)*(2*len), j=k%len; int a=blk+j,b=a+len;
+            float u=sm_pe[a*GROUP+tok], v=sm_pe[b*GROUP+tok];
+            sm_pe[a*GROUP+tok]=u+v; sm_pe[b*GROUP+tok]=u-v;
+        }
+        __syncthreads();
+    }
+    // CONSUME: reduce to a per-CTA checksum (stands in for the FMHA MMA reads).
+    float acc=0;
+    for (int idx=tid; idx<GROUP*DCKV; idx+=nth) acc += sm_ckv[idx]*INV_SQRT_DCKV;
+    for (int idx=tid; idx<GROUP*DPE;  idx+=nth) acc += sm_pe[idx]*INV_SQRT_DPE;
+    atomicAdd(&sink[n & 31], acc);
+}
+
+// Bandwidth floor: just read the packed KVarN bytes (the HBM traffic the FMHA
+// pays anyway to bring the sparse blocks on-chip), reduce to checksum.
+__global__ void kvarn_readonly_kernel(
+    uint8_t const* __restrict__ store, int const* __restrict__ block_ids,
+    float* __restrict__ sink, int total_bytes)
+{
+    int n = blockIdx.x, bid = block_ids[n];
+    uint8_t const* slot = store + (size_t)bid * total_bytes;
+    int acc = 0;
+    for (int idx = threadIdx.x; idx < total_bytes; idx += blockDim.x) acc += slot[idx];
+    atomicAdd(&sink[n & 31], (float)acc);
+}
+
+// ===================================================================
 // Optimized: fp16-smem KVarN dequant. Same math, working set in __half ->
 // 72KB smem -> 2 CTAs/SM, ~2x the high-N throughput. Butterfly math stays fp32.
 // ===================================================================
@@ -486,8 +554,12 @@ int main(int argc, char** argv) {
     // ---- N-sweep: per-step cost across batch (blocks restored/step) ----
     // Reuse the store pool; launch more CTAs against strided ids. This mirrors the
     // round-4 sweep rows (sparse topK=32 blocks/req; b1/b8/b32 grow N=32/256/1024).
-    printf("\n--- N-sweep: in-kernel (fp32-smem | fp16-smem) vs python-staged vs budget ---\n");
-    printf("  N   fp32sm_us  fp16sm_us  fp16/blk  fp8_us  pyStaged_us(*)  fp16sm_%%budget\n");
+    CK(cudaFuncSetAttribute(kvarn_dequant_fused_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    float* d_sink; CK(cudaMalloc(&d_sink, 32*sizeof(float)));
+
+    printf("\n--- N-sweep: writeout vs FUSED(no-write) vs read-floor vs staged ---\n");
+    printf("  N  writeout_us  FUSED_us  readfloor_us  fp8_us  staged_us(*)  FUSED_%%budget  staged_%%budget\n");
     int sweepN[] = {1, 8, 32, 64, 128, 256, 512, 1024};
     for (int sn : sweepN) {
         if (sn > NUM_BLOCKS) continue;
@@ -495,23 +567,25 @@ int main(int argc, char** argv) {
         for (int i=0;i<sn;i++) ids_s[i] = (i*7) % NUM_BLOCKS;
         CK(cudaMalloc(&d_ids_s, sn*sizeof(int)));
         CK(cudaMemcpy(d_ids_s, ids_s.data(), sn*sizeof(int), cudaMemcpyHostToDevice));
-        __half *o_ckv, *o_kpe;
+        __half *o_ckv, *o_kpe, *o_f8;
         CK(cudaMalloc(&o_ckv, (size_t)sn*GROUP*DCKV*sizeof(__half)));
         CK(cudaMalloc(&o_kpe, (size_t)sn*GROUP*DPE*sizeof(__half)));
-        auto run32 = [&](){ kvarn_dequant_kernel<<<sn, threads, smem>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
-        auto run16 = [&](){ kvarn_dequant_kernel_h<<<sn, threads, smem_h>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
-        run32(); run16(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-        float t32 = time_ms(run32, iters, warmup);
-        float t16 = time_ms(run16, iters, warmup);
-        __half *f8o; CK(cudaMalloc(&f8o,(size_t)sn*GROUP*(DCKV+DPE)*sizeof(__half)));
-        auto runf8=[&](){ fp8_dequant_kernel<<<sn,threads>>>(d_fp8,d_ids_s,f8o,1.0f); };
-        runf8(); CK(cudaDeviceSynchronize()); float tf8=time_ms(runf8,iters,warmup);
+        CK(cudaMalloc(&o_f8,  (size_t)sn*GROUP*(DCKV+DPE)*sizeof(__half)));
+        auto runW  = [&](){ kvarn_dequant_kernel<<<sn, threads, smem>>>(d_store, d_ids_s, o_ckv, o_kpe, L.total); };
+        auto runF  = [&](){ kvarn_dequant_fused_kernel<<<sn, threads, smem>>>(d_store, d_ids_s, d_sink, L.total); };
+        auto runR  = [&](){ kvarn_readonly_kernel<<<sn, threads>>>(d_store, d_ids_s, d_sink, L.total); };
+        auto runf8 = [&](){ fp8_dequant_kernel<<<sn, threads>>>(d_fp8, d_ids_s, o_f8, 1.0f); };
+        runW(); runF(); runR(); runf8(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        float tW=time_ms(runW,iters,warmup), tF=time_ms(runF,iters,warmup);
+        float tR=time_ms(runR,iters,warmup), tf8=time_ms(runf8,iters,warmup);
         double py = (sn<=1)?172.5:(sn<=8)?316.1:(sn<=32)?808.4:(808.4*sn/32.0);
-        printf("%5d   %8.2f   %8.2f  %7.3f  %6.2f   %12.1f   %6.1f%%\n",
-               sn, t32*1e3, t16*1e3, t16*1e3/sn, tf8*1e3, py, t16*1e3/budget_us*100);
-        CK(cudaFree(d_ids_s)); CK(cudaFree(o_ckv)); CK(cudaFree(o_kpe)); CK(cudaFree(f8o));
+        printf("%5d   %9.2f  %8.2f   %10.2f  %6.2f   %11.1f   %7.1f%%   %7.1f%%\n",
+               sn, tW*1e3, tF*1e3, tR*1e3, tf8*1e3, py, tF*1e3/budget_us*100, py/budget_us*100);
+        CK(cudaFree(d_ids_s)); CK(cudaFree(o_ckv)); CK(cudaFree(o_kpe)); CK(cudaFree(o_f8));
     }
-    printf("(*) pyStaged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.\n");
+    printf("(*) staged: b1/b8/b32 from round-4 system_decode_overhead.log; >b32 linearly extrapolated.\n");
+    printf("FUSED = dequant+FWHT consumed in smem (no fp16 global write) = production end-state cost.\n");
+    CK(cudaFree(d_sink));
 
     CK(cudaFree(d_store)); CK(cudaFree(d_ids)); CK(cudaFree(d_ckv)); CK(cudaFree(d_kpe));
     CK(cudaFree(d_fp8)); CK(cudaFree(d_fp8out)); CK(cudaFree(d_fp16)); CK(cudaFree(d_fp16out));
