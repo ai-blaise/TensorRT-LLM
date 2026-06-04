@@ -82,7 +82,7 @@ def synth(bid, tpb, D, dev):
 def build_attn(M, amortize):
     a = type("A", (), {})()
     a.layer_idx = 0
-    a._kvarn_restored_gen = {}
+    a._kvarn_restored_gen = None
     for nm, fn in M.items():
         setattr(a, nm, types.MethodType(fn, a))
     return a

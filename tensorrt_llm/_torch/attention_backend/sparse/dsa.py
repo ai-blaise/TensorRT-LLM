@@ -1495,9 +1495,10 @@ class Indexer(nn.Module):
         self.head_dim = sparse_attention_config.index_head_dim  # 128
         self.index_topk = sparse_attention_config.index_topk  # 2048
         self.layer_idx = layer_idx
-        # block_id -> commit_gen last reconstructed into this layer's fp16
-        # main pool (amortized KVarN decode restore). Empty when amortize off.
-        self._kvarn_restored_gen = {}
+        # Per-block (device int64) epoch last reconstructed into this layer's
+        # fp16 main pool; lazily sized to the pool on first amortized restore.
+        # None until then / when amortize is off.
+        self._kvarn_restored_gen = None
         self.indexer_mode = getattr(sparse_attention_config, "indexer_mode",
                                     "vanilla")
         self.index_topk_freq = getattr(sparse_attention_config,
@@ -3622,41 +3623,51 @@ class DSATrtllmAttention(TrtllmAttention):
             return
         tpb = mgr.tokens_per_block
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
-        bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime
         lo, hi = self._kvarn_seq_range(metadata, True)
-        amortize = bool(getattr(mgr, "kvarn_amortize_restore", False))
-        # Per-(layer) epoch of the block content last reconstructed into the
-        # fp16 pool. block_id -> commit_gen at restore time.
-        restored_gen = self._kvarn_restored_gen if amortize else None
-        # Gather the committed block ids referenced this step; under amortize,
-        # keep only the ones whose fp16 slot is stale (never restored, or the
-        # block-id was recycled+re-committed since we last restored it).
-        valid_host = pool.valid.to("cpu")
-        commit_gen = pool.commit_gen
-        to_restore = []
-        for i in range(lo, hi):
-            n_full = int(kv_lens[i]) // tpb
-            for b in range(n_full):
-                block_id = int(bt[i, b])
-                if block_id < 0 or not bool(valid_host[block_id]):
-                    continue
-                if amortize and restored_gen.get(block_id) == commit_gen[block_id]:
-                    continue  # fp16 slot already holds this block's content
-                to_restore.append(block_id)
-        if not to_restore:
+        if hi <= lo:
             return
-        block_ids = sorted(set(to_restore))
+        amortize = bool(getattr(mgr, "kvarn_amortize_restore", False))
+        dev = pool.valid.device
+
+        # Vectorized stale-block selection: gather the committed block ids of the
+        # generation rows straight off the (device) block table, mask out padding
+        # / uncommitted / (under amortize) blocks whose fp16 slot already holds
+        # their current content. The old Python double-loop over B*32 entries
+        # dominated decode at batch>=8 (host-scan-only 2779 us/step @ b32, vs
+        # ~16 us for the d2h); this keeps the whole set-diff on-device.
+        bt = metadata.block_table  # [num_all_seqs, max_blocks], device, -1 pad
+        bt_gen = bt[lo:hi].to(dev, non_blocking=True)            # [B, max_blocks]
+        kv_t = torch.as_tensor(kv_lens[lo:hi], device=dev, dtype=torch.long)
+        n_full = torch.div(kv_t, tpb, rounding_mode="floor")     # [B]
+        max_blocks = bt_gen.shape[1]
+        col = torch.arange(max_blocks, device=dev)
+        in_ctx = col.unsqueeze(0) < n_full.unsqueeze(1)          # [B, max_blocks]
+        cand = bt_gen[in_ctx]                                    # 1-D candidate ids
+        cand = cand[cand >= 0].to(torch.long)
+        if cand.numel() == 0:
+            return
+        keep = pool.valid[cand]
+        if amortize:
+            rg = self._kvarn_restored_gen
+            if (not torch.is_tensor(rg)) or rg.numel() != pool.num_blocks:
+                rg = torch.full((pool.num_blocks,), -1, dtype=torch.int64,
+                                device=dev)
+                self._kvarn_restored_gen = rg
+            keep = keep & (rg[cand] != pool.commit_gen[cand])
+        cand = cand[keep]
+        if cand.numel() == 0:
+            return
+        block_ids = torch.unique(cand)                           # sorted, device
         ckv_d, kpe_d = pool.load_blocks(block_ids)  # [N,G,Dckv] / [N,G,Dpe]
         buf = mgr.get_buffers(self.layer_idx, kv_layout="NHD")  # [P,1,tpb,1,D]
         Dckv = mgr.kvarn_cfg.kv_lora_rank
-        ids = torch.as_tensor(block_ids, device=buf.device, dtype=torch.long)
+        ids = block_ids.to(buf.device)
         # scatter the reconstructed latent back: blk[:, :Dckv]=ckv, [:, Dckv:]=k_pe
         buf[ids, 0, :, 0, :Dckv] = ckv_d.to(buf.dtype)
         buf[ids, 0, :, 0, Dckv:] = kpe_d.to(buf.dtype)
         if amortize:
-            for bid in block_ids:
-                restored_gen[bid] = commit_gen[bid]
+            self._kvarn_restored_gen[block_ids] = pool.commit_gen[block_ids]
 
     def mla_rope_generation(
         self,

@@ -186,9 +186,11 @@ class KVarNLatentPool:
         # Per-block content epoch: bumped on every (re)commit. The amortized
         # decode restore reconstructs a block into the fp16 main pool only when
         # its restored epoch lags commit_gen (committed blocks are immutable
-        # until the block-id is recycled and re-committed). Host-side int so the
-        # restore set-diff stays a cheap CPU compare.
-        self.commit_gen = [0] * num_blocks
+        # until the block-id is recycled and re-committed). Device int tensor so
+        # the per-step stale-block set-diff is a vectorized GPU compare, not a
+        # Python loop (the loop dominates at batch>=8, see bench_amort_e2e).
+        self.commit_gen = torch.zeros((num_blocks,), dtype=torch.int64,
+                                      device=device)
         # Hadamard matrices cached once per layer (shared across all blocks).
         self.H_ckv = hadamard_matrix(cfg.kv_lora_rank, device, torch.float32)
         self.H_pe = hadamard_matrix(cfg.qk_rope_head_dim, device, torch.float32)
@@ -250,7 +252,7 @@ class KVarNLatentPool:
                                  H_ckv=self.H_ckv, H_pe=self.H_pe)
         self._serialize_into(block_id, rec)
         self.valid[block_id] = True
-        self.commit_gen[block_id] += 1
+        self.commit_gen[block_id] += 1  # bump content epoch (device tensor)
 
     # -- read --------------------------------------------------------------
 
