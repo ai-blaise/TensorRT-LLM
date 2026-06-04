@@ -202,6 +202,21 @@ _HISA_FUSED_BLOCK_SCORE_MAX_BLOCKS = 64
 # identical selected sets (Jaccard=1.0). Below this threshold prefer C++.
 _DSL_TOPK_MIN_KV_LEN = 32768
 
+# Decode Top-K kernel selection by LOGITS WIDTH (= the paged-MQA-logits output
+# column count = kv_cache max_seq_len, NOT the live kv_len). The C++
+# indexer_topk_decode takes a fast per-row insertion path only for
+# numColumns < 12288; at/above that it falls to a ~2x-slower path (B200 sweep,
+# B=8 topk=1024, graphed: C++ 8.2us at width<=8192 jumps to 16.4us at
+# width>=12288 and stays flat, while cute_dsl_indexer_topk_decode is ~10-12us
+# flat across width and selects a bit-identical Top-K set). Production decode
+# runs the logits at max_seq_len=132096 (sdt_gen.yaml) regardless of the short
+# ~4.6K live prefix, so the width is always >=12288 and the DSL kernel wins by
+# ~4us/recompute-F layer. Gate the DSL path on this width crossover so the
+# scoring-width regime (not just the >=32K long-context kv regime) takes the
+# faster kernel. DSL scratch is O(num_gen_tokens * live_kv_len) (bounded by the
+# 256-token cap below), independent of the padded width, so it stays cheap.
+_DSL_TOPK_MIN_COLS = 12288
+
 
 def _pick_dsl_expand(
     next_n: int,
@@ -3259,12 +3274,19 @@ class Indexer(nn.Module):
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
                 elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
-                      and metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN):
-                    # DSL allocates O(num_gen_tokens * kv_len) scratch, so it is
-                    # capped at 256 tokens. It only beats the C++ kernel once
-                    # kv_len is long enough to amortize that scratch (see
-                    # _DSL_TOPK_MIN_KV_LEN); shorter contexts fall through to the
-                    # 3.7x-faster C++ path below.
+                      and (metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN
+                           or logits_decode.shape[1] >= _DSL_TOPK_MIN_COLS)):
+                    # DSL allocates O(num_gen_tokens * live_kv_len) scratch, so
+                    # it is capped at 256 tokens. It beats the C++ kernel in two
+                    # regimes: (a) long live kv (>= _DSL_TOPK_MIN_KV_LEN), and
+                    # (b) wide scoring logits (>= _DSL_TOPK_MIN_COLS columns =
+                    # max_seq_len), where the C++ kernel leaves its fast
+                    # insertion path. Production hits (b) every step (logits
+                    # width = max_seq_len = 132096 >> 12288), so the short-prefix
+                    # decode now takes the faster DSL Top-K instead of the
+                    # slow-path C++ kernel. Narrow scoring widths (< 12288) with
+                    # short kv still fall through to the faster C++ insertion
+                    # path below.
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
