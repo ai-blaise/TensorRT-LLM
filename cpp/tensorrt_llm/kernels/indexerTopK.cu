@@ -1001,8 +1001,10 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     else if (numColumns < effectiveSplitWorkThreshold)
     {
         // Radix sort path — InputT propagated; histogram/sort run on float keys.
+        // Adaptive final-sort: short real-kv rows (rowLen<kSortingAlgorithmThreshold)
+        // fall back to insertion at runtime, mirroring the fp32 path. Graph-safe.
         auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT, /*kAdaptiveFinalSort=*/true>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
