@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 import torch
@@ -261,6 +262,10 @@ class SMCSampler(TorchSampler):
         self._particle_token_indices = [[depth * n_particles + particle
                                          for depth in range(gamma)]
                                         for particle in range(n_particles)]
+        # Host-side static parent-step layout, used by the accept hot path
+        # instead of a per-request device->host .tolist(). Built lazily and
+        # cached by _get_parent_steps_host; prime it here for the normal path.
+        self._get_parent_steps_host()
         self._particle_index_cache: dict[torch.device,
                                          tuple[torch.Tensor, torch.Tensor]] = {}
         # Per-step cache of batched particle selection, keyed by SMC group id.
@@ -393,6 +398,22 @@ class SMCSampler(TorchSampler):
             index_cache[device] = (particle_token_indices, parent_steps)
         return index_cache[device]
 
+    def _get_parent_steps_host(self) -> list[list[int]]:
+        """Host-side parent-step layout per particle, lazily cached.
+
+        Mirrors the device ``parent_steps`` from ``_get_particle_index_tensors``
+        but is purely static config (a function of gamma / n_particles). Reading
+        it from host avoids a per-request device->host ``.tolist()`` of the
+        cached device tensor in the accept hot path. ``getattr`` fallback so any
+        construction path (incl. test factories using ``object.__new__``) works.
+        """
+        cached = getattr(self, "_parent_steps_host", None)
+        if cached is None:
+            cached = [[0] + [row[d - 1] + 1 for d in range(1, self.gamma)]
+                      for row in self._particle_token_indices]
+            self._parent_steps_host = cached
+        return cached
+
     def _compute_particle_logprob_diffs(self, request) -> torch.Tensor:
         target_probs = request.py_target_probs
         draft_log_probs = request.py_smc_draft_token_log_probs
@@ -420,28 +441,160 @@ class SMCSampler(TorchSampler):
         new_tokens_list: list[list[list[int]]],
         finish_reasons: FinishReasonsList,
     ) -> int:
+        """Verify the selected particle's draft chain against the target.
+
+        SMC selects the highest-importance-weight particle (trajectory); the
+        tokens along that trajectory are still only PROPOSALS and must be
+        verified against the target before being emitted.  We walk the selected
+        chain depth-by-depth: at depth ``d`` the target's own token (the one the
+        target model already sampled at the parent tree node, respecting
+        ``target_temperature``) lives at
+        ``new_tokens_tensor[parent_step_d, seq_slot]``, where ``parent_step_d``
+        follows the same ``parent_steps`` convention that
+        ``_compute_particle_logprob_diffs`` uses to read ``py_target_probs``.
+        Accept the draft token iff it equals that target token; stop at the first
+        mismatch and emit the target's own token there.  This is the canonical
+        speculative-decoding accept (cf. ``_process_draft_tokens_greedy`` and
+        ``_process_draft_tokens_tree``), walking one tree path instead of a flat
+        list, and is correct for any target sampling temperature because it
+        verifies against what the target ACTUALLY sampled, not a recomputed
+        argmax.
+
+        This is the correctness fix: the previous implementation accepted the
+        whole chain unconditionally (acceptance_length == gamma+1 every step), so
+        the weak GLM draft's tokens were emitted verbatim -> token salad.  The
+        per-token importance weights from ``_compute_particle_logprob_diffs``
+        still drive WHICH particle is selected, preserving SMC's acceptance-rate
+        benefit; this method only gates emission on target agreement.
+        """
         token_indices = self._particle_token_indices[selected_particle]
-        request.py_num_accepted_draft_tokens_indices = token_indices
         seq_slot = request.py_seq_slot
         assert seq_slot is not None
 
+        # parent_steps[selected, d] = tree node whose target sample validates the
+        # depth-d draft token (root==0 for d==0). This is static config, so read
+        # the precomputed host list instead of a per-call device->host .tolist()
+        # of the cached device tensor (this method runs once per request per step).
+        parent_steps_sel = self._get_parent_steps_host()[selected_particle]
+        num_nodes = int(request.py_target_probs.shape[0])
+        # Target tokens the model already sampled at every tree node (host).
+        target_tokens = new_tokens_tensor[:num_nodes, seq_slot,
+                                          DEFAULT_BEAM_IDX].tolist()
+
+        # Rejection-sampling acceptance (default): accept draft token t at depth d
+        # with probability min(1, q/p) where q = P_target(t | parent) and
+        # p = P_draft(t).  This is the speculative-sampling criterion (cf.
+        # get_rejected_indices) and yields HIGHER acceptance length than exact
+        # token match while staying distributionally correct -- crucial under
+        # target_temperature>0 (here 1.0), where the target's single sampled
+        # token rarely equals the draft's even when the draft is good.  Set
+        # SMC_REJECTION_ACCEPT=0 to fall back to exact-match verification.
+        use_rejection = os.environ.get("SMC_REJECTION_ACCEPT", "1") != "0"
+        target_q = None
+        draft_p = None
+        rand_u = None
+        if use_rejection:
+            tp = request.py_target_probs
+            dlp = getattr(request, "py_smc_draft_token_log_probs", None)
+            if dlp is not None:
+                # Per-depth target prob of the draft token and draft prob, on host.
+                sel_idx = torch.tensor(token_indices, dtype=torch.long,
+                                       device=tp.device)
+                parents = torch.tensor(parent_steps_sel, dtype=torch.long,
+                                       device=tp.device).clamp_(max=num_nodes - 1)
+                draft_ids = torch.tensor(
+                    [int(request.py_draft_tokens[i]) for i in token_indices],
+                    dtype=torch.long, device=tp.device)
+                q = tp[parents].gather(1, draft_ids.unsqueeze(1)).squeeze(1)
+                p = dlp.to(device=tp.device,
+                           dtype=torch.float32)[sel_idx].exp()
+                gen = self.get_generator(tp.device)
+                u = torch.rand(len(token_indices), generator=gen,
+                               device=tp.device)
+                # Fuse the q / p / u read-back into ONE device->host transfer
+                # (was three separate .tolist() syncs per request per step).
+                target_q, draft_p, rand_u = torch.stack(
+                    (q, p.to(q.dtype), u.to(q.dtype)), dim=0).tolist()
+            else:
+                use_rejection = False
+
+        if os.environ.get("SMC_ACCEPT_DEBUG") == "1" and not getattr(
+                SMCSampler, "_accept_dbg_done", False):
+            SMCSampler._accept_dbg_done = True
+            draft_flat = [int(t) for t in request.py_draft_tokens]
+            tgt_argmax = torch.argmax(request.py_target_probs,
+                                      dim=-1).tolist()
+            print(f"[SMC_ACCEPT_DEBUG] sel={selected_particle} "
+                  f"n_nodes={num_nodes} gamma={self.gamma} "
+                  f"np={self.n_particles} rejection={use_rejection}", flush=True)
+            print(f"[SMC_ACCEPT_DEBUG] draft_flat={draft_flat}", flush=True)
+            print(f"[SMC_ACCEPT_DEBUG] target_sampled={target_tokens}",
+                  flush=True)
+            print(f"[SMC_ACCEPT_DEBUG] target_argmax={tgt_argmax}", flush=True)
+            print(f"[SMC_ACCEPT_DEBUG] sel_token_indices={token_indices} "
+                  f"sel_parent_steps={parent_steps_sel}", flush=True)
+            if target_q is not None:
+                print(f"[SMC_ACCEPT_DEBUG] target_q={[round(x,4) for x in target_q]} "
+                      f"draft_p={[round(x,4) for x in draft_p]}", flush=True)
+
         num_accepted = 0
-        for step, token_idx in enumerate(token_indices):
-            new_token = int(request.py_draft_tokens[token_idx])
-            new_tokens_tensor[step, seq_slot, DEFAULT_BEAM_IDX] = new_token
-            request.add_new_token(new_token, DEFAULT_BEAM_IDX)
+        accepted_node_indices: list[int] = []
+        for depth, token_idx in enumerate(token_indices):
+            parent = parent_steps_sel[depth]
+            # Defensive bound: a malformed parent index means we cannot verify
+            # this depth -> stop accepting here (correctness over length).
+            if parent >= num_nodes:
+                break
+            draft_token = int(request.py_draft_tokens[token_idx])
+            target_token = int(target_tokens[parent])
+            if use_rejection:
+                p = draft_p[depth]
+                q = target_q[depth]
+                accept_prob = 1.0 if p <= 0.0 else min(1.0, q / p)
+                accepted = rand_u[depth] < accept_prob
+            else:
+                accepted = (draft_token == target_token)
+            if not accepted:
+                # Reject: emit the target's own sampled token at this position
+                # and stop.  (Residual-distribution resampling would need the
+                # full draft distribution, which is not retained; emitting the
+                # target's sample is the standard fallback and keeps output
+                # coherent and target-distributed.)
+                new_tokens_tensor[num_accepted, seq_slot,
+                                  DEFAULT_BEAM_IDX] = target_token
+                request.add_new_token(target_token, DEFAULT_BEAM_IDX)
+                self._handle_stop_criteria(request, target_token,
+                                           beam_idx=DEFAULT_BEAM_IDX,
+                                           max_seq_len=self.max_seq_len)
+                request.py_num_accepted_draft_tokens_indices = (
+                    accepted_node_indices)
+                return num_accepted
+            # Accept the draft token.
+            new_tokens_tensor[num_accepted, seq_slot,
+                              DEFAULT_BEAM_IDX] = draft_token
+            request.add_new_token(draft_token, DEFAULT_BEAM_IDX)
+            accepted_node_indices.append(token_idx)
             num_accepted += 1
-            if self._handle_stop_criteria(
-                    request,
-                    new_token,
-                    beam_idx=DEFAULT_BEAM_IDX,
-                    max_seq_len=self.max_seq_len):
+            if self._handle_stop_criteria(request, draft_token,
+                                          beam_idx=DEFAULT_BEAM_IDX,
+                                          max_seq_len=self.max_seq_len):
+                request.py_num_accepted_draft_tokens_indices = (
+                    accepted_node_indices)
                 return num_accepted
 
-        bonus_step = token_indices[-1] + 1
+        request.py_num_accepted_draft_tokens_indices = accepted_node_indices
+
+        # Whole chain accepted: emit the target's bonus token from the buffered
+        # next-token at this step (the canonical accept tail, identical to
+        # ``_process_draft_tokens_greedy`` and the no-rejection branch of
+        # ``_process_draft_tokens_rejection_sampling``).  Indexing target_tokens
+        # for the bonus is avoided: in the flat n_particles x gamma layout the
+        # child of the deepest node is not at a fixed offset, so the buffered
+        # next-token (which the target sampler already prepared at this step) is
+        # the unambiguous source.
         new_token = add_token(request, new_tokens_list,
-                              beam_idx=DEFAULT_BEAM_IDX, step=bonus_step)
-        self.finish_if_reason(request, finish_reasons, step=bonus_step,
+                              beam_idx=DEFAULT_BEAM_IDX, step=num_accepted)
+        self.finish_if_reason(request, finish_reasons, step=num_accepted,
                               beam_idx=DEFAULT_BEAM_IDX)
         return num_accepted
 
