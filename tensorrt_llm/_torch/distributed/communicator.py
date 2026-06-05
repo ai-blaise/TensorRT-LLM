@@ -155,6 +155,10 @@ class Distributed(ABC):
         return self.mapping.has_cp_helix()
 
     @property
+    def has_cp_block_token(self):
+        return self.mapping.has_cp_block_token()
+
+    @property
     def cp_config(self):
         return self.mapping.cp_config
 

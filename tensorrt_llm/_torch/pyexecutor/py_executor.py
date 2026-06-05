@@ -4200,7 +4200,7 @@ class PyExecutor:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
-            elif cp_type == CpType.HELIX:
+            elif cp_type in (CpType.HELIX, CpType.LAYERSPLIT):
                 # Take the usual route with _update_request_states_tp().
                 pass
             else:

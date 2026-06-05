@@ -14,7 +14,7 @@
 # limitations under the License.
 import unittest
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 
 class TestMapping(unittest.TestCase):
@@ -81,3 +81,31 @@ class TestMapping(unittest.TestCase):
         self.assertEqual(m.next_pp_rank(), 1)
         self.assertEqual(m.prev_cp_rank(), 8)
         self.assertEqual(m.next_cp_rank(), 10)
+
+    def test_layersplit_cp_supports_moe_ep(self):
+        m = Mapping(world_size=4,
+                    rank=1,
+                    tp_size=2,
+                    cp_size=2,
+                    moe_ep_size=4,
+                    cp_config={"cp_type": "LAYERSPLIT"})
+
+        self.assertEqual(m.cp_config["cp_type"], CpType.LAYERSPLIT)
+        self.assertTrue(m.has_cp_layersplit())
+        self.assertFalse(m.has_cp_helix())
+        self.assertTrue(m.has_cp_block_token())
+        self.assertEqual(m.moe_tp_size, 1)
+        self.assertEqual(m.moe_ep_size, 4)
+        self.assertEqual(m.attn_tp_size, 2)
+        self.assertEqual(m.attn_cp_size, 2)
+        self.assertEqual(m.tp_group, [1, 3])
+        self.assertEqual(m.cp_group, [0, 1])
+
+    def test_non_layersplit_cp_still_rejects_moe_ep(self):
+        with self.assertRaises(NotImplementedError):
+            Mapping(world_size=4,
+                    rank=0,
+                    tp_size=2,
+                    cp_size=2,
+                    moe_ep_size=4,
+                    cp_config={"cp_type": "RING"})

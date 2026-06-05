@@ -935,7 +935,9 @@ class CpConfig(StrictBaseModel):
                             description="Context parallel type.")
     tokens_per_block: Optional[int] = Field(
         default=None,
-        description="Number of tokens per block. Used in HELIX parallelism.")
+        description=
+        "Number of tokens per block. Used in HELIX and LAYERSPLIT parallelism."
+    )
     use_nccl_for_alltoall: Optional[bool] = Field(
         default=None,
         description=
@@ -4763,17 +4765,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_helix_tokens_per_block(self) -> 'TorchLlmArgs':
-        """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when HELIX parallelism is active."""
+        """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when block-token CP is active."""
         if self.context_parallel_size == 1 or self.cp_config is None:
             return self
 
         cp_type = self.cp_config.cp_type
-        if cp_type == CpType.HELIX:
+        if cp_type in (CpType.HELIX, CpType.LAYERSPLIT):
             cp_tokens_per_block = self.cp_config.tokens_per_block
             if cp_tokens_per_block is not None:
                 kv_tokens_per_block = self.kv_cache_config.tokens_per_block
                 assert cp_tokens_per_block == kv_tokens_per_block, (
-                    f"When HELIX parallelism is active, cp_config.tokens_per_block ({cp_tokens_per_block}) "
+                    f"When {cp_type.name} parallelism is active, cp_config.tokens_per_block ({cp_tokens_per_block}) "
                     f"must match kv_cache_config.tokens_per_block ({kv_tokens_per_block})."
                 )
 

@@ -105,7 +105,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         # across CP ranks for the SAME batch element, so reduction is still needed
         # within the CP group.
         needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
-        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_block_token(
         )
         self.self_attn = Qwen3Attention(
             model_config,
@@ -282,10 +282,10 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
         # For other layers (e.g., MLP), CP ranks are repurposed to TP. We save
         # the original mapping with CP, repurpose CP to TP for model construction,
         # and restore the original mapping afterward.
-        if model_config.mapping.has_cp_helix():
+        if model_config.mapping.has_cp_block_token():
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
             model_config._frozen = False
-            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
+            model_config.mapping = model_config.mapping.repurpose_cp_to_tp(
             )
             model_config._frozen = True
 

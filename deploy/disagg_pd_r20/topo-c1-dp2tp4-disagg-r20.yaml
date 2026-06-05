@@ -42,9 +42,7 @@ data:
     moe_expert_parallel_size: 4
     context_parallel_size: 2
     cp_config:
-      # LayerSplit is the custom feature. HELIX is only TRT-LLM's current
-      # CP process-group layout that permits MoE EP with CP>1.
-      cp_type: HELIX
+      cp_type: LAYERSPLIT
     enable_attention_dp: false
     trust_remote_code: true
     enable_chunked_prefill: true

@@ -1368,7 +1368,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         # across CP ranks for the SAME batch element, so reduction is still needed
         # within the CP group.
         needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
-        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_block_token(
         )
         if config.model_type == "deepseek_v32":
             self.self_attn = DeepseekV32Attention(
@@ -1992,14 +1992,14 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # is in action. This shall be passed on to attention which is the only layer that's
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
-        if model_config.mapping.has_cp_helix():
+        if model_config.mapping.has_cp_block_token():
             print(
                 "[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
             # Repurpose KVP ranks to TP while keeping other details the same.
             model_config._frozen = False
-            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
+            model_config.mapping = model_config.mapping.repurpose_cp_to_tp(
             )
             model_config._frozen = True
 

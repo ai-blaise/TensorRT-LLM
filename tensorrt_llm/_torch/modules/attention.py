@@ -225,7 +225,7 @@ def _helix_cp_allgather_input(hidden_states: torch.Tensor,
     The first layer already has the full input from the embedding.
     Subsequent layers need to undo the previous layer's reduce-scatter.
     """
-    if (mapping.has_cp_helix() and mapping.enable_attention_dp
+    if (mapping.has_cp_block_token() and mapping.enable_attention_dp
             and layer_idx > 0):
         hidden_states = cp_allgather(hidden_states, mapping, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
@@ -248,7 +248,7 @@ def _helix_cp_output_projection(
     result so each CP rank processes a distinct token chunk through the MLP.
     Falls back to the standard AllReduce path otherwise.
     """
-    if mapping.has_cp_helix() and mapping.enable_attention_dp:
+    if mapping.has_cp_block_token() and mapping.enable_attention_dp:
         attn_output = o_proj(
             attn_output,
             all_reduce_params=AllReduceParams(enable_allreduce=False),
@@ -282,7 +282,7 @@ def maybe_slice_for_helix_cp(tensor: torch.Tensor,
     Call this in the decoder layer on the residual *after* the attention
     forward, so that Attention/MLA forward signatures stay unchanged.
     """
-    if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
+    if (mapping_with_cp is not None and mapping_with_cp.has_cp_block_token()
             and mapping_with_cp.enable_attention_dp and layer_idx == 0):
         tensor, chunk_size = _helix_cp_pad(tensor, attn_metadata.num_tokens,
                                            mapping_with_cp.cp_size)
@@ -304,7 +304,7 @@ def maybe_allgather_for_helix_cp(
     Should be called at the end of the model's ``forward()`` method,
     after the decoder layer loop.
     """
-    if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
+    if (mapping_with_cp is not None and mapping_with_cp.has_cp_block_token()
             and mapping_with_cp.enable_attention_dp):
         hidden_states = cp_allgather(hidden_states, mapping_with_cp, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
@@ -436,8 +436,8 @@ class Attention(nn.Module):
             tp_size = 1
 
         if self.mapping.cp_size > 1:
-            assert self.mapping.has_cp_helix(
-            ), f"CP type must be HELIX for Attention, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.has_cp_block_token(
+            ), f"CP type must be HELIX/LAYERSPLIT for Attention, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=dp_size * tp_size * pp_size * cp_size,
@@ -715,7 +715,7 @@ class Attention(nn.Module):
         # We intentionally skip passing out_scale to FMHA here
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
-        if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
+        if self.mapping.has_cp_block_token() and attn_metadata.num_contexts == 0:
             assert output is None, (
                 "Helix produces BF16 partial outputs which may not match a pre-allocated FP8/NVFP4 buffer for torch.compile inplace output."
             )
@@ -1276,8 +1276,8 @@ class MLA(nn.Module):
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulysses yet")
         if self.mapping.cp_size > 1:
-            assert self.mapping.has_cp_helix(
-            ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.has_cp_block_token(
+            ), f"CP type must be HELIX/LAYERSPLIT for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=pp_size * dp_size * tp_size * cp_size,
@@ -1624,7 +1624,7 @@ class MLA(nn.Module):
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
-        if self.mapping.has_cp_helix():
+        if self.mapping.has_cp_block_token():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),

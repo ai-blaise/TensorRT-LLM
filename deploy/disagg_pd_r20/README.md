@@ -69,20 +69,17 @@ exist on a4-us-002-rl9.
 LayerSplit splits the DSA KV / indexer-K cache across **context-parallel** ranks.
 This manifest runs the prefill worker as TP2 x CP2 on four GPUs
 (`tensor_parallel_size: 2`, `context_parallel_size: 2`, `cp_config.cp_type:
-HELIX`) so LayerSplit is a real CP split and MoE EP remains supported. HELIX is
-not the custom piece; it is the only TRT-LLM CP process-group layout that
-currently permits `moe_expert_parallel_size > 1` with `context_parallel_size > 1`.
-There is
+LAYERSPLIT`) so LayerSplit is a real CP split and MoE EP remains supported. There is
 **no** `--context-parallel-size` Dynamo CLI flag; CP is set only through the
 engine YAML `context_parallel_size` field. Decode remains TP4/CP1 and consumes
 the reassembled KV through the cpfix image.
 
 ## KV handoff shape
 
-The deployment follows the same handoff shape as the vLLM MORI-IO write-mode
-recipe: the prefill side is the KV producer, decode has pre-allocated KV blocks,
-and the transfer path uses one cached peer session carrying block/stride metadata
-instead of routing per-request block IDs through the proxy. In this TRT-LLM
-setup, UCX is the transport and the cpfix path reassembles the prefill
-LayerSplit CP shards into the decode worker's TP4/CP1 KV layout before decode
-generation.
+The deployment uses the TRT-LLM disaggregated KV transceiver, not vLLM MORI-IO.
+The MORI-IO write-mode shape is still the useful reference point: prefill is the
+KV producer, decode owns pre-allocated KV blocks, and transfer metadata must
+describe block and layer layout precisely. In this setup, UCX is the transport,
+LayerSplit owns the prefill-side CP-sharded DSA KV/indexer-K layout, and the
+cpfix path reassembles those shards into the decode worker's TP4/CP1 KV layout
+before decode generation.

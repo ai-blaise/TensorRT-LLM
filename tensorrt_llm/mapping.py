@@ -31,6 +31,8 @@ class CpType(StrEnum):
     RING = "RING"
     # CP type for helix parallelism
     HELIX = "HELIX"
+    # CP type for LayerSplit DSA KV/indexer-K ownership.
+    LAYERSPLIT = "LAYERSPLIT"
 
 
 class MappingBase:
@@ -130,7 +132,8 @@ class MappingBase:
                 f"but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
-        if moe_ep_size != 1 and cp_size > 1 and cp_type != CpType.HELIX:
+        if (moe_ep_size != 1 and cp_size > 1
+                and cp_type not in (CpType.HELIX, CpType.LAYERSPLIT)):
             raise NotImplementedError(
                 f"CP {cp_type} doesn't support MoE tp/ep yet")
 
@@ -247,6 +250,14 @@ class MappingBase:
     def has_cp_helix(self):
         return self.cp_size > 1 and self.cp_config.get(
             "cp_type") == CpType.HELIX
+
+    def has_cp_layersplit(self):
+        return self.cp_size > 1 and self.cp_config.get(
+            "cp_type") == CpType.LAYERSPLIT
+
+    def has_cp_block_token(self):
+        return self.cp_size > 1 and self.cp_config.get(
+            "cp_type") in (CpType.HELIX, CpType.LAYERSPLIT)
 
     def get_node_rank(self, rank: int):
         return rank // self.gpus_per_node
@@ -530,10 +541,10 @@ class Mapping(MappingBase):
                          enable_attention_dp=enable_attention_dp,
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp)
 
-    def repurpose_helix_cp_to_tp(self):
-        # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
+    def repurpose_cp_to_tp(self):
+        # In block-token CP, CP is relevant only for the attention layer. These ranks are repurposed to TP
         # for FFN layers.
-        assert self.has_cp_helix()
+        assert self.has_cp_block_token()
         return Mapping(
             world_size=self.world_size,
             rank=self.rank,
@@ -549,6 +560,9 @@ class Mapping(MappingBase):
             # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
+
+    def repurpose_helix_cp_to_tp(self):
+        return self.repurpose_cp_to_tp()
 
     # DeviceMesh specific methods
     @property

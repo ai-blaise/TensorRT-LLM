@@ -10,8 +10,6 @@
 # NOTE on LayerSplit + TP2xCP2: LayerSplit splits the DSA KV / indexer-K cache across
 # context-parallel (CP) ranks. This prefill worker runs on four GPUs as
 # tensor_parallel_size=2 and context_parallel_size=2, so the CP split is real.
-# cp_config.cp_type remains HELIX only because TRT-LLM currently requires that
-# CP process-group layout for MoE EP with CP>1; it is not the custom feature.
 # There is no Dynamo CLI flag for context_parallel_size; CP is set in this engine YAML.
 # Decode remains TP4/CP1 and consumes the reassembled KV via the cpfix image.
 # =============================================================================
@@ -20,9 +18,7 @@ tensor_parallel_size: 2
 moe_expert_parallel_size: 4
 context_parallel_size: 2
 cp_config:
-  # LayerSplit is the custom feature; HELIX is the internal TRT-LLM CP layout
-  # needed today for MoE EP + CP>1.
-  cp_type: HELIX
+  cp_type: LAYERSPLIT
 enable_attention_dp: false
 trust_remote_code: true
 enable_chunked_prefill: true

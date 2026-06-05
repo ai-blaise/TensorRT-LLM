@@ -513,7 +513,7 @@ def merge_requests(
                 cp_config=cp_config,
                 exclude_last_generation_logits=exclude_last_generation_logits,
             )
-        elif cp_type == CpType.HELIX:
+        elif cp_type in (CpType.HELIX, CpType.LAYERSPLIT):
             return merge_helix_requests(
                 new_requests,
                 cp_rank=cp_rank,
