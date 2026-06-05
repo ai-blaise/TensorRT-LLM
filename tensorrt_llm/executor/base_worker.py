@@ -701,7 +701,7 @@ class BaseWorker(GenerationExecutor):
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
+            ValueError: If ``sleep_config`` is not set.
         """
         # _autodeploy is intentionally excluded: its allocations are not tagged
         # under sleep_config VMM scopes, so release_with_tag would silently
@@ -715,20 +715,15 @@ class BaseWorker(GenerationExecutor):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
-        # Non-rank-0 processes block on their local control_action_done
-        # threading.Event with no Python caller to release it — deadlock.
-        if self.llm_args.parallel_config.world_size > 1:
-            raise NotImplementedError(
-                f"{method}() requires parallel_config.world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
-
     def sleep(self, sleep_tags: List[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  Uses
+        Uses
         ``PyExecutor.control_action()`` to drain in-flight requests and pause
         the event loop before calling ``release_with_tag()``, matching the
-        ``@control_action_decorator`` behaviour used in Ray.
+        ``@control_action_decorator`` behaviour used in Ray. Multi-rank MPI
+        callers must dispatch this method to all ranks together so the
+        control-action barriers have matching participants.
 
         Only allocations backed by virtual memory (VMM) and registered under
         the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
@@ -749,7 +744,6 @@ class BaseWorker(GenerationExecutor):
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("sleep")
 
@@ -767,8 +761,8 @@ class BaseWorker(GenerationExecutor):
     def wakeup(self, wakeup_tags: List[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
-        details on VMM scope restrictions and backend prerequisites.
+        See :meth:`sleep` for details on multi-rank dispatch requirements,
+        VMM scope restrictions, and backend prerequisites.
 
         Args:
             wakeup_tags: List of
@@ -783,7 +777,6 @@ class BaseWorker(GenerationExecutor):
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("wakeup")
 

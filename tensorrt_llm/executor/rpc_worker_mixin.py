@@ -40,12 +40,15 @@ class RpcWorkerMixin:
         self.rpc_addr = rpc_addr
 
     def start_rpc_server(self):
-        if self.rank == 0:
-            # Use num_workers if set on the instance, otherwise use class default
-            num_workers = getattr(self, "num_workers", RpcWorkerMixin.NUM_WORKERS)
-            self.rpc_server = RPCServer(self, num_workers=num_workers, hmac_key=self.hmac_key)
-            self.rpc_server.bind(self.rpc_addr)
-            self.rpc_server.start()
+        # Use num_workers if set on the instance, otherwise use class default.
+        # MPI IPC workers receive a rank-specific address, so every worker can
+        # expose control RPCs such as sleep/wakeup without binding conflicts.
+        num_workers = getattr(self, "num_workers", RpcWorkerMixin.NUM_WORKERS)
+        self.rpc_server = RPCServer(self,
+                                    num_workers=num_workers,
+                                    hmac_key=self.hmac_key)
+        self.rpc_server.bind(self.rpc_addr)
+        self.rpc_server.start()
 
     def submit(self, request: GenerationRequest):
         """Submits a request to the worker."""

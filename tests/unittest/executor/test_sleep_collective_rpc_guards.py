@@ -40,6 +40,7 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
     from tensorrt_llm.executor.base_worker import BaseWorker
 
     w = object.__new__(BaseWorker)
+    w.doing_shutdown = True
     w._backend = backend
     w._is_pytorch_backend = backend in ("pytorch", "_autodeploy")
     w.llm_args = SimpleNamespace(
@@ -59,6 +60,9 @@ def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
     p = object.__new__(Cls)
     p.model_world_size = model_world_size
     p.rpc_client = rpc_client
+    p.workers_started = False
+    if cls_name == "ipc":
+        p.rpc_clients = [rpc_client] if rpc_client is not None else []
     return p
 
 
@@ -93,11 +97,10 @@ class TestBaseWorkerSleepGuards:
         with pytest.raises(ValueError, match="Sleep feature is not enabled"):
             getattr(w, method)(["kv_cache"])
 
-    def test_multirank_raises(self, method):
-        """world_size > 1 must raise before control_action() is entered."""
+    def test_multirank_preconditions_are_allowed(self, method):
+        """world_size > 1 is valid when the proxy dispatches to all ranks."""
         w = _make_worker(world_size=2)
-        with pytest.raises(NotImplementedError, match="parallel_config.world_size == 1"):
-            getattr(w, method)(["kv_cache"])
+        w._check_sleep_wakeup_preconditions(method)
 
     def test_backend_checked_before_sleep_config(self, method):
         """Backend check fires even when sleep_config is also absent."""
@@ -120,42 +123,23 @@ class TestBaseWorkerSleepGuards:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cls", ["ipc", "rpc"])
-class TestProxyCollectiveRpcGuards:
-    """Guard-path tests for both IPC and RPC proxy collective_rpc() shims."""
+class TestIpcProxyCollectiveRpc:
+    """Guard-path tests for IPC proxy collective_rpc()."""
 
-    def test_raises_for_multirank(self, cls):
-        """Raises NotImplementedError when model_world_size > 1."""
-        p = _make_proxy(cls, model_world_size=2, rpc_client=MagicMock())
-        with pytest.raises(NotImplementedError, match="model_world_size == 1"):
-            p.collective_rpc("sleep")
-
-    def test_raises_for_unique_reply_rank(self, cls):
-        """Raises NotImplementedError when unique_reply_rank is provided."""
-        p = _make_proxy(cls, rpc_client=MagicMock())
-        with pytest.raises(NotImplementedError):
-            p.collective_rpc("sleep", unique_reply_rank=0)
-
-    def test_raises_for_target_ranks(self, cls):
-        """Raises NotImplementedError when target_ranks is provided."""
-        p = _make_proxy(cls, rpc_client=MagicMock())
-        with pytest.raises(NotImplementedError):
-            p.collective_rpc("sleep", target_ranks=[0, 1])
-
-    def test_single_rank_routes_to_rpc_client(self, cls):
+    def test_single_rank_routes_to_rpc_client(self):
         """Blocking call returns [result] and forwards args/kwargs."""
         mock_call = MagicMock()
         mock_call.remote.return_value = "ok"
         mock_client = MagicMock()
         mock_client.my_method.return_value = mock_call
 
-        p = _make_proxy(cls, model_world_size=1, rpc_client=mock_client)
+        p = _make_proxy("ipc", model_world_size=1, rpc_client=mock_client)
         result = p.collective_rpc("my_method", args=(1,), kwargs={"k": "v"})
 
         mock_client.my_method.assert_called_once_with(1, k="v")
         assert result == ["ok"]
 
-    def test_single_rank_non_block_returns_future(self, cls):
+    def test_single_rank_non_block_returns_future(self):
         """non_block=True returns [Future] without calling .remote()."""
         mock_future = MagicMock()
         mock_call = MagicMock()
@@ -163,11 +147,91 @@ class TestProxyCollectiveRpcGuards:
         mock_client = MagicMock()
         mock_client.my_method.return_value = mock_call
 
-        p = _make_proxy(cls, model_world_size=1, rpc_client=mock_client)
+        p = _make_proxy("ipc", model_world_size=1, rpc_client=mock_client)
         result = p.collective_rpc("my_method", non_block=True)
 
         mock_call.remote.assert_not_called()
         assert result == [mock_future]
+
+    def test_multirank_fans_out_to_all_rpc_clients(self):
+        clients = []
+        for rank in range(3):
+            call = MagicMock()
+            call.remote.return_value = f"rank{rank}"
+            client = MagicMock()
+            client.sleep.return_value = call
+            clients.append(client)
+
+        p = _make_proxy("ipc", model_world_size=3)
+        p.rpc_clients = clients
+        result = p.collective_rpc("sleep", args=(["kv_cache"],))
+
+        assert result == ["rank0", "rank1", "rank2"]
+        for client in clients:
+            client.sleep.assert_called_once_with(["kv_cache"])
+
+    def test_target_ranks_select_subset(self):
+        clients = []
+        for rank in range(3):
+            call = MagicMock()
+            call.remote.return_value = f"rank{rank}"
+            client = MagicMock()
+            client.wakeup.return_value = call
+            clients.append(client)
+
+        p = _make_proxy("ipc", model_world_size=3)
+        p.rpc_clients = clients
+        result = p.collective_rpc("wakeup",
+                                  args=(["kv_cache"],),
+                                  target_ranks=[0, 2])
+
+        assert result == ["rank0", "rank2"]
+        clients[0].wakeup.assert_called_once_with(["kv_cache"])
+        clients[1].wakeup.assert_not_called()
+        clients[2].wakeup.assert_called_once_with(["kv_cache"])
+
+    def test_unique_reply_rank_selects_one_rank(self):
+        clients = []
+        for rank in range(2):
+            call = MagicMock()
+            call.remote.return_value = f"rank{rank}"
+            client = MagicMock()
+            client.fetch.return_value = call
+            clients.append(client)
+
+        p = _make_proxy("ipc", model_world_size=2)
+        p.rpc_clients = clients
+        result = p.collective_rpc("fetch", unique_reply_rank=1)
+
+        assert result == ["rank1"]
+        clients[0].fetch.assert_not_called()
+        clients[1].fetch.assert_called_once_with()
+
+    def test_invalid_target_rank_raises(self):
+        p = _make_proxy("ipc", model_world_size=2, rpc_client=MagicMock())
+        with pytest.raises(ValueError, match="out of range"):
+            p.collective_rpc("sleep", target_ranks=[2])
+
+
+class TestRpcProxyCollectiveRpcGuards:
+    """Guard-path tests for RPC proxy collective_rpc()."""
+
+    def test_raises_for_multirank(self):
+        p = _make_proxy("rpc", model_world_size=2, rpc_client=MagicMock())
+        with pytest.raises(NotImplementedError, match="model_world_size == 1"):
+            p.collective_rpc("sleep")
+
+    def test_single_rank_routes_to_rpc_client(self):
+        mock_call = MagicMock()
+        mock_call.remote.return_value = "ok"
+        mock_client = MagicMock()
+        mock_client.my_method.return_value = mock_call
+
+        p = _make_proxy("rpc", model_world_size=1, rpc_client=mock_client)
+        result = p.collective_rpc("my_method", args=(1,), kwargs={"k": "v"})
+
+        mock_client.my_method.assert_called_once_with(1, k="v")
+        assert result == ["ok"]
 
 
 # IPC proxy additionally validates the rpc_client initialisation guard.

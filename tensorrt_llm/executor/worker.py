@@ -46,7 +46,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
-        rpc_addr: Optional[str] = None,
+        rpc_addr: Optional[Union[str, List[str]]] = None,
         hmac_key: bytes = b"",
     ) -> None:
         super().__init__(
@@ -68,6 +68,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
+        if isinstance(rpc_addr, list):
+            rpc_addr = rpc_addr[mpi_rank()]
         if rpc_addr is not None:
             assert hmac_key, "hmac_key is required when rpc_addr is set"
             self.rpc_addr = rpc_addr
@@ -166,7 +168,7 @@ def worker_main(
     hf_model_dir: Optional[Path] = None,
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
-    rpc_addr: Optional[str] = None,
+    rpc_addr: Optional[Union[str, List[str]]] = None,
     hmac_key: bytes = b"",
 ) -> None:
 

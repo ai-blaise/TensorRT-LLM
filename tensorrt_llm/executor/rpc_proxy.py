@@ -226,6 +226,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             NotImplementedError: If ``model_world_size > 1``, or if
                 ``unique_reply_rank`` or ``target_ranks`` are provided.
         """
+        if self.model_world_size > 1:
+            raise NotImplementedError(
+                "RPC proxy collective_rpc only supports model_world_size == 1; "
+                "use the IPC or Ray executor for multi-rank deployments.")
         _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
                                     target_ranks)
         kwargs = kwargs or {}

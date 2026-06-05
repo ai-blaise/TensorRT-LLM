@@ -58,17 +58,32 @@ def _check_collective_rpc_guard(
     """Validate collective_rpc preconditions shared by IPC and RPC proxies.
 
     Raises:
-        NotImplementedError: If ``model_world_size > 1``, or if
-            ``unique_reply_rank`` or ``target_ranks`` are provided.
+        NotImplementedError: If both ``unique_reply_rank`` and
+            ``target_ranks`` are provided.
     """
-    if model_world_size > 1:
+    if unique_reply_rank is not None and target_ranks is not None:
         raise NotImplementedError(
-            "MPI collective_rpc only supports model_world_size == 1; "
-            "use the Ray executor for multi-rank deployments.")
-    if unique_reply_rank is not None or target_ranks is not None:
-        raise NotImplementedError(
-            "unique_reply_rank and target_ranks are not supported; "
-            "this shim only reaches rank-0.")
+            "unique_reply_rank and target_ranks are mutually exclusive.")
+    if isinstance(target_ranks, list):
+        invalid = [
+            rank for rank in target_ranks
+            if rank < 0 or rank >= model_world_size
+        ]
+        if invalid:
+            raise ValueError(
+                f"target_ranks out of range for model_world_size={model_world_size}: {invalid}"
+            )
+    elif isinstance(target_ranks, int) and (target_ranks < 0
+                                           or target_ranks >= model_world_size):
+        raise ValueError(
+            f"target_rank {target_ranks} out of range for model_world_size={model_world_size}"
+        )
+    if unique_reply_rank is not None and (unique_reply_rank < 0
+                                          or unique_reply_rank >=
+                                          model_world_size):
+        raise ValueError(
+            f"unique_reply_rank {unique_reply_rank} out of range for model_world_size={model_world_size}"
+        )
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -131,15 +146,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
-        # Generate RPC address and key for stats RPC
-        self.rpc_addr = get_unique_ipc_addr()
+        # Generate one RPC address per worker. Rank 0 remains the default
+        # stats/control endpoint for backwards compatibility, while
+        # collective_rpc can fan out to every MPI rank for sleep/wakeup.
+        self.rpc_addrs = [
+            get_unique_ipc_addr() for _ in range(model_world_size)
+        ]
+        self.rpc_addr = self.rpc_addrs[0]
         self.hmac_key = os.urandom(32)
 
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
-                             rpc_addr=self.rpc_addr,
+                             rpc_addr=self.rpc_addrs,
                              hmac_key=self.hmac_key)
 
         if "log_level" not in worker_kwargs:
@@ -147,10 +167,14 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
+        self.rpc_clients: List[RPCClient] = []
         self._start_executor_workers(worker_kwargs)
 
-        # Create RPC client after workers are started (worker starts RPC server)
-        self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
+        # Create RPC clients after workers are started (workers start RPC servers)
+        self.rpc_clients = [
+            RPCClient(addr, hmac_key=self.hmac_key) for addr in self.rpc_addrs
+        ]
+        self.rpc_client = self.rpc_clients[0]
 
         # Event used to wake the error monitor thread for a clean shutdown
         # instead of polling with sleep loops.
@@ -508,9 +532,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         # step3: finish all remaining work
 
         # close the RPC client
-        if self.rpc_client is not None:
-            self.rpc_client.close()
-            self.rpc_client = None
+        for client in getattr(self, "rpc_clients", []):
+            client.close()
+        self.rpc_clients = []
+        self.rpc_client = None
 
         # close all the sockets
         self.request_queue.close()
@@ -564,12 +589,13 @@ class GenerationExecutorProxy(GenerationExecutor):
         unique_reply_rank: Optional[int] = None,
         target_ranks: Optional[Union[int, List[int]]] = None,
     ) -> List:
-        """Execute a method call on the rank-0 GPU worker via the RPC client.
+        """Execute a method call on GPU workers via per-rank RPC clients.
 
-        Rank-0-only shim; only ``model_world_size == 1`` is supported.
         Shares the :meth:`RayExecutor.collective_rpc` signature for uniform
-        dispatch from :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`,
-        but does not broadcast to all workers.
+        dispatch from :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`.
+        When no rank selector is supplied, the call fans out to every MPI
+        worker. This is required for control actions such as sleep/wakeup,
+        whose internal barriers require matching callers on all ranks.
 
         Args:
             method: Name of the worker method to invoke.
@@ -585,21 +611,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             :class:`~concurrent.futures.Future` when ``non_block=True``.
 
         Raises:
-            RuntimeError: If the RPC client has not been initialised yet.
-            NotImplementedError: If ``model_world_size > 1``, or if
-                ``unique_reply_rank`` or ``target_ranks`` are provided.
+            RuntimeError: If RPC clients have not been initialised yet.
+            NotImplementedError: If both ``unique_reply_rank`` and
+                ``target_ranks`` are provided.
         """
-        if self.rpc_client is None:
+        clients = getattr(self, "rpc_clients", None)
+        if not clients:
             raise RuntimeError(
-                "RPC client is not initialised — collective_rpc() cannot be "
+                "RPC clients are not initialised — collective_rpc() cannot be "
                 "called before the executor workers have started.")
+        if target_ranks is None and unique_reply_rank is not None:
+            target_ranks = unique_reply_rank
+            unique_reply_rank = None
         _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
                                     target_ranks)
         kwargs = kwargs or {}
-        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        selected_clients = (
+            clients if target_ranks is None else
+            [clients[rank] for rank in target_ranks] if isinstance(
+                target_ranks, list) else [clients[target_ranks]])
+        remote_calls = [
+            getattr(client, method)(*args, **kwargs)
+            for client in selected_clients
+        ]
         if non_block:
-            return [remote_call.remote_future()]
-        return [remote_call.remote()]
+            return [remote_call.remote_future() for remote_call in remote_calls]
+        return [remote_call.remote() for remote_call in remote_calls]
 
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.
