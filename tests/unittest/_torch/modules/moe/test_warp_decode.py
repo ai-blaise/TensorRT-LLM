@@ -325,11 +325,21 @@ def test_warp_decode_rejects_eplb_slots():
 def test_warp_decode_force_raises_exact_guard_reason():
     moe = _moe(
         model_config=types.SimpleNamespace(warp_decode_config=_config("force")),
-        warp_decode_is_decode_only=False,
+        layer_load_balancer=object(),
     )
-    with pytest.raises(NotImplementedError, match="not_decode_only"):
+    with pytest.raises(NotImplementedError, match="eplb_not_supported"):
         try_run_warp_decode(moe, **_inputs())
     assert moe.warp_decode_last_status == "fallback"
+    assert moe.warp_decode_last_reason == "eplb_not_supported"
+
+
+def test_warp_decode_force_skips_context_or_warmup_batches():
+    moe = _moe(
+        model_config=types.SimpleNamespace(warp_decode_config=_config("force")),
+        warp_decode_is_decode_only=False,
+    )
+    assert try_run_warp_decode(moe, **_inputs()) is None
+    assert moe.warp_decode_last_status == "not_applicable"
     assert moe.warp_decode_last_reason == "not_decode_only"
 
 
@@ -345,9 +355,9 @@ def test_warp_decode_disallows_fallback_when_requested():
     config.allow_parallelism_fallback = False
     moe = _moe(
         model_config=types.SimpleNamespace(warp_decode_config=config),
-        warp_decode_is_decode_only=False,
+        layer_load_balancer=object(),
     )
-    with pytest.raises(NotImplementedError, match="not_decode_only"):
+    with pytest.raises(NotImplementedError, match="eplb_not_supported"):
         try_run_warp_decode(moe, **_inputs())
     assert moe.warp_decode_last_status == "fallback"
-    assert moe.warp_decode_last_reason == "not_decode_only"
+    assert moe.warp_decode_last_reason == "eplb_not_supported"

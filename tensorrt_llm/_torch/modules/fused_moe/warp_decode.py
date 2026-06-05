@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 class WarpDecodeStatus(str, Enum):
     DISABLED = "disabled"
     FALLBACK = "fallback"
+    NOT_APPLICABLE = "not_applicable"
     SELECTED = "selected"
 
 
@@ -867,6 +868,9 @@ def try_run_warp_decode(
         all_rank_num_tokens=all_rank_num_tokens,
     )
     if reason is not None:
+        if reason == "not_decode_only":
+            _record(moe, WarpDecodeStatus.NOT_APPLICABLE, reason)
+            return None
         _guard_failure(moe, config, reason)
         return None
 
