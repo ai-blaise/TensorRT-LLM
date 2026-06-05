@@ -30,12 +30,12 @@ container `r20-unified-build`, `FROM
 local/dynamo-trtllm-optrt-custom:canonical-r17-wins-20260605`) sets the final tag.
 
 **Expected tag (confirm with the build agent before apply):**
-`local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-pyfix-20260605`
+`local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-20260605`
 
 ## Deploy (orchestrator only -- gated)
 
 ```bash
-export UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-pyfix-20260605   # from build agent
+export UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-20260605   # from build agent
 envsubst '$UNIFIED_IMAGE' < topo-c1-dp2tp4-disagg-r20.yaml | \
   KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
 ```
@@ -72,14 +72,14 @@ This manifest runs the prefill worker as TP2 x CP2 on four GPUs
 LAYERSPLIT`) so LayerSplit is a real CP split and MoE EP remains supported. There is
 **no** `--context-parallel-size` Dynamo CLI flag; CP is set only through the
 engine YAML `context_parallel_size` field. Decode remains TP4/CP1 and consumes
-the reassembled KV through the cpfix image.
+the reassembled KV through the LayerSplit KV handoff path.
 
 ## KV handoff shape
 
 The deployment uses the TRT-LLM disaggregated KV transceiver, not vLLM MORI-IO.
-The MORI-IO write-mode shape is still the useful reference point: prefill is the
-KV producer, decode owns pre-allocated KV blocks, and transfer metadata must
+The MORI-IO write-mode shape is only the handoff reference: prefill is the KV
+producer, decode owns pre-allocated KV blocks, and transfer metadata must
 describe block and layer layout precisely. In this setup, UCX is the transport,
 LayerSplit owns the prefill-side CP-sharded DSA KV/indexer-K layout, and the
-cpfix path reassembles those shards into the decode worker's TP4/CP1 KV layout
-before decode generation.
+LayerSplit handoff reassembles those shards into the decode worker's TP4/CP1 KV
+layout before decode generation.

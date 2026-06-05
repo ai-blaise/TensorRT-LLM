@@ -70,8 +70,9 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   # ---- LayerSplit ON (prefill custom piece) ----
-  # Matches the MORI-IO write-mode shape: producer-side layer KV is transferred
-  # into decode's pre-allocated cache, with CP shards reassembled for TP4/CP1.
+  # MORI-IO-shaped handoff, implemented by TRT-LLM UCX transfer: producer-side
+  # layer KV is transferred into decode's pre-allocated cache, with CP shards
+  # reassembled for TP4/CP1.
   layersplit_enabled: true
   layersplit_owner_assignment: contiguous       # required by CP handoff reassembly inference
   layersplit_transfer_backend: auto              # auto -> UCX/NIXL per cache-transceiver
