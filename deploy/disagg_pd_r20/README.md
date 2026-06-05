@@ -7,12 +7,12 @@ with the custom pieces toggled ON.
 
 | Worker   | GPUs  | Parallelism            | Custom piece ON                              |
 |----------|-------|------------------------|----------------------------------------------|
-| prefill  | 4 GPUs | TP2xCP2 HELIX / EP4, ADP=false | **LayerSplit** (`layersplit_enabled: true`) |
+| prefill  | 4 GPUs | TP2xCP2 LayerSplit / EP4, ADP=false | **LayerSplit** (`layersplit_enabled: true`) |
 | decode   | 4 GPUs | TP4 / EP4, ADP=false | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **SMC-SD** (`speculative_config.decoding_type: SMC`) |
 | Frontend | -     | KV router (`--router-mode kv`) | -                                  |
 
 This is 1P x 4GPU + 1D x 4GPU disaggregated serving with real LayerSplit on
-prefill (`TP2 x CP2` HELIX) and non-CP decode (`TP4 x CP1`).
+prefill (`TP2 x CP2`) and non-CP decode (`TP4 x CP1`).
 
 ## Why node 002 (k3s)
 
@@ -69,7 +69,20 @@ exist on a4-us-002-rl9.
 LayerSplit splits the DSA KV / indexer-K cache across **context-parallel** ranks.
 This manifest runs the prefill worker as TP2 x CP2 on four GPUs
 (`tensor_parallel_size: 2`, `context_parallel_size: 2`, `cp_config.cp_type:
-HELIX`) so LayerSplit is a real CP split and MoE EP remains supported. There is
+HELIX`) so LayerSplit is a real CP split and MoE EP remains supported. HELIX is
+not the custom piece; it is the only TRT-LLM CP process-group layout that
+currently permits `moe_expert_parallel_size > 1` with `context_parallel_size > 1`.
+There is
 **no** `--context-parallel-size` Dynamo CLI flag; CP is set only through the
 engine YAML `context_parallel_size` field. Decode remains TP4/CP1 and consumes
 the reassembled KV through the cpfix image.
+
+## KV handoff shape
+
+The deployment follows the same handoff shape as the vLLM MORI-IO write-mode
+recipe: the prefill side is the KV producer, decode has pre-allocated KV blocks,
+and the transfer path uses one cached peer session carrying block/stride metadata
+instead of routing per-request block IDs through the proxy. In this TRT-LLM
+setup, UCX is the transport and the cpfix path reassembles the prefill
+LayerSplit CP shards into the decode worker's TP4/CP1 KV layout before decode
+generation.

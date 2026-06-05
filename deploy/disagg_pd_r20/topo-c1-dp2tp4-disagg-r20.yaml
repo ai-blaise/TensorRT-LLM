@@ -2,7 +2,7 @@
 # Disagg P/D r20 -- cell1 DP2/TP4-disagg winner, custom pieces toggled ON.
 #
 # Topology (exact): single 8xB200 node.
-#   * 1 PREFILL worker -- TP2xCP2 HELIX / EP4, enable_attention_dp=false, 4 GPUs,
+#   * 1 PREFILL worker -- TP2xCP2 LayerSplit / EP4, enable_attention_dp=false, 4 GPUs,
 #       LayerSplit ON   (prefill.yaml: sparse_attention_config.layersplit_enabled=true)
 #   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=false, GPUs 4-7,
 #       WarpDecode ON   (decode.yaml: moe_config.warp_decode.enabled=true, tile_mode=decode_1cta
@@ -42,6 +42,8 @@ data:
     moe_expert_parallel_size: 4
     context_parallel_size: 2
     cp_config:
+      # LayerSplit is the custom feature. HELIX is only TRT-LLM's current
+      # CP process-group layout that permits MoE EP with CP>1.
       cp_type: HELIX
     enable_attention_dp: false
     trust_remote_code: true
@@ -93,6 +95,10 @@ data:
       hisa_execution_mode: optimized
       use_cute_dsl_topk: true
       use_cute_dsl_paged_mqa_logits: true
+      # Blog-aligned handoff: prefill owns LayerSplit's CP-sharded DSA
+      # KV/indexer-K cache, then the UCX transceiver writes/reassembles it into
+      # decode's pre-allocated TP4/CP1 cache. Keep all CP ranks participating
+      # until a partial-rank protocol is implemented.
       layersplit_enabled: true
       layersplit_owner_assignment: contiguous
       layersplit_transfer_backend: auto

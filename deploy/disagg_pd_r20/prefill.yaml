@@ -1,6 +1,6 @@
 # =============================================================================
 # Disagg P/D r20 -- PREFILL worker engine config (cell1 DP2/TP4-disagg winner)
-# 1 prefill worker, TP2xCP2 HELIX / EP4, enable_attention_dp=false, 4 GPUs.
+# 1 prefill worker, TP2xCP2 LayerSplit / EP4, enable_attention_dp=false, 4 GPUs.
 # Custom piece ON for prefill: LayerSplit (DSA KV / indexer-K owner-local store).
 # Derived from the validated topo-c1-dp2tp4-disagg-smc ConfigMap prefill.yaml
 # (deploy/smcsd_fiport/smc_configmap.yaml), + LayerSplit enable knobs from the
@@ -10,6 +10,8 @@
 # NOTE on LayerSplit + TP2xCP2: LayerSplit splits the DSA KV / indexer-K cache across
 # context-parallel (CP) ranks. This prefill worker runs on four GPUs as
 # tensor_parallel_size=2 and context_parallel_size=2, so the CP split is real.
+# cp_config.cp_type remains HELIX only because TRT-LLM currently requires that
+# CP process-group layout for MoE EP with CP>1; it is not the custom feature.
 # There is no Dynamo CLI flag for context_parallel_size; CP is set in this engine YAML.
 # Decode remains TP4/CP1 and consumes the reassembled KV via the cpfix image.
 # =============================================================================
@@ -18,6 +20,8 @@ tensor_parallel_size: 2
 moe_expert_parallel_size: 4
 context_parallel_size: 2
 cp_config:
+  # LayerSplit is the custom feature; HELIX is the internal TRT-LLM CP layout
+  # needed today for MoE EP + CP>1.
   cp_type: HELIX
 enable_attention_dp: false
 trust_remote_code: true
@@ -70,6 +74,8 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   # ---- LayerSplit ON (prefill custom piece) ----
+  # Matches the MORI-IO write-mode shape: producer-side layer KV is transferred
+  # into decode's pre-allocated cache, with CP shards reassembled for TP4/CP1.
   layersplit_enabled: true
   layersplit_owner_assignment: contiguous       # required by CP handoff reassembly inference
   layersplit_transfer_backend: auto              # auto -> UCX/NIXL per cache-transceiver
