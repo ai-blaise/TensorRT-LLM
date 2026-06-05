@@ -4409,9 +4409,15 @@ class DSACacheManager(KVCacheManager):
             or os.environ.get("TRTLLM_KVARN_AMORTIZE", "") in ("1", "true", "True"))
         self.kvarn_latent_pool_per_layer = []
         if self.kvarn_cfg is not None:
-            dev = self.indexer_k_cache_pool_per_layer[0].device \
-                if self.indexer_k_cache_pool_per_layer else \
-                torch.device("cuda")
+            # The KVarN side-pool mirrors the dense MLA KV pool, not the
+            # Indexer-K pool.  Build it on the primary KV device; the
+            # Indexer-K side-pool is intentionally allocated later and remains
+            # controlled only by indexer_k_dtype.
+            if self.num_local_layers > 0 and self.layer_offsets:
+                first_layer_idx = next(iter(self.layer_offsets))
+                dev = self.get_buffers(first_layer_idx, kv_layout="NHD").device
+            else:
+                dev = torch.device("cuda")
             self.kvarn_latent_pool_per_layer = [
                 KVarNLatentPool(self.num_blocks, self.tokens_per_block,
                                 self.kvarn_cfg, dev)
