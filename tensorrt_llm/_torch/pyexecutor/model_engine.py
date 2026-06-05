@@ -2503,6 +2503,10 @@ class PyTorchModelEngine(ModelEngine):
         # (start_idx, end_idx, seq_slot) for first_draft requests
         first_draft_input_ids_positions = []
 
+        helix_is_inactive_rank, helix_position_offsets = [], []
+        # Cache invariant method result to avoid repeated calls per-request.
+        _has_block_token_cp = self.mapping.has_cp_block_token()
+
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -2510,8 +2514,15 @@ class PyTorchModelEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            position_ids.extend(
-                range(begin_compute, begin_compute + len(prompt_tokens)))
+            prompt_position_ids = range(begin_compute,
+                                        begin_compute + len(prompt_tokens))
+            position_ids.extend(prompt_position_ids)
+            if _has_block_token_cp:
+                # Context steps must have all CP ranks participate in attention
+                # collectives. Inactive-rank masking is a generation-phase
+                # concern after decode ownership rotates by block.
+                helix_is_inactive_rank.append(False)
+                helix_position_offsets.extend(prompt_position_ids)
 
             # Track position for updating the inputs of draft model
             if self.is_draft_model and num_accepted_tokens_device is not None:
@@ -2775,9 +2786,6 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank, helix_position_offsets = [], []
-        # Cache invariant method result to avoid repeated calls per-request
-        _has_block_token_cp = self.mapping.has_cp_block_token()
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width

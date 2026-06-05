@@ -52,10 +52,10 @@ except ImportError:  # standalone / unit-test import (sibling module)
 SYSTEM_INTEGRATION = """\
 System-tier integration plan (production decode path):
 
-  1. Config flag: add ``kv_cache_dtype="kvarn_k4v2_g{block}"`` (and k2v2) to the
-     op-trt CacheDType enum + a ``KVarNConfig`` (ported presets). Gate via
-     ``TRTLLM_KV_CACHE_QUANT=kvarn`` and a model-config field so the deploy
-     selects it like fp8/nvfp4 today.
+  1. Config flag: set ``sparse_attention_config.mla_latent_kv_dtype`` to a
+     ``kvarn_k<ckv>v<pe>`` value and resolve it into a ``KVarNConfig``. This is
+     dense MLA latent KV storage only; Indexer K remains controlled by
+     ``indexer_k_dtype``.
 
   2. KV-cache manager: size the MLA latent pool for the packed KVarN record
      (k_bits*kv_lora_rank/8 + v_bits*pe/8 + fp16 scales) per (block) instead of

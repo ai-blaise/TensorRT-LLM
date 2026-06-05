@@ -14,7 +14,7 @@ default is off until the dense-MLA decode read-path wiring lands.
 | # | Piece | File | Figure | Default |
 |---|-------|------|--------|---------|
 | 10 | Variance-normalized latent quant (k4v4) | `kvarn_core.py`, `kvarn_mla.py`, `kvarn_backend.py` | 314 B/tok, 3.67×, cos 0.99418 | opt-in (flag) |
-| 11 | BDR fold: amortized in-kernel dequant-on-read | `kvarn_inkernel/*.cu`, `kvarn_backend.py` | 71.7 µs fill / 1.12 µs steady | opt-in (`kvarn_amortize_restore`) |
+| 11 | BDR fold: amortized in-kernel dequant-on-read | `kvarn_inkernel/*.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady | opt-in (`mla_latent_kv_amortize`) |
 
 ---
 
@@ -57,7 +57,7 @@ Same MLA latent, cosine vs the FP16 ground truth (`bench_kvarn_intel_correctness
 | fp16 | 1152 | 1.00× | 1.00000 |
 | fp8-e4m3 | 576 | 2.00× | 0.99965 |
 | nvfp4 | 324 | 3.56× | 0.99581 |
-| **kvarn-k4v4** | **314** | **3.67×** | **0.99418** (cos_ckv 0.99390, cos_kpe 0.99582) |
+| **kvarn_k4v4** | **314** | **3.67×** | **0.99418** (cos_ckv 0.99390, cos_kpe 0.99582) |
 
 KVarN-k4v4 is the **fewest bytes/token** (highest capacity) at a fidelity **on
 par with NVFP4** and **1.83× the fp8 capacity**. The amortized restore (below)
@@ -66,12 +66,15 @@ preserves this exactly (cos ≥ 1.0 vs the dequant reference,
 
 - **Config / pool:** `kvarn_backend.py` — `KVarNConfig` (`name`, `latent_dim`,
   `packed_bytes`, `bits_per_elem`), `parse_kvarn_dtype` / `resolve_kvarn_config`
-  (so `kv_cache_dtype="kvarn-k4v4"` resolves), and `KVarNLatentPool`
+  (so `mla_latent_kv_dtype="kvarn_k4v4"` resolves), and `KVarNLatentPool`
   (`store_block`, `load_block`, `load_blocks`, the serialize/deserialize layout).
-- **Enable:** opt-in — set the KV cache dtype to a KVarN config
+- **Enable:** opt-in — set the dense MLA latent KV dtype to a KVarN config
+  with `mla_latent_kv_dtype` or `TRTLLM_MLA_LATENT_KV_DTYPE`
   (`is_kvarn_dtype` / `parse_kvarn_dtype`). DEFAULT off.
-- **Composes with:** the Indexer / sparse-MLA, which read the **dequantized**
-  latent — KVarN changes only storage, transparent to selection and attention.
+- **Composes with:** the Indexer / sparse-MLA, which read the **dequantized
+  dense MLA latent** — KVarN changes only dense MLA storage. It is not an
+  Indexer K-cache dtype; Indexer storage remains `indexer_k_dtype="fp8"` or
+  `"fp4"`.
 
 ## BDR fold: in-kernel dequant-on-read
 
@@ -124,7 +127,7 @@ should scale with **churn, not working-set**.
     effectively free → **NET WIN, +1.93× capacity vs fp8 @ cos 0.994**. At b32
     standalone it adds latency, which is exactly why the amortization is the
     lever (and drives it back under budget).
-- **Enable:** opt-in via `kvarn_amortize_restore` (DEFAULT OFF). The in-kernel
+- **Enable:** opt-in via `mla_latent_kv_amortize` (DEFAULT OFF). The in-kernel
   CUDA path drives it to the 71.7 µs / 1.12 µs end-state.
 - **Correctness:** `amortize == full-restore` within FP16 batch rounding,
   ground-truth **cos ≥ 1.0**, recycle re-commit re-restores correctly
@@ -137,10 +140,10 @@ should scale with **churn, not working-set**.
 ## Enabling KVarN
 
 ```python
-# KV cache dtype selects KVarN; resolve_kvarn_config parses "kvarn-k4v4".
-kv_cache_dtype = "kvarn-k4v4"        # opt-in; default is fp8/nvfp4
+# Dense MLA latent KV dtype selects KVarN; resolve_kvarn_config parses "kvarn_k4v4".
+mla_latent_kv_dtype = "kvarn_k4v4"   # opt-in; default is auto/fp8/nvfp4
 # Amortized restore (decode capacity unlock) is separately flag-gated:
-kvarn_amortize_restore = True        # DEFAULT False
+mla_latent_kv_amortize = True        # DEFAULT False
 ```
 
 The component-level quant (#10) gives the capacity; the BDR-fold amortized
@@ -159,8 +162,9 @@ attention path + `sparse_mla_decode_nvfp4` FlashMLA kernel; verify cos
 
 ## Composition with the rest of the campaign
 
-- **Indexer / Sparse-MLA**: read the dequantized latent; KVarN is storage-only,
-  transparent to top-k selection and attention.
+- **Indexer / Sparse-MLA**: read the dequantized dense MLA latent; KVarN is
+  storage-only for dense MLA KV, transparent to top-k selection and attention,
+  and never replaces the Indexer K-cache dtype.
 - **NVFP4 fusions** (`nvfp4_fusions.md`): the s2-fold dequant rides the
   add+RMSNorm path; no extra HBM round-trip.
 - **LayerSplit** (`../source/features/layersplit.md`): the KVarN latent pool is

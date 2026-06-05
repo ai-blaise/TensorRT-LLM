@@ -265,9 +265,10 @@ and `seq_len_threshold` (width-correct logits).
   `topk_indices`. The Indexer and the attention kernel are pipelined per layer;
   the MSA 2-stream split (#7) overlaps the two attention head groups while the
   Indexer top-k is being produced.
-- **KVarN** (`kvarn.md`) shares the latent KV cache the Indexer scores against;
-  the Indexer reads the (dequantized) latent, KVarN changes only how that latent
-  is *stored*, so the two are independent at the selection level.
+- **KVarN** (`kvarn.md`) stores the dense MLA latent KV that the Indexer scores
+  against after dequantization. It is not an Indexer K-cache dtype; Indexer
+  storage remains `indexer_k_dtype="fp8"` or `"fp4"`, so the two are independent
+  at the selection level.
 - **LayerSplit** (`../source/features/layersplit.md`) broadcasts the owner CP
   rank's indexer-K cache slot to peers before the Indexer reads it — the Indexer
   hook is exactly the LayerSplit broadcast point. The Indexer optimizations run

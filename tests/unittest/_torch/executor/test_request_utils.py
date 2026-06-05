@@ -276,6 +276,60 @@ def test_merge_requests_with_helix_cp_config():
             assert llm_request.get_tokens(0) == [7, 8]
 
 
+def test_merge_requests_with_layersplit_cp_config():
+    """LayerSplit keeps full context on every CP rank.
+
+    LayerSplit splits the DSA KV / indexer-K cache by layer ownership; it must
+    not reuse HELIX's block-token prompt partitioning.
+    """
+    tokens_per_block = 2
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        max_tokens=5,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(),
+    )
+    request_item = RequestQueueItem(id=1, request=executor_request)
+
+    cp_config = {
+        "cp_type": CpType.LAYERSPLIT,
+        "tokens_per_block": tokens_per_block,
+    }
+
+    rank_tokens = {}
+    for rank in [0, 1]:
+        result = merge_requests(
+            [request_item],
+            cp_config=cp_config,
+            cp_rank=rank,
+            cp_size=2,
+            exclude_last_generation_logits=False,
+        )
+        assert len(result) == 1
+        rank_tokens[rank] = result[0].get_tokens(0)
+        assert result[0].total_input_len_cp == 8
+        assert result[0].seqlen_this_rank_cp == 8
+        assert result[0].py_helix_is_inactive_rank is False
+
+    assert rank_tokens == {
+        0: [1, 2, 3, 4, 5, 6, 7, 8],
+        1: [1, 2, 3, 4, 5, 6, 7, 8],
+    }
+
+
+def test_merge_requests_helix_requires_tokens_per_block():
+    """HELIX block-token CP callers must pass a page size before splitting."""
+    with pytest.raises(ValueError, match="requires cp_config.tokens_per_block"):
+        merge_requests(
+            [RequestQueueItem(1, Mock())],
+            cp_config={"cp_type": CpType.HELIX},
+            cp_rank=0,
+            cp_size=2,
+            exclude_last_generation_logits=False,
+        )
+
+
 def test_get_from_waiting_queue():
     """Test getting items from waiting queue."""
     # Add items to waiting queue

@@ -159,7 +159,12 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
         service._ctx_client = AsyncMock()
         service._gen_client = AsyncMock()
         ctx_server_info = {
-            "server_info": {"disaggregated_params": {"encoded_opaque_state": opaque_state}}
+            "server_info": {
+                "disaggregated_params": {
+                    "encoded_opaque_state": opaque_state,
+                    "ctx_info_endpoint": ["ctx:9000"],
+                }
+            }
         }
         service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", ctx_server_info))
         service._gen_router.get_next_server = AsyncMock(
@@ -208,6 +213,7 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
 
         gen_req = service._gen_client.send_request.call_args.args[0]
         assert gen_req.disaggregated_params.request_type == "generation_only"
+        assert gen_req.disaggregated_params.ctx_info_endpoint == "ctx:9000"
         if schedule_style == "generation_first":
             assert gen_req.disaggregated_params.encoded_opaque_state == opaque_state
             assert gen_req.disaggregated_params.ctx_usage is None

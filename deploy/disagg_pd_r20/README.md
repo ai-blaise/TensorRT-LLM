@@ -79,7 +79,8 @@ the reassembled KV through the LayerSplit KV handoff path.
 The deployment uses the TRT-LLM disaggregated KV transceiver, not vLLM MORI-IO.
 The MORI-IO write-mode shape is only the handoff reference: prefill is the KV
 producer, decode owns pre-allocated KV blocks, and transfer metadata must
-describe block and layer layout precisely. In this setup, UCX is the transport,
-LayerSplit owns the prefill-side CP-sharded DSA KV/indexer-K layout, and the
-LayerSplit handoff reassembles those shards into the decode worker's TP4/CP1 KV
-layout before decode generation.
+describe block and layer layout precisely. In this setup, NIXL is the TRT-LLM
+cache transceiver, pinned to the UCX NIXL communication backend, LayerSplit owns
+the prefill-side CP-sharded DSA KV/indexer-K layout, and the LayerSplit handoff
+reassembles those shards into the decode worker's TP4/CP1 KV layout before
+decode generation.

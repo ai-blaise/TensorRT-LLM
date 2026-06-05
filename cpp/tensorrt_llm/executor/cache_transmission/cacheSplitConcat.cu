@@ -987,7 +987,7 @@ __global__ void splitKVCacheForWindowKernel(T const** __restrict__ inputBlocks, 
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void concatKVCacheForMLAKernel(T const** __restrict__ inputCaches, T** __restrict__ outputBlocks,
     int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int outputBlockNum, int domainPPSize,
-    int domainTPSize, int kvFactor, uint64_t* prefixLayerNumDevPtr)
+    int domainTPSize, int domainCPSize, int kvFactor, uint64_t* prefixLayerNumDevPtr)
 {
 
     int const subWarpId = threadIdx.x / subWarpSize;
@@ -999,6 +999,8 @@ __global__ void concatKVCacheForMLAKernel(T const** __restrict__ inputCaches, T*
 #pragma unroll 1
     for (int blockId = blockIdx.y; blockId < outputBlockNum; blockId += gridDim.y)
     {
+        int const rankInDomainCP = blockId % domainCPSize;
+        int const blockIdInDomainCP = blockId / domainCPSize;
 #pragma unroll 1
         for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
         {
@@ -1014,12 +1016,12 @@ __global__ void concatKVCacheForMLAKernel(T const** __restrict__ inputCaches, T*
                 T* outputBlockPtr = outputBlocks[blockId];
                 T* kOutputPtr = outputBlockPtr + layerId * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headId * tokensPerBlock * dimsPerHead;
-                int inputCacheIdx = rankInDomainPP;
+                int inputCacheIdx = rankInDomainCP * domainPPSize + rankInDomainPP;
                 T const* inputCachePtr = inputCaches[inputCacheIdx];
                 int headIdInDomainTP = headId;
 
                 T const* kInputPtr = inputCachePtr
-                    + static_cast<int64_t>(blockId)
+                    + static_cast<int64_t>(blockIdInDomainCP)
                         * (static_cast<int64_t>(layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead))
                     + static_cast<int64_t>(layerIdInDomainPP) * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + static_cast<int64_t>(headIdInDomainTP) * tokensPerBlock * dimsPerHead;
@@ -1050,7 +1052,7 @@ template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void concatLayerShardedKVCacheForMLAKernel(T const** __restrict__ inputCaches,
     T** __restrict__ outputBlocks, int tokensPerBlock, int numLayers, int outputLayerStart, int headNum,
     int dimsPerHead, int outputBlockNum, int inputCacheNum, int kvFactor, uint64_t const* shardLayerStartDevPtr,
-    uint64_t const* shardLayerNumDevPtr)
+    uint64_t const* shardLayerNumDevPtr, int domainCPSize)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -1061,6 +1063,11 @@ __global__ void concatLayerShardedKVCacheForMLAKernel(T const** __restrict__ inp
 #pragma unroll 1
     for (int blockId = blockIdx.y; blockId < outputBlockNum; blockId += gridDim.y)
     {
+        int const rankInDomainCP = blockId % domainCPSize;
+        int const blockIdInDomainCP = blockId / domainCPSize;
+        int const cachesPerCPDomain = inputCacheNum / domainCPSize;
+        int const cacheStart = rankInDomainCP * cachesPerCPDomain;
+        int const cacheEnd = cacheStart + cachesPerCPDomain;
 #pragma unroll 1
         for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
         {
@@ -1068,7 +1075,7 @@ __global__ void concatLayerShardedKVCacheForMLAKernel(T const** __restrict__ inp
             int inputCacheIdx = -1;
             int localLayerId = 0;
             int localLayerNum = 0;
-            for (int i = 0; i < inputCacheNum; ++i)
+            for (int i = cacheStart; i < cacheEnd; ++i)
             {
                 auto const shardStart = static_cast<int>(shardLayerStartDevPtr[i]);
                 auto const shardNum = static_cast<int>(shardLayerNumDevPtr[i]);
@@ -1092,7 +1099,7 @@ __global__ void concatLayerShardedKVCacheForMLAKernel(T const** __restrict__ inp
                     + headId * tokensPerBlock * dimsPerHead;
                 T const* inputCachePtr = inputCaches[inputCacheIdx];
                 T const* kInputPtr = inputCachePtr
-                    + static_cast<int64_t>(blockId)
+                    + static_cast<int64_t>(blockIdInDomainCP)
                         * (static_cast<int64_t>(localLayerNum * kvFactor * headNum * tokensPerBlock * dimsPerHead))
                     + static_cast<int64_t>(localLayerId) * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + static_cast<int64_t>(headId) * tokensPerBlock * dimsPerHead;
@@ -1602,16 +1609,14 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     }
 
     auto targetRankInfo = targetIRanks(destCacheState, selfCacheState, selfIdx);
-    auto const expectedRankNum
-        = static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize
-            * (targetRankInfo.mPeerLayerShardedByCP ? targetRankInfo.mDomainCPSize : 1));
+    auto const expectedRankNum = static_cast<size_t>(
+        targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize * targetRankInfo.mDomainCPSize);
     TLLM_CHECK(targetRankInfo.mIRanks.size() == expectedRankNum);
 
     auto inputCacheNum = targetRankInfo.mIRanks.size();
     if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA)
     {
-        inputCacheNum = targetRankInfo.mDomainPPSize
-            * (targetRankInfo.mPeerLayerShardedByCP ? targetRankInfo.mDomainCPSize : 1);
+        inputCacheNum = targetRankInfo.mDomainPPSize * targetRankInfo.mDomainCPSize;
     }
     else
     {
@@ -1733,6 +1738,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
 
     int const domainPPSize = targetRankInfo.mDomainPPSize;
     int const domainTPSize = targetRankInfo.mDomainTPSize;
+    int const domainCPSize = targetRankInfo.mDomainCPSize;
     int const headNumDomainTP
         = headNum / (domainTPSize / targetRankInfo.mPeerDupHeadFactor); // TODO: duplicate head factor
     int const kvFactor = selfAttentionConfig.mKvFactor;
@@ -1757,14 +1763,15 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
                 concatLayerShardedKVCacheForMLAKernel<T, mlaSubWarpSize, 16>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                         ouptutBlockPtrsDev, tokensPerBlock, numLayers, outputStartLayerId, headNum, dimsPerHead, outputBlockNumSum,
-                        inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr);
+                        inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr,
+                        domainCPSize);
             }
             else
             {
                 concatKVCacheForMLAKernel<T, mlaSubWarpSize, 16>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                         ouptutBlockPtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead, outputBlockNumSum,
-                        domainPPSize, domainTPSize, kvFactor, prefixLayerNumDevPtr);
+                        domainPPSize, domainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
             }
         }
         else if (isWindow)
@@ -1792,14 +1799,15 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
                 concatLayerShardedKVCacheForMLAKernel<T, mlaSubWarpSize, 8>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                         ouptutBlockPtrsDev, tokensPerBlock, numLayers, outputStartLayerId, headNum, dimsPerHead, outputBlockNumSum,
-                        inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr);
+                        inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr,
+                        domainCPSize);
             }
             else
             {
                 concatKVCacheForMLAKernel<T, mlaSubWarpSize, 8>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                         ouptutBlockPtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead, outputBlockNumSum,
-                        domainPPSize, domainTPSize, kvFactor, prefixLayerNumDevPtr);
+                        domainPPSize, domainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
             }
         }
         else if (isWindow)
@@ -1830,14 +1838,15 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
                     concatLayerShardedKVCacheForMLAKernel<T, mlaSubWarpSize, 4>
                         <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                             ouptutBlockPtrsDev, tokensPerBlock, numLayers, outputStartLayerId, headNum, dimsPerHead, outputBlockNumSum,
-                            inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr);
+                            inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr,
+                            domainCPSize);
                 }
                 else
                 {
                     concatKVCacheForMLAKernel<T, mlaSubWarpSize, 4>
                         <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                             ouptutBlockPtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead, outputBlockNumSum,
-                            domainPPSize, domainTPSize, kvFactor, prefixLayerNumDevPtr);
+                            domainPPSize, domainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
                 }
             }
             else if (isWindow)
@@ -1873,14 +1882,15 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
                     concatLayerShardedKVCacheForMLAKernel<T, mlaSubWarpSize, 2>
                         <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                             ouptutBlockPtrsDev, tokensPerBlock, numLayers, outputStartLayerId, headNum, dimsPerHead, outputBlockNumSum,
-                            inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr);
+                            inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr,
+                            domainCPSize);
                 }
                 else
                 {
                     concatKVCacheForMLAKernel<T, mlaSubWarpSize, 2>
                         <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                             ouptutBlockPtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead, outputBlockNumSum,
-                            domainPPSize, domainTPSize, kvFactor, prefixLayerNumDevPtr);
+                            domainPPSize, domainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
                 }
             }
             else if (isWindow)
@@ -1912,14 +1922,15 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
                     concatLayerShardedKVCacheForMLAKernel<T, mlaSubWarpSize, 1>
                         <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                             ouptutBlockPtrsDev, tokensPerBlock, numLayers, outputStartLayerId, headNum, dimsPerHead, outputBlockNumSum,
-                            inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr);
+                            inputCacheNum, kvFactor, peerLayerStartInDomainRanksDevPtr, peerLayerNumInDomainRanksDevPtr,
+                            domainCPSize);
                 }
                 else
                 {
                     concatKVCacheForMLAKernel<T, mlaSubWarpSize, 1>
                         <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputSplitBlockPtrsDev,
                             ouptutBlockPtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead, outputBlockNumSum,
-                            domainPPSize, domainTPSize, kvFactor, prefixLayerNumDevPtr);
+                            domainPPSize, domainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
                 }
             }
             else if (isWindow)

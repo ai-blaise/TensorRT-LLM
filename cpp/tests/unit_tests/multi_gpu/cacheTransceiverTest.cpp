@@ -2448,6 +2448,35 @@ TEST(targetTest, CacheStateNODP)
             /*expectPPDomain*/ 2,
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 4, /*expectNeedSend*/ false);
     }
+
+    // Production LayerSplit disagg shape: TP2xCP2 prefill feeds TP4xCP1 decode.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+        tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
+        std::vector<SizeType32> const contextAttentionLayerNumPerPP{numLayers};
+        std::vector<SizeType32> const genAttentionLayerNumPerPP{numLayers};
+        auto const attentionType = texec::kv_cache::CacheState::AttentionType::kMLA;
+        auto const sharedModelConfig
+            = texec::kv_cache::CacheState::ModelConfig{std::vector(numLayers, numHeads), sizePerHead, tokensPerBlock};
+        auto const contextCache = texec::kv_cache::CacheState(
+            sharedModelConfig, contextWC, contextAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+        auto const genCache = texec::kv_cache::CacheState(
+            sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+
+        auto const genRank0TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, 0);
+        EXPECT_EQ((std::vector<int>{0, 1}), genRank0TargetInfo.mIRanks);
+        EXPECT_EQ(1, genRank0TargetInfo.mDomainPPSize);
+        EXPECT_EQ(1, genRank0TargetInfo.mDomainTPSize);
+        EXPECT_EQ(2, genRank0TargetInfo.mDomainCPSize);
+        EXPECT_FALSE(genRank0TargetInfo.mPeerLayerShardedByCP);
+
+        auto const genRank3TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, 3);
+        EXPECT_EQ((std::vector<int>{2, 3}), genRank3TargetInfo.mIRanks);
+        EXPECT_EQ(1, genRank3TargetInfo.mDomainPPSize);
+        EXPECT_EQ(1, genRank3TargetInfo.mDomainTPSize);
+        EXPECT_EQ(2, genRank3TargetInfo.mDomainCPSize);
+        EXPECT_FALSE(genRank3TargetInfo.mPeerLayerShardedByCP);
+    }
 }
 
 TEST(targetTest, CacheStateNODPForGQAWithCP)

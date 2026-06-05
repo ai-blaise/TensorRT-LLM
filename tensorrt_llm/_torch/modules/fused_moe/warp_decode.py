@@ -244,6 +244,26 @@ def _tensor_data(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return tensor
 
 
+def _nvfp4_weight_bytes(weight: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Return FP4 weights in the byte-packed layout consumed by trtllm_gen."""
+    if weight is None:
+        return None
+    fp4x2_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if weight.dtype == torch.uint8 or (
+            fp4x2_dtype is not None and weight.dtype == fp4x2_dtype):
+        return weight
+    return weight.contiguous().view(torch.uint8)
+
+
+def _nvfp4_scale_fp8(scale: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Return NVFP4 block scales in the FP8 layout consumed by trtllm_gen."""
+    if scale is None:
+        return None
+    if scale.dtype == torch.float8_e4m3fn:
+        return scale
+    return scale.contiguous().view(torch.float8_e4m3fn)
+
+
 def _is_standard_bf16_weight_layout(moe: "ConfigurableMoE") -> bool:
     quant_method = getattr(moe.backend, "quant_method", None)
     if getattr(quant_method, "use_shuffled_weight", False):
@@ -343,7 +363,20 @@ def _run_nvfp4_explicit_tactic(
     local_num_experts: int,
     scaling_vector_size: int,
 ) -> torch.Tensor:
-    del hidden_size, scaling_vector_size
+    w13 = _nvfp4_weight_bytes(w13)
+    w2 = _nvfp4_weight_bytes(w2)
+    w13_scale = _nvfp4_scale_fp8(w13_scale)
+    w2_scale = _nvfp4_scale_fp8(w2_scale)
+    if w13 is None or w2 is None or w13_scale is None or w2_scale is None:
+        raise RuntimeError("NVFP4 tensors disappeared after guard check.")
+    packed_hidden_size = int(w13.shape[-1])
+    padded_hidden_size = packed_hidden_size * 2
+    if x.shape[-1] < packed_hidden_size:
+        x = _pad_nvfp4_last_dim(x, packed_hidden_size)
+    expected_scale_cols = padded_hidden_size // scaling_vector_size
+    if x_sf.shape[-1] < expected_scale_cols:
+        x_sf = _pad_nvfp4_last_dim(x_sf, expected_scale_cols)
+    output = torch.empty((x.shape[0], hidden_size), dtype=torch.bfloat16, device=x.device)
     # Enable PDL for the decode bucket. The direct C++ runner call avoids the
     # registered custom-op dispatcher and Python TunableRunner wrapper while
     # preserving the same trtllm_gen kernels. Tactic selection defaults to auto
@@ -357,13 +390,13 @@ def _run_nvfp4_explicit_tactic(
         x,
         x_sf.flatten().view(torch.float8_e4m3fn),
         w13,
-        w13_scale.view(torch.float8_e4m3fn),
+        w13_scale,
         None,
         None,
         None,
         None,
         w2,
-        w2_scale.view(torch.float8_e4m3fn),
+        w2_scale,
         None,
         output1_scale,
         output1_gate_scale,
@@ -381,13 +414,25 @@ def _run_nvfp4_explicit_tactic(
         _nvfp4_overlay_tactic(int(x.shape[0])),
         topk_weights.to(torch.bfloat16),
         topk_ids,
-        None,
+        output,
     )[0]
 
 
 @lru_cache(maxsize=None)
 def _nvfp4_torch_runner():
     return torch.classes.trtllm.FP4BlockScaleMoERunner(_TRTLLM_GEN_SWIGLU)
+
+
+def _pad_nvfp4_last_dim(tensor: torch.Tensor, target_cols: int) -> torch.Tensor:
+    """Pad packed NVFP4 payloads/scales to the runner's padded hidden contract."""
+    if tensor.shape[-1] == target_cols:
+        return tensor.contiguous()
+    if tensor.shape[-1] > target_cols:
+        raise ValueError(
+            f"NVFP4 tensor width {tensor.shape[-1]} exceeds target {target_cols}.")
+    padded = tensor.new_zeros((*tensor.shape[:-1], target_cols))
+    padded[..., :tensor.shape[-1]].copy_(tensor)
+    return padded
 
 
 @lru_cache(maxsize=None)
@@ -476,20 +521,33 @@ def _warp_decode_nvfp4_moe_autotuned_reference(
     local_num_experts: int,
     scaling_vector_size: int,
 ) -> torch.Tensor:
-    del hidden_size, scaling_vector_size
+    w13 = _nvfp4_weight_bytes(w13)
+    w2 = _nvfp4_weight_bytes(w2)
+    w13_scale = _nvfp4_scale_fp8(w13_scale)
+    w2_scale = _nvfp4_scale_fp8(w2_scale)
+    if w13 is None or w2 is None or w13_scale is None or w2_scale is None:
+        raise RuntimeError("NVFP4 tensors disappeared after guard check.")
+    packed_hidden_size = int(w13.shape[-1])
+    padded_hidden_size = packed_hidden_size * 2
+    if x.shape[-1] < packed_hidden_size:
+        x = _pad_nvfp4_last_dim(x, packed_hidden_size)
+    expected_scale_cols = padded_hidden_size // scaling_vector_size
+    if x_sf.shape[-1] < expected_scale_cols:
+        x_sf = _pad_nvfp4_last_dim(x_sf, expected_scale_cols)
+    output = torch.empty((x.shape[0], hidden_size), dtype=torch.bfloat16, device=x.device)
     outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
         None,
         None,
         x,
         x_sf.flatten().view(torch.float8_e4m3fn),
         w13,
-        w13_scale.view(torch.float8_e4m3fn),
+        w13_scale,
         None,
         None,
         None,
         None,
         w2,
-        w2_scale.view(torch.float8_e4m3fn),
+        w2_scale,
         None,
         output1_scale,
         output1_gate_scale,
@@ -507,7 +565,7 @@ def _warp_decode_nvfp4_moe_autotuned_reference(
         _TRTLLM_GEN_SWIGLU,
         topk_weights.to(torch.bfloat16),
         topk_ids,
-        None,
+        output,
         8192,
         False,
     )
@@ -559,6 +617,14 @@ def _get_nvfp4_cursor_op():
 
 def _has_nvfp4_cursor_op() -> bool:
     return _get_nvfp4_cursor_op() is not None
+
+
+def _get_supported_nvfp4_cursor_op(num_tokens: int):
+    try:
+        get_cursor_warp_decode_plan(num_tokens)
+    except ValueError:
+        return None
+    return _get_nvfp4_cursor_op()
 
 
 def _backend_int(backend, name: str, default: int = 0) -> int:
@@ -672,11 +738,10 @@ def _nvfp4_guard_failure(
     if _top_k(moe, token_selected_experts) != _NVFP4_TARGET_TOP_K:
         return "top_k_not_8"
     if _num_tokens(x) > _NVFP4_TRTLLM_GEN_CROSSOVER_TOKENS:
-        try:
-            get_cursor_warp_decode_plan(_num_tokens(x))
-        except ValueError:
-            return "nvfp4_batch_above_cursor_bucket"
-        if not _has_nvfp4_cursor_op() and _get_nvfp4_op() is None:
+        if (
+            _get_supported_nvfp4_cursor_op(_num_tokens(x)) is None
+            and _get_nvfp4_op() is None
+        ):
             return "nvfp4_cursor_warp_decode_op_unavailable"
     if x.dtype not in _NVFP4_SUPPORTED_INPUT_DTYPES:
         return f"nvfp4_input_dtype_{x.dtype}"
@@ -713,8 +778,32 @@ def _nvfp4_guard_failure(
     w2_scale = _get_backend_tensor(moe, "w2_weight_scale", "w2_weight_scaling_factor")
     if w13 is None or w13_scale is None or w2 is None or w2_scale is None:
         return "nvfp4_missing_weights_or_scales"
+    w13 = _nvfp4_weight_bytes(w13)
+    w2 = _nvfp4_weight_bytes(w2)
+    w13_scale = _nvfp4_scale_fp8(w13_scale)
+    w2_scale = _nvfp4_scale_fp8(w2_scale)
+    if w13 is None or w2 is None or w13_scale is None or w2_scale is None:
+        return "nvfp4_missing_weights_or_scales"
     if w13.dim() != 3 or w2.dim() != 3:
         return "nvfp4_weight_rank_mismatch"
+    if w13_scale.dim() != 3 or w2_scale.dim() != 3:
+        return "nvfp4_weight_scale_rank_mismatch"
+    packed_hidden_size = int(w13.shape[-1])
+    padded_hidden_size = packed_hidden_size * 2
+    if packed_hidden_size < int(x.shape[-1]):
+        return "nvfp4_weight_hidden_smaller_than_input"
+    if padded_hidden_size % scaling_vector_size != 0:
+        return "nvfp4_padded_hidden_not_scale_aligned"
+    if int(w13_scale.shape[-1]) != padded_hidden_size // scaling_vector_size:
+        return "nvfp4_w13_scale_hidden_mismatch"
+    if int(w2.shape[1]) != padded_hidden_size:
+        return "nvfp4_w2_hidden_mismatch"
+    if int(w2_scale.shape[1]) != padded_hidden_size:
+        return "nvfp4_w2_scale_hidden_mismatch"
+    if int(w2.shape[-1]) != intermediate_size // 2:
+        return "nvfp4_w2_intermediate_mismatch"
+    if int(w2_scale.shape[-1]) != intermediate_size // scaling_vector_size:
+        return "nvfp4_w2_scale_intermediate_mismatch"
     if (
         _num_tokens(x) <= _NVFP4_TRTLLM_GEN_CROSSOVER_TOKENS
         and _get_nvfp4_op() is None
@@ -757,7 +846,10 @@ def get_warp_decode_guard_failure(
         return "eplb_not_supported"
     if _num_tokens(x) == 0:
         return "empty_batch"
-    if _num_tokens(x) > getattr(config, "max_batch_size", 64):
+    if (
+        not getattr(moe, "has_nvfp4", False)
+        and _num_tokens(x) > getattr(config, "max_batch_size", 64)
+    ):
         return "batch_too_large"
 
     if getattr(moe, "has_nvfp4", False):
@@ -817,7 +909,7 @@ def _run_nvfp4_warp_decode(
     local_num_experts = _backend_int(
         moe.backend, "expert_size_per_partition", _backend_int(moe.backend, "num_slots", 0))
 
-    cursor_op = _get_nvfp4_cursor_op()
+    cursor_op = _get_supported_nvfp4_cursor_op(_num_tokens(x))
     use_cursor = _num_tokens(x) > _NVFP4_TRTLLM_GEN_CROSSOVER_TOKENS and cursor_op is not None
     op = cursor_op if use_cursor else _get_nvfp4_op()
     if op is None:

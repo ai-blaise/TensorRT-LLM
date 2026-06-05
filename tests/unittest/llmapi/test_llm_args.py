@@ -29,6 +29,7 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CalibConfig, ContextChunkingPolicy,
                                           CudaGraphConfig, DecodingBaseConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -1300,6 +1301,25 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
+
+    def test_kvarn_is_dense_mla_latent_dtype_not_indexer_dtype(self):
+        config = DeepSeekSparseAttentionConfig(
+            indexer_k_dtype="fp4",
+            index_head_dim=128,
+            mla_latent_kv_dtype="kvarn_k4v4",
+            mla_latent_kv_amortize=True,
+        )
+
+        assert config.mla_latent_kv_dtype == "kvarn_k4v4"
+        assert config.mla_latent_kv_amortize is True
+        assert config.indexer_k_dtype == "fp4"
+
+        with pytest.raises(ValidationError, match="dense MLA latent KV storage only"):
+            DeepSeekSparseAttentionConfig(
+                indexer_k_dtype="fp4",
+                index_head_dim=128,
+                mla_latent_kv_dtype="kvarn-k4v4",
+            )
 
     def test_torch_compile_config_arbitrary_args(self):
         """Test that TorchCompileConfig rejects arbitrary arguments."""

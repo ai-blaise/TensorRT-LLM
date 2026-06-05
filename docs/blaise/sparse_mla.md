@@ -166,7 +166,7 @@ with with_multi_stream(False):
 - **Indexer** (`indexer.md`) produces the `topk_indices` this attention reads;
   the 2-stream split overlaps the indexer projections with the attention head
   group.
-- **KVarN** (`kvarn.md`) changes how the latent KV is stored; the sparse-MLA
+- **KVarN** (`kvarn.md`) changes how the dense MLA latent KV is stored; the sparse-MLA
   kernel reads the dequantized latent, so KVarN is transparent to the scheduler
   and the head-split.
 - **LayerSplit** (`../source/features/layersplit.md`) broadcasts the owner CP

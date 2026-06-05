@@ -19,6 +19,9 @@ add_subdirectory(cutlass_kernels)
 add_subdirectory(cuteDslKernels)
 add_subdirectory(flashMLA)
 add_subdirectory(contextFusedMultiHeadAttention)
+set(CONTEXT_ATTENTION_GENERATED_KERNEL_TARGETS
+    ${CONTEXT_ATTENTION_GENERATED_KERNEL_TARGETS}
+    PARENT_SCOPE)
 add_subdirectory(decoderMaskedMultiheadAttention)
 add_subdirectory(selectiveScan)
 add_subdirectory(userbuffers)

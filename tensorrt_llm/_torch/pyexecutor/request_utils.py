@@ -403,6 +403,40 @@ def merge_helix_requests(
     return req_with_children
 
 
+def merge_layersplit_requests(
+    new_requests: List,
+    exclude_last_generation_logits: bool,
+) -> List[LlmRequest]:
+    """Merge requests for LayerSplit CP.
+
+    LayerSplit partitions DSA KV / indexer-K caches by transformer layer, not
+    prompt tokens. Every CP rank must therefore see the complete context token
+    stream; layer ownership and per-layer active-block broadcasts decide which
+    rank owns each layer's cache. Routing LayerSplit through the HELIX
+    block-token splitter leaves one TP/CP slice without the current context and
+    can wedge the prefill broadcast path.
+    """
+    req_with_children = []
+
+    for req_item in new_requests:
+        input_token_ids = req_item.request.input_token_ids
+        input_len = len(input_token_ids)
+        req = executor_request_to_llm_request(
+            req_id=req_item.id,
+            executor_request=req_item.request,
+            child_req_ids=req_item.child_req_ids,
+            exclude_last_generation_logits=exclude_last_generation_logits,
+        )
+        req.total_input_len_cp = input_len
+        req.seqlen_this_rank_cp = input_len
+        req.py_helix_is_inactive_rank = False
+        req_with_children.append(req)
+        if req.child_requests:
+            req_with_children.extend(req.child_requests)
+
+    return req_with_children
+
+
 def merge_star_attention_requests(
     new_requests: List,
     cp_rank: int,
@@ -513,12 +547,22 @@ def merge_requests(
                 cp_config=cp_config,
                 exclude_last_generation_logits=exclude_last_generation_logits,
             )
-        elif cp_type in (CpType.HELIX, CpType.LAYERSPLIT):
+        elif cp_type == CpType.HELIX:
+            if "tokens_per_block" not in cp_config:
+                raise ValueError(
+                    f"{cp_type.name} CP requires cp_config.tokens_per_block; "
+                    "populate it from kv_cache_config.tokens_per_block before "
+                    "building the Mapping.")
             return merge_helix_requests(
                 new_requests,
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 tokens_per_block=cp_config["tokens_per_block"],
+                exclude_last_generation_logits=exclude_last_generation_logits,
+            )
+        elif cp_type == CpType.LAYERSPLIT:
+            return merge_layersplit_requests(
+                new_requests,
                 exclude_last_generation_logits=exclude_last_generation_logits,
             )
         else:

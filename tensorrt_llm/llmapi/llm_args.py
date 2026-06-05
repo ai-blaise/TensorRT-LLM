@@ -399,6 +399,13 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "content latent and <pe> bits on the 64-d RoPE key, ~2.3-4.4 "
         "bits/elem at FP16-accuracy. Requires the DSA MLA path; group is "
         "bound to tokens_per_block.")
+    mla_latent_kv_amortize: bool = Field(
+        default=False,
+        description=
+        "When mla_latent_kv_dtype selects KVarN, restore only committed dense "
+        "MLA latent KV blocks whose reconstructed fp16 slot is stale. This is "
+        "a dense-MLA KVarN read-path optimization; it does not change Indexer "
+        "K storage, which remains controlled by indexer_k_dtype.")
     enable_nvfp4_hisa: bool = Field(
         default=False,
         description=
@@ -481,6 +488,28 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                         f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
                         f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
                         f"for non-Blackwell GPUs.")
+        latent_kv_dtype = (self.mla_latent_kv_dtype or "auto").lower()
+        self.mla_latent_kv_dtype = latent_kv_dtype
+        if latent_kv_dtype.startswith("kvarn"):
+            if not latent_kv_dtype.startswith("kvarn_k") or "v" not in latent_kv_dtype:
+                raise ValueError(
+                    "mla_latent_kv_dtype KVarN values must use "
+                    "'kvarn_k<ckv_bits>v<pe_bits>' (for example "
+                    "'kvarn_k4v4'). KVarN is dense MLA latent KV storage only; "
+                    "Indexer storage remains controlled by indexer_k_dtype.")
+            try:
+                ckv_part, pe_part = latent_kv_dtype[len("kvarn_k"):].split("v", 1)
+                ckv_bits = int(ckv_part)
+                pe_bits = int(pe_part)
+            except ValueError as exc:
+                raise ValueError(
+                    "mla_latent_kv_dtype KVarN values must use integer bit "
+                    "widths in 'kvarn_k<ckv_bits>v<pe_bits>'.") from exc
+            invalid_bits = [bits for bits in (ckv_bits, pe_bits) if bits not in (2, 3, 4)]
+            if invalid_bits:
+                raise ValueError(
+                    "mla_latent_kv_dtype KVarN bit widths must be one of "
+                    f"2, 3, or 4; got ckv={ckv_bits}, pe={pe_bits}.")
         if self.index_topk_freq is not None and self.index_topk_freq < 1:
             raise ValueError("index_topk_freq must be at least 1.")
         if (self.index_topk_step_freq is not None
@@ -4772,8 +4801,10 @@ class TorchLlmArgs(BaseLlmArgs):
         cp_type = self.cp_config.cp_type
         if cp_type in (CpType.HELIX, CpType.LAYERSPLIT):
             cp_tokens_per_block = self.cp_config.tokens_per_block
-            if cp_tokens_per_block is not None:
-                kv_tokens_per_block = self.kv_cache_config.tokens_per_block
+            kv_tokens_per_block = self.kv_cache_config.tokens_per_block
+            if cp_tokens_per_block is None:
+                self.cp_config.tokens_per_block = kv_tokens_per_block
+            else:
                 assert cp_tokens_per_block == kv_tokens_per_block, (
                     f"When {cp_type.name} parallelism is active, cp_config.tokens_per_block ({cp_tokens_per_block}) "
                     f"must match kv_cache_config.tokens_per_block ({kv_tokens_per_block})."

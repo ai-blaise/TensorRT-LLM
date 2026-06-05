@@ -46,7 +46,7 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.45
   tokens_per_block: 64
 cache_transceiver_config:
-  backend: UCX
+  backend: NIXL
   max_tokens_in_buffer: 131072
 moe_config:
   backend: WARPDECODE

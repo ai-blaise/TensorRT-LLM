@@ -66,7 +66,7 @@ data:
       free_gpu_memory_fraction: 0.7
       tokens_per_block: 64
     cache_transceiver_config:
-      backend: UCX
+      backend: NIXL
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE
@@ -93,7 +93,7 @@ data:
       hisa_execution_mode: optimized
       use_cute_dsl_topk: true
       use_cute_dsl_paged_mqa_logits: true
-      # MORI-IO-shaped handoff, implemented by TRT-LLM UCX transfer: prefill
+      # MORI-IO-shaped handoff, implemented by TRT-LLM NIXL transfer: prefill
       # owns LayerSplit's CP-sharded DSA KV/indexer-K cache, then the transceiver
       # writes/reassembles it into decode's pre-allocated TP4/CP1 cache. Keep all
       # CP ranks participating until a partial-rank protocol is implemented.
@@ -130,7 +130,7 @@ data:
       free_gpu_memory_fraction: 0.45
       tokens_per_block: 64
     cache_transceiver_config:
-      backend: UCX
+      backend: NIXL
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE
@@ -252,7 +252,9 @@ spec:
       - name: NVIDIA_GDRCOPY
         value: '1'
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
-        value: '1'
+        value: '0'
+      - name: TRTLLM_NIXL_KVCACHE_BACKEND
+        value: UCX
       - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
         value: '1'
       - name: TRTLLM_ENABLE_PDL
@@ -386,7 +388,9 @@ spec:
       - name: NVIDIA_GDRCOPY
         value: '1'
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
-        value: '1'
+        value: '0'
+      - name: TRTLLM_NIXL_KVCACHE_BACKEND
+        value: UCX
       - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
         value: '1'
       - name: TRTLLM_ENABLE_PDL

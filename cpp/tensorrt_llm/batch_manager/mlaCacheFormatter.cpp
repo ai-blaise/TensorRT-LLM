@@ -47,26 +47,31 @@ std::pair<std::vector<size_t>, std::vector<size_t>> MLACacheFormatter::pickRecvC
         return {{}, {}};
     }
 
-    TLLM_CHECK_WITH_INFO(targetInfo.mDomainCPSize == 1 || targetInfo.mPeerLayerShardedByCP,
-        "MLA CP-shrink receive is only supported for contiguous LayerSplit layer shards");
     TLLM_CHECK(numConnections == counterPartRanks.size());
     std::vector<size_t> pickUpConnections;
     std::vector<size_t> localRankIndices;
     int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
-    auto const requiredRankNum
-        = targetInfo.mPeerLayerShardedByCP ? targetInfo.mIRanks.size() : static_cast<size_t>(targetInfo.mDomainPPSize);
-    for (size_t i = 0; i < requiredRankNum; i++)
+    auto const cpDomainSize = static_cast<size_t>(targetInfo.mDomainCPSize);
+    auto const tpDomainSize = static_cast<size_t>(targetInfo.mDomainTPSize);
+    auto const ppDomainSize = static_cast<size_t>(targetInfo.mDomainPPSize);
+    auto const ranksPerCPDomain = tpDomainSize * ppDomainSize;
+    TLLM_CHECK_WITH_INFO(ranksPerCPDomain > 0, "MLA receive rank domain must be non-empty");
+    auto const tpDomainRank = static_cast<size_t>(dpRank % targetInfo.mDomainTPSize);
+    auto const requiredRankNum = cpDomainSize * ppDomainSize;
+    for (size_t cpDomainIdx = 0; cpDomainIdx < cpDomainSize; ++cpDomainIdx)
     {
-        size_t rankIdx = targetInfo.mPeerLayerShardedByCP
-            ? i
-            : i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize;
-        auto rank = targetInfo.mIRanks.at(rankIdx);
-        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
-        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
-        pickUpConnections.push_back(std::distance(counterPartRanks.begin(), it));
-        localRankIndices.push_back(rankIdx);
+        for (size_t ppDomainIdx = 0; ppDomainIdx < ppDomainSize; ++ppDomainIdx)
+        {
+            size_t rankIdx = cpDomainIdx * ranksPerCPDomain + tpDomainRank * ppDomainSize + ppDomainIdx;
+            auto rank = targetInfo.mIRanks.at(rankIdx);
+            auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
+            TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+            pickUpConnections.push_back(std::distance(counterPartRanks.begin(), it));
+            localRankIndices.push_back(rankIdx);
+        }
     }
+    TLLM_CHECK(pickUpConnections.size() == requiredRankNum);
     return {pickUpConnections, localRankIndices};
 }
 
@@ -513,11 +518,17 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 auto const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
                 TLLM_CHECK_WITH_INFO(selfAttentionLayerNum != 0, "selfAttentionLayerNum should not be 0");
                 std::vector<size_t> bufferEleSizes(targetNum, 0);
-                auto const cacheSizePerLayer = cacheBlockSize * blockNum / selfAttentionLayerNum;
                 for (size_t i = 0; i < targetNum; i++)
                 {
+                    auto const rankIdx = static_cast<SizeType32>(localRankIndices[i]);
+                    auto const ranksPerCPDomain = targetInfo.mDomainTPSize * targetInfo.mDomainPPSize;
+                    TLLM_CHECK_WITH_INFO(ranksPerCPDomain > 0, "MLA receive rank domain must be non-empty");
+                    auto const cpDomainIdx = rankIdx / ranksPerCPDomain;
+                    auto const peerBlockNum = executor::kv_cache::getBlockNumAccountingForCP(
+                        cpDomainIdx, targetInfo.mDomainCPSize, blockNum);
+                    auto const cacheSizePerLayer = cacheBlockSize * peerBlockNum / selfAttentionLayerNum;
                     auto const peerAttentionLayerNum = targetInfo.getPeerDomainRankLayerNum(
-                        static_cast<SizeType32>(localRankIndices[i]));
+                        rankIdx);
                     bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
                 }
                 return bufferEleSizes;

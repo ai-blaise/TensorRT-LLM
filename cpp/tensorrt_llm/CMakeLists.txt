@@ -182,6 +182,7 @@ set(TRTLLM_LINK_LIBS
     flash_mla_src
     flash_mla_nvfp4_sparse_src
     context_attention_src
+    ${CONTEXT_ATTENTION_GENERATED_KERNEL_TARGETS}
     decoder_attention_src
     trtllm_gen_fmha
     trtllm_gen_fp8_block_scale_moe

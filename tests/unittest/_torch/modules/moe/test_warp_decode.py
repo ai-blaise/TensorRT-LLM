@@ -17,7 +17,15 @@ class TRTLLMGenFusedMoE:
     pass
 
 
-def _populate_nvfp4_backend(backend, *, weights=True, local_experts=128):
+def _populate_nvfp4_backend(
+    backend,
+    *,
+    weights=True,
+    local_experts=128,
+    packed_hidden_size=3584,
+    weight_storage_dtype=torch.uint8,
+    scale_storage_dtype=torch.uint8,
+):
     backend.hidden_size = 7168
     backend.intermediate_size = 2048
     backend.num_experts = 128
@@ -26,10 +34,33 @@ def _populate_nvfp4_backend(backend, *, weights=True, local_experts=128):
     backend.slot_start = 0
     backend.scaling_vector_size = 16
     if weights:
-        backend.w3_w1_weight = torch.empty((local_experts, 4096, 3584), dtype=torch.uint8)
-        backend.w3_w1_weight_scale = torch.empty((local_experts, 4096, 448), dtype=torch.uint8)
-        backend.w2_weight = torch.empty((local_experts, 7168, 1024), dtype=torch.uint8)
-        backend.w2_weight_scale = torch.empty((local_experts, 7168, 128), dtype=torch.uint8)
+        padded_hidden_size = packed_hidden_size * 2
+        storage_factor = torch.empty((), dtype=weight_storage_dtype).element_size()
+        assert packed_hidden_size % storage_factor == 0
+        assert 1024 % storage_factor == 0
+        scale_storage_factor = torch.empty((), dtype=scale_storage_dtype).element_size()
+        assert (padded_hidden_size // 16) % scale_storage_factor == 0
+        assert 128 % scale_storage_factor == 0
+        backend.w3_w1_weight = torch.empty(
+            (local_experts, 4096, packed_hidden_size // storage_factor),
+            dtype=weight_storage_dtype,
+        )
+        backend.w3_w1_weight_scale = torch.empty(
+            (
+                local_experts,
+                4096,
+                (padded_hidden_size // 16) // scale_storage_factor,
+            ),
+            dtype=scale_storage_dtype,
+        )
+        backend.w2_weight = torch.empty(
+            (local_experts, padded_hidden_size, 1024 // storage_factor),
+            dtype=weight_storage_dtype,
+        )
+        backend.w2_weight_scale = torch.empty(
+            (local_experts, padded_hidden_size, 128 // scale_storage_factor),
+            dtype=scale_storage_dtype,
+        )
         backend.fc31_alpha = torch.ones((local_experts,), dtype=torch.float32)
         backend.fc2_alpha = torch.ones((local_experts,), dtype=torch.float32)
         backend.fc2_input_scale = torch.ones((1,), dtype=torch.float32)
@@ -168,6 +199,142 @@ def test_warp_decode_selects_explicit_tactic_nvfp4_op(monkeypatch):
     assert moe.warp_decode_last_reason == "nvfp4_explicit_tactic_op"
 
 
+def test_warp_decode_explicit_tactic_pads_nvfp4_hidden_to_weight_contract(monkeypatch):
+    backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE(), packed_hidden_size=4096)
+    moe = _moe(backend=backend, has_nvfp4=True)
+    inputs = _inputs(num_tokens=2)
+    inputs["x"] = torch.empty((2, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((2, 448), dtype=torch.uint8)
+
+    class _Runner:
+
+        def run_moe(self, *args):
+            assert args[2].shape == (2, 4096)
+            assert args[3].numel() == 2 * 512
+            assert args[4].shape[-1] == 4096
+            assert args[10].shape[1] == 8192
+            assert args[11].shape[1] == 8192
+            assert args[-1].shape == (2, 7168)
+            return [args[-1]]
+
+    monkeypatch.setattr(warp_decode, "_nvfp4_torch_runner", lambda: _Runner())
+
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+    output = warp_decode._run_nvfp4_explicit_tactic(
+        inputs["x"],
+        inputs["x_sf"],
+        backend.w3_w1_weight,
+        backend.w3_w1_weight_scale,
+        backend.w2_weight,
+        backend.w2_weight_scale,
+        backend.fc31_alpha,
+        backend.fc31_alpha,
+        backend.fc2_alpha,
+        inputs["token_selected_experts"],
+        inputs["token_final_scales"],
+        7168,
+        2048,
+        128,
+        0,
+        128,
+        16,
+    )
+
+    assert output.shape == (2, 7168)
+
+
+def test_warp_decode_explicit_tactic_views_stored_nvfp4_weights_as_bytes(monkeypatch):
+    backend = _populate_nvfp4_backend(
+        TRTLLMGenFusedMoE(), weight_storage_dtype=torch.int64)
+    moe = _moe(backend=backend, has_nvfp4=True)
+    inputs = _inputs(num_tokens=2)
+    inputs["x"] = torch.empty((2, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((2, 448), dtype=torch.uint8)
+
+    class _Runner:
+
+        def run_moe(self, *args):
+            assert args[4].dtype == torch.uint8
+            assert args[4].shape == (128, 4096, 3584)
+            assert args[10].dtype == torch.uint8
+            assert args[10].shape == (128, 7168, 1024)
+            assert args[-1].shape == (2, 7168)
+            return [args[-1]]
+
+    monkeypatch.setattr(warp_decode, "_nvfp4_torch_runner", lambda: _Runner())
+
+    assert backend.w3_w1_weight.dtype == torch.int64
+    assert backend.w3_w1_weight.shape[-1] == 448
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+    output = warp_decode._run_nvfp4_explicit_tactic(
+        inputs["x"],
+        inputs["x_sf"],
+        backend.w3_w1_weight,
+        backend.w3_w1_weight_scale,
+        backend.w2_weight,
+        backend.w2_weight_scale,
+        backend.fc31_alpha,
+        backend.fc31_alpha,
+        backend.fc2_alpha,
+        inputs["token_selected_experts"],
+        inputs["token_final_scales"],
+        7168,
+        2048,
+        128,
+        0,
+        128,
+        16,
+    )
+
+    assert output.shape == (2, 7168)
+
+
+def test_warp_decode_explicit_tactic_views_stored_nvfp4_scales_as_fp8(monkeypatch):
+    backend = _populate_nvfp4_backend(
+        TRTLLMGenFusedMoE(), scale_storage_dtype=torch.int64)
+    moe = _moe(backend=backend, has_nvfp4=True)
+    inputs = _inputs(num_tokens=2)
+    inputs["x"] = torch.empty((2, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((2, 448), dtype=torch.uint8)
+
+    class _Runner:
+
+        def run_moe(self, *args):
+            assert args[5].dtype == torch.float8_e4m3fn
+            assert args[5].shape == (128, 4096, 448)
+            assert args[11].dtype == torch.float8_e4m3fn
+            assert args[11].shape == (128, 7168, 128)
+            assert args[-1].shape == (2, 7168)
+            return [args[-1]]
+
+    monkeypatch.setattr(warp_decode, "_nvfp4_torch_runner", lambda: _Runner())
+
+    assert backend.w3_w1_weight_scale.dtype == torch.int64
+    assert backend.w3_w1_weight_scale.shape[-1] == 56
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+    output = warp_decode._run_nvfp4_explicit_tactic(
+        inputs["x"],
+        inputs["x_sf"],
+        backend.w3_w1_weight,
+        backend.w3_w1_weight_scale,
+        backend.w2_weight,
+        backend.w2_weight_scale,
+        backend.fc31_alpha,
+        backend.fc31_alpha,
+        backend.fc2_alpha,
+        inputs["token_selected_experts"],
+        inputs["token_final_scales"],
+        7168,
+        2048,
+        128,
+        0,
+        128,
+        16,
+    )
+
+    assert output.shape == (2, 7168)
+
+
 def test_warp_decode_allows_nvfp4_cuda_graph_bucket(monkeypatch):
     backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
     moe = _moe(
@@ -260,7 +427,7 @@ def test_warp_decode_selects_explicit_nvfp4_op_for_c32_without_cursor(monkeypatc
     assert moe.warp_decode_last_reason == "nvfp4_explicit_tactic_op"
 
 
-def test_warp_decode_rejects_cursor_batch_above_c32(monkeypatch):
+def test_warp_decode_uses_explicit_nvfp4_autotune_above_cursor_buckets(monkeypatch):
     backend = _populate_nvfp4_backend(TRTLLMGenFusedMoE())
     config = _config()
     config.max_batch_size = 64
@@ -269,14 +436,32 @@ def test_warp_decode_rejects_cursor_batch_above_c32(monkeypatch):
         has_nvfp4=True,
         model_config=types.SimpleNamespace(warp_decode_config=config),
     )
-    inputs = _inputs(num_tokens=64)
-    inputs["x"] = torch.empty((64, 3584), dtype=torch.uint8)
-    inputs["x_sf"] = torch.empty((64, 448), dtype=torch.uint8)
+    inputs = _inputs(num_tokens=128)
+    inputs["x"] = torch.empty((128, 3584), dtype=torch.uint8)
+    inputs["x_sf"] = torch.empty((128, 448), dtype=torch.uint8)
+
+    def _op(*args):
+        assert args[0] is inputs["x"]
+        assert args[1] is inputs["x_sf"]
+        assert args[9] is inputs["token_selected_experts"]
+        assert args[10] is inputs["token_final_scales"]
+        return torch.empty((128, 7168), dtype=torch.bfloat16)
 
     monkeypatch.setattr(warp_decode, "_get_nvfp4_cursor_op", lambda: object())
+    monkeypatch.setattr(warp_decode, "_get_nvfp4_op", lambda: _op)
 
-    assert get_warp_decode_guard_failure(moe, **inputs) == (
-        "nvfp4_batch_above_cursor_bucket")
+    assert get_warp_decode_guard_failure(moe, **inputs) is None
+    output = try_run_warp_decode(moe, **inputs)
+    assert output.shape == (128, 7168)
+    assert moe.warp_decode_last_status == "selected"
+    assert moe.warp_decode_last_reason == "nvfp4_explicit_tactic_op"
+
+
+def test_warp_decode_rejects_bf16_batch_above_config_max():
+    moe = _moe()
+    inputs = _inputs(num_tokens=9)
+
+    assert get_warp_decode_guard_failure(moe, **inputs) == "batch_too_large"
 
 
 def test_warp_decode_allows_nvfp4_after_external_dispatch(monkeypatch):

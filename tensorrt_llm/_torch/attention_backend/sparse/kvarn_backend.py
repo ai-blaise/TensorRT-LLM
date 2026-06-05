@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KVarN system-tier backend: kv_cache_dtype="kvarn_*" for the op-trt MLA path.
+"""KVarN system-tier backend: mla_latent_kv_dtype="kvarn_*" for the op-trt MLA path.
 
 This is the *system-level* wiring that turns the validated component
-(``kvarn_core`` + ``kvarn_mla``) into a selectable KV-cache backend, parallel
-to the existing fp8 / nvfp4 latent-cache modes.
+(``kvarn_core`` + ``kvarn_mla``) into a selectable dense MLA latent-cache
+backend, parallel to the existing fp8 / nvfp4 latent-cache modes. It does not
+change Indexer K storage.
 
 Design (faithful to ``kvarn_mla.SYSTEM_INTEGRATION``, Stage-a end-state):
 
   * ``KVarNConfig`` — the preset (bits per ckv / k_pe, Sinkhorn iters, sink
-    tokens) plus the byte accounting. Selected by a ``kv_cache_dtype`` string
-    ``kvarn_k{cb}v{pb}`` (e.g. ``kvarn_k4v2``) and/or env ``TRTLLM_KV_CACHE_QUANT``.
+    tokens) plus the byte accounting. Selected by an
+    ``mla_latent_kv_dtype`` string ``kvarn_k{cb}v{pb}`` (e.g.
+    ``kvarn_k4v2``) and/or env ``TRTLLM_MLA_LATENT_KV_DTYPE``.
 
   * ``KVarNLatentPool`` — a per-layer side-pool, allocated by the cache manager
     exactly like the indexer-K side-pool (plain torch tensors, indexed by the
@@ -112,23 +114,25 @@ class KVarNConfig:
         return self.packed_bytes(group) * 8 / (group * self.latent_dim)
 
 
-def is_kvarn_dtype(kv_cache_dtype) -> bool:
-    return isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith(_KVARN_PREFIX)
+def is_kvarn_dtype(mla_latent_kv_dtype) -> bool:
+    return isinstance(mla_latent_kv_dtype, str) and mla_latent_kv_dtype.startswith(_KVARN_PREFIX)
 
 
-def parse_kvarn_dtype(kv_cache_dtype: str, **overrides) -> KVarNConfig:
+def parse_kvarn_dtype(mla_latent_kv_dtype: str, **overrides) -> KVarNConfig:
     """``"kvarn_k4v2"`` -> KVarNConfig(ckv_bits=4, pe_bits=2).
 
     Accepts model-dim overrides (kv_lora_rank, qk_rope_head_dim, sink_tokens).
     """
-    assert is_kvarn_dtype(kv_cache_dtype), kv_cache_dtype
-    body = kv_cache_dtype[len(_KVARN_PREFIX):]  # "k4v2"
+    assert is_kvarn_dtype(mla_latent_kv_dtype), mla_latent_kv_dtype
+    body = mla_latent_kv_dtype[len(_KVARN_PREFIX):]  # "k4v2"
     cb = pb = None
     if body.startswith("k") and "v" in body:
         kpart, vpart = body[1:].split("v", 1)
         cb, pb = int(kpart), int(vpart)
     if cb is None or pb is None:
-        raise ValueError(f"bad kvarn dtype {kv_cache_dtype!r}; want kvarn_k<ckv>v<pe>")
+        raise ValueError(
+            f"bad dense MLA latent KVarN dtype {mla_latent_kv_dtype!r}; "
+            "want kvarn_k<ckv>v<pe>")
     for bits in (cb, pb):
         if bits not in (2, 3, 4):
             raise ValueError(f"kvarn bits must be 2/3/4, got {bits}")
@@ -139,14 +143,14 @@ def parse_kvarn_dtype(kv_cache_dtype: str, **overrides) -> KVarNConfig:
     return KVarNConfig(**fields)
 
 
-def resolve_kvarn_config(kv_cache_dtype=None, **overrides):
+def resolve_kvarn_config(mla_latent_kv_dtype=None, **overrides):
     """Resolve a KVarNConfig from an explicit dtype string or the env override.
 
     Returns ``None`` when KVarN is not selected (caller keeps fp8/nvfp4 path).
     """
-    if is_kvarn_dtype(kv_cache_dtype):
-        return parse_kvarn_dtype(kv_cache_dtype, **overrides)
-    env = os.environ.get("TRTLLM_KV_CACHE_QUANT", "")
+    if is_kvarn_dtype(mla_latent_kv_dtype):
+        return parse_kvarn_dtype(mla_latent_kv_dtype, **overrides)
+    env = os.environ.get("TRTLLM_MLA_LATENT_KV_DTYPE", "")
     if is_kvarn_dtype(env):
         return parse_kvarn_dtype(env, **overrides)
     return None

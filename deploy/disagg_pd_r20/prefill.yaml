@@ -42,7 +42,7 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.7
   tokens_per_block: 64
 cache_transceiver_config:
-  backend: UCX
+  backend: NIXL
   max_tokens_in_buffer: 131072
 moe_config:
   backend: WARPDECODE
@@ -70,7 +70,7 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   # ---- LayerSplit ON (prefill custom piece) ----
-  # MORI-IO-shaped handoff, implemented by TRT-LLM UCX transfer: producer-side
+  # MORI-IO-shaped handoff, implemented by TRT-LLM NIXL transfer: producer-side
   # layer KV is transferred into decode's pre-allocated cache, with CP shards
   # reassembled for TP4/CP1.
   layersplit_enabled: true

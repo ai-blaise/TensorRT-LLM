@@ -54,4 +54,4 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-D_USE_MATH_DEFINES -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math --ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage>
 )
-set_cuda_architectures(flash_mla_nvfp4_sparse_src 100f)
+set_cuda_architectures(flash_mla_nvfp4_sparse_src 100)

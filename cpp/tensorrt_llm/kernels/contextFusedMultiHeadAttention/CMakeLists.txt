@@ -67,6 +67,7 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
   file(GLOB arch_files "fmha_v2_cu/*_sm${arch}.cu")
   if(arch_files)
     set(TARGET_NAME _context_attention_kernels_${arch})
+    list(APPEND CONTEXT_ATTENTION_GENERATED_KERNEL_TARGETS ${TARGET_NAME})
     add_library(${TARGET_NAME} OBJECT ${arch_files})
     target_compile_definitions(${TARGET_NAME} PRIVATE USE_DEMO_BERT_PARAMS=1
                                                       GENERATE_CUBIN=1)
@@ -80,5 +81,10 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
     set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
     target_sources(context_attention_src
                    PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
+    target_link_libraries(context_attention_src PUBLIC ${TARGET_NAME})
   endif()
 endforeach()
+
+set(CONTEXT_ATTENTION_GENERATED_KERNEL_TARGETS
+    ${CONTEXT_ATTENTION_GENERATED_KERNEL_TARGETS}
+    PARENT_SCOPE)

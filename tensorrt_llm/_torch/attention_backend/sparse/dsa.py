@@ -4132,7 +4132,7 @@ class DSATrtllmAttention(TrtllmAttention):
         decode kernel reads correct latent values, using the BATCHED restore
         primitive (one pool.load_blocks() for the step; ~1.2-2.4 us/block).
 
-        AMORTIZATION (kvarn_amortize_restore, default ON when KVarN is enabled):
+        AMORTIZATION (mla_latent_kv_amortize, default OFF):
         committed full blocks are immutable -- their packed KVarN bytes never
         change until the block-id is recycled and re-committed (pool.commit_gen
         bumps then). During steady decode the only main-pool write is to the
@@ -4147,8 +4147,8 @@ class DSATrtllmAttention(TrtllmAttention):
         32 reqs commit a fresh block the SAME step) 71.7 us = 21% budget (6.7x);
         steady-state 1.12 us = 0.33% budget. cos_ckv=cos_kpe=1.000000.
 
-        Set kvarn_amortize_restore=False (or the AMORTIZE flag off) to fall back
-        to the always-correct full per-step restore."""
+        Set mla_latent_kv_amortize=False (or leave the AMORTIZE env off) to
+        fall back to the always-correct full per-step restore."""
         mgr = self._kvarn_mgr(metadata)
         if mgr is None:
             return

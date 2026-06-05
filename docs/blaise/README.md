@@ -91,10 +91,10 @@ of each doc. The campaign-level composition matrix:
 
 | Piece ↓ composes-with → | Indexer | Sparse-MLA | NVFP4-fusion | KVarN | WarpDecode | LayerSplit | SMC-SD |
 |---|---|---|---|---|---|---|---|
-| **Indexer (1–6)** | — | feeds top-k | independent | shares cache | independent | shares KV pool | per-draft |
+| **Indexer (1–6)** | — | feeds top-k | independent | reads dequantized dense MLA latent; Indexer K remains `fp8`/`fp4` | independent | shares KV pool | per-draft |
 | **Sparse-MLA (7–9)** | consumes top-k | — | independent | reads latent | independent | CP-broadcast | per-draft |
 | **NVFP4-fusion (13–15)** | independent | independent | — | BDR-fold path | MoE path | independent | per-draft |
-| **KVarN (10–11)** | shares cache | reads latent | BDR-fold path | — | independent | LayerSplit pool | per-draft |
+| **KVarN (10–11)** | dense MLA latent only; not Indexer K | reads latent | BDR-fold path | — | independent | LayerSplit dense KV pool | per-draft |
 | **WarpDecode (12)** | independent | independent | MoE path | independent | — | orthogonal (MoE vs KV) | per-draft |
 | **LayerSplit (17)** | shares KV pool | CP-broadcast | independent | shares pool | orthogonal | — | per-draft |
 | **SMC-SD (16)** | per-draft | per-draft | per-draft | per-draft | per-draft | per-draft | — |

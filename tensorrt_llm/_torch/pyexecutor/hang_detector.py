@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 from contextlib import contextmanager
 from typing import Callable, Optional
@@ -6,12 +7,31 @@ from typing import Callable, Optional
 from tensorrt_llm._utils import print_all_stacks
 from tensorrt_llm.logger import logger
 
+PYEXECUTOR_HANG_DETECTION_TIMEOUT_ENV = "TRTLLM_PYEXECUTOR_HANG_DETECTION_TIMEOUT"
+_DEFAULT_TIMEOUT = 300
+
+
+def _resolve_timeout(timeout: Optional[int]) -> int:
+    if timeout is not None:
+        return timeout
+
+    env_timeout = os.getenv(PYEXECUTOR_HANG_DETECTION_TIMEOUT_ENV)
+    if env_timeout is None:
+        return _DEFAULT_TIMEOUT
+
+    try:
+        return int(env_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            f"{PYEXECUTOR_HANG_DETECTION_TIMEOUT_ENV} must be an integer number of seconds"
+        ) from exc
+
 
 class HangDetector:
     def __init__(
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
-        self.timeout = timeout if timeout is not None else 300
+        self.timeout = _resolve_timeout(timeout)
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.task = None
