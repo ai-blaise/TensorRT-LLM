@@ -2,7 +2,7 @@
 # Disagg P/D r20 -- cell1 DP2/TP4-disagg winner, custom pieces toggled ON.
 #
 # Topology (exact): single 8xB200 node.
-#   * 1 PREFILL worker -- TP2xCP2 / EP2, enable_attention_dp=false, 4 GPUs,
+#   * 1 PREFILL worker -- TP2xCP2 HELIX / EP4, enable_attention_dp=false, 4 GPUs,
 #       LayerSplit ON   (prefill.yaml: sparse_attention_config.layersplit_enabled=true)
 #   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=false, GPUs 4-7,
 #       WarpDecode ON   (decode.yaml: moe_config.warp_decode.enabled=true, tile_mode=decode_1cta
@@ -39,8 +39,10 @@ data:
   prefill.yaml: |
     backend: pytorch
     tensor_parallel_size: 2
-    moe_expert_parallel_size: 2
+    moe_expert_parallel_size: 4
     context_parallel_size: 2
+    cp_config:
+      cp_type: HELIX
     enable_attention_dp: false
     trust_remote_code: true
     enable_chunked_prefill: true
@@ -292,7 +294,7 @@ spec:
           - --tensor-parallel-size
           - '2'
           - --expert-parallel-size
-          - '2'
+          - '4'
           - --gpus-per-node
           - '4'
           - --max-batch-size
