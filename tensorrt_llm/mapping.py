@@ -98,7 +98,7 @@ class MappingBase:
                 attn_tp_size = tp_size * cp_size
                 attn_cp_size = 1
             else:
-                # fallback to helix
+                # Default block-token CP layout for HELIX and LayerSplit.
                 attn_tp_size = tp_size
                 attn_cp_size = cp_size
 
@@ -562,6 +562,7 @@ class Mapping(MappingBase):
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
 
     def repurpose_helix_cp_to_tp(self):
+        # Backward-compatible alias for callers that predate has_cp_block_token.
         return self.repurpose_cp_to_tp()
 
     # DeviceMesh specific methods

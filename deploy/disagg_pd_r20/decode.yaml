@@ -11,7 +11,7 @@
 #   moe_config.backend: WARPDECODE          -> selects output-owned NVFP4 decode path
 #   moe_config.warp_decode.enabled: true    -> arm the decode fast path
 #   moe_config.warp_decode.tile_mode: decode_1cta  -> pin 1-CTA (tile_size=128) decode-optimal, skip profiling
-#   policy: auto (default) + allow_parallelism_fallback: true (default) -> safe under TP/EP/disagg
+#   policy: force + allow_parallelism_fallback: false -> fail closed if WarpDecode cannot run
 #   companion env (set in the manifest pod env): TRTLLM_WARP_DECODE_FIXED_TACTIC=1 (fixed-tactic overlay,
 #     default-on; pins the retuned NVFP4 tactic in-graph) + TRTLLM_ENABLE_PDL=1.
 #
@@ -54,8 +54,8 @@ moe_config:
   warp_decode:
     enabled: true                  # WarpDecode ON (decode fast path armed)
     tile_mode: decode_1cta         # pin 1-CTA decode-optimal tile, skip profiling
-    policy: auto                   # guards still gate; falls back to native MoE if a guard fails
-    allow_parallelism_fallback: true
+    policy: force                  # fail closed if WarpDecode guards reject this setup
+    allow_parallelism_fallback: false
     max_batch_size: 64
 nvfp4_gemm_config:
   allowed_backends: [cutlass, cublaslt, cuda_core]

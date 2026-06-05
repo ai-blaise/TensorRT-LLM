@@ -941,12 +941,12 @@ class CpConfig(StrictBaseModel):
     use_nccl_for_alltoall: Optional[bool] = Field(
         default=None,
         description=
-        "Whether to use NCCL for alltoall communication. Used in HELIX parallelism. Defaults to True."
+        "Whether to use NCCL for alltoall communication. Used in block-token CP parallelism. Defaults to True."
     )
     fifo_version: Optional[int] = Field(
         default=None,
         description=
-        "FIFO version for alltoall communication. Used in HELIX parallelism. Defaults to 2."
+        "FIFO version for alltoall communication. Used in block-token CP parallelism. Defaults to 2."
     )
     cp_anchor_size: Optional[int] = Field(
         default=None, description="Anchor size for STAR attention.")

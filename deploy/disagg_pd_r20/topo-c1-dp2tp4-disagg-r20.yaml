@@ -138,8 +138,8 @@ data:
       warp_decode:
         enabled: true
         tile_mode: decode_1cta
-        policy: auto
-        allow_parallelism_fallback: true
+        policy: force
+        allow_parallelism_fallback: false
         max_batch_size: 64
     nvfp4_gemm_config:
       allowed_backends: [cutlass, cublaslt, cuda_core]
