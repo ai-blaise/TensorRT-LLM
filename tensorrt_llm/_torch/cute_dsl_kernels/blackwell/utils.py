@@ -199,6 +199,34 @@ def is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
 
 
+def _nvvm_fmin_wants_result_type() -> bool:
+    """Whether nvvm.fmin's first positional parameter is the result type.
+
+    cutlass-dsl changed the generated nvvm.fmin binding signature across
+    versions: newer builds expect ``fmin(result_type, a, b, *, nan=...)`` while
+    older builds (e.g. the one shipped in the current op-trt serve image) expect
+    ``fmin(a, b, *, c=None, nan=...)`` -- two positional operands, no leading
+    result type. Detect it from the binding's own signature so the same source
+    runs against both; cached because the binding never changes within a process.
+    """
+    cached = getattr(_nvvm_fmin_wants_result_type, "_cached", None)
+    if cached is not None:
+        return cached
+    wants_type = False
+    try:
+        import inspect
+        params = list(inspect.signature(nvvm.fmin).parameters.values())
+        positional = [p for p in params
+                      if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                    inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        # Newer API: (result_type, a, b) -> 3 positional. Older API: (a, b) -> 2.
+        wants_type = len(positional) >= 3
+    except (ValueError, TypeError):
+        wants_type = False
+    _nvvm_fmin_wants_result_type._cached = wants_type
+    return wants_type
+
+
 @dsl_user_op
 def fmin(a: Union[float, cutlass.Float32],
          b: Union[float, cutlass.Float32],
@@ -208,15 +236,11 @@ def fmin(a: Union[float, cutlass.Float32],
          ip=None) -> cutlass.Float32:
     a_ir = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
     b_ir = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
-    return cutlass.Float32(
-        nvvm.fmin(
-            a_ir.type,
-            a_ir,
-            b_ir,
-            nan=nan,
-            loc=loc,
-            ip=ip,
-        ))
+    if _nvvm_fmin_wants_result_type():
+        result = nvvm.fmin(a_ir.type, a_ir, b_ir, nan=nan, loc=loc, ip=ip)
+    else:
+        result = nvvm.fmin(a_ir, b_ir, nan=nan, loc=loc, ip=ip)
+    return cutlass.Float32(result)
 
 
 def sigmoid_f32(a: Union[float, cutlass.Float32],
