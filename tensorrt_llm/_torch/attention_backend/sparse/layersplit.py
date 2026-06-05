@@ -596,7 +596,7 @@ class LayerSplitRuntimeState:
 
         policy = str(
             getattr(sparse_attn_config, "layersplit_owner_assignment",
-                    "round_robin"))
+                    "contiguous"))
         transfer_backend = str(
             getattr(sparse_attn_config, "layersplit_transfer_backend", "auto"))
         all_cp_ranks_transfer = bool(
@@ -853,7 +853,7 @@ def build_layersplit_layer_mask(
         return None
     policy = str(
         getattr(sparse_attn_config, "layersplit_owner_assignment",
-                "round_robin"))
+                "contiguous"))
     # M5d-tight-v2: return the *balanced* mask so every CP rank's
     # sum(layer_mask) is identical and the C++ KVCacheManager allocates
     # the same num_blocks on every rank — required for the global

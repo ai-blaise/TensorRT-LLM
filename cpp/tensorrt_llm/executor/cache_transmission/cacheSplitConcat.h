@@ -46,10 +46,27 @@ struct TargetRanksInfo
     // Used for both KV and RNN cache transfer
     std::vector<int> mPeerLayerNumInDomainPP;
 
+    // LayerSplit with CP-owned contiguous layer ranges makes CP ranks inside
+    // the same PP rank carry different layer slices. These vectors are ordered
+    // like mIRanks and describe the peer rank's global layer slice intersected
+    // with this rank's requested layer span.
+    bool mPeerLayerShardedByCP{false};
+    std::vector<int> mPeerLayerStartInDomainRanks;
+    std::vector<int> mPeerLayerNumInDomainRanks;
+
     int getPeerPPDomainLayerNum(int targetRankIdx) const
     {
         int ppDomainRankIdx = targetRankIdx % mDomainPPSize;
         return mPeerLayerNumInDomainPP.at(ppDomainRankIdx);
+    }
+
+    int getPeerDomainRankLayerNum(int targetRankIdx) const
+    {
+        if (mPeerLayerNumInDomainRanks.empty())
+        {
+            return getPeerPPDomainLayerNum(targetRankIdx);
+        }
+        return mPeerLayerNumInDomainRanks.at(targetRankIdx);
     }
 };
 
