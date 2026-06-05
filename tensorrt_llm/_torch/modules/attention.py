@@ -2689,9 +2689,20 @@ class MLA(nn.Module):
             # Use generation_only for generation phase and context_only for context phase in DSA attention
             attention_input_type = AttentionInputType.generation_only
 
+            # fused_q is [num_tokens, num_heads_tp, kv_lora_rank + qk_rope_head_dim]
+            # (the bmm + rope output). The trtllm MLA generation op expects a 2-D
+            # [num_tokens, num_heads_tp * (kv_lora_rank + qk_rope_head_dim)] q
+            # (it asserts q.shape[1] == qkv_hidden_size). The NVFP4 FlashMLA path
+            # above consumes the 3-D form directly, but this trtllm path needs the
+            # head dim flattened -- otherwise q.shape[1] is num_heads_tp and the
+            # assert trips. This also makes the SMC spec-decode s_q>1 case work,
+            # since the flatten is over the trailing head dims only.
+            fused_q_2d = fused_q.reshape(fused_q.shape[0], -1) \
+                if fused_q.dim() == 3 else fused_q
+
             attn_out_latent = self._attn_forward_gen(
                 self.mqa,
-                fused_q,
+                fused_q_2d,
                 None,
                 None,
                 position_ids,
