@@ -30,12 +30,12 @@ container `r20-unified-build`, `FROM
 local/dynamo-trtllm-optrt-custom:canonical-r17-wins-20260605`) sets the final tag.
 
 **Expected tag (confirm with the build agent before apply):**
-`local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-20260605`
+`local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-warpfix-20260605`
 
 ## Deploy (orchestrator only -- gated)
 
 ```bash
-export UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-20260605   # from build agent
+export UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-warpfix-20260605   # from build agent
 envsubst '$UNIFIED_IMAGE' < topo-c1-dp2tp4-disagg-r20.yaml | \
   KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
 ```
