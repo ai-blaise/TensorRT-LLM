@@ -618,7 +618,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         clients = getattr(self, "rpc_clients", None)
         if not clients:
             raise RuntimeError(
-                "RPC clients are not initialised — collective_rpc() cannot be "
+                "RPC client is not initialised — collective_rpc() cannot be "
                 "called before the executor workers have started.")
         if target_ranks is None and unique_reply_rank is not None:
             target_ranks = unique_reply_rank
