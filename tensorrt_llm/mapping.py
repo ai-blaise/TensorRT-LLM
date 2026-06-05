@@ -29,7 +29,7 @@ class CpType(StrEnum):
     STAR = "STAR"
     # CP type for ring attention
     RING = "RING"
-    # CP type for helix parallelism
+    # Legacy block-token CP type.
     HELIX = "HELIX"
     # CP type for LayerSplit DSA KV/indexer-K ownership.
     LAYERSPLIT = "LAYERSPLIT"

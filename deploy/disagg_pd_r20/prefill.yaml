@@ -11,7 +11,7 @@
 # context-parallel (CP) ranks. This prefill worker runs on four GPUs as
 # tensor_parallel_size=2 and context_parallel_size=2, so the CP split is real.
 # There is no Dynamo CLI flag for context_parallel_size; CP is set in this engine YAML.
-# Decode remains TP4/CP1 and consumes the reassembled KV via the cpfix image.
+# Decode remains TP4/CP1 and consumes the reassembled KV via the LayerSplit handoff path.
 # =============================================================================
 backend: pytorch
 tensor_parallel_size: 2
