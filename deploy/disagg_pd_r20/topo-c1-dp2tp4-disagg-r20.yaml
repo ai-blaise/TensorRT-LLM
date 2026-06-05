@@ -1,0 +1,491 @@
+# =============================================================================
+# Disagg P/D r20 -- cell1 DP2/TP4-disagg winner, custom pieces toggled ON.
+#
+# Topology (exact): single 8xB200 node.
+#   * 1 PREFILL worker -- TP2xCP2 / EP4, enable_attention_dp=false, GPUs 0-3,
+#       LayerSplit ON   (prefill.yaml: sparse_attention_config.layersplit_enabled=true)
+#   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=false, GPUs 4-7,
+#       WarpDecode ON   (decode.yaml: moe_config.warp_decode.enabled=true, tile_mode=decode_1cta
+#                        + env TRTLLM_WARP_DECODE_FIXED_TACTIC=1)
+#       SMC-SD ON       (decode.yaml: speculative_config.decoding_type=SMC, GLM-4-9B-FP8 draft
+#                        + env NCCL_NET_PLUGIN=none)
+#   * 1 Frontend (KV router) -- dynamo.frontend, http :8000
+#
+# Target node: a4-us-002-rl9 (k3s) -- the more-validated disagg P/D path. The 001
+# docker path (deploy/smcsd_fiport/r12_001/smc_launch_001.sh) is AGGREGATED (single
+# trtllm-serve, no P/D split); the disaggregated prefill/decode artifact is this
+# DynamoGraphDeployment CRD (nvidia.com/v1alpha1) which is k3s-native and is the
+# pattern the validated topo-c1-dp2tp4-disagg-smc deploy already used on 002.
+#
+# Image: BOTH workers + frontend run the UNIFIED wins+SMC image. Parameterized as
+# ${UNIFIED_IMAGE}; the build agent (branch op-trt-canonical-smc-r20, build container
+# r20-unified-build, FROM local/dynamo-trtllm-optrt-custom:canonical-r17-wins-20260605)
+# sets the final tag. Expected tag (record only -- confirm with build agent before apply):
+#   local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-20260605
+# Substitute at deploy time, e.g.:
+#   UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-20260605 \
+#     envsubst < topo-c1-dp2tp4-disagg-r20.yaml | \
+#     KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
+#
+# DO NOT apply here -- the orchestrator owns the gated deploy.
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: topo-c1-dp2tp4-disagg-r20-config
+  namespace: dynamo-system
+data:
+  prefill.yaml: |
+    backend: pytorch
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 4
+    context_parallel_size: 2
+    enable_attention_dp: false
+    trust_remote_code: true
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    allreduce_strategy: AUTO
+    use_cute_dsl_blockscaling_bmm: true
+    use_cute_dsl_bf16_bmm: true
+    max_batch_size: 32
+    max_input_len: 131072
+    max_seq_len: 132096
+    max_num_tokens: 8192
+    print_iter_log: false
+    stream_interval: 50
+    num_postprocess_workers: 8
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.7
+      tokens_per_block: 64
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 131072
+    moe_config:
+      backend: WARPDECODE
+      use_low_precision_moe_combine: true
+      warp_decode:
+        enabled: false
+        tile_mode: autotune
+    nvfp4_gemm_config:
+      allowed_backends: [cutlass, cublaslt, cuda_core]
+    sparse_attention_config:
+      algorithm: dsa
+      indexer_mode: indexcache-hisa
+      index_n_heads: 64
+      index_head_dim: 128
+      index_topk: 1024
+      index_topk_pattern: FSSS
+      index_topk_freq: 4
+      indexer_k_dtype: fp4
+      enable_nvfp4_hisa: true
+      hisa_block_size: 128
+      hisa_block_topk: 64
+      hisa_compression_ratio: 4.0
+      hisa_min_seq_len: 65536
+      hisa_execution_mode: optimized
+      use_cute_dsl_topk: true
+      use_cute_dsl_paged_mqa_logits: true
+      layersplit_enabled: true
+      layersplit_owner_assignment: contiguous
+      layersplit_transfer_backend: auto
+      layersplit_all_cp_ranks_transfer: true
+      layersplit_owner_local_alloc: false
+  decode.yaml: |
+    backend: pytorch
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    context_parallel_size: 1
+    enable_attention_dp: false
+    trust_remote_code: true
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: false
+    allreduce_strategy: AUTO
+    use_cute_dsl_blockscaling_bmm: true
+    use_cute_dsl_bf16_bmm: true
+    max_batch_size: 64
+    max_input_len: 131072
+    max_seq_len: 132096
+    max_num_tokens: 2048
+    print_iter_log: false
+    stream_interval: 50
+    num_postprocess_workers: 8
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.45
+      tokens_per_block: 64
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 131072
+    moe_config:
+      backend: WARPDECODE
+      use_low_precision_moe_combine: true
+      warp_decode:
+        enabled: true
+        tile_mode: decode_1cta
+        policy: auto
+        allow_parallelism_fallback: true
+        max_batch_size: 64
+    nvfp4_gemm_config:
+      allowed_backends: [cutlass, cublaslt, cuda_core]
+    sparse_attention_config:
+      algorithm: dsa
+      indexer_mode: indexcache-hisa
+      index_n_heads: 64
+      index_head_dim: 128
+      index_topk: 1024
+      index_topk_pattern: FSSS
+      index_topk_freq: 4
+      indexer_k_dtype: fp4
+      enable_nvfp4_hisa: true
+      hisa_block_size: 128
+      hisa_block_topk: 64
+      hisa_compression_ratio: 4.0
+      hisa_min_seq_len: 65536
+      hisa_execution_mode: optimized
+      use_cute_dsl_topk: true
+      use_cute_dsl_paged_mqa_logits: true
+      layersplit_enabled: false
+    speculative_config:
+      decoding_type: SMC
+      speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
+      gamma: 6
+      n_particles: 4
+      resample_threshold: 0.5
+      draft_temperature: 0.7
+      target_temperature: 1.0
+      draft_attention_backend: triton
+      draft_kv_cache_dtype: bfloat16
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: topo-c1-dp2tp4-disagg-r20
+  namespace: dynamo-system
+  labels:
+    ai-blaise.io/inference-engine: tensorrt-llm-op-trt
+    ai-blaise.io/topology: c1-dp2tp4-disagg-r20
+    app.kubernetes.io/part-of: dynamo-production
+spec:
+  backendFramework: trtllm
+  services:
+    Frontend:
+      componentType: frontend
+      envFromSecret: hf-token-secret
+      replicas: 1
+      envs:
+      - name: DYN_LOG
+        value: info
+      - name: DYN_TOKENIZER
+        value: fastokens
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: a4-us-002-rl9
+        tolerations:
+        - operator: Exists
+        mainContainer:
+          image: ${UNIFIED_IMAGE}
+          imagePullPolicy: Never
+          command:
+          - python3
+          - -m
+          - dynamo.frontend
+          args:
+          - --http-port
+          - '8000'
+          - --router-mode
+          - kv
+          volumeMounts:
+          - mountPath: /models
+            name: models
+            readOnly: true
+        volumes:
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
+    prefill:
+      componentType: worker
+      envFromSecret: hf-token-secret
+      replicas: 1
+      resources:
+        requests:
+          cpu: '48'
+          memory: 384Gi
+          gpu: '4'
+        limits:
+          gpu: '4'
+      envs:
+      - name: CUDA_VISIBLE_DEVICES
+        value: 0,1,2,3
+      - name: OMPI_MCA_pml
+        value: ob1
+      - name: OMPI_MCA_btl
+        value: self,tcp,vader
+      - name: UCX_TLS
+        value: tcp,self,sm,cuda_copy,cuda_ipc
+      - name: NCCL_IB_DISABLE
+        value: '1'
+      - name: NCCL_MNNVL_ENABLE
+        value: '1'
+      - name: NCCL_CUMEM_ENABLE
+        value: '1'
+      - name: NCCL_NVLS_ENABLE
+        value: '1'
+      - name: NCCL_GRAPH_MIXING_SUPPORT
+        value: '0'
+      - name: NCCL_NET_PLUGIN
+        value: none
+      - name: NVIDIA_GDRCOPY
+        value: '1'
+      - name: UCX_CUDA_IPC_ENABLE_MNNVL
+        value: '1'
+      - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+        value: '1'
+      - name: TRTLLM_ENABLE_PDL
+        value: '1'
+      - name: TRTLLM_SERVER_DISABLE_GC
+        value: '1'
+      - name: TRTLLM_WORKER_DISABLE_GC
+        value: '1'
+      - name: TRTLLM_FORCE_COMM_METHOD
+        value: NVLINK_TWO_SIDED
+      - name: ENABLE_CONFIGURABLE_MOE
+        value: '1'
+      - name: TLLM_LOG_LEVEL
+        value: WARNING
+      - name: HF_HOME
+        value: /models
+      - name: HF_HUB_OFFLINE
+        value: '1'
+      - name: HF_MODULES_CACHE
+        value: /tmp/hf_modules
+      - name: PYTHONUNBUFFERED
+        value: '1'
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: a4-us-002-rl9
+        tolerations:
+        - operator: Exists
+        mainContainer:
+          image: ${UNIFIED_IMAGE}
+          imagePullPolicy: Never
+          workingDir: /workspace
+          command:
+          - python3
+          - -m
+          - dynamo.trtllm
+          args:
+          - --model-path
+          - /models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft
+          - --served-model-name
+          - BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft
+          - --disaggregation-mode
+          - prefill
+          - --tensor-parallel-size
+          - '2'
+          - --expert-parallel-size
+          - '4'
+          - --gpus-per-node
+          - '4'
+          - --max-batch-size
+          - '32'
+          - --max-num-tokens
+          - '8192'
+          - --max-seq-len
+          - '132096'
+          - --free-gpu-memory-fraction
+          - '0.7'
+          - --kv-block-size
+          - '64'
+          - --connector
+          - none
+          - --extra-engine-args
+          - /workspace/optrt-config/prefill.yaml
+          - --publish-events-and-metrics
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 720
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 720
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 720
+          volumeMounts:
+          - mountPath: /workspace/optrt-config
+            name: nvidia-config
+            readOnly: true
+          - mountPath: /models
+            name: models
+            readOnly: true
+        volumes:
+        - name: nvidia-config
+          configMap:
+            name: topo-c1-dp2tp4-disagg-r20-config
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
+    decode:
+      componentType: worker
+      envFromSecret: hf-token-secret
+      replicas: 1
+      resources:
+        requests:
+          cpu: '48'
+          memory: 384Gi
+          gpu: '4'
+        limits:
+          gpu: '4'
+      envs:
+      - name: CUDA_VISIBLE_DEVICES
+        value: 4,5,6,7
+      - name: OMPI_MCA_pml
+        value: ob1
+      - name: OMPI_MCA_btl
+        value: self,tcp,vader
+      - name: UCX_TLS
+        value: tcp,self,sm,cuda_copy,cuda_ipc
+      - name: NCCL_IB_DISABLE
+        value: '1'
+      - name: NCCL_MNNVL_ENABLE
+        value: '1'
+      - name: NCCL_CUMEM_ENABLE
+        value: '1'
+      - name: NCCL_NVLS_ENABLE
+        value: '1'
+      - name: NCCL_GRAPH_MIXING_SUPPORT
+        value: '0'
+      # SMC-SD requires NCCL_NET_PLUGIN=none (avoids libnccl double-free on the SMC path)
+      - name: NCCL_NET_PLUGIN
+        value: none
+      - name: NVIDIA_GDRCOPY
+        value: '1'
+      - name: UCX_CUDA_IPC_ENABLE_MNNVL
+        value: '1'
+      - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+        value: '1'
+      - name: TRTLLM_ENABLE_PDL
+        value: '1'
+      # WarpDecode fixed-tactic overlay, default-on (pins retuned NVFP4 tactic in-graph)
+      - name: TRTLLM_WARP_DECODE_FIXED_TACTIC
+        value: '1'
+      - name: SMC_REJECTION_ACCEPT
+        value: '1'
+      - name: TRTLLM_SERVER_DISABLE_GC
+        value: '1'
+      - name: TRTLLM_WORKER_DISABLE_GC
+        value: '1'
+      - name: TRTLLM_FORCE_COMM_METHOD
+        value: NVLINK_TWO_SIDED
+      - name: ENABLE_CONFIGURABLE_MOE
+        value: '1'
+      - name: TLLM_LOG_LEVEL
+        value: WARNING
+      - name: HF_HOME
+        value: /models
+      - name: HF_HUB_OFFLINE
+        value: '1'
+      - name: HF_MODULES_CACHE
+        value: /tmp/hf_modules
+      - name: PYTHONUNBUFFERED
+        value: '1'
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: a4-us-002-rl9
+        tolerations:
+        - operator: Exists
+        mainContainer:
+          image: ${UNIFIED_IMAGE}
+          imagePullPolicy: Never
+          workingDir: /workspace
+          command:
+          - python3
+          - -m
+          - dynamo.trtllm
+          args:
+          - --model-path
+          - /models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft
+          - --served-model-name
+          - BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft
+          - --disaggregation-mode
+          - decode
+          - --tensor-parallel-size
+          - '4'
+          - --expert-parallel-size
+          - '4'
+          - --gpus-per-node
+          - '4'
+          - --max-batch-size
+          - '64'
+          - --max-num-tokens
+          - '8192'
+          - --max-seq-len
+          - '132096'
+          - --free-gpu-memory-fraction
+          - '0.8'
+          - --kv-block-size
+          - '64'
+          - --connector
+          - none
+          - --extra-engine-args
+          - /workspace/optrt-config/decode.yaml
+          - --publish-events-and-metrics
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 720
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 720
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 720
+          volumeMounts:
+          - mountPath: /workspace/optrt-config
+            name: nvidia-config
+            readOnly: true
+          - mountPath: /models
+            name: models
+            readOnly: true
+        volumes:
+        - name: nvidia-config
+          configMap:
+            name: topo-c1-dp2tp4-disagg-r20-config
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
