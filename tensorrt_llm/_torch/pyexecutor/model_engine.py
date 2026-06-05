@@ -849,8 +849,15 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
-        with self.cuda_graph_runner.allow_capture():
-            self._run_cuda_graph_warmup(resource_manager)
+        # HELIX CP currently has decode/generation warmup shapes that do not
+        # match the regular TRT-LLM attention backend's capture assumptions.
+        if self.mapping.has_cp_helix():
+            logger.info(
+                "[ModelEngine::warmup] Skipping CUDA graph warmup for HELIX CP."
+            )
+        else:
+            with self.cuda_graph_runner.allow_capture():
+                self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
