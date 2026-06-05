@@ -449,6 +449,63 @@ class TestVerifyCtxResponseDiagnostics:
         assert result is resp
 
 
+class TestDisaggRequestPinning:
+
+    def test_ctx_response_pinning_metadata_is_authoritative(self):
+        svc = _make_service("context_first")
+        request = CompletionRequest(model="test-model", prompt="hello")
+        ctx_response = _make_completion_response(
+            "",
+            finish_reason="length",
+            disagg_request_id=123,
+            prompt_token_ids=[10, 11, 12],
+        )
+        dp = ctx_response.choices[0].disaggregated_params
+        dp.ctx_dp_rank = 3
+        dp.ctx_info_endpoint = "tcp://actual-context:5555"
+
+        gen_request = svc._get_gen_request(
+            request,
+            ctx_response,
+            disagg_request_id=123,
+            ctx_server_info={
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_dp_rank": None,
+                        "ctx_info_endpoint": ["tcp://server-info:5555"],
+                    }
+                }
+            },
+        )
+
+        assert gen_request.prompt == [10, 11, 12]
+        assert gen_request.disaggregated_params.request_type == "generation_only"
+        assert gen_request.disaggregated_params.ctx_dp_rank == 3
+        assert gen_request.disaggregated_params.ctx_info_endpoint == "tcp://actual-context:5555"
+
+    def test_ctx_server_info_backfills_missing_pinning_metadata(self):
+        svc = _make_service("context_first")
+        request = CompletionRequest(model="test-model", prompt="hello")
+        ctx_response = _make_completion_response("", finish_reason="length")
+
+        gen_request = svc._get_gen_request(
+            request,
+            ctx_response,
+            disagg_request_id=42,
+            ctx_server_info={
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_dp_rank": 2,
+                        "ctx_info_endpoint": ["tcp://server-info:5555"],
+                    }
+                }
+            },
+        )
+
+        assert gen_request.disaggregated_params.ctx_dp_rank == 2
+        assert gen_request.disaggregated_params.ctx_info_endpoint == "tcp://server-info:5555"
+
+
 class TestFirstGenLogProbsSerializeRoundtrip:
     """Roundtrip tests for _serialize/_deserialize_first_gen_log_probs."""
 

@@ -238,14 +238,23 @@ class OpenAIDisaggregatedService(OpenAIService):
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
             if disaggregated_params:
-                # ctx_info_endpoint from get_disaggregated_params() is a list;
-                # the Pydantic model expects a single str.
+                # Server-level params are static pinning hints.  The actual
+                # context response is authoritative because it contains the
+                # scheduled ctx_dp_rank and request-local transfer metadata.
+                # Only backfill fields the context response did not stamp.
+                backfill = {}
                 ep = disaggregated_params.get("ctx_info_endpoint")
                 if isinstance(ep, list) and ep:
-                    disaggregated_params = {**disaggregated_params, "ctx_info_endpoint": ep[0]}
-                request.disaggregated_params = request.disaggregated_params.model_copy(
-                    update=disaggregated_params
-                )
+                    ep = ep[0]
+                for key, value in disaggregated_params.items():
+                    if key == "ctx_info_endpoint":
+                        value = ep
+                    if value is not None and getattr(request.disaggregated_params, key, None) is None:
+                        backfill[key] = value
+                if backfill:
+                    request.disaggregated_params = request.disaggregated_params.model_copy(
+                        update=backfill
+                    )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
