@@ -1,6 +1,6 @@
 # =============================================================================
 # Disagg P/D r20 -- PREFILL worker engine config (cell1 DP2/TP4-disagg winner)
-# 1 prefill worker, TP2xCP2 / EP4, enable_attention_dp=false, GPUs 0-3.
+# 1 prefill worker, TP2xCP2 / EP2, enable_attention_dp=false, 4 GPUs.
 # Custom piece ON for prefill: LayerSplit (DSA KV / indexer-K owner-local store).
 # Derived from the validated topo-c1-dp2tp4-disagg-smc ConfigMap prefill.yaml
 # (deploy/smcsd_fiport/smc_configmap.yaml), + LayerSplit enable knobs from the
@@ -15,7 +15,7 @@
 # =============================================================================
 backend: pytorch
 tensor_parallel_size: 2
-moe_expert_parallel_size: 4
+moe_expert_parallel_size: 2
 context_parallel_size: 2
 enable_attention_dp: false
 trust_remote_code: true

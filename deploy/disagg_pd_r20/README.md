@@ -7,8 +7,8 @@ with the custom pieces toggled ON.
 
 | Worker   | GPUs  | Parallelism            | Custom piece ON                              |
 |----------|-------|------------------------|----------------------------------------------|
-| prefill  | 0-3   | TP2xCP2 / EP4, ADP=false   | **LayerSplit** (`layersplit_enabled: true`)  |
-| decode   | 4-7   | TP4 / EP4, ADP=false   | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **SMC-SD** (`speculative_config.decoding_type: SMC`) |
+| prefill  | 4 GPUs | TP2xCP2 / EP2, ADP=false | **LayerSplit** (`layersplit_enabled: true`) |
+| decode   | 4 GPUs | TP4 / EP4, ADP=false | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **SMC-SD** (`speculative_config.decoding_type: SMC`) |
 | Frontend | -     | KV router (`--router-mode kv`) | -                                  |
 
 This is 1P x 4GPU + 1D x 4GPU disaggregated serving with real LayerSplit on

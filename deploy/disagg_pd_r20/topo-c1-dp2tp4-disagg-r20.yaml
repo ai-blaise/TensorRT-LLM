@@ -2,7 +2,7 @@
 # Disagg P/D r20 -- cell1 DP2/TP4-disagg winner, custom pieces toggled ON.
 #
 # Topology (exact): single 8xB200 node.
-#   * 1 PREFILL worker -- TP2xCP2 / EP4, enable_attention_dp=false, GPUs 0-3,
+#   * 1 PREFILL worker -- TP2xCP2 / EP2, enable_attention_dp=false, 4 GPUs,
 #       LayerSplit ON   (prefill.yaml: sparse_attention_config.layersplit_enabled=true)
 #   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=false, GPUs 4-7,
 #       WarpDecode ON   (decode.yaml: moe_config.warp_decode.enabled=true, tile_mode=decode_1cta
@@ -39,7 +39,7 @@ data:
   prefill.yaml: |
     backend: pytorch
     tensor_parallel_size: 2
-    moe_expert_parallel_size: 4
+    moe_expert_parallel_size: 2
     context_parallel_size: 2
     enable_attention_dp: false
     trust_remote_code: true
@@ -225,8 +225,6 @@ spec:
         limits:
           gpu: '4'
       envs:
-      - name: CUDA_VISIBLE_DEVICES
-        value: 0,1,2,3
       - name: OMPI_MCA_pml
         value: ob1
       - name: OMPI_MCA_btl
@@ -294,7 +292,7 @@ spec:
           - --tensor-parallel-size
           - '2'
           - --expert-parallel-size
-          - '4'
+          - '2'
           - --gpus-per-node
           - '4'
           - --max-batch-size
@@ -360,8 +358,6 @@ spec:
         limits:
           gpu: '4'
       envs:
-      - name: CUDA_VISIBLE_DEVICES
-        value: 4,5,6,7
       - name: OMPI_MCA_pml
         value: ob1
       - name: OMPI_MCA_btl
