@@ -38,12 +38,13 @@ _KV_CACHE_MAP = {
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 _BLAISE_DEFAULT_GQA_KVARN_DTYPE = "kvarn_k2v2_g128"
-_KVARN_GQA_REFERENCE_ENV = "TRTLLM_ENABLE_KVARN_GQA_REFERENCE"
+_KVARN_GQA_FUSED_OPS = ("kvarn_gqa_store", "kvarn_gqa_decode")
 
 
-def _allow_kvarn_gqa_reference_backend() -> bool:
-    return os.environ.get(_KVARN_GQA_REFERENCE_ENV, "").lower() in (
-        "1", "true", "yes", "on")
+def _has_kvarn_gqa_fused_backend() -> bool:
+    trtllm_ops = getattr(torch.ops, "trtllm", None)
+    return trtllm_ops is not None and all(
+        hasattr(trtllm_ops, op_name) for op_name in _KVARN_GQA_FUSED_OPS)
 
 
 def _as_dict(value):
@@ -181,16 +182,17 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    if is_kvarn_gqa and not _allow_kvarn_gqa_reference_backend():
+    if is_kvarn_gqa and not _has_kvarn_gqa_fused_backend():
         raise NotImplementedError(
             "Generic/GQA KVarN KV cache was requested with "
-            f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}. The GQA backend "
-            "present in this series is a reference implementation only and is "
-            "not production-promoted because the fused B200 store/decode kernel, "
-            "packed-record disaggregated transfer with fp16 sink/tail side-state, "
-            "sparse-indexed packed reads, and CUDA graph request lifecycle are "
-            f"still missing. Set {_KVARN_GQA_REFERENCE_ENV}=1 only for isolated "
-            "correctness experiments; dense MLA KVarN remains controlled by "
+            f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}. The production fused "
+            f"GQA KVarN ops {_KVARN_GQA_FUSED_OPS!r} are not registered, so "
+            "startup fails closed instead of promoting the reference Python "
+            "store/restore path or falling back to fp16/fp8/nvfp4 KV. Missing "
+            "production pieces are fused B200 store/decode kernels, packed-record "
+            "disaggregated transfer with fp16 sink/tail side-state, sparse-indexed "
+            "packed reads, CUDA graph request lifecycle, and correctness/perf "
+            "proof. Dense MLA KVarN remains controlled by "
             "sparse_attention_config.mla_latent_kv_dtype.")
 
     # If we get to this point we have a valid explicit quantization setting.

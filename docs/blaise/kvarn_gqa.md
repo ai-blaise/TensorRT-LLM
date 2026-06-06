@@ -41,8 +41,9 @@ This handoff is intentionally split into two merge lanes:
   KVarN pages or route model execution through the reference backend.
 - **B: reference backend** is not production-promoted. It adds byte-backed page
   allocation, Python-level store/restore, fp16 sink/tail side state, and SDPA
-  scoring for isolated correctness experiments only. Startup still fails closed
-  unless `TRTLLM_ENABLE_KVARN_GQA_REFERENCE=1` is set. Do not enable this in the
+  scoring for isolated code review only. Startup still fails closed unless both
+  `torch.ops.trtllm.kvarn_gqa_store` and
+  `torch.ops.trtllm.kvarn_gqa_decode` are registered. Do not enable this in the
   op-trt deployment until the fused B200 store/decode kernel, packed-record
   disaggregated transfer with fp16 sink/tail side-state, sparse-indexed packed
   reads, CUDA graph request lifecycle, and E2E perf proof are complete.
@@ -57,11 +58,11 @@ Indexer/HISA sparse K path.
 |---|---|---|
 | Packed 2-bit record format | **Implemented as primitives** | `kvarn_k2v2_g128` maps one 128-token block/head to a 9,728-byte record, hosted as 76 byte slots per token. Layout, bit pack/unpack, Hadamard/variance-normalized store, dequant restore, and transfer-view shapes are tested. |
 | Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
-| HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the reference env opt-in is set or a future production backend removes the gate. |
+| HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the fused store/decode ops are registered and the production backend removes the gate. |
 | Disaggregated transfer compatibility | **Not production-ready** | Packed pages plus fp16 sink/tail side state need a connector payload contract. Current connector mode rejects rather than reinterpreting packed records as dense K/V. |
 | CUDA graph lifecycle | **Not production-ready** | Side tensors are preallocated, but request-slot assignment, slot recycling, and reference restore/scoring still use Python/host control. |
 | Sparse packed reads | **Missing** | HISA/Indexer sparse selection over packed KVarN records needs a dedicated read/dequant path. |
-| Fused B200 store/decode kernels | **Missing** | Current backend is Python-level restore plus SDPA; no `torch.ops.trtllm.kvarn_gqa_decode`/store kernel is registered. |
+| Fused B200 store/decode kernels | **Missing** | Current backend is Python-level restore plus SDPA; neither `torch.ops.trtllm.kvarn_gqa_store` nor `torch.ops.trtllm.kvarn_gqa_decode` is registered. |
 | Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
 | Performance proof | **Missing** | Microbench has a correctness floor and `--require-fused` promotion guard, but no fused B200 numbers or c16 tok/s/user proof exist. |
 | Production enablement | **Blocked** | Requires fused kernels, disagg side-state transfer, sparse packed reads, graph-safe lifecycle, fp16/fp8 correctness proof, and c16 E2E performance proof. |
@@ -89,8 +90,9 @@ Implemented:
 - Resource/capacity accounting uses the packed slope
   `layers * local_kv_heads * 76 bytes/token` rather than dense K+V bytes.
 - `kv_cache_config.dtype="kvarn_k2v2_g128"` is accepted only with
-  `tokens_per_block=128`; validation remains fail-closed unless
-  `TRTLLM_ENABLE_KVARN_GQA_REFERENCE=1` is set for isolated reference runs.
+  `tokens_per_block=128`; validation remains fail-closed unless both
+  `torch.ops.trtllm.kvarn_gqa_store` and
+  `torch.ops.trtllm.kvarn_gqa_decode` are registered.
 - Hugging Face artifacts can request GQA KVarN explicitly through top-level
   `kv_cache_dtype`, or through `quantization_config.kvarn.gqa`.
 - HF artifacts can declare production default support without a YAML override by
@@ -129,9 +131,9 @@ Set `kv_cache_dtype` to `"auto"`, `"none"`, or set
 
 ## Remaining production work
 
-The production fail-close remains in place for GQA KVarN. The opt-in reference
-backend is useful for isolated correctness experiments, but these pieces must be
-finished before the deployment can be called complete:
+The production fail-close remains in place for GQA KVarN. The reference
+backend is not a deployment path; these pieces must be finished before the
+deployment can be called complete:
 
 1. CUDA/Triton kernels: replace Python restore + SDPA with fused full-block
    store, packed 2-bit load, dequant/scaled dot-product/value accumulation for
@@ -157,13 +159,65 @@ finished before the deployment can be called complete:
    the current code still needs a full LayerSplit run to verify non-owner scratch
    routing for generic GQA KVarN, separate from dense MLA LayerSplit.
 
+## Fused B200 implementation plan
+
+The next production patch should land a real fused path, not another reference
+wrapper. File/function boundaries:
+
+1. **CUDA/C++ op registration**
+   - Add `cpp/tensorrt_llm/kernels/kvarnGqaKernels.{h,cu}` with two SM100/B200
+     entry points: `kvarnGqaStoreK2V2G128` for full 128-token block commit and
+     `kvarnGqaDecodeK2V2G128` for decode/draft query scoring.
+   - Add THOP bindings in `cpp/tensorrt_llm/thop/kvarnGqaOp.cpp` and register
+     `torch.ops.trtllm.kvarn_gqa_store` and
+     `torch.ops.trtllm.kvarn_gqa_decode`.
+   - Build integration belongs in the existing CMake/Bazel custom-op lists next
+     to the other TRT-LLM torch custom ops.
+
+2. **Python dispatch and cache integration**
+   - Replace the reference restore path in
+     `tensorrt_llm/_torch/attention_backend/kvarn_gqa_attention.py` with calls to
+     the fused ops when `model_loader._has_kvarn_gqa_fused_backend()` is true.
+   - Keep `_util.py` allocation as UINT8 `CacheType.SELFKONLY`,
+     `tokens_per_block=128`, `head_dim=76`, and add explicit fp16 sink/tail side
+     buffer registration instead of Python dict lifetime.
+   - Keep `utils.py` sparse-attention rejection until sparse packed reads are
+     implemented; do not route Indexer/HISA through this path.
+
+3. **Disaggregation and graph lifecycle**
+   - Extend `tensorrt_llm/_torch/disaggregation/resource/kv_extractor.py` to
+     expose KVarN record payloads plus `sink_k/sink_v/tail_k/tail_v/valid/commit_gen`
+     side-state as typed regions.
+   - Update connector/transceiver metadata so UCX/NIXL/Mooncake transport
+     selection moves opaque KVarN records without treating them as dense K/V.
+   - Add request lifecycle hooks in the KV manager/resource manager to recycle
+     side-pool slots graph-safely on request finish, reject/replay, and block
+     reuse.
+
+4. **Correctness gates**
+   - Add CPU/torch round-trip tests for record layout and fused op shape checks.
+   - Add CUDA parity tests comparing fused GQA KVarN attention/logits against
+     fp16/fp8 KV for M in `{1, 5, 25}`, batch/concurrency 1 and 16, and sequence
+     lengths `{1k, 8k, 32k, 64k, 128k}`.
+   - Include SMC draft/verify odd-M, LayerSplit CP2 ownership, request pinning,
+     Moondream overlap, WarpDecode EP/TP, and connector transport selection in
+     smoke/E2E gates.
+
+5. **Benchmark gates**
+   - Extend `benchmarks/python/bench_kvarn_gqa_micro.py --require-fused` to fail
+     unless both fused ops are registered and faster than the reference restore
+     path.
+   - Add a deployment benchmark that records tok/s/user after first token at c16
+     across 1k, 8k, 32k, 64k, and 128k. Do not remove the fail-close until this
+     is faster than fp16/fp8 KV and meets the production target.
+
 ## Tests and benchmark harness
 
 Current focused coverage:
 
 - `tests/unittest/llmapi/test_kvarn_gqa_config.py`: dtype validation, HF explicit
   request, HF default-on declaration, explicit disable, default startup
-  fail-close, and env-gated reference quant-mode selection.
+  fail-close, and fused-op-gated quant-mode selection.
 - `tests/unittest/_torch/attention/test_kvarn_gqa.py`: k2v2 record layout,
   2/3/4-bit pack/unpack, store/restore shape/finiteness/cosine, packed-pool
   commit state, transfer-view shape, fixed-capacity side-pool behavior, sink/tail
@@ -171,9 +225,9 @@ Current focused coverage:
 - `benchmarks/python/bench_kvarn_gqa_micro.py`: light pack/restore/reference
   scoring timing for `M in {1,5,25}`. It enforces a restore-cosine floor and
   supports `--require-fused`, which fails until a real
-  `torch.ops.trtllm.kvarn_gqa_decode` op is registered. Use it only on an idle
-  GPU or CPU; it is a reference baseline, not the fused production-kernel
-  benchmark.
+  `torch.ops.trtllm.kvarn_gqa_store` and
+  `torch.ops.trtllm.kvarn_gqa_decode` are registered. Use it only on an idle GPU
+  or CPU; it is a reference baseline, not the fused production-kernel benchmark.
 
 Example:
 
@@ -197,8 +251,8 @@ python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --require-fused
 - Disaggregated transfer must move packed records plus fp16 sink/tail state and
   must fail if the selected backend only knows dense K/V tensors.
 
-`kvarn_k2v2_g128` is now HF-deployable/defaultable and has an opt-in
-reference GQA KV backend for non-MLA models. It remains fail-closed by default
-and is not production-promoted; the remaining work is native fused decode/store,
+`kvarn_k2v2_g128` is now HF-deployable/defaultable and has reference GQA KV
+code for review, but it remains fail-closed by default and is not
+production-promoted. The remaining work is native fused decode/store,
 disaggregated side-state transfer, sparse packed reads, CUDA graph lifecycle,
 and E2E perf proof before it can satisfy the production throughput target.

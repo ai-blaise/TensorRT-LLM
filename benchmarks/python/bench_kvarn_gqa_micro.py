@@ -71,12 +71,14 @@ def main() -> None:
 
     pack_us = _bench(lambda: quantize_gqa_tile(k, v, cfg), args.iters, device)
     restore_us = _bench(lambda: dequantize_gqa_tile(records, cfg), args.iters, device)
-    fused_available = hasattr(getattr(torch.ops, "trtllm", object()),
-                              "kvarn_gqa_decode")
+    trtllm_ops = getattr(torch.ops, "trtllm", object())
+    fused_available = (hasattr(trtllm_ops, "kvarn_gqa_store")
+                       and hasattr(trtllm_ops, "kvarn_gqa_decode"))
     if args.require_fused and not fused_available:
         raise SystemExit(
-            "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_decode "
-            "is not registered; do not promote the reference path as fused")
+            "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_store "
+            "and torch.ops.trtllm.kvarn_gqa_decode are not both registered; "
+            "do not promote the reference path as fused")
 
     print(f"dtype={cfg.dtype} tile_bytes={cfg.tile_bytes_aligned} bytes_per_token_slot={cfg.bytes_per_token_slot}")
     print(f"restore_cosine_k={k_cos:.4f} restore_cosine_v={v_cos:.4f}")

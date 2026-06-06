@@ -9,8 +9,9 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.pyexecutor import model_loader
 from tensorrt_llm._torch.pyexecutor.model_loader import (
-    _KVARN_GQA_REFERENCE_ENV,
+    _KVARN_GQA_FUSED_OPS,
     _hf_kvarn_gqa_kv_dtype,
     validate_and_set_kv_cache_quant,
 )
@@ -59,26 +60,27 @@ def test_hf_config_defaults_gqa_kvarn_when_model_declares_support():
     assert _hf_kvarn_gqa_kv_dtype(cfg) is None
 
 
-def test_gqa_kvarn_request_fails_closed_without_reference_opt_in(monkeypatch):
+def test_gqa_kvarn_request_fails_closed_without_fused_ops(monkeypatch):
     model_config = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
         pretrained_config=SimpleNamespace(),
     )
-    monkeypatch.delenv(_KVARN_GQA_REFERENCE_ENV, raising=False)
+    monkeypatch.setattr(model_loader, "_has_kvarn_gqa_fused_backend", lambda: False)
 
-    with pytest.raises(NotImplementedError, match="reference implementation only"):
+    with pytest.raises(NotImplementedError, match="production fused"):
         validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
 
 
-def test_gqa_kvarn_reference_opt_in_sets_kvarn_quant_mode(monkeypatch):
+def test_gqa_kvarn_fused_ops_gate_sets_kvarn_quant_mode(monkeypatch):
     model_config = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
         pretrained_config=SimpleNamespace(),
     )
-    monkeypatch.setenv(_KVARN_GQA_REFERENCE_ENV, "1")
+    monkeypatch.setattr(model_loader, "_has_kvarn_gqa_fused_backend", lambda: True)
 
     validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
 
+    assert _KVARN_GQA_FUSED_OPS == ("kvarn_gqa_store", "kvarn_gqa_decode")
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.KVARN.value
     assert model_config.quant_config.kv_cache_dtype == "kvarn_k2v2_g128"
 
