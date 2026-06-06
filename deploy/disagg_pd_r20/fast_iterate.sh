@@ -5,9 +5,10 @@ VM_HOST="${VM_HOST:-34.106.33.128}"
 VM_USER="${VM_USER:-spencergarnets}"
 REMOTE_REPO="${REMOTE_REPO:-/tmp/tensorrt-llm-op-trt-fast}"
 IMAGE_REPO="${IMAGE_REPO:-docker.io/local/dynamo-trtllm-optrt-custom}"
-BASE_IMAGE="${BASE_IMAGE:-local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-20260605}"
+BASE_IMAGE="${BASE_IMAGE:-local/dynamo-trtllm-optrt-custom:canonical-smc-r20-fullsrc-ls-kvarn2-nvlsfix-smcfi-multidecode-swapabodd-tritonquant-scalecontig-oddmpad-tma128-kvarndef-20260606}"
 TARGET_NODE="${TARGET_NODE:-a4-us-001-rl9}"
 DGD_NAME="${DGD_NAME:-topo-c1-dp2tp4-disagg-r20}"
+REQUIRED_TRANSPORT_WRAPPERS="${REQUIRED_TRANSPORT_WRAPPERS:-ucx,nixl}"
 DEPLOY=0
 SYNC=1
 FULL_SYNC=0
@@ -40,6 +41,9 @@ Options:
   --target-node NAME    Kubernetes nodeSelector hostname (default: $TARGET_NODE)
   --dgd-name NAME       DGD/ConfigMap name; use a suffix for warm canaries
   --tag-suffix TEXT     Human suffix added after the git sha (default: fast)
+  --required-transport-wrappers LIST
+                        Comma-separated wrapper libs required before deploy
+                        (default: ucx,nixl; set empty to skip)
   --deploy              Apply the DGD after build/import
   --prewarm             Run the lightweight cache/model visibility prewarm job
                         after build and before deploy
@@ -66,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --target-node) TARGET_NODE="$2"; shift 2 ;;
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
     --tag-suffix) TAG_SUFFIX="$2"; shift 2 ;;
+    --required-transport-wrappers) REQUIRED_TRANSPORT_WRAPPERS="$2"; shift 2 ;;
     --deploy) DEPLOY=1; shift ;;
     --prewarm) PREWARM=1; shift ;;
     --use-local-registry) USE_LOCAL_REGISTRY=1; shift ;;
@@ -222,6 +227,40 @@ if [[ "$BUILD" == 1 ]]; then
   fi
 fi
 
+if [[ -n "$REQUIRED_TRANSPORT_WRAPPERS" ]]; then
+  check_image="$BUILD_IMAGE_TAG"
+  check_script='
+set -euo pipefail
+base="/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs"
+IFS="," read -ra wrappers <<<"$REQUIRED_TRANSPORT_WRAPPERS"
+missing=0
+for wrapper in "${wrappers[@]}"; do
+  wrapper="${wrapper//[[:space:]]/}"
+  [[ -z "$wrapper" ]] && continue
+  path="$base/libtensorrt_llm_${wrapper}_wrapper.so"
+  if [[ -s "$path" ]]; then
+    echo "transport_wrapper_ok=$wrapper:$path"
+  else
+    echo "transport_wrapper_missing=$wrapper:$path" >&2
+    missing=1
+  fi
+done
+exit "$missing"
+'
+  if command -v nerdctl >/dev/null 2>&1; then
+    sudo nerdctl -n k8s.io run --rm --entrypoint /bin/bash \
+      -e REQUIRED_TRANSPORT_WRAPPERS="$REQUIRED_TRANSPORT_WRAPPERS" \
+      "$check_image" -lc "$check_script"
+  elif command -v docker >/dev/null 2>&1 && docker image inspect "$check_image" >/dev/null 2>&1; then
+    docker run --rm --entrypoint /bin/bash \
+      -e REQUIRED_TRANSPORT_WRAPPERS="$REQUIRED_TRANSPORT_WRAPPERS" \
+      "$check_image" -lc "$check_script"
+  else
+    echo "unable to preflight transport wrappers for $check_image: no runnable local image engine found" >&2
+    exit 2
+  fi
+fi
+
 if [[ "$PREWARM" == 1 ]]; then
   pull_policy=Never
   if [[ "$USE_LOCAL_REGISTRY" == 1 ]]; then
@@ -347,7 +386,7 @@ fi
 EOS
 
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' ALLOW_CHAINED_OVERLAY='$ALLOW_CHAINED_OVERLAY' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
+  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' REQUIRED_TRANSPORT_WRAPPERS='$REQUIRED_TRANSPORT_WRAPPERS' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' ALLOW_CHAINED_OVERLAY='$ALLOW_CHAINED_OVERLAY' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
   <<<"$REMOTE_SCRIPT"
 
 echo "built_image=$IMAGE_TAG"

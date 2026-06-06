@@ -58,12 +58,15 @@ overlay image on the B200 VM and uses `nerdctl -n k8s.io build` when available s
 the image lands directly in k3s containerd. If `nerdctl` is unavailable, it falls
 back to Docker BuildKit plus a single `ctr images import`; if the requested base
 image is already in k3s containerd but not Docker, the script loads that base
-into Docker once. Use `--base-image` to layer on top of the latest known-good
-full image. Do not chain thin overlays on top of earlier thin overlays: the
+into Docker once. By default, the script layers on the latest known-good
+full-source runtime that carries both UCX and NIXL transport wrappers. Use
+`--base-image` only when intentionally selecting another proven full image. Do not chain thin overlays on top of earlier thin overlays: the
 extra layer depth can exceed containerd rootfs mount option limits. New r20
 overlay images are labeled and `fast_iterate.sh` refuses them as a base unless
 `--allow-chained-overlay` is passed deliberately. Use `--full-sync` only when
-remote debugging needs the full repository.
+remote debugging needs the full repository. The script also preflights required
+transport wrappers before prewarm/deploy; the default requirement is `ucx,nixl`
+and can be adjusted with `--required-transport-wrappers`.
 
 For the fastest image handoff, add `--use-local-registry`. The script starts or
 reuses a `registry:2` container on the VM, pushes the thin overlay to
@@ -77,7 +80,6 @@ Build only:
 ```bash
 deploy/disagg_pd_r20/fast_iterate.sh \
   --vm 34.106.33.128 \
-  --base-image docker.io/local/dynamo-trtllm-optrt-custom:optrt-2b0ec68-swapab-host-pinharden-20260606 \
   --target-node a4-us-001-rl9 \
   --tag-suffix swapab-host
 ```
@@ -87,7 +89,6 @@ Build and apply the main DGD:
 ```bash
 deploy/disagg_pd_r20/fast_iterate.sh \
   --vm 34.106.33.128 \
-  --base-image docker.io/local/dynamo-trtllm-optrt-custom:optrt-2b0ec68-swapab-host-pinharden-20260606 \
   --target-node a4-us-001-rl9 \
   --tag-suffix swapab-host \
   --use-local-registry \
@@ -100,7 +101,7 @@ Build and warm an isolated canary DGD on the second B200 VM:
 ```bash
 deploy/disagg_pd_r20/fast_iterate.sh \
   --vm 34.106.191.132 \
-  --base-image docker.io/local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-warpfix11-20260605 \
+  --base-image local/dynamo-trtllm-optrt-custom:canonical-smc-r20-fullsrc-ls-kvarn2-nvlsfix-smcfi-multidecode-swapabodd-tritonquant-scalecontig-oddmpad-tma128-kvarndef-20260606 \
   --target-node a4-us-002-rl9 \
   --dgd-name topo-c1-dp2tp4-disagg-r20-canary \
   --tag-suffix canary \
