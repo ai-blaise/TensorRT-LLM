@@ -621,21 +621,17 @@ def _unpack_ue8m0_scale_for_triton(
     assert sf_packed.dim() == 2
     n, k = weight_shape
     block_n, block_k = block_size
-    n_groups = triton.cdiv(n, block_n)
-    k_groups = triton.cdiv(k, block_k)
-    mn_repeat, k_div_4 = sf_packed.shape
-    k_packed = k_div_4 * 4
-
-    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
-    sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
-    if mn_repeat == n:
-        indices = torch.arange(0, n, block_n, device=sf_packed.device)
-        sf_fp32 = sf_fp32.index_select(0, indices)
-    elif mn_repeat != n_groups:
+    if block_n != block_k:
         raise ValueError(
-            f"Unexpected packed UE8M0 scale shape: sf_packed.shape={sf_packed.shape}, "
-            f"weight_shape={weight_shape}, block_size={block_size}")
-    return sf_fp32[:, :k_groups].contiguous()
+            "DeepGEMM/TMA scale inverse currently expects square block scales; "
+            f"got block_size={block_size}")
+
+    from tensorrt_llm.quantization.utils.fp8_utils import inverse_transform_sf
+
+    return inverse_transform_sf(sf_packed,
+                                mn=n,
+                                k=k,
+                                block_size=block_n).contiguous()
 
 
 def _preload_ue8m0_scale_for_triton(
