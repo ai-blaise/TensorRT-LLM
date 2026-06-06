@@ -31,6 +31,26 @@ bytes. Because `9,728 / 128 = 76`, op-trt can host the packed record as a
 byte-backed self-only page with `head_dim=76` once the cache manager and
 attention backend learn that this page is opaque KVarN data, not dense K/V.
 
+## Parent integration note
+
+This handoff is intentionally split into two merge lanes:
+
+- **A: safe scaffolding** can merge now. It adds the Huawei-compatible k2v2/g128
+  byte layout, 2/3/4-bit pack/unpack tests, HF/config parsing, fail-closed
+  validation, docs, and the microbench harness. It does not allocate generic GQA
+  KVarN pages or route model execution through the reference backend.
+- **B: reference backend** is not production-promoted. It adds byte-backed page
+  allocation, Python-level store/restore, fp16 sink/tail side state, and SDPA
+  scoring for isolated correctness experiments only. Startup still fails closed
+  unless `TRTLLM_ENABLE_KVARN_GQA_REFERENCE=1` is set. Do not enable this in the
+  op-trt deployment until the fused B200 store/decode kernel, packed-record
+  disaggregated transfer with fp16 sink/tail side-state, sparse-indexed packed
+  reads, CUDA graph request lifecycle, and E2E perf proof are complete.
+
+Dense MLA KVarN remains separate and production-owned by
+`sparse_attention_config.mla_latent_kv_dtype`; GQA KVarN never replaces the
+Indexer/HISA sparse K path.
+
 ## Current op-trt status
 
 Implemented:
@@ -54,7 +74,8 @@ Implemented:
 - Resource/capacity accounting uses the packed slope
   `layers * local_kv_heads * 76 bytes/token` rather than dense K+V bytes.
 - `kv_cache_config.dtype="kvarn_k2v2_g128"` is accepted only with
-  `tokens_per_block=128`.
+  `tokens_per_block=128`; validation remains fail-closed unless
+  `TRTLLM_ENABLE_KVARN_GQA_REFERENCE=1` is set for isolated reference runs.
 - Hugging Face artifacts can request GQA KVarN explicitly through top-level
   `kv_cache_dtype`, or through `quantization_config.kvarn.gqa`.
 - HF artifacts can declare production default support without a YAML override by
@@ -161,8 +182,8 @@ python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --require-fused
 - Disaggregated transfer must move packed records plus fp16 sink/tail state and
   must fail if the selected backend only knows dense K/V tensors.
 
-`kvarn_k2v2_g128` is now HF-deployable/defaultable and has a runnable reference
-GQA KV backend for non-MLA models. It is still a correctness-first backend with
-preallocated side-state; the remaining work is native fused decode/store plus
-disaggregated side-state transfer before it can satisfy the production
-throughput target.
+`kvarn_k2v2_g128` is now HF-deployable/defaultable and has an opt-in
+reference GQA KV backend for non-MLA models. It remains fail-closed by default
+and is not production-promoted; the remaining work is native fused decode/store,
+disaggregated side-state transfer, sparse packed reads, CUDA graph lifecycle,
+and E2E perf proof before it can satisfy the production throughput target.

@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from tensorrt_llm._torch.pyexecutor.model_loader import (
+    _KVARN_GQA_REFERENCE_ENV,
     _hf_kvarn_gqa_kv_dtype,
     validate_and_set_kv_cache_quant,
 )
@@ -58,11 +59,23 @@ def test_hf_config_defaults_gqa_kvarn_when_model_declares_support():
     assert _hf_kvarn_gqa_kv_dtype(cfg) is None
 
 
-def test_gqa_kvarn_request_sets_kvarn_quant_mode():
+def test_gqa_kvarn_request_fails_closed_without_reference_opt_in(monkeypatch):
     model_config = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
         pretrained_config=SimpleNamespace(),
     )
+    monkeypatch.delenv(_KVARN_GQA_REFERENCE_ENV, raising=False)
+
+    with pytest.raises(NotImplementedError, match="reference implementation only"):
+        validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
+
+
+def test_gqa_kvarn_reference_opt_in_sets_kvarn_quant_mode(monkeypatch):
+    model_config = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        pretrained_config=SimpleNamespace(),
+    )
+    monkeypatch.setenv(_KVARN_GQA_REFERENCE_ENV, "1")
 
     validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
 
