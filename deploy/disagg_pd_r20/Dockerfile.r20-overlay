@@ -13,6 +13,7 @@ ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages
 # behavior.
 COPY --chown=dynamo:0 tensorrt_llm/mapping.py ${SITE_PACKAGES}/tensorrt_llm/mapping.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/request_utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/request_utils.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor_creator.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/model_engine.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
@@ -43,6 +44,7 @@ COPY --chown=dynamo:0 tensorrt_llm/executor/worker.py ${SITE_PACKAGES}/tensorrt_
 RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/mapping.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/request_utils.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
