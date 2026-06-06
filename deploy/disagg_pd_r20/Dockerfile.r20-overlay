@@ -32,6 +32,7 @@ COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/attention.py ${SITE_PACKAGES}/
 COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/gated_mlp.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/gated_mlp.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/mlp.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/mlp.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/custom_ops/torch_custom_ops.py ${SITE_PACKAGES}/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/auto_deploy/custom_ops/quantization/torch_quant.py ${SITE_PACKAGES}/tensorrt_llm/_torch/auto_deploy/custom_ops/quantization/torch_quant.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/distributed/ops.py ${SITE_PACKAGES}/tensorrt_llm/_torch/distributed/ops.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/fused_moe/warp_decode.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/fused_moe/warp_decode.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py
@@ -61,6 +62,7 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/gated_mlp.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/mlp.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/auto_deploy/custom_ops/quantization/torch_quant.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/distributed/ops.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py \
     ${SITE_PACKAGES}/tensorrt_llm/llmapi/llm_args.py \

@@ -1620,6 +1620,18 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
+        if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
+            logger.warning_once(
+                "[fp8_swap_ab_gemm] Using Triton block-FP8 matmul for "
+                f"non-8-aligned SM100 packed-scale M={input.size(0)}; "
+                "DeepGEMM SwapAB faults this warmup shape.",
+                key=("fp8_swap_ab_gemm",
+                     "triton_block_fp8_non_8_aligned_sm100"),
+            )
+            return _fp8_swap_ab_triton_block_matmul(input, weight,
+                                                    weight_scale,
+                                                    self.output_dtype)
+
         orig_m = input.size(0)
         pad_m = 0
         quant_input = input
@@ -1685,6 +1697,11 @@ def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
     return False
 
 
+def _should_use_triton_block_fp8_swap_ab_odd_m(
+        input: torch.Tensor, weight_scale: torch.Tensor) -> bool:
+    return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
+
+
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
     # The CUDA quantizer can illegal-access on odd SMC draft batches on SM100,
     # while the Triton quantizer handles the same shapes correctly.
@@ -1736,6 +1753,41 @@ def _fp8_swap_ab_dequantized_matmul(
     return output_cpu.to(output_dtype).to(device=device)
 
 
+def _fp8_swap_ab_triton_block_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert input.dim() == 2 and weight.dim() == 2
+    assert input.dtype == torch.bfloat16
+    assert weight.dtype == torch.float8_e4m3fn
+    assert weight_scale.dtype == torch.int32
+    assert input.size(1) == weight.size(1)
+
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (  # noqa: E501
+        _safe_act_quant,
+        _w8a8_block_fp8_matmul_triton,
+    )
+
+    block_size = [128, 128]
+    qinput, input_scale = _safe_act_quant(input.contiguous(), block_size[1])
+    block_weight_scale = fp8_utils.inverse_transform_sf(
+        weight_scale,
+        mn=weight.size(0),
+        k=weight.size(1),
+        block_size=block_size[1],
+    )
+    return _w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight.contiguous(),
+        input_scale,
+        block_weight_scale,
+        block_size,
+        output_dtype=output_dtype,
+    )
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
@@ -1744,6 +1796,16 @@ def fp8_swap_ab_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
+    if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
+        logger.warning_once(
+            "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 packed-scale "
+            f"M={input.size(0)} to Triton block-FP8 matmul.",
+            key=("fp8_swap_ab_gemm",
+                 "direct_triton_block_fp8_non_8_aligned_sm100"),
+        )
+        return _fp8_swap_ab_triton_block_matmul(input, weight, weight_scale,
+                                                output_dtype)
+
     if _should_use_dequantized_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(
             "[fp8_swap_ab_gemm] Bypassing DeepGEMM SwapAB for "
