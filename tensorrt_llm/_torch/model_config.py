@@ -155,22 +155,22 @@ def _get_blaise_kvarn_overrides(
         "mla_latent_kv_amortize": True,
     }
 
+    def get_config_value(source: Any, key: str, default: Any = None) -> Any:
+        if isinstance(source, dict):
+            return source.get(key, default)
+        return getattr(source, key, default)
+
     for source in (pretrained_config, quant_config, kvarn_config):
         if source is None:
             continue
-        if isinstance(source, dict):
-            getter = source.get
-        else:
-            getter = lambda key, default=None, source=source: getattr(
-                source, key, default)
-        dtype = getter("mla_latent_kv_dtype", None)
+        dtype = get_config_value(source, "mla_latent_kv_dtype")
         if dtype is None:
-            dtype = getter("dense_mla_kv_dtype", None)
+            dtype = get_config_value(source, "dense_mla_kv_dtype")
         if _is_kvarn_dtype(dtype):
             overrides["mla_latent_kv_dtype"] = str(dtype).lower()
-        amortize = getter("mla_latent_kv_amortize", None)
+        amortize = get_config_value(source, "mla_latent_kv_amortize")
         if amortize is None:
-            amortize = getter("amortize", None)
+            amortize = get_config_value(source, "amortize")
         if amortize is not None:
             overrides["mla_latent_kv_amortize"] = bool(amortize)
 
