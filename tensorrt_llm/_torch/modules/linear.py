@@ -40,6 +40,14 @@ def _is_sm100_odd_m_packed_scale_swap_ab(input: torch.Tensor,
             and weight_scale.dtype == torch.int32)
 
 
+def _is_sm100_odd_m_fp8_blockscale(input: torch.Tensor) -> bool:
+    return get_sm_version() >= 100 and input.size(0) % 8 != 0
+
+
+def _allow_odd_m_cute_dsl_fp8_blockscale() -> bool:
+    return os.environ.get("TRTLLM_ALLOW_ODD_M_CUTE_DSL_FP8", "0") == "1"
+
+
 def _set_buffer(module: nn.Module, name: str,
                 value: Optional[torch.Tensor]) -> None:
     if name in module._buffers:
@@ -1120,6 +1128,13 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
+                if (_is_sm100_odd_m_fp8_blockscale(input)
+                        and not _allow_odd_m_cute_dsl_fp8_blockscale()):
+                    raise RuntimeError(
+                        "Odd-M SM100 FP8 block-scale Linear with CuteDSL or "
+                        "DeepGEMM disabled is not enabled for the SMC-SD path. "
+                        "Use the packed-scale padded DeepGEMM SwapAB route, or "
+                        "set TRTLLM_ALLOW_ODD_M_CUTE_DSL_FP8=1 to opt in.")
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
                 output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(

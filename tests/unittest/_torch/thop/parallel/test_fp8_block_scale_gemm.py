@@ -15,6 +15,7 @@
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
     _preload_ue8m0_scale_for_triton
+from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
 
 
 def _make_swap_ab_inputs(dtype, m, k, n):
@@ -205,6 +207,26 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_preloaded_scale_requires_opt_in(
     with pytest.raises(RuntimeError,
                        match="preloaded FP32 Triton scales is disabled"):
         torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+def test_fp8_block_scale_linear_sm100_odd_m_cute_dsl_requires_opt_in(
+        monkeypatch):
+    monkeypatch.delenv("TRTLLM_ALLOW_ODD_M_CUTE_DSL_FP8", raising=False)
+    method = FP8BlockScalesLinearMethod()
+    module = SimpleNamespace(
+        use_cute_dsl_blockscaling_mm=True,
+        disable_deep_gemm=False,
+        input_scale=torch.tensor(1., device='cuda', dtype=torch.float32),
+    )
+    a = torch.randn((25, 7168), device='cuda', dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError,
+                       match="Odd-M SM100 FP8 block-scale Linear"):
+        method.apply(module, a, None)
 
 
 @pytest.mark.skipif(
