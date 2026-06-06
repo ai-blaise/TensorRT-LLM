@@ -18,7 +18,7 @@
 # limitations under the License.
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -509,6 +509,35 @@ def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(s_ptr + pid, s)
 
 
+@triton.jit
+def _sglang_per_token_group_quant_8bit_kernel(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    group_size,
+    eps,
+    bit8_min,
+    bit8_max,
+    BLOCK: tl.constexpr,
+):
+    # SGLang-style per-token/group quantization.  Use one program per group
+    # rather than flattening the whole activation tensor into an unmasked grid;
+    # the latter has reproduced SM100 illegal accesses for SMC draft M=25.
+    group_id = tl.program_id(0)
+    y_ptr += group_id.to(tl.int64) * group_size
+    y_q_ptr += group_id.to(tl.int64) * group_size
+
+    cols = tl.arange(0, BLOCK)
+    mask = cols < group_size
+    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y_s = tl.maximum(tl.max(tl.abs(y)), eps) / bit8_max
+    y_q = tl.clamp(y / y_s, bit8_min,
+                   bit8_max).to(y_q_ptr.dtype.element_ty)
+
+    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    tl.store(y_s_ptr + group_id, y_s)
+
+
 def _safe_act_quant(x: torch.Tensor,
                     block_size: int = 128,
                     scale_dtype: Optional[torch.dtype] = None) -> tuple:
@@ -530,6 +559,36 @@ def _safe_act_quant(x: torch.Tensor,
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+    return y, s
+
+
+def _sglang_safe_act_quant(x: torch.Tensor,
+                           block_size: int = 128,
+                           scale_dtype: Optional[torch.dtype] = None
+                           ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SGLang-style activation quantization for odd SM100 SMC draft batches."""
+    assert x.is_contiguous()
+    assert x.shape[-1] % block_size == 0
+    if scale_dtype is None:
+        scale_dtype = x.dtype
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    s = x.new_empty(*x.shape[:-1],
+                    x.shape[-1] // block_size,
+                    dtype=scale_dtype)
+    info = torch.finfo(torch.float8_e4m3fn)
+    grid = (x.numel() // block_size, )
+    _sglang_per_token_group_quant_8bit_kernel[grid](
+        x,
+        y,
+        s,
+        block_size,
+        1e-10,
+        bit8_min=info.min,
+        bit8_max=info.max,
+        BLOCK=triton.next_power_of_2(block_size),
+        num_warps=min(max(block_size // 256, 1), 8),
+        num_stages=1,
+    )
     return y, s
 
 
@@ -896,9 +955,9 @@ def _sglang_fp8_swap_ab_block_matmul(
         raise RuntimeError(
             "Odd-M SM100 SwapAB must pass preloaded FP32 Triton scales; "
             "runtime unpack of packed UE8M0 scales is disabled.")
-    qinput, input_scale = _safe_act_quant(input.contiguous(),
-                                          128,
-                                          scale_dtype=torch.float32)
+    qinput, input_scale = _sglang_safe_act_quant(input.contiguous(),
+                                                 128,
+                                                 scale_dtype=torch.float32)
     _smc_cuda_sync_probe("smc fp8_swap_ab activation quant")
     output = _w8a8_block_fp8_matmul_triton_strict_mask(
         qinput,
