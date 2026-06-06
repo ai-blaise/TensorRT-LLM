@@ -112,6 +112,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
 
+    # Shared speculative decoding metadata contract. SMC/drafting code mutates
+    # these fields regardless of the concrete attention backend.
+    is_spec_decoding_enabled: bool = False
+    use_spec_decoding: bool = False
+    is_spec_dec_tree: bool = False
+    is_spec_dec_dynamic_tree: bool = False
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
     # outside stream capture (flashinfer plan() does device->host syncs).
@@ -437,6 +451,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     @property
     def kv_lens_cuda(self) -> torch.Tensor:
         return self._kv_lens_cuda[:self.num_contexts + self.num_generations]
+
+    @property
+    def spec_decoding_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
+        offsets = self.spec_decoding_position_offsets
+        if offsets is not None and offsets.dim() == 1:
+            return offsets.view(self.max_num_requests, -1)
+        return offsets
+
+    def update_position_offsets_for_cpp(self, query_len: int) -> None:
+        offsets = self.spec_decoding_position_offsets
+        if offsets is None or offsets.dim() != 1:
+            self.spec_decoding_position_offsets_cpp = offsets
+            return
+
+        if self.max_num_requests > 0 and query_len > 0:
+            total = self.max_num_requests * query_len
+            self.spec_decoding_position_offsets_cpp = offsets[:total].view(
+                self.max_num_requests, query_len)
+        else:
+            self.spec_decoding_position_offsets_cpp = offsets
 
     @property
     def batch_indices(self) -> torch.Tensor:
