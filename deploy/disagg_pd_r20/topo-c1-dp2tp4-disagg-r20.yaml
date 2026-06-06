@@ -292,8 +292,14 @@ spec:
         value: '1'
       - name: HF_MODULES_CACHE
         value: /cache/optrt/hf_modules
+      - name: TRANSFORMERS_CACHE
+        value: /cache/optrt/transformers
+      - name: HF_DATASETS_CACHE
+        value: /cache/optrt/hf_datasets
       - name: XDG_CACHE_HOME
         value: /cache/optrt/xdg
+      - name: PIP_CACHE_DIR
+        value: /cache/optrt/pip
       - name: TORCH_EXTENSIONS_DIR
         value: /cache/optrt/torch_extensions
       - name: TRITON_CACHE_DIR
@@ -322,7 +328,7 @@ spec:
           command:
           - sh
           - -lc
-          - mkdir -p /cache/optrt/hf_modules /cache/optrt/xdg /cache/optrt/torch_extensions /cache/optrt/triton /cache/optrt/cuda /cache/optrt/tensorrt_llm/dg /cache/optrt/tensorrt_llm/llmapi_build && chmod -R 0777 /cache/optrt
+          - mkdir -p /cache/optrt/hf_modules /cache/optrt/transformers /cache/optrt/hf_datasets /cache/optrt/xdg /cache/optrt/pip /cache/optrt/torch_extensions /cache/optrt/triton /cache/optrt/cuda /cache/optrt/tensorrt_llm/dg /cache/optrt/tensorrt_llm/llmapi_build && chmod -R 0777 /cache/optrt
           volumeMounts:
           - mountPath: /cache/optrt
             name: optrt-cache
@@ -464,8 +470,14 @@ spec:
         value: '1'
       - name: HF_MODULES_CACHE
         value: /cache/optrt/hf_modules
+      - name: TRANSFORMERS_CACHE
+        value: /cache/optrt/transformers
+      - name: HF_DATASETS_CACHE
+        value: /cache/optrt/hf_datasets
       - name: XDG_CACHE_HOME
         value: /cache/optrt/xdg
+      - name: PIP_CACHE_DIR
+        value: /cache/optrt/pip
       - name: TORCH_EXTENSIONS_DIR
         value: /cache/optrt/torch_extensions
       - name: TRITON_CACHE_DIR
@@ -494,7 +506,7 @@ spec:
           command:
           - sh
           - -lc
-          - mkdir -p /cache/optrt/hf_modules /cache/optrt/xdg /cache/optrt/torch_extensions /cache/optrt/triton /cache/optrt/cuda /cache/optrt/tensorrt_llm/dg /cache/optrt/tensorrt_llm/llmapi_build && chmod -R 0777 /cache/optrt
+          - mkdir -p /cache/optrt/hf_modules /cache/optrt/transformers /cache/optrt/hf_datasets /cache/optrt/xdg /cache/optrt/pip /cache/optrt/torch_extensions /cache/optrt/triton /cache/optrt/cuda /cache/optrt/tensorrt_llm/dg /cache/optrt/tensorrt_llm/llmapi_build && chmod -R 0777 /cache/optrt
           volumeMounts:
           - mountPath: /cache/optrt
             name: optrt-cache

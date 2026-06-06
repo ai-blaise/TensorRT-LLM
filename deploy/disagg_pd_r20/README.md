@@ -87,6 +87,7 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --target-node a4-us-001-rl9 \
   --tag-suffix swapab-host \
   --use-local-registry \
+  --prewarm \
   --deploy
 ```
 
@@ -112,7 +113,10 @@ The DGD mounts `/var/lib/optrt-cache` from the host into both prefill and decode
 as `/cache/optrt`. These paths persist across pod restarts:
 
 - `/cache/optrt/hf_modules` for Hugging Face remote-code modules.
+- `/cache/optrt/transformers` and `/cache/optrt/hf_datasets` for HF library
+  metadata caches.
 - `/cache/optrt/xdg` for generic Python/library caches.
+- `/cache/optrt/pip` for Python package/download cache.
 - `/cache/optrt/torch_extensions` for Torch extension builds.
 - `/cache/optrt/triton` for Triton kernel cache.
 - `/cache/optrt/cuda` for CUDA JIT cache.
@@ -126,7 +130,19 @@ IMAGE=docker.io/local/dynamo-trtllm-optrt-custom:optrt-<sha>-<suffix> \
 deploy/disagg_pd_r20/prewarm_caches.sh \
   --vm 34.106.33.128 \
   --target-node a4-us-001-rl9 \
-  --image "$IMAGE"
+  --image "$IMAGE" \
+  --image-pull-policy Never
+```
+
+For VM-local registry images from `fast_iterate.sh --use-local-registry`, use
+`IfNotPresent` so k3s can pull the already-pushed thin image:
+
+```bash
+deploy/disagg_pd_r20/prewarm_caches.sh \
+  --vm 34.106.33.128 \
+  --target-node a4-us-001-rl9 \
+  --image localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-<sha>-<suffix> \
+  --image-pull-policy IfNotPresent
 ```
 
 This prewarm job validates that the image is resident in k3s containerd, the

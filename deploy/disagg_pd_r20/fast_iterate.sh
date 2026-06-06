@@ -12,6 +12,7 @@ DEPLOY=0
 SYNC=1
 FULL_SYNC=0
 BUILD=1
+PREWARM=0
 USE_LOCAL_REGISTRY=0
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 TAG_SUFFIX="${TAG_SUFFIX:-fast}"
@@ -39,6 +40,8 @@ Options:
   --dgd-name NAME       DGD/ConfigMap name; use a suffix for warm canaries
   --tag-suffix TEXT     Human suffix added after the git sha (default: fast)
   --deploy              Apply the DGD after build/import
+  --prewarm             Run the lightweight cache/model visibility prewarm job
+                        after build and before deploy
   --use-local-registry  Push the thin image to a VM-local registry and pull it
   --local-registry HOST Registry host:port (default: $LOCAL_REGISTRY)
   --full-sync           Sync the whole repo instead of the overlay build subset
@@ -61,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
     --tag-suffix) TAG_SUFFIX="$2"; shift 2 ;;
     --deploy) DEPLOY=1; shift ;;
+    --prewarm) PREWARM=1; shift ;;
     --use-local-registry) USE_LOCAL_REGISTRY=1; shift ;;
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --full-sync) FULL_SYNC=1; shift ;;
@@ -124,7 +128,10 @@ DEPLOY_IMAGE_TAG="$IMAGE_TAG"
 
 sudo mkdir -p \
   /var/lib/optrt-cache/hf_modules \
+  /var/lib/optrt-cache/transformers \
+  /var/lib/optrt-cache/hf_datasets \
   /var/lib/optrt-cache/xdg \
+  /var/lib/optrt-cache/pip \
   /var/lib/optrt-cache/torch_extensions \
   /var/lib/optrt-cache/triton \
   /var/lib/optrt-cache/cuda \
@@ -165,6 +172,95 @@ if [[ "$BUILD" == 1 ]]; then
   fi
 fi
 
+if [[ "$PREWARM" == 1 ]]; then
+  pull_policy=Never
+  if [[ "$USE_LOCAL_REGISTRY" == 1 ]]; then
+    pull_policy=IfNotPresent
+  fi
+  JOB_NAME="optrt-cache-prewarm-$(date -u +%Y%m%d%H%M%S)"
+  cat >/tmp/"$JOB_NAME".yaml <<YAML
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $JOB_NAME
+  namespace: dynamo-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 900
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: $TARGET_NODE
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: prewarm
+        image: $DEPLOY_IMAGE_TAG
+        imagePullPolicy: $pull_policy
+        command: [python3, -c]
+        args:
+        - |
+          import importlib
+          import os
+          from pathlib import Path
+          os.environ.setdefault("HF_HOME", "/models")
+          os.environ.setdefault("HF_HUB_OFFLINE", "1")
+          os.environ.setdefault("HF_MODULES_CACHE", "/cache/optrt/hf_modules")
+          os.environ.setdefault("TRANSFORMERS_CACHE", "/cache/optrt/transformers")
+          os.environ.setdefault("HF_DATASETS_CACHE", "/cache/optrt/hf_datasets")
+          os.environ.setdefault("XDG_CACHE_HOME", "/cache/optrt/xdg")
+          os.environ.setdefault("PIP_CACHE_DIR", "/cache/optrt/pip")
+          os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/cache/optrt/torch_extensions")
+          os.environ.setdefault("TRITON_CACHE_DIR", "/cache/optrt/triton")
+          os.environ.setdefault("CUDA_CACHE_PATH", "/cache/optrt/cuda")
+          os.environ.setdefault("TRTLLM_DG_CACHE_DIR", "/cache/optrt/tensorrt_llm/dg")
+          os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE", "1")
+          os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE_ROOT", "/cache/optrt/tensorrt_llm/llmapi_build")
+          for path in [
+              "/cache/optrt/hf_modules", "/cache/optrt/transformers",
+              "/cache/optrt/hf_datasets", "/cache/optrt/xdg", "/cache/optrt/pip",
+              "/cache/optrt/torch_extensions", "/cache/optrt/triton",
+              "/cache/optrt/cuda", "/cache/optrt/tensorrt_llm/dg",
+              "/cache/optrt/tensorrt_llm/llmapi_build",
+          ]:
+              Path(path).mkdir(parents=True, exist_ok=True)
+          for module in ["torch", "transformers", "tensorrt_llm"]:
+              importlib.import_module(module)
+          from transformers import AutoConfig, AutoTokenizer
+          for model in [
+              "/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft",
+              "/models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+          ]:
+              print(f"prewarm_model={model}")
+              AutoConfig.from_pretrained(model, trust_remote_code=True, local_files_only=True)
+              try:
+                  AutoTokenizer.from_pretrained(model, trust_remote_code=True, local_files_only=True)
+              except Exception as exc:
+                  print(f"tokenizer_prewarm_warning={model}: {exc}")
+          print("optrt_cache_prewarm=ok")
+        volumeMounts:
+        - mountPath: /models
+          name: models
+          readOnly: true
+        - mountPath: /cache/optrt
+          name: optrt-cache
+      volumes:
+      - name: models
+        hostPath:
+          path: /models
+          type: Directory
+      - name: optrt-cache
+        hostPath:
+          path: /var/lib/optrt-cache
+          type: DirectoryOrCreate
+YAML
+  sudo -E /usr/local/bin/k3s kubectl -n dynamo-system apply -f /tmp/"$JOB_NAME".yaml
+  sudo -E /usr/local/bin/k3s kubectl -n dynamo-system wait --for=condition=complete --timeout=300s job/"$JOB_NAME"
+  sudo -E /usr/local/bin/k3s kubectl -n dynamo-system logs job/"$JOB_NAME"
+  sudo -E /usr/local/bin/k3s kubectl -n dynamo-system delete job "$JOB_NAME" --ignore-not-found=true >/dev/null
+fi
+
 if [[ "$DEPLOY" == 1 ]]; then
   OUT="/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml"
   TARGET_NODE="$TARGET_NODE" UNIFIED_IMAGE="$DEPLOY_IMAGE_TAG" DGD_NAME="$DGD_NAME" USE_LOCAL_REGISTRY="$USE_LOCAL_REGISTRY" python3 - <<'PY'
@@ -192,7 +288,7 @@ fi
 EOS
 
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' OUT='/tmp/${DGD_NAME}-${IMAGE_TAG##*:}.yaml' bash -s" \
+  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' OUT='/tmp/${DGD_NAME}-${IMAGE_TAG##*:}.yaml' bash -s" \
   <<<"$REMOTE_SCRIPT"
 
 echo "image=$IMAGE_TAG"

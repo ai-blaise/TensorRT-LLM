@@ -5,6 +5,7 @@ VM_HOST="${VM_HOST:-34.106.33.128}"
 VM_USER="${VM_USER:-spencergarnets}"
 TARGET_NODE="${TARGET_NODE:-a4-us-001-rl9}"
 IMAGE="${IMAGE:-}"
+IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Never}"
 MODEL_PATH="${MODEL_PATH:-/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP}"
 SSH_OPTS=(
@@ -24,6 +25,8 @@ validates that the mounted model artifacts are visible before a full DGD rollout
 
 Options:
   --image IMAGE          Image already present in k3s containerd
+  --image-pull-policy P  Kubernetes image pull policy (default: Never;
+                         use IfNotPresent for VM-local registry images)
   --vm HOST              Target VM IP or hostname (default: $VM_HOST)
   --user USER            SSH user (default: $VM_USER)
   --target-node NAME     Kubernetes nodeSelector hostname (default: $TARGET_NODE)
@@ -36,6 +39,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image) IMAGE="$2"; shift 2 ;;
+    --image-pull-policy) IMAGE_PULL_POLICY="$2"; shift 2 ;;
     --vm) VM_HOST="$2"; shift 2 ;;
     --user) VM_USER="$2"; shift 2 ;;
     --target-node) TARGET_NODE="$2"; shift 2 ;;
@@ -59,7 +63,10 @@ set -euo pipefail
 
 sudo mkdir -p \
   /var/lib/optrt-cache/hf_modules \
+  /var/lib/optrt-cache/transformers \
+  /var/lib/optrt-cache/hf_datasets \
   /var/lib/optrt-cache/xdg \
+  /var/lib/optrt-cache/pip \
   /var/lib/optrt-cache/torch_extensions \
   /var/lib/optrt-cache/triton \
   /var/lib/optrt-cache/cuda \
@@ -86,7 +93,7 @@ spec:
       containers:
       - name: prewarm
         image: $IMAGE
-        imagePullPolicy: Never
+        imagePullPolicy: $IMAGE_PULL_POLICY
         command: [python3, -c]
         args:
         - |
@@ -96,13 +103,17 @@ spec:
           os.environ.setdefault("HF_HOME", "/models")
           os.environ.setdefault("HF_HUB_OFFLINE", "1")
           os.environ.setdefault("HF_MODULES_CACHE", "/cache/optrt/hf_modules")
+          os.environ.setdefault("TRANSFORMERS_CACHE", "/cache/optrt/transformers")
+          os.environ.setdefault("HF_DATASETS_CACHE", "/cache/optrt/hf_datasets")
           os.environ.setdefault("XDG_CACHE_HOME", "/cache/optrt/xdg")
+          os.environ.setdefault("PIP_CACHE_DIR", "/cache/optrt/pip")
           os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/cache/optrt/torch_extensions")
           os.environ.setdefault("TRITON_CACHE_DIR", "/cache/optrt/triton")
           os.environ.setdefault("CUDA_CACHE_PATH", "/cache/optrt/cuda")
+          os.environ.setdefault("TRTLLM_DG_CACHE_DIR", "/cache/optrt/tensorrt_llm/dg")
           os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE", "1")
           os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE_ROOT", "/cache/optrt/tensorrt_llm/llmapi_build")
-          for path in ["/cache/optrt/hf_modules", "/cache/optrt/xdg", "/cache/optrt/torch_extensions", "/cache/optrt/triton", "/cache/optrt/cuda", "/cache/optrt/tensorrt_llm/dg", "/cache/optrt/tensorrt_llm/llmapi_build"]:
+          for path in ["/cache/optrt/hf_modules", "/cache/optrt/transformers", "/cache/optrt/hf_datasets", "/cache/optrt/xdg", "/cache/optrt/pip", "/cache/optrt/torch_extensions", "/cache/optrt/triton", "/cache/optrt/cuda", "/cache/optrt/tensorrt_llm/dg", "/cache/optrt/tensorrt_llm/llmapi_build"]:
               Path(path).mkdir(parents=True, exist_ok=True)
           for module in ["torch", "transformers", "tensorrt_llm"]:
               importlib.import_module(module)
@@ -122,14 +133,22 @@ spec:
           value: "1"
         - name: HF_MODULES_CACHE
           value: /cache/optrt/hf_modules
+        - name: TRANSFORMERS_CACHE
+          value: /cache/optrt/transformers
+        - name: HF_DATASETS_CACHE
+          value: /cache/optrt/hf_datasets
         - name: XDG_CACHE_HOME
           value: /cache/optrt/xdg
+        - name: PIP_CACHE_DIR
+          value: /cache/optrt/pip
         - name: TORCH_EXTENSIONS_DIR
           value: /cache/optrt/torch_extensions
         - name: TRITON_CACHE_DIR
           value: /cache/optrt/triton
         - name: CUDA_CACHE_PATH
           value: /cache/optrt/cuda
+        - name: TRTLLM_DG_CACHE_DIR
+          value: /cache/optrt/tensorrt_llm/dg
         - name: TLLM_LLMAPI_BUILD_CACHE
           value: "1"
         - name: TLLM_LLMAPI_BUILD_CACHE_ROOT
@@ -158,5 +177,5 @@ sudo -E /usr/local/bin/k3s kubectl -n dynamo-system delete job "$JOB_NAME" --ign
 EOS
 
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "IMAGE='$IMAGE' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' DRAFT_MODEL_PATH='$DRAFT_MODEL_PATH' JOB_NAME='$JOB_NAME' bash -s" \
+  "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' DRAFT_MODEL_PATH='$DRAFT_MODEL_PATH' JOB_NAME='$JOB_NAME' bash -s" \
   <<<"$REMOTE_SCRIPT"
