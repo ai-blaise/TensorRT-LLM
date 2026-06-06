@@ -46,6 +46,9 @@ def main() -> None:
     parser.add_argument("--min-cosine", type=float, default=0.55)
     parser.add_argument("--require-fused", action="store_true",
                         help="fail unless a fused KVarN GQA op is registered")
+    parser.add_argument("--try-decode-op", action="store_true",
+                        help="run the experimental decode op even while backend_ready() is false")
+    parser.add_argument("--decode-op-atol", type=float, default=5e-2)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -86,6 +89,30 @@ def main() -> None:
             "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_store, "
             "kvarn_gqa_decode, and kvarn_gqa_backend_ready() are not all "
             "present and production-ready; do not promote the reference path as fused")
+    if args.try_decode_op:
+        if device.type != "cuda":
+            raise SystemExit("--try-decode-op requires a CUDA device")
+        if not hasattr(trtllm_ops, "kvarn_gqa_decode"):
+            raise SystemExit("torch.ops.trtllm.kvarn_gqa_decode is not registered")
+        packed_records = records.unsqueeze(0).contiguous()
+        block_ids = torch.zeros((1,), device=device, dtype=torch.int64)
+        empty_side = torch.empty((0,), device=device, dtype=torch.float16)
+        for m, q in q_by_m.items():
+            seq_lens = torch.full((m,), cfg.group, device=device, dtype=torch.int32)
+            op_out = trtllm_ops.kvarn_gqa_decode(
+                q.contiguous(), packed_records, block_ids, empty_side, empty_side,
+                empty_side, empty_side, seq_lens, args.kv_heads, args.kv_heads,
+                cfg.head_dim, cfg.group)
+            k_ref, v_ref = dequantize_gqa_tile(records, cfg)
+            logits = torch.einsum("mhd,thd->hmt", q.float(), k_ref.float())
+            probs = torch.softmax(logits / (cfg.head_dim ** 0.5), dim=-1)
+            ref_out = torch.einsum("hmt,thd->mhd", probs, v_ref.float())
+            max_abs = (op_out.float() - ref_out.float()).abs().max().item()
+            if max_abs > args.decode_op_atol:
+                raise SystemExit(
+                    f"decode op mismatch for odd_m={m}: max_abs={max_abs:.6f} "
+                    f"atol={args.decode_op_atol:.6f}")
+            print(f"decode_op_odd_m={m} max_abs={max_abs:.6f}")
 
     print(f"dtype={cfg.dtype} tile_bytes={cfg.tile_bytes_aligned} bytes_per_token_slot={cfg.bytes_per_token_slot}")
     print(f"restore_cosine_k={k_cos:.4f} restore_cosine_v={v_cos:.4f}")

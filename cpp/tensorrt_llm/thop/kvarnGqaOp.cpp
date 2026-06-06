@@ -37,6 +37,40 @@ void check_cuda_contiguous(th::Tensor const& tensor, char const* name)
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
+
+struct PackedRecordStrides
+{
+    bool pageLayout;
+    int64_t strideBlock;
+    int64_t strideToken;
+    int64_t strideHead;
+    int64_t strideByte;
+};
+
+PackedRecordStrides get_packed_record_strides(th::Tensor const& packedRecords, int64_t numKvHeads, char const* opName)
+{
+    if (packedRecords.dim() == 3)
+    {
+        TORCH_CHECK(packedRecords.size(1) >= numKvHeads, opName, " packed_records [blocks, kv_heads, tile_bytes] has too few kv heads");
+        TORCH_CHECK(packedRecords.size(2) >= tk::KVarNGqaK2V2G128Layout::kTileBytes,
+            opName, " packed_records [blocks, kv_heads, tile_bytes] tile dim is too small");
+        return PackedRecordStrides{false, packedRecords.stride(0), 0, packedRecords.stride(1), packedRecords.stride(2)};
+    }
+    if (packedRecords.dim() == 5)
+    {
+        TORCH_CHECK(packedRecords.size(1) >= 1, opName, " packed_records page layout needs a K plane at dim=1");
+        TORCH_CHECK(packedRecords.size(2) == tk::KVarNGqaK2V2G128Layout::kGroupSize,
+            opName, " packed_records page layout requires tokens_per_block=128");
+        TORCH_CHECK(packedRecords.size(3) >= numKvHeads, opName, " packed_records page layout has too few kv heads");
+        TORCH_CHECK(packedRecords.size(4) == tk::KVarNGqaK2V2G128Layout::kBytesPerTokenSlot,
+            opName, " packed_records page layout requires bytes_per_token_slot=76");
+        return PackedRecordStrides{true, packedRecords.stride(0), packedRecords.stride(2), packedRecords.stride(3),
+            packedRecords.stride(4)};
+    }
+    TORCH_CHECK(false, opName,
+        " packed_records must be [blocks, kv_heads, 9728] record layout or [blocks, planes, 128, kv_heads, 76] page layout");
+}
+
 void check_group_shape(int64_t headDim, int64_t groupSize)
 {
     TORCH_CHECK(headDim == tk::KVarNGqaK2V2G128Layout::kHeadDim,
@@ -71,11 +105,14 @@ void kvarn_gqa_store(th::Tensor const& k, th::Tensor const& v, th::Tensor const&
         "kvarn_gqa_store input shape must match group_size/head_dim");
     TORCH_CHECK(blockIds.dim() == 1 && blockIds.size(0) == k.size(0),
         "block_ids must be [num_blocks] and match K/V blocks");
+    auto strides = get_packed_record_strides(packedRecords, k.size(2), "kvarn_gqa_store");
 
     auto stream = at::cuda::getCurrentCUDAStream(k.get_device());
     tk::invokeKvarnGqaStoreK2V2G128(k.data_ptr(), v.data_ptr(), packedRecords.data_ptr<std::uint8_t>(),
         blockIds.data_ptr<std::int64_t>(), static_cast<int>(layerIdx), static_cast<int>(k.size(0)),
-        static_cast<int>(k.size(2)), static_cast<int>(headDim), static_cast<int>(groupSize), stream);
+        static_cast<int>(k.size(2)), static_cast<int>(headDim), static_cast<int>(groupSize),
+        k.scalar_type() == at::ScalarType::BFloat16, strides.pageLayout, strides.strideBlock, strides.strideToken,
+        strides.strideHead, strides.strideByte, stream);
 }
 
 th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords, th::Tensor const& blockIds,
@@ -100,6 +137,9 @@ th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords
     TORCH_CHECK(q.size(1) == numHeads && q.size(2) == headDim,
         "q shape must match num_heads/head_dim");
     TORCH_CHECK(numHeads % numKvHeads == 0, "num_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(seqLens.dim() == 1 && (seqLens.size(0) == 1 || seqLens.size(0) == q.size(0)),
+        "seq_lens must be [1] or [num_queries]");
+    auto strides = get_packed_record_strides(packedRecords, numKvHeads, "kvarn_gqa_decode");
 
     auto output = th::empty_like(q);
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
@@ -107,7 +147,8 @@ th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords
         blockIds.data_ptr<std::int64_t>(), sinkK.data_ptr(), sinkV.data_ptr(), tailK.data_ptr(), tailV.data_ptr(),
         seqLens.data_ptr<std::int32_t>(), output.data_ptr(), static_cast<int>(q.size(0)), static_cast<int>(blockIds.size(0)),
         static_cast<int>(numHeads), static_cast<int>(numKvHeads), static_cast<int>(headDim), static_cast<int>(groupSize),
-        stream);
+        q.scalar_type() == at::ScalarType::BFloat16, static_cast<int>(seqLens.size(0)), strides.pageLayout,
+        strides.strideBlock, strides.strideToken, strides.strideHead, strides.strideByte, stream);
     return output;
 }
 

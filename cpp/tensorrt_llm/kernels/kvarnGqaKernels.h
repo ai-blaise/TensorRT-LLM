@@ -38,13 +38,15 @@ struct KVarNGqaK2V2G128Layout
 bool kvarnGqaBackendReady();
 
 void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* packedRecords,
-    std::int64_t const* blockIds, int layerIdx, int numBlocks, int numKvHeads, int headDim, int groupSize,
+    std::int64_t const* blockIds, int layerIdx, int numBlocks, int numKvHeads, int headDim, int groupSize, bool useBf16,
+    bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken, std::int64_t strideHead, std::int64_t strideByte,
     cudaStream_t stream = 0);
 
 void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecords,
     std::int64_t const* blockIds, void const* sinkK, void const* sinkV, void const* tailK, void const* tailV,
     std::int32_t const* seqLens, void* output, int numQueries, int numBlocks, int numHeads, int numKvHeads,
-    int headDim, int groupSize, cudaStream_t stream = 0);
+    int headDim, int groupSize, bool useBf16, int seqLensCount, bool pageLayout, std::int64_t strideBlock,
+    std::int64_t strideToken, std::int64_t strideHead, std::int64_t strideByte, cudaStream_t stream = 0);
 
 } // namespace kernels
 
