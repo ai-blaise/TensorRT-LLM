@@ -4040,6 +4040,11 @@ class DSATrtllmAttention(TrtllmAttention):
                                skip_create_weights_in_init,
                                sparse_attention_config, dtype, layer_idx,
                                aux_stream)
+        # Per-block (device int64) epoch last reconstructed into this layer's
+        # fp16 main pool; lazily sized to the KVarN pool on first amortized
+        # restore. This state belongs to the attention layer, because decode
+        # restore runs before the Indexer path.
+        self._kvarn_restored_gen = None
 
     def sparse_attn_predict(
         self,
