@@ -30,6 +30,47 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
 from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
 
 
+def _pack_ue8m0_exponents(exponents: torch.Tensor) -> torch.Tensor:
+    assert exponents.dtype == torch.uint8
+    n, k_groups = exponents.shape
+    packed_cols = (k_groups + 3) // 4
+    packed = torch.zeros((n, packed_cols), dtype=torch.int32)
+    packed_u8 = packed.view(torch.uint8).view(n, packed_cols * 4)
+    packed_u8[:, :k_groups] = exponents
+    return packed
+
+
+def test_preload_ue8m0_scale_for_triton_accepts_partial_final_n_group():
+    n, k = 2112, 7168
+    block_n, block_k = 128, 128
+    n_groups = (n + block_n - 1) // block_n
+    k_groups = (k + block_k - 1) // block_k
+    exponents = ((torch.arange(n_groups * k_groups, dtype=torch.int32).view(
+        n_groups, k_groups) % 32) + 96).to(torch.uint8)
+    repeated_exponents = exponents.repeat_interleave(block_n, dim=0)[:n]
+    packed = _pack_ue8m0_exponents(repeated_exponents.contiguous())
+
+    unpacked = _preload_ue8m0_scale_for_triton(packed, (n, k),
+                                               [block_n, block_k])
+    expected = (exponents.to(torch.int32) << 23).view(torch.float32)
+
+    assert torch.equal(unpacked.cpu(), expected)
+
+
+def test_preload_ue8m0_scale_for_triton_rejects_bad_repeated_rows():
+    n, k = 2112, 7168
+    block_n, block_k = 128, 128
+    n_groups = (n + block_n - 1) // block_n
+    k_groups = (k + block_k - 1) // block_k
+    exponents = torch.full((n_groups, k_groups), 127, dtype=torch.uint8)
+    repeated_exponents = exponents.repeat_interleave(block_n, dim=0)[:n]
+    repeated_exponents[129, 0] = 126
+    packed = _pack_ue8m0_exponents(repeated_exponents.contiguous())
+
+    with pytest.raises(ValueError, match="scale rows are not repeated"):
+        _preload_ue8m0_scale_for_triton(packed, (n, k), [block_n, block_k])
+
+
 def _make_swap_ab_inputs(dtype, m, k, n):
     torch.random.manual_seed(0)
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k

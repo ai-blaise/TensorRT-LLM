@@ -779,18 +779,20 @@ def _unpack_ue8m0_scale_for_triton(
     k_groups = triton.cdiv(k, block_k)
 
     mn_repeat, k_div_4 = sf_packed.shape
-    if mn_repeat < n_groups * block_n:
+    if mn_repeat not in (n, n_groups):
         raise ValueError(
-            "Packed UE8M0 scale rows do not cover the block-N groups: "
-            f"rows={mn_repeat}, required={n_groups * block_n}, "
-            f"weight_shape={weight_shape}, block_size={block_size}.")
+            "Packed UE8M0 scale rows must either match SGLang's repeated-N "
+            "layout or its collapsed block layout: "
+            f"rows={mn_repeat}, expected_repeated_rows={n}, "
+            f"expected_collapsed_rows={n_groups}, weight_shape={weight_shape}, "
+            f"block_size={block_size}.")
     if k_div_4 * 4 < k_groups:
         raise ValueError(
             "Packed UE8M0 scale columns do not cover the block-K groups: "
             f"cols={k_div_4}, required_packed_cols={(k_groups + 3) // 4}, "
             f"weight_shape={weight_shape}, block_size={block_size}.")
 
-    sf_packed = sf_packed[:n_groups * block_n, :((k_groups + 3) // 4)]
+    sf_packed = sf_packed[:, :((k_groups + 3) // 4)]
     packed_rows, packed_cols = sf_packed.shape
     packed_k = packed_cols * 4
 
@@ -799,9 +801,14 @@ def _unpack_ue8m0_scale_for_triton(
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
     sf_fp32 = sf_fp32[:, :k_groups]
 
-    sf_blocks = sf_fp32.view(n_groups, block_n, k_groups)
-    first_rows = sf_blocks[:, 0, :]
-    if not torch.all(first_rows[:, None, :] == sf_blocks):
+    if mn_repeat == n_groups:
+        return sf_fp32.contiguous()
+
+    block_starts = torch.arange(0, n, block_n, device=sf_packed.device)
+    first_rows = sf_fp32.index_select(0, block_starts)
+    row_groups = torch.arange(n, device=sf_packed.device) // block_n
+    expected_rows = first_rows.index_select(0, row_groups)
+    if not torch.all(expected_rows == sf_fp32[:n, :]):
         raise ValueError(
             "Packed UE8M0 scale rows are not repeated within block-N groups; "
             "cannot safely reinterpret them as SGLang Triton block scales.")
