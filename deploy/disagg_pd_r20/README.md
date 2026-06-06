@@ -166,8 +166,23 @@ and compiling kernels.
   iterations and alternate-name canary deployments.
 - `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
   prewarm/validation job.
+- `cache_report.sh` -- read-only VM report for persistent-cache growth, local
+  registry availability, and k3s/containerd image residency.
 - `Dockerfile.r20-overlay.dockerignore` -- overlay-specific build-context
   allowlist so thin-image rebuilds do not ship the full repo to Docker/BuildKit.
+
+Inspect cache/image residency without touching pods:
+
+```bash
+deploy/disagg_pd_r20/cache_report.sh \
+  --vm 34.106.33.128 \
+  --image-filter dynamo-trtllm-optrt-custom
+```
+
+Run this after the first cold rollout and again after the next overlay rollout.
+The useful signal is whether `triton`, `cuda`, `deep_gemm`, and
+`tensorrt_llm/*` grow and then stabilize; if they remain empty, the workers are
+not writing to the intended persistent cache paths.
 
 ## Knob provenance
 
