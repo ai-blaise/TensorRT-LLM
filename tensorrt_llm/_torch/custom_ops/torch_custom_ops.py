@@ -24,6 +24,7 @@ import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
@@ -1614,17 +1615,16 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
-        if _should_use_padded_deep_gemm_fp8_swap_ab_odd_m(input, weight_scale):
+        if _should_use_dequantized_swap_ab_odd_m(input, weight_scale):
             logger.warning_once(
-                "[fp8_swap_ab_gemm] Using padded DeepGEMM SwapAB for "
+                "[fp8_swap_ab_gemm] Using dequantized matmul for "
                 f"non-8-aligned SM100 packed-scale M={input.size(0)}; "
-                "DeepGEMM SwapAB faults this shape.",
+                "DeepGEMM SwapAB faults this warmup shape.",
                 key=("fp8_swap_ab_gemm",
-                     "padded_deep_gemm_non_8_aligned_sm100"),
+                     "dequantized_non_8_aligned_sm100"),
             )
-            return _fp8_swap_ab_padded_deep_gemm(
-                input, weight, weight_scale, self.output_dtype,
-                self.disable_ue8m0_cast)
+            return _fp8_swap_ab_dequantized_matmul(input, weight, weight_scale,
+                                                   self.output_dtype)
 
         a, a_sf = _fp8_quantize_1x128_ue8m0(input, self.quant_tactic)
         output = torch.empty(
@@ -1655,8 +1655,8 @@ def _is_non_8_aligned_sm100_packed_scale(input: torch.Tensor,
             and weight_scale.dtype == torch.int32)
 
 
-def _should_use_padded_deep_gemm_fp8_swap_ab_odd_m(
-        input: torch.Tensor, weight_scale: torch.Tensor) -> bool:
+def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
+                                          weight_scale: torch.Tensor) -> bool:
     return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
 
 
@@ -1666,43 +1666,41 @@ def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
     return get_sm_version() >= 100 and input.size(0) % 8 != 0
 
 
-@torch.compiler.disable()
-def _fp8_swap_ab_padded_deep_gemm(
+def _fp8_block_scale_for_swap_ab(weight: torch.Tensor,
+                                 weight_scale: torch.Tensor) -> torch.Tensor:
+    weight_scale = weight_scale.detach().cpu()
+    if weight_scale.dtype == torch.int32:
+        return fp8_utils.inverse_transform_sf(
+            weight_scale,
+            mn=weight.size(0),
+            k=weight.size(1),
+            block_size=128,
+        )
+    return weight_scale.float()
+
+
+def _fp8_swap_ab_dequantized_matmul(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
-    """Small/odd-M SM100 SwapAB path for packed UE8M0 weight scales.
-
-    This intentionally leaves aligned M on DeepGEMM.  For the odd draft/decode
-    shapes that fault in DeepGEMM, pad only M to an 8-aligned bucket, run the
-    standard quantize + DeepGEMM path, then slice the real rows back out.
-    """
+    """Host safety path for odd-M SM100 packed-scale SwapAB warmup shapes."""
     assert input.dim() == 2 and weight.dim() == 2
     assert input.dtype == torch.bfloat16
     assert weight.dtype == torch.float8_e4m3fn
     assert weight_scale.dtype == torch.int32
     assert input.size(1) == weight.size(1)
 
-    m, k = input.shape
-    n = weight.size(0)
-    padded_m = ((m + 7) // 8) * 8
-    padded_input = input.new_zeros((padded_m, k))
-    padded_input[:m].copy_(input)
-    a, a_sf = _fp8_quantize_1x128_ue8m0(padded_input,
-                                         Fp8QuantKernelRunner.TACTIC_TRITON)
-    padded_output = torch.empty((padded_m, n),
-                                device=input.device,
-                                dtype=output_dtype)
-    deep_gemm.fp8_gemm_nt(
-        (a, a_sf),
-        (weight, weight_scale),
-        padded_output,
-        disable_ue8m0_cast=disable_ue8m0_cast,
-    )
-    return padded_output[:m].contiguous()
+    scale = _fp8_block_scale_for_swap_ab(weight, weight_scale)
+    scale = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    scale = scale[:weight.size(0), :weight.size(1)]
+    device = input.device
+    input_cpu = input.detach().cpu().float()
+    weight_cpu = weight.detach().cpu().float()
+    scale_cpu = scale.detach().cpu().float()
+    output_cpu = torch.matmul(input_cpu, (weight_cpu * scale_cpu).t())
+    return output_cpu.to(output_dtype).to(device=device)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
@@ -1713,16 +1711,16 @@ def fp8_swap_ab_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
-    if _should_use_padded_deep_gemm_fp8_swap_ab_odd_m(input, weight_scale):
+    if _should_use_dequantized_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(
             "[fp8_swap_ab_gemm] Bypassing DeepGEMM SwapAB for "
-            f"non-8-aligned SM100 packed-scale M={input.size(0)}; using padded "
-            "DeepGEMM for this shape.",
+            f"non-8-aligned SM100 packed-scale M={input.size(0)}; using "
+            "dequantized matmul for this unsupported warmup shape.",
             key=("fp8_swap_ab_gemm",
-                 "direct_padded_deep_gemm_non_8_aligned_sm100"),
+                 "direct_dequantized_non_8_aligned_sm100"),
         )
-        return _fp8_swap_ab_padded_deep_gemm(input, weight, weight_scale,
-                                             output_dtype, disable_ue8m0_cast)
+        return _fp8_swap_ab_dequantized_matmul(input, weight, weight_scale,
+                                               output_dtype)
 
     tuner = AutoTuner.get()
 
