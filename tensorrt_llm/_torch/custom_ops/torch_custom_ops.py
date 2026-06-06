@@ -1541,12 +1541,14 @@ def _(
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
     TACTIC_TRITON = 1
+    if tactic == TACTIC_TRITON and not input.is_contiguous():
+        input = input.contiguous()
     if tactic == TACTIC_TRITON:
         a, a_sf = fp8_quantize.triton_fp8_quantize_1x128(input, use_ue8m0=True)
     else:
         a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
     a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-        a_sf.transpose(0, 1))
+        a_sf.transpose(0, 1).contiguous())
     return a, a_sf
 
 
