@@ -1632,6 +1632,17 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
+        if _should_use_packed_scale_triton_swap_ab_odd_m(input, weight_scale):
+            logger.warning_once(
+                "[fp8_swap_ab_gemm] Using Triton packed-scale block-FP8 "
+                f"matmul for non-8-aligned SM100 M={input.size(0)}; "
+                "DeepGEMM SwapAB faults this shape.",
+                key=("fp8_swap_ab_gemm",
+                     "packed_scale_triton_non_8_aligned_sm100"),
+            )
+            return _fp8_swap_ab_packed_scale_triton_matmul(
+                input, weight, weight_scale, self.output_dtype)
+
         if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
             logger.warning_once(
                 "[fp8_swap_ab_gemm] Using Triton block-FP8 matmul for "
@@ -1728,6 +1739,11 @@ def _should_use_triton_block_fp8_swap_ab_odd_m(
     return (_allow_preloaded_triton_swap_ab_odd_m()
             and _is_non_8_aligned_sm100_preloaded_triton_scale(
                 input, weight_scale))
+
+
+def _should_use_packed_scale_triton_swap_ab_odd_m(
+        input: torch.Tensor, weight_scale: torch.Tensor) -> bool:
+    return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
 
 
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
@@ -1883,6 +1899,71 @@ def _fp8_swap_ab_triton_block_matmul(
                                             output_dtype)
 
 
+def _fp8_swap_ab_packed_scale_triton_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """SGLang-style odd-M SwapAB path that consumes packed UE8M0 scales."""
+    assert input.dim() == 2 and weight.dim() == 2
+    assert input.dtype == torch.bfloat16
+    assert weight.dtype == torch.float8_e4m3fn
+    assert weight_scale.dtype == torch.int32
+    assert input.size(1) == weight.size(1)
+
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
+        _sglang_safe_act_quant
+
+    qinput, input_scale = _sglang_safe_act_quant(input.contiguous(),
+                                                 128,
+                                                 scale_dtype=torch.float32)
+    _smc_cuda_sync_probe("smc fp8_swap_ab packed-scale activation quant")
+
+    weight_fp8 = weight.contiguous()
+    output = torch.empty((input.size(0), weight_fp8.size(0)),
+                         device=input.device,
+                         dtype=output_dtype)
+
+    block_m = 64
+    block_n = 128
+    block_k = 128
+    group_m = 32
+
+    def grid(meta):
+        return (triton.cdiv(input.size(0), meta["BLOCK_SIZE_M"]) *
+                triton.cdiv(weight_fp8.size(0), meta["BLOCK_SIZE_N"]), )
+
+    _fp8_swap_ab_packed_scale_matmul_kernel[grid](
+        qinput,
+        weight_fp8,
+        output,
+        input_scale,
+        weight_scale,
+        input.size(0),
+        weight_fp8.size(0),
+        input.size(1),
+        qinput.stride(0),
+        qinput.stride(1),
+        weight_fp8.stride(1),
+        weight_fp8.stride(0),
+        output.stride(0),
+        output.stride(1),
+        input_scale.stride(0),
+        input_scale.stride(1),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        GROUP_SIZE_M=group_m,
+        num_warps=4,
+        num_stages=3,
+    )
+    _smc_cuda_sync_probe("smc fp8_swap_ab packed-scale triton matmul")
+    return output
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
@@ -1907,6 +1988,16 @@ def fp8_swap_ab_gemm(
         )
         return _fp8_swap_ab_triton_block_matmul(input, weight, weight_scale,
                                                 output_dtype)
+
+    if _should_use_packed_scale_triton_swap_ab_odd_m(input, weight_scale):
+        logger.warning_once(
+            "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 packed-scale "
+            f"M={input.size(0)} to Triton packed-scale block-FP8 matmul.",
+            key=("fp8_swap_ab_gemm",
+                 "direct_packed_scale_triton_non_8_aligned_sm100"),
+        )
+        return _fp8_swap_ab_packed_scale_triton_matmul(
+            input, weight, weight_scale, output_dtype)
 
     if _should_use_dequantized_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(

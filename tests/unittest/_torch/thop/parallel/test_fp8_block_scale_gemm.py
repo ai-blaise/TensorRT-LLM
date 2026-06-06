@@ -95,7 +95,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
     "dtype",
     [torch.bfloat16],
 )
-def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_pads(dtype, m, k, n):
+def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_triton(dtype, m, k, n):
     a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(dtype, m, k, n)
 
     output_expected = a @ b.t()
@@ -136,7 +136,7 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_cuda_graph_replay():
     or os.environ.get("TRTLLM_RUN_SMC_SWAPAB_PERF", "0") != "1",
     reason="Set TRTLLM_RUN_SMC_SWAPAB_PERF=1 on Blackwell to run this opt-in benchmark.",
 )
-def test_fp8_swap_ab_gemm_sm100_odd_m_padded_perf_smoke():
+def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_perf_smoke():
     timings = {}
     for m in (25, 128):
         a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(
@@ -161,7 +161,7 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_padded_perf_smoke():
         timings[m] = start.elapsed_time(end) / iters
 
     print(
-        f"smc_swapab_padded_perf m25_ms={timings[25]:.6f} "
+        f"smc_swapab_packed_scale_perf m25_ms={timings[25]:.6f} "
         f"m128_ms={timings[128]:.6f} ratio={timings[25] / timings[128]:.3f}")
 
 
