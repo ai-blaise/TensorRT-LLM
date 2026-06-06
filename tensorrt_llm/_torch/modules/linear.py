@@ -1125,9 +1125,12 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
-            elif _is_sm100_odd_m_packed_scale_swap_ab(
-                    input, module.weight_scale) and getattr(
-                        module, "weight_scale_triton_fp32", None) is not None:
+            elif (os.environ.get("TRTLLM_USE_PRELOADED_TRITON_SWAPAB_ODD_M",
+                                 "0") == "1"
+                  and _is_sm100_odd_m_packed_scale_swap_ab(
+                      input, module.weight_scale)
+                  and getattr(module, "weight_scale_triton_fp32",
+                              None) is not None):
                 output = torch.ops.trtllm.fp8_swap_ab_gemm(
                     input,
                     module.weight,

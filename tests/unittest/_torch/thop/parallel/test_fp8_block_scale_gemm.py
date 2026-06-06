@@ -77,8 +77,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
     "dtype",
     [torch.bfloat16],
 )
-def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_fails_closed(
-        dtype, m, k, n):
+def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_pads(dtype, m, k, n):
     torch.random.manual_seed(0)
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
@@ -92,9 +91,11 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_fails_closed(
         is_sfa=False,
     )
 
-    with pytest.raises(RuntimeError,
-                       match="requires preloaded FP32 Triton block scales"):
-        torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+    output_expected = a @ b.t()
+    output = torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-2
 
 
 @pytest.mark.skipif(

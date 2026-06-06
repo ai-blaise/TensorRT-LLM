@@ -1620,11 +1620,6 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
-        if _is_non_8_aligned_sm100_packed_scale(input, weight_scale):
-            raise RuntimeError(
-                "Odd-M SM100 packed-scale fp8_swap_ab_gemm requires "
-                "preloaded FP32 Triton block scales; runtime GPU unpack is "
-                "disabled.")
         if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
             logger.warning_once(
                 "[fp8_swap_ab_gemm] Using Triton block-FP8 matmul for "
@@ -1874,11 +1869,6 @@ def fp8_swap_ab_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
-    if _is_non_8_aligned_sm100_packed_scale(input, weight_scale):
-        raise RuntimeError(
-            "Odd-M SM100 packed-scale fp8_swap_ab_gemm requires preloaded "
-            "FP32 Triton block scales; runtime GPU unpack is disabled.")
-
     if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(
             "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 "
