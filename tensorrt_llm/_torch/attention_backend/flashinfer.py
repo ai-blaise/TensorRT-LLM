@@ -106,6 +106,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
+    _kv_lens_cuda: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
 
@@ -432,6 +433,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                        self.num_generations]
 
     @property
+    def kv_lens_cuda(self) -> torch.Tensor:
+        return self._kv_lens_cuda[:self.num_contexts + self.num_generations]
+
+    @property
     def batch_indices(self) -> torch.Tensor:
         return self._batch_indices[:self.num_tokens]
 
@@ -478,6 +483,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
+        self._kv_lens_cuda = torch.empty((self.max_num_requests, ),
+                                         dtype=torch.int,
+                                         device='cuda')
         self._batch_indices = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -688,6 +696,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.kv_cache_params = KVCacheParams(use_cache=False)
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
+            self._kv_lens_cuda[:n].copy_(self.seq_lens_kv_cuda[:n],
+                                         non_blocking=True)
             self.num_ctx_cached_tokens = 0
             for plan_params in list(self._plan_params_to_wrappers.keys()):
                 if plan_params.attention_mask_data is None:
@@ -717,6 +727,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
+        self._kv_lens_cuda[:kv_lens.size(0)].copy_(kv_lens,
+                                                   non_blocking=True)
+        kv_lens = self.kv_lens_cuda
 
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
