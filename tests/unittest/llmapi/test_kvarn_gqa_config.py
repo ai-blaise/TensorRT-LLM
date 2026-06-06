@@ -1,8 +1,7 @@
 """GQA KVarN KV-cache config plumbing coverage.
 
-These tests intentionally stop at config/fail-fast behavior. The generic GQA
-store/read/dequant kernels are not present in op-trt yet, so KVarN GQA requests
-must not silently fall through to fp16/fp8/nvfp4 cache behavior.
+These tests cover HF/default routing and fail-closed config behavior. The
+reference GQA backend is intentionally isolated from dense MLA and Indexer paths.
 """
 
 from types import SimpleNamespace
@@ -69,3 +68,26 @@ def test_gqa_kvarn_request_sets_kvarn_quant_mode():
 
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.KVARN.value
     assert model_config.quant_config.kv_cache_dtype == "kvarn_k2v2_g128"
+
+
+def test_hf_dense_mla_kvarn_config_does_not_enable_gqa_kvarn():
+    cfg = SimpleNamespace(
+        quantization_config={
+            "kvarn": {"path": "dense_mla", "dtype": "kvarn_k2v2"}
+        }
+    )
+
+    assert _hf_kvarn_gqa_kv_dtype(cfg) is None
+
+
+def test_hf_indexer_kvarn_config_does_not_enable_gqa_kvarn():
+    cfg = SimpleNamespace(
+        quantization_config={
+            "kvarn": {
+                "indexer": {"enabled": True, "dtype": "fp4_hisa"},
+                "gqa": {"enabled": False},
+            }
+        }
+    )
+
+    assert _hf_kvarn_gqa_kv_dtype(cfg) is None

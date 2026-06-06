@@ -43,6 +43,9 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--sinkhorn-iters", type=int, default=4)
     parser.add_argument("--queries", type=int, nargs="+", default=[1, 5, 25])
+    parser.add_argument("--min-cosine", type=float, default=0.55)
+    parser.add_argument("--require-fused", action="store_true",
+                        help="fail unless a fused KVarN GQA op is registered")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -56,11 +59,28 @@ def main() -> None:
     }
 
     records = quantize_gqa_tile(k, v, cfg)
+    k_restore, v_restore = dequantize_gqa_tile(records, cfg)
+    k_cos = torch.nn.functional.cosine_similarity(
+        k.float().flatten(), k_restore.float().flatten(), dim=0).item()
+    v_cos = torch.nn.functional.cosine_similarity(
+        v.float().flatten(), v_restore.float().flatten(), dim=0).item()
+    if min(k_cos, v_cos) < args.min_cosine:
+        raise SystemExit(
+            f"KVarN GQA restore correctness below floor: k_cos={k_cos:.4f} "
+            f"v_cos={v_cos:.4f} floor={args.min_cosine:.4f}")
+
     pack_us = _bench(lambda: quantize_gqa_tile(k, v, cfg), args.iters, device)
     restore_us = _bench(lambda: dequantize_gqa_tile(records, cfg), args.iters, device)
+    fused_available = hasattr(getattr(torch.ops, "trtllm", object()),
+                              "kvarn_gqa_decode")
+    if args.require_fused and not fused_available:
+        raise SystemExit(
+            "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_decode "
+            "is not registered; do not promote the reference path as fused")
 
     print(f"dtype={cfg.dtype} tile_bytes={cfg.tile_bytes_aligned} bytes_per_token_slot={cfg.bytes_per_token_slot}")
-    print(f"pack_us={pack_us:.2f} restore_us={restore_us:.2f} kv_heads={args.kv_heads}")
+    print(f"restore_cosine_k={k_cos:.4f} restore_cosine_v={v_cos:.4f}")
+    print(f"pack_us={pack_us:.2f} restore_us={restore_us:.2f} kv_heads={args.kv_heads} fused_available={fused_available}")
     for m, q in q_by_m.items():
         def score_once():
             k_restore, v_restore = dequantize_gqa_tile(records, cfg)

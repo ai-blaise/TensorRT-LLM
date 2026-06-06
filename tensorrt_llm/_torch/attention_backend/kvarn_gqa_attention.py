@@ -15,7 +15,6 @@ fused CUDA/Triton decode kernel.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -30,74 +29,165 @@ from .kvarn_gqa import (KVarNGQAConfig, dequantize_gqa_tile,
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
-@dataclass
-class _TailBlock:
-    k: torch.Tensor
-    v: torch.Tensor
-    filled: torch.Tensor
+class _KVarNGQASidePool:
+    """Preallocated fp16 sink/tail state for KVarN GQA.
 
+    The Python request-id -> slot dictionary is host bookkeeping, but tensor
+    storage is fixed after construction so CUDA graph capture does not see new
+    allocations for sink/tail buffers. Each active request owns one tail block;
+    full non-speculative tails are committed into packed pages before reuse.
+    """
 
-class _KVarNGQARuntimeState:
-    def __init__(self, cfg: KVarNGQAConfig):
+    def __init__(self, cfg: KVarNGQAConfig, *, num_layers: int,
+                 max_batch_size: int, max_blocks_per_seq: int,
+                 num_kv_heads: int, dtype: torch.dtype, device: torch.device):
         self.cfg = cfg
-        self.sink: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        self.tail: dict[tuple[int, int, int], _TailBlock] = {}
-        self.committed: set[tuple[int, int, int]] = set()
-        self.commit_gen: dict[tuple[int, int, int], int] = {}
+        self.num_layers = num_layers
+        self.max_batch_size = max_batch_size
+        self.max_blocks_per_seq = max_blocks_per_seq
+        self.num_kv_heads = num_kv_heads
+        self.dtype = dtype
+        self.device = device
+        shape = (num_layers, max_batch_size, cfg.sink_tokens,
+                 num_kv_heads, cfg.head_dim)
+        tail_shape = (num_layers, max_batch_size, cfg.group,
+                      num_kv_heads, cfg.head_dim)
+        self.sink_k = torch.empty(shape, device=device, dtype=dtype)
+        self.sink_v = torch.empty(shape, device=device, dtype=dtype)
+        self.sink_len = torch.zeros((num_layers, max_batch_size),
+                                    device=device, dtype=torch.int32)
+        self.tail_k = torch.empty(tail_shape, device=device, dtype=dtype)
+        self.tail_v = torch.empty(tail_shape, device=device, dtype=dtype)
+        self.tail_filled = torch.zeros((num_layers, max_batch_size, cfg.group),
+                                       device=device, dtype=torch.bool)
+        self.tail_block_start = torch.full((num_layers, max_batch_size), -1,
+                                           device=device, dtype=torch.int64)
+        self.committed = torch.zeros((num_layers, max_batch_size,
+                                      max(1, max_blocks_per_seq)),
+                                     device=device, dtype=torch.bool)
+        self.commit_gen = torch.zeros_like(self.committed, dtype=torch.int64)
+        self.request_to_slot: dict[int, int] = {}
+        self.slot_to_request: dict[int, int] = {}
+        self.request_block_to_slot_block: dict[tuple[int, int, int], int] = {}
 
-    def _tail_for(self, layer: int, request_id: int, block_start: int,
-                  template: torch.Tensor) -> _TailBlock:
-        key = (layer, request_id, block_start)
-        tail = self.tail.get(key)
-        if tail is None:
-            shape = (self.cfg.group, template.shape[1], template.shape[2])
-            tail = _TailBlock(
-                k=torch.empty(shape, device=template.device, dtype=template.dtype),
-                v=torch.empty(shape, device=template.device, dtype=template.dtype),
-                filled=torch.zeros((self.cfg.group,), device=template.device, dtype=torch.bool),
-            )
-            self.tail[key] = tail
-        return tail
+    @property
+    def max_committed_blocks(self) -> int:
+        return self.committed.shape[2]
 
-    def put_sink(self, layer: int, request_id: int, k_tok: torch.Tensor,
+    def slot_for_request(self, request_id: int) -> int:
+        slot = self.request_to_slot.get(request_id)
+        if slot is not None:
+            return slot
+        for candidate in range(self.max_batch_size):
+            if candidate not in self.slot_to_request:
+                self.request_to_slot[request_id] = candidate
+                self.slot_to_request[candidate] = request_id
+                return candidate
+        raise RuntimeError(
+            f"KVarN GQA side pool exhausted: max_batch_size={self.max_batch_size}, "
+            f"request_id={request_id}")
+
+    def put_sink(self, layer: int, slot: int, k_tok: torch.Tensor,
                  v_tok: torch.Tensor, pos: int) -> None:
-        key = (layer, request_id)
-        sink = self.sink.get(key)
-        if sink is None:
-            shape = (self.cfg.sink_tokens, k_tok.shape[0], k_tok.shape[1])
-            sink = (
-                torch.empty(shape, device=k_tok.device, dtype=k_tok.dtype),
-                torch.empty(shape, device=v_tok.device, dtype=v_tok.dtype),
-            )
-            self.sink[key] = sink
-        sink[0][pos].copy_(k_tok)
-        sink[1][pos].copy_(v_tok)
+        self.sink_k[layer, slot, pos].copy_(k_tok)
+        self.sink_v[layer, slot, pos].copy_(v_tok)
+        self.sink_len[layer, slot] = max(int(self.sink_len[layer, slot].item()),
+                                         pos + 1)
 
-    def put_tail(self, layer: int, request_id: int, block_start: int,
+    def put_tail(self, layer: int, slot: int, block_start: int,
                  block_offset: int, k_tok: torch.Tensor,
-                 v_tok: torch.Tensor) -> _TailBlock:
-        tail = self._tail_for(layer, request_id, block_start, k_tok.unsqueeze(0))
-        tail.k[block_offset].copy_(k_tok)
-        tail.v[block_offset].copy_(v_tok)
-        tail.filled[block_offset] = True
-        return tail
+                 v_tok: torch.Tensor) -> None:
+        cur_start = int(self.tail_block_start[layer, slot].item())
+        if cur_start != block_start:
+            if cur_start != -1 and bool(self.tail_filled[layer, slot].any().item()):
+                raise RuntimeError(
+                    "KVarN GQA tail advanced before previous tail committed; "
+                    "speculative/generation side state needs multi-tail support")
+            self.tail_block_start[layer, slot] = block_start
+            self.tail_filled[layer, slot].zero_()
+        self.tail_k[layer, slot, block_offset].copy_(k_tok)
+        self.tail_v[layer, slot, block_offset].copy_(v_tok)
+        self.tail_filled[layer, slot, block_offset] = True
 
-    def mark_committed(self, layer: int, request_id: int, block_start: int) -> None:
-        key = (layer, request_id, block_start)
-        self.committed.add(key)
-        self.commit_gen[key] = self.commit_gen.get(key, 0) + 1
-        self.tail.pop(key, None)
+    def tail_is_full(self, layer: int, slot: int) -> bool:
+        return bool(self.tail_filled[layer, slot].all().item())
 
-    def is_committed(self, layer: int, request_id: int, block_start: int) -> bool:
-        return (layer, request_id, block_start) in self.committed
+    def tail_tensors(self, layer: int, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.tail_k[layer, slot], self.tail_v[layer, slot]
+
+    def clear_tail(self, layer: int, slot: int) -> None:
+        self.tail_filled[layer, slot].zero_()
+        self.tail_block_start[layer, slot] = -1
+
+    def mark_committed(self, layer: int, slot: int, request_id: int,
+                       block_start: int) -> None:
+        block_num = block_start // self.cfg.group
+        if block_num >= self.max_committed_blocks:
+            raise RuntimeError(
+                f"KVarN GQA commit block {block_num} exceeds graph-safe side-pool "
+                f"capacity {self.max_committed_blocks}; increase max_seq_len/tokens_per_block")
+        self.committed[layer, slot, block_num] = True
+        self.commit_gen[layer, slot, block_num] += 1
+        self.request_block_to_slot_block[(layer, request_id, block_start)] = block_num
+        self.clear_tail(layer, slot)
+
+    def is_committed(self, layer: int, slot: int, block_start: int) -> bool:
+        block_num = block_start // self.cfg.group
+        return (block_num < self.max_committed_blocks
+                and bool(self.committed[layer, slot, block_num].item()))
+
+    def sink_tensors(self, layer: int, slot: int, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        available = int(self.sink_len[layer, slot].item())
+        if available < n:
+            raise RuntimeError(
+                f"KVarN GQA sink state incomplete for layer={layer} slot={slot}: "
+                f"need={n}, available={available}; transferred KV must restore sink side state")
+        return self.sink_k[layer, slot, :n], self.sink_v[layer, slot, :n]
+
+    def active_tail_tensors(self, layer: int, slot: int,
+                            block_start: int, take: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cur_start = int(self.tail_block_start[layer, slot].item())
+        if cur_start != block_start:
+            raise RuntimeError(
+                f"KVarN GQA tail block missing for layer={layer} slot={slot} "
+                f"block_start={block_start}, active={cur_start}")
+        return self.tail_k[layer, slot, :take], self.tail_v[layer, slot, :take]
+
+    def transfer_snapshot(self, layer: int, request_id: int) -> dict[str, torch.Tensor]:
+        slot = self.slot_for_request(request_id)
+        return {
+            "sink_k": self.sink_k[layer, slot],
+            "sink_v": self.sink_v[layer, slot],
+            "sink_len": self.sink_len[layer, slot].reshape(1),
+            "tail_k": self.tail_k[layer, slot],
+            "tail_v": self.tail_v[layer, slot],
+            "tail_filled": self.tail_filled[layer, slot],
+            "tail_block_start": self.tail_block_start[layer, slot].reshape(1),
+            "committed": self.committed[layer, slot],
+            "commit_gen": self.commit_gen[layer, slot],
+        }
 
 
-def _get_or_create_state(kv_cache_manager, cfg: KVarNGQAConfig) -> _KVarNGQARuntimeState:
-    state = getattr(kv_cache_manager, "_kvarn_gqa_state", None)
-    if state is None:
-        state = _KVarNGQARuntimeState(cfg)
-        setattr(kv_cache_manager, "_kvarn_gqa_state", state)
-    return state
+def _get_or_create_side_pool(kv_cache_manager, cfg: KVarNGQAConfig,
+                             *, layer_idx: int, kv_pages: torch.Tensor,
+                             dtype: torch.dtype) -> _KVarNGQASidePool:
+    pool = getattr(kv_cache_manager, "_kvarn_gqa_side_pool", None)
+    num_layers = max(getattr(kv_cache_manager, "layer_offsets", {layer_idx: 0}).values()) + 1
+    max_batch_size = int(getattr(kv_cache_manager, "max_batch_size", 1))
+    max_blocks_per_seq = int(getattr(kv_cache_manager, "max_blocks_per_seq",
+                                     max(1, math.ceil(getattr(kv_cache_manager, "max_seq_len",
+                                                              cfg.group) / cfg.group))))
+    num_kv_heads = int(kv_pages.shape[3])
+    if pool is None:
+        pool = _KVarNGQASidePool(cfg,
+                                 num_layers=num_layers,
+                                 max_batch_size=max_batch_size,
+                                 max_blocks_per_seq=max_blocks_per_seq,
+                                 num_kv_heads=num_kv_heads,
+                                 dtype=dtype,
+                                 device=kv_pages.device)
+        setattr(kv_cache_manager, "_kvarn_gqa_side_pool", pool)
+    return pool
 
 
 def _record_view_from_page(page: torch.Tensor, cfg: KVarNGQAConfig) -> torch.Tensor:
@@ -170,20 +260,20 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             v = v.view(kv_len, self.num_kv_heads, self.head_dim).contiguous()
         return q, k, v, kv_len
 
-    def _commit_tail_if_full(self, state: _KVarNGQARuntimeState,
+    def _commit_tail_if_full(self, state: _KVarNGQASidePool,
                              kv_pages: torch.Tensor, layer: int,
-                             request_id: int, block_start: int,
-                             block_id: int, tail: _TailBlock,
-                             allow_commit: bool) -> None:
-        if not allow_commit or not bool(tail.filled.all().item()):
+                             request_id: int, slot: int, block_start: int,
+                             block_id: int, allow_commit: bool) -> None:
+        if not allow_commit or not state.tail_is_full(layer, slot):
             return
-        record = quantize_gqa_tile(tail.k, tail.v, self.cfg)
+        tail_k, tail_v = state.tail_tensors(layer, slot)
+        record = quantize_gqa_tile(tail_k, tail_v, self.cfg)
         _write_record_to_page(kv_pages[block_id, 0], record, self.cfg)
-        state.mark_committed(layer, request_id, block_start)
+        state.mark_committed(layer, slot, request_id, block_start)
 
-    def _store_new_tokens(self, state: _KVarNGQARuntimeState,
+    def _store_new_tokens(self, state: _KVarNGQASidePool,
                           kv_pages: torch.Tensor, request_id: int,
-                          block_ids: list[int], past_seen_token: int,
+                          slot: int, block_ids: list[int], past_seen_token: int,
                           k: Optional[torch.Tensor], v: Optional[torch.Tensor],
                           *, allow_commit: bool) -> None:
         if k is None or v is None:
@@ -191,7 +281,7 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
         for i in range(k.shape[0]):
             pos = past_seen_token + i
             if pos < self.cfg.sink_tokens:
-                state.put_sink(self.layer_idx, request_id, k[i], v[i], pos)
+                state.put_sink(self.layer_idx, slot, k[i], v[i], pos)
                 continue
             block_num = pos // self.cfg.group
             block_start = block_num * self.cfg.group
@@ -200,23 +290,22 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 raise RuntimeError(
                     f"KVarN GQA missing block id for request={request_id} "
                     f"position={pos} block_num={block_num} ids={block_ids}")
-            tail = state.put_tail(self.layer_idx, request_id, block_start,
-                                  block_offset, k[i], v[i])
+            state.put_tail(self.layer_idx, slot, block_start, block_offset, k[i], v[i])
             self._commit_tail_if_full(state, kv_pages, self.layer_idx,
-                                      request_id, block_start,
-                                      block_ids[block_num], tail, allow_commit)
+                                      request_id, slot, block_start,
+                                      block_ids[block_num], allow_commit)
 
-    def _load_sequence(self, state: _KVarNGQARuntimeState,
+    def _load_sequence(self, state: _KVarNGQASidePool,
                        kv_pages: torch.Tensor, request_id: int,
-                       block_ids: list[int], seq_len: int,
+                       slot: int, block_ids: list[int], seq_len: int,
                        dtype: torch.dtype, device: torch.device):
         pieces_k = []
         pieces_v = []
-        sink = state.sink.get((self.layer_idx, request_id))
-        if sink is not None and seq_len > 0:
+        if seq_len > 0:
             n = min(seq_len, self.cfg.sink_tokens)
-            pieces_k.append(sink[0][:n].to(device=device, dtype=dtype))
-            pieces_v.append(sink[1][:n].to(device=device, dtype=dtype))
+            sink_k, sink_v = state.sink_tensors(self.layer_idx, slot, n)
+            pieces_k.append(sink_k.to(device=device, dtype=dtype))
+            pieces_v.append(sink_v.to(device=device, dtype=dtype))
 
         pos = self.cfg.sink_tokens
         while pos < seq_len:
@@ -228,19 +317,16 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     f"KVarN GQA missing read block id for request={request_id} "
                     f"position={pos} block_num={block_num} ids={block_ids}")
             if take == self.cfg.group and state.is_committed(
-                    self.layer_idx, request_id, block_start):
+                    self.layer_idx, slot, block_start):
                 record = _record_view_from_page(kv_pages[block_ids[block_num], 0], self.cfg)
                 k_tile, v_tile = dequantize_gqa_tile(record, self.cfg)
                 pieces_k.append(k_tile.to(dtype=dtype))
                 pieces_v.append(v_tile.to(dtype=dtype))
             else:
-                tail = state.tail.get((self.layer_idx, request_id, block_start))
-                if tail is None:
-                    raise RuntimeError(
-                        f"KVarN GQA tail block missing for request={request_id} "
-                        f"layer={self.layer_idx} block_start={block_start}")
-                pieces_k.append(tail.k[:take].to(dtype=dtype))
-                pieces_v.append(tail.v[:take].to(dtype=dtype))
+                tail_k, tail_v = state.active_tail_tensors(self.layer_idx, slot,
+                                                            block_start, take)
+                pieces_k.append(tail_k.to(dtype=dtype))
+                pieces_v.append(tail_v.to(dtype=dtype))
             pos = block_start + take
 
         if not pieces_k:
@@ -310,7 +396,9 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_pages = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_layout="NHD")
         if kv_pages.dtype != torch.uint8:
             raise RuntimeError(f"KVarN GQA expected uint8 packed KV pages, got {kv_pages.dtype}")
-        state = _get_or_create_state(metadata.kv_cache_manager, self.cfg)
+        state = _get_or_create_side_pool(metadata.kv_cache_manager, self.cfg,
+                                         layer_idx=self.layer_idx, kv_pages=kv_pages,
+                                         dtype=q.dtype)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         block_ids_per_seq = metadata.kv_cache_manager.get_batch_cache_indices(metadata.request_ids)
@@ -327,15 +415,17 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             past = int(past_seen_tokens[sample_idx])
             request_id = int(metadata.request_ids[sample_idx])
             block_ids = [int(x) for x in block_ids_per_seq[sample_idx]]
-            # Commit only context/full prefill blocks. Generation/speculative draft
-            # tokens remain in fp16 tail state so reject/rewind cannot leave a
-            # quantized block containing unaccepted tokens.
-            allow_commit = sample_idx < metadata.num_contexts
-            self._store_new_tokens(state, kv_pages, request_id, block_ids, past,
+            # Speculative draft tokens remain in fp16 tail state so reject/rewind
+            # cannot leave packed records containing unaccepted tokens. Ordinary
+            # generation commits full 128-token tails to avoid unbounded side state.
+            use_spec_decoding = bool(getattr(metadata, "use_spec_decoding", False))
+            allow_commit = sample_idx < metadata.num_contexts or not use_spec_decoding
+            slot = state.slot_for_request(request_id)
+            self._store_new_tokens(state, kv_pages, request_id, slot, block_ids, past,
                                    k_view, v_view, allow_commit=allow_commit)
             total_kv_len = past + new_kv_len
             k_states, v_states = self._load_sequence(state, kv_pages, request_id,
-                                                     block_ids, total_kv_len,
+                                                     slot, block_ids, total_kv_len,
                                                      single_q.dtype, single_q.device)
             attn_mask, is_causal = self._make_mask(forward_args.attention_mask,
                                                    past, new_kv_len, single_q.device,

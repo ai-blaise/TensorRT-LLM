@@ -41,9 +41,12 @@ Implemented:
   pool, and transfer-view metadata shape.
 - `tensorrt_llm/_torch/attention_backend/kvarn_gqa_attention.py` is the first
   runnable GQA KVarN backend. It forces split Q/K/V, commits full context blocks
-  into packed KVarN records, keeps the first 128 sink tokens and speculative
-  generation tail in fp16, restores packed records for GQA SDPA, and rejects
-  sparse-indexed reads until a packed sparse read path exists.
+  into packed KVarN records, keeps the first 128 sink tokens and in-progress
+  speculative tail in fp16, restores packed records for GQA SDPA, and rejects
+  sparse-indexed reads until a packed sparse read path exists. The side buffers
+  are preallocated by layer/request slot with commit metadata sized to
+  `max_blocks_per_seq`, so ordinary decode does not allocate new sink/tail
+  tensors inside the step.
 - `_util.py` allocates non-MLA KVarN GQA KV as an opaque UINT8 self-only page
   pool. For k2v2/g128 it uses `tokens_per_block=128`, `head_dim=76`, and
   `CacheType.SELFKONLY`, so each page is exactly one 9,728-byte KVarN record per
@@ -99,17 +102,21 @@ called complete:
    generation and SMC draft/verify query shapes, including odd M values such as
    25. Python per-token/tile loops are functional but not acceptable for the
    c16 throughput target.
-2. Disaggregated transfer: `kv_extractor.py` and `kv_cache_transceiver.py` must
-   transfer packed records plus fp16 sink/tail state as KVarN records. The
-   current runnable backend explicitly rejects connector mode rather than
-   falling back to dense K/V transfer.
+2. Disaggregated transfer: `kv_extractor.py` and the cache transceiver must
+   transfer packed records plus fp16 sink/tail side-state as KVarN records. The
+   side pool now exposes a tensor snapshot contract (`sink_k`, `sink_v`,
+   `tail_k`, `tail_v`, `tail_filled`, `tail_block_start`, `committed`,
+   `commit_gen`), but connector mode still rejects at startup until those
+   tensors are registered/restored with the transfer backend.
 3. Sparse-indexed GQA reads: HISA/Indexer state remains separate and is not
    quantized by KVarN, but sparse read selection over packed KVarN records needs
    its own read/dequant path before `sparse_attn_config` can compose with this
    backend.
-4. CUDA graph state: request-owned fp16 sink/tail state is Python-managed in the
-   reference backend. A production kernel path should preallocate graph-safe
-   side buffers and mirror commit generations on device.
+4. CUDA graph state: sink/tail tensors and commit generations are preallocated,
+   but request-slot assignment and reference restore/scoring are still
+   Python-managed. Full graph capture needs native store/restore/decode kernels
+   plus a request lifecycle hook to recycle side-pool slots without host-side
+   mutation inside a captured region.
 5. LayerSplit/CP proof: packed pages are byte pages and can be owner-split, but
    the current code still needs a full LayerSplit run to verify non-owner scratch
    routing for generic GQA KVarN, separate from dense MLA LayerSplit.
@@ -123,15 +130,20 @@ Current focused coverage:
   selection.
 - `tests/unittest/_torch/attention/test_kvarn_gqa.py`: k2v2 record layout,
   2/3/4-bit pack/unpack, store/restore shape/finiteness/cosine, packed-pool
-  commit state, and transfer-view shape.
+  commit state, transfer-view shape, fixed-capacity side-pool behavior, sink/tail
+  fail-close, and side-state snapshot shape.
 - `benchmarks/python/bench_kvarn_gqa_micro.py`: light pack/restore/reference
-  scoring timing for `M in {1,5,25}`. Use it only on an idle GPU or CPU; it is a
-  reference baseline, not the fused production-kernel benchmark.
+  scoring timing for `M in {1,5,25}`. It enforces a restore-cosine floor and
+  supports `--require-fused`, which fails until a real
+  `torch.ops.trtllm.kvarn_gqa_decode` op is registered. Use it only on an idle
+  GPU or CPU; it is a reference baseline, not the fused production-kernel
+  benchmark.
 
 Example:
 
 ```bash
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --kv-heads 8 --iters 100 --queries 1 5 25
+python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --require-fused
 ```
 
 ## Composition contract
@@ -150,6 +162,7 @@ python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --kv-heads 8 --i
   must fail if the selected backend only knows dense K/V tensors.
 
 `kvarn_k2v2_g128` is now HF-deployable/defaultable and has a runnable reference
-GQA KV backend for non-MLA models. It is still a correctness-first backend; the
-remaining work is native fused decode/store plus disaggregated transfer support
-before it can satisfy the production throughput target.
+GQA KV backend for non-MLA models. It is still a correctness-first backend with
+preallocated side-state; the remaining work is native fused decode/store plus
+disaggregated side-state transfer before it can satisfy the production
+throughput target.

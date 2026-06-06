@@ -6,6 +6,9 @@ import pytest
 
 _TORCH = pytest.importorskip("torch")
 
+from tensorrt_llm._torch.attention_backend.kvarn_gqa_attention import (  # noqa: E402
+    _KVarNGQASidePool,
+)
 from tensorrt_llm._torch.attention_backend.kvarn_gqa import (  # noqa: E402
     KVarNGQAConfig,
     KVarNGQAPackedPool,
@@ -83,3 +86,68 @@ def test_kvarn_gqa_packed_pool_and_transfer_view():
     assert view["records"].shape == (1, 1, cfg.tile_bytes_aligned)
     assert view["valid"].shape == (1,)
     assert view["tile_bytes"].item() == cfg.tile_bytes_aligned
+
+
+def test_kvarn_gqa_side_pool_is_fixed_capacity_and_snapshot_ready():
+    torch = _TORCH
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    pool = _KVarNGQASidePool(
+        cfg,
+        num_layers=2,
+        max_batch_size=2,
+        max_blocks_per_seq=3,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    slot = pool.slot_for_request(17)
+    k_tok = torch.ones((1, cfg.head_dim), dtype=torch.float16)
+    v_tok = torch.full_like(k_tok, 2)
+
+    pool.put_sink(1, slot, k_tok, v_tok, 0)
+    sink_k, sink_v = pool.sink_tensors(1, slot, 1)
+    assert sink_k.shape == (1, 1, cfg.head_dim)
+    assert torch.equal(sink_k[0], k_tok)
+    assert torch.equal(sink_v[0], v_tok)
+
+    for offset in range(cfg.group):
+        pool.put_tail(1, slot, cfg.group, offset, k_tok, v_tok)
+    committed_id = id(pool.committed)
+    pool.mark_committed(1, slot, 17, cfg.group)
+    assert id(pool.committed) == committed_id
+    assert pool.is_committed(1, slot, cfg.group)
+
+    snapshot = pool.transfer_snapshot(1, 17)
+    assert snapshot["sink_k"].shape == (cfg.sink_tokens, 1, cfg.head_dim)
+    assert snapshot["tail_k"].shape == (cfg.group, 1, cfg.head_dim)
+    assert snapshot["committed"].shape == (3,)
+    assert snapshot["commit_gen"].shape == (3,)
+
+    with pytest.raises(RuntimeError, match="exceeds graph-safe side-pool"):
+        pool.mark_committed(1, slot, 17, cfg.group * 3)
+
+
+def test_kvarn_gqa_side_pool_fails_closed_for_missing_sink_and_tail():
+    torch = _TORCH
+    cfg = KVarNGQAConfig()
+    pool = _KVarNGQASidePool(
+        cfg,
+        num_layers=1,
+        max_batch_size=1,
+        max_blocks_per_seq=2,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    slot = pool.slot_for_request(9)
+    tok = torch.zeros((1, cfg.head_dim), dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="sink state incomplete"):
+        pool.sink_tensors(0, slot, 1)
+
+    pool.put_tail(0, slot, cfg.group, 0, tok, tok)
+    with pytest.raises(RuntimeError, match="tail advanced"):
+        pool.put_tail(0, slot, cfg.group * 2, 0, tok, tok)
+
+    with pytest.raises(RuntimeError, match="side pool exhausted"):
+        pool.slot_for_request(10)
