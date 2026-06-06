@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import triton
@@ -497,7 +497,9 @@ def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(s_ptr + pid, s)
 
 
-def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
+def _safe_act_quant(x: torch.Tensor,
+                    block_size: int = 128,
+                    scale_dtype: Optional[torch.dtype] = None) -> tuple:
     """Block-wise FP8 activation quantization (CUDA-graph safe).
 
     Drop-in replacement for ``transformers.integrations.finegrained_fp8.act_quant``
@@ -508,9 +510,11 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    # Keep scale metadata in the model dtype to avoid FP32->BF16 cast kernels
-    # when the tensor is consumed by downstream MoE/quantized paths.
-    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=x.dtype)
+    if scale_dtype is None:
+        # Keep scale metadata in the model dtype to avoid FP32->BF16 cast
+        # kernels when the tensor is consumed by downstream MoE/quantized paths.
+        scale_dtype = x.dtype
+    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=scale_dtype)
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
@@ -546,6 +550,7 @@ def _w8a8_block_fp8_matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    needs_masking: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -566,20 +571,31 @@ def _w8a8_block_fp8_matmul_kernel(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if needs_masking:
+            a = tl.load(a_ptrs,
+                        mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
+                        other=0.0)
+            b = tl.load(b_ptrs,
+                        mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                        other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
 
-        k_start = k * BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1,
+                                0)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
@@ -593,6 +609,83 @@ def _w8a8_block_fp8_matmul_kernel(
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+def _unpack_ue8m0_scale_for_triton(
+    sf_packed: torch.Tensor,
+    weight_shape: tuple[int, int],
+    block_size: List[int],
+) -> torch.Tensor:
+    """Unpack DeepGEMM/TMA UE8M0 scales for SGLang-style Triton W8A8 GEMM."""
+    assert sf_packed.dtype == torch.int32
+    assert sf_packed.dim() == 2
+    n, k = weight_shape
+    block_n, block_k = block_size
+    n_groups = triton.cdiv(n, block_n)
+    k_groups = triton.cdiv(k, block_k)
+    mn_repeat, k_div_4 = sf_packed.shape
+    k_packed = k_div_4 * 4
+
+    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
+    sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+    if mn_repeat == n:
+        indices = torch.arange(0, n, block_n, device=sf_packed.device)
+        sf_fp32 = sf_fp32.index_select(0, indices)
+    elif mn_repeat != n_groups:
+        raise ValueError(
+            f"Unexpected packed UE8M0 scale shape: sf_packed.shape={sf_packed.shape}, "
+            f"weight_shape={weight_shape}, block_size={block_size}")
+    return sf_fp32[:, :k_groups].contiguous()
+
+
+def _select_sglang_b200_w8a8_config(M: int, N: int,
+                                    K: int) -> Dict[str, int]:
+    """SGLang-shaped B200 fallback configs for small SMC draft batches."""
+    del N, K
+    if M <= 16:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 32,
+            "num_warps": 4,
+            "num_stages": 4,
+        }
+    if M <= 32:
+        return {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 16,
+            "num_warps": 8,
+            "num_stages": 3,
+        }
+    if M <= 96:
+        return {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 16,
+            "num_warps": 8,
+            "num_stages": 4,
+        }
+    if M <= 256:
+        return {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 16,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    return {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 8,
+        "num_stages": 2,
+    }
 
 
 def _w8a8_block_fp8_matmul_triton(
@@ -617,6 +710,8 @@ def _w8a8_block_fp8_matmul_triton(
     M = A.numel() // A.shape[-1]
     N, K = B.shape
     assert B.ndim == 2 and B.is_contiguous()
+    if Bs.dtype == torch.int32:
+        Bs = _unpack_ue8m0_scale_for_triton(Bs, (N, K), [block_n, block_k])
     assert Bs.ndim == 2
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
@@ -624,11 +719,10 @@ def _w8a8_block_fp8_matmul_triton(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    BLOCK_SIZE_M = 128
-    if M < BLOCK_SIZE_M:
-        BLOCK_SIZE_M = max(triton.next_power_of_2(M), 16)
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
+    config = _select_sglang_b200_w8a8_config(M, N, K)
+    if config["BLOCK_SIZE_K"] < block_k:
+        config = {**config, "BLOCK_SIZE_K": block_k}
+    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
@@ -654,12 +748,28 @@ def _w8a8_block_fp8_matmul_triton(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
+        **config,
+        needs_masking=needs_masking,
     )
     return C
+
+
+def _sglang_fp8_swap_ab_block_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """SGLang-style W8A8 block-FP8 matmul for packed UE8M0 SwapAB weights."""
+    qinput, input_scale = _safe_act_quant(input.contiguous(),
+                                          128,
+                                          scale_dtype=torch.float32)
+    return _w8a8_block_fp8_matmul_triton(qinput,
+                                         weight.contiguous(),
+                                         input_scale,
+                                         weight_scale,
+                                         [128, 128],
+                                         output_dtype=output_dtype)
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())

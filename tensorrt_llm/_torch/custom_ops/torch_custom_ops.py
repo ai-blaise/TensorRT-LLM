@@ -1849,45 +1849,10 @@ def _fp8_swap_ab_triton_block_matmul(
     assert input.size(1) == weight.size(1)
 
     from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
-        _safe_act_quant
+        _sglang_fp8_swap_ab_block_matmul
 
-    qinput, input_scale = _safe_act_quant(input.contiguous(), 128)
-    weight_fp8 = weight.contiguous()
-    output = input.new_empty((input.size(0), weight.size(0)),
-                             dtype=output_dtype)
-    M, K = qinput.shape
-    N = weight_fp8.size(0)
-    BLOCK_SIZE_M = max(triton.next_power_of_2(M), 16) if M < 128 else 128
-
-    def grid(meta):
-        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) *
-                triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
-
-    _fp8_swap_ab_packed_scale_matmul_kernel[grid](
-        qinput,
-        weight_fp8,
-        output,
-        input_scale,
-        weight_scale,
-        M,
-        N,
-        K,
-        qinput.stride(0),
-        qinput.stride(1),
-        weight_fp8.stride(1),
-        weight_fp8.stride(0),
-        output.stride(0),
-        output.stride(1),
-        input_scale.stride(0),
-        input_scale.stride(1),
-        weight_scale.stride(0),
-        weight_scale.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=128,
-        GROUP_SIZE_M=8,
-    )
-    return output
+    return _sglang_fp8_swap_ab_block_matmul(input, weight, weight_scale,
+                                            output_dtype)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
