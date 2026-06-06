@@ -64,6 +64,39 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "m, k, n",
+    [(25, 7168, 2112), (33, 1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale(dtype, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
+    act_b_sf = fp8_utils.transform_sf_into_required_layout(
+        act_b_sf,
+        mn=act_b_fp8.shape[0],
+        k=act_b_fp8.shape[1],
+        recipe=(1, 128, 128),
+        is_sfa=False,
+    )
+
+    output_expected = a @ b.t()
+    output = torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-2
+
+
+@pytest.mark.skipif(
     getSMVersion() != 100 and getSMVersion() != 89 and getSMVersion() != 120,
     reason="The test is for Blackwell and Ada only. Current SM is %d." %
     getSMVersion(),
