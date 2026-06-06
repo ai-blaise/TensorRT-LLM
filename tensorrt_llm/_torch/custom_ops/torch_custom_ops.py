@@ -1753,6 +1753,89 @@ def _fp8_swap_ab_dequantized_matmul(
     return output_cpu.to(output_dtype).to(device=device)
 
 
+@triton.jit
+def _fp8_swap_ab_packed_scale_matmul_kernel(
+    A,
+    B,
+    C,
+    As,
+    BsPacked,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_m,
+    stride_Bs_k,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am * stride_As_m
+    bs_rows = (offs_bn // BLOCK_SIZE_N) * BLOCK_SIZE_N
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs,
+                    mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
+                    other=0.0)
+        b = tl.load(b_ptrs,
+                    mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
+                    & (offs_bn[None, :] < N),
+                    other=0.0)
+
+        k_block = k
+        a_s = tl.load(As_ptrs + k_block * stride_As_k)
+        bs_col = k_block // 4
+        bs_shift = (k_block % 4) * 8
+        bs_i32 = tl.load(BsPacked + bs_rows * stride_Bs_m +
+                         bs_col * stride_Bs_k,
+                         mask=offs_bn < N,
+                         other=0)
+        bs_byte = (bs_i32 >> bs_shift) & 0xFF
+        b_s = tl.exp2(bs_byte.to(tl.float32) - 127.0)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
 def _fp8_swap_ab_triton_block_matmul(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1765,27 +1848,46 @@ def _fp8_swap_ab_triton_block_matmul(
     assert weight_scale.dtype == torch.int32
     assert input.size(1) == weight.size(1)
 
-    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (  # noqa: E501
-        _safe_act_quant,
-        _w8a8_block_fp8_matmul_triton,
-    )
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
+        _safe_act_quant
 
-    block_size = [128, 128]
-    qinput, input_scale = _safe_act_quant(input.contiguous(), block_size[1])
-    block_weight_scale = fp8_utils.inverse_transform_sf(
-        weight_scale,
-        mn=weight.size(0),
-        k=weight.size(1),
-        block_size=block_size[1],
-    )
-    return _w8a8_block_fp8_matmul_triton(
+    qinput, input_scale = _safe_act_quant(input.contiguous(), 128)
+    weight_fp8 = weight.contiguous()
+    output = input.new_empty((input.size(0), weight.size(0)),
+                             dtype=output_dtype)
+    M, K = qinput.shape
+    N = weight_fp8.size(0)
+    BLOCK_SIZE_M = max(triton.next_power_of_2(M), 16) if M < 128 else 128
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) *
+                triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
+
+    _fp8_swap_ab_packed_scale_matmul_kernel[grid](
         qinput,
-        weight.contiguous(),
+        weight_fp8,
+        output,
         input_scale,
-        block_weight_scale,
-        block_size,
-        output_dtype=output_dtype,
+        weight_scale,
+        M,
+        N,
+        K,
+        qinput.stride(0),
+        qinput.stride(1),
+        weight_fp8.stride(1),
+        weight_fp8.stride(0),
+        output.stride(0),
+        output.stride(1),
+        input_scale.stride(0),
+        input_scale.stride(1),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=128,
+        GROUP_SIZE_M=8,
     )
+    return output
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
