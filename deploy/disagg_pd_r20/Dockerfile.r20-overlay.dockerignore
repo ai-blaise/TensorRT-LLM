@@ -1,0 +1,13 @@
+**
+!deploy/
+!deploy/disagg_pd_r20/
+!deploy/disagg_pd_r20/**
+!tensorrt_llm/
+!tensorrt_llm/**
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.so
+**/*.egg-info/
+**/.pytest_cache/
+**/.ruff_cache/

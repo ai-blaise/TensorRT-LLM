@@ -291,7 +291,21 @@ spec:
       - name: HF_HUB_OFFLINE
         value: '1'
       - name: HF_MODULES_CACHE
-        value: /tmp/hf_modules
+        value: /cache/optrt/hf_modules
+      - name: XDG_CACHE_HOME
+        value: /cache/optrt/xdg
+      - name: TORCH_EXTENSIONS_DIR
+        value: /cache/optrt/torch_extensions
+      - name: TRITON_CACHE_DIR
+        value: /cache/optrt/triton
+      - name: CUDA_CACHE_PATH
+        value: /cache/optrt/cuda
+      - name: TRTLLM_DG_CACHE_DIR
+        value: /cache/optrt/tensorrt_llm/dg
+      - name: TLLM_LLMAPI_BUILD_CACHE
+        value: '1'
+      - name: TLLM_LLMAPI_BUILD_CACHE_ROOT
+        value: /cache/optrt/tensorrt_llm/llmapi_build
       - name: PYTHONUNBUFFERED
         value: '1'
       extraPodSpec:
@@ -299,6 +313,19 @@ spec:
           kubernetes.io/hostname: ${TARGET_NODE}
         tolerations:
         - operator: Exists
+        initContainers:
+        - name: prepare-optrt-cache
+          image: ${UNIFIED_IMAGE}
+          imagePullPolicy: Never
+          securityContext:
+            runAsUser: 0
+          command:
+          - sh
+          - -lc
+          - mkdir -p /cache/optrt/hf_modules /cache/optrt/xdg /cache/optrt/torch_extensions /cache/optrt/triton /cache/optrt/cuda /cache/optrt/tensorrt_llm/dg /cache/optrt/tensorrt_llm/llmapi_build && chmod -R 0777 /cache/optrt
+          volumeMounts:
+          - mountPath: /cache/optrt
+            name: optrt-cache
         mainContainer:
           image: ${UNIFIED_IMAGE}
           imagePullPolicy: Never
@@ -363,6 +390,8 @@ spec:
           - mountPath: /models
             name: models
             readOnly: true
+          - mountPath: /cache/optrt
+            name: optrt-cache
         volumes:
         - name: nvidia-config
           configMap:
@@ -371,6 +400,10 @@ spec:
           hostPath:
             path: /models
             type: Directory
+        - name: optrt-cache
+          hostPath:
+            path: /var/lib/optrt-cache
+            type: DirectoryOrCreate
     decode:
       componentType: worker
       envFromSecret: hf-token-secret
@@ -430,7 +463,21 @@ spec:
       - name: HF_HUB_OFFLINE
         value: '1'
       - name: HF_MODULES_CACHE
-        value: /tmp/hf_modules
+        value: /cache/optrt/hf_modules
+      - name: XDG_CACHE_HOME
+        value: /cache/optrt/xdg
+      - name: TORCH_EXTENSIONS_DIR
+        value: /cache/optrt/torch_extensions
+      - name: TRITON_CACHE_DIR
+        value: /cache/optrt/triton
+      - name: CUDA_CACHE_PATH
+        value: /cache/optrt/cuda
+      - name: TRTLLM_DG_CACHE_DIR
+        value: /cache/optrt/tensorrt_llm/dg
+      - name: TLLM_LLMAPI_BUILD_CACHE
+        value: '1'
+      - name: TLLM_LLMAPI_BUILD_CACHE_ROOT
+        value: /cache/optrt/tensorrt_llm/llmapi_build
       - name: PYTHONUNBUFFERED
         value: '1'
       extraPodSpec:
@@ -438,6 +485,19 @@ spec:
           kubernetes.io/hostname: ${TARGET_NODE}
         tolerations:
         - operator: Exists
+        initContainers:
+        - name: prepare-optrt-cache
+          image: ${UNIFIED_IMAGE}
+          imagePullPolicy: Never
+          securityContext:
+            runAsUser: 0
+          command:
+          - sh
+          - -lc
+          - mkdir -p /cache/optrt/hf_modules /cache/optrt/xdg /cache/optrt/torch_extensions /cache/optrt/triton /cache/optrt/cuda /cache/optrt/tensorrt_llm/dg /cache/optrt/tensorrt_llm/llmapi_build && chmod -R 0777 /cache/optrt
+          volumeMounts:
+          - mountPath: /cache/optrt
+            name: optrt-cache
         mainContainer:
           image: ${UNIFIED_IMAGE}
           imagePullPolicy: Never
@@ -502,6 +562,8 @@ spec:
           - mountPath: /models
             name: models
             readOnly: true
+          - mountPath: /cache/optrt
+            name: optrt-cache
         volumes:
         - name: nvidia-config
           configMap:
@@ -510,3 +572,7 @@ spec:
           hostPath:
             path: /models
             type: Directory
+        - name: optrt-cache
+          hostPath:
+            path: /var/lib/optrt-cache
+            type: DirectoryOrCreate

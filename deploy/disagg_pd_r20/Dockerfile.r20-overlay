@@ -1,4 +1,5 @@
-FROM local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-20260605
+ARG BASE_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-20260605
+FROM ${BASE_IMAGE}
 USER root
 
 ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages

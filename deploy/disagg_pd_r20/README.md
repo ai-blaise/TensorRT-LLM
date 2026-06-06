@@ -48,13 +48,99 @@ envsubst '$UNIFIED_IMAGE' < topo-c1-dp2tp4-disagg-r20.yaml | \
 `hf-token-secret` (namespace `dynamo-system`) and a `/models` host directory must
 exist on a4-us-002-rl9.
 
+## Fast iteration path
+
+Use `fast_iterate.sh` for Python/config/doc/test iterations. It rsyncs only the
+overlay build subset (`tensorrt_llm`, `deploy`, and Docker metadata) by default,
+then falls back to tar-over-SSH when the VM does not have `rsync`. It builds the
+existing thin overlay image on the B200 VM and uses `nerdctl -n k8s.io build`
+when available so the image lands directly in k3s containerd. If `nerdctl` is
+unavailable, it falls back to Docker BuildKit plus a single `ctr images import`;
+if the requested base image is already in k3s containerd but not Docker, the
+script loads that base into Docker once. Use `--base-image` to layer on top of
+the latest known-good full image. Use `--full-sync` only when remote debugging
+needs the full repository.
+
+Build only:
+
+```bash
+deploy/disagg_pd_r20/fast_iterate.sh \
+  --vm 34.106.33.128 \
+  --base-image docker.io/local/dynamo-trtllm-optrt-custom:optrt-2b0ec68-swapab-host-pinharden-20260606 \
+  --target-node a4-us-001-rl9 \
+  --tag-suffix swapab-host
+```
+
+Build and apply the main DGD:
+
+```bash
+deploy/disagg_pd_r20/fast_iterate.sh \
+  --vm 34.106.33.128 \
+  --base-image docker.io/local/dynamo-trtllm-optrt-custom:optrt-2b0ec68-swapab-host-pinharden-20260606 \
+  --target-node a4-us-001-rl9 \
+  --tag-suffix swapab-host \
+  --deploy
+```
+
+Build and warm an isolated canary DGD on the second B200 VM:
+
+```bash
+deploy/disagg_pd_r20/fast_iterate.sh \
+  --vm 34.106.191.132 \
+  --base-image docker.io/local/dynamo-trtllm-optrt-custom:canonical-smc-r20-layersplit-warpfix11-20260605 \
+  --target-node a4-us-002-rl9 \
+  --dgd-name topo-c1-dp2tp4-disagg-r20-canary \
+  --tag-suffix canary \
+  --deploy
+```
+
+The canary name rewrites both the `DynamoGraphDeployment` and ConfigMap names,
+so it can coexist with the main DGD when there are enough free GPUs. Keep the
+main DGD untouched while a production workload is active.
+
+## Persistent caches
+
+The DGD mounts `/var/lib/optrt-cache` from the host into both prefill and decode
+as `/cache/optrt`. These paths persist across pod restarts:
+
+- `/cache/optrt/hf_modules` for Hugging Face remote-code modules.
+- `/cache/optrt/xdg` for generic Python/library caches.
+- `/cache/optrt/torch_extensions` for Torch extension builds.
+- `/cache/optrt/triton` for Triton kernel cache.
+- `/cache/optrt/cuda` for CUDA JIT cache.
+- `/cache/optrt/tensorrt_llm/dg` for DeepGEMM/TRT-LLM generated artifacts.
+- `/cache/optrt/tensorrt_llm/llmapi_build` for `TLLM_LLMAPI_BUILD_CACHE`.
+
+Prepare and lightly prewarm those caches before a rollout:
+
+```bash
+IMAGE=docker.io/local/dynamo-trtllm-optrt-custom:optrt-<sha>-<suffix> \
+deploy/disagg_pd_r20/prewarm_caches.sh \
+  --vm 34.106.33.128 \
+  --target-node a4-us-001-rl9 \
+  --image "$IMAGE"
+```
+
+This prewarm job validates that the image is resident in k3s containerd, the
+production model paths are visible under `/models`, and offline HF config/tokenizer
+loading works before the full prefill/decode workers spend time loading weights
+and compiling kernels.
+
 ## Files
 
 - `topo-c1-dp2tp4-disagg-r20.yaml` -- the deployable manifest: a `ConfigMap`
   (`topo-c1-dp2tp4-disagg-r20-config`, holds `prefill.yaml` + `decode.yaml`) plus
   the `DynamoGraphDeployment` (`topo-c1-dp2tp4-disagg-r20`). Apply this one file.
+- `Dockerfile.r20-overlay` -- configurable-base thin overlay image for
+  Python/config iterations.
 - `prefill.yaml` / `decode.yaml` -- standalone copies of the two engine configs
   (identical to the ConfigMap data blocks) for review / diff / reuse.
+- `fast_iterate.sh` -- fast rsync/build/import/apply helper for thin overlay
+  iterations and alternate-name canary deployments.
+- `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
+  prewarm/validation job.
+- `Dockerfile.r20-overlay.dockerignore` -- overlay-specific build-context
+  allowlist so thin-image rebuilds do not ship the full repo to Docker/BuildKit.
 
 ## Knob provenance
 
