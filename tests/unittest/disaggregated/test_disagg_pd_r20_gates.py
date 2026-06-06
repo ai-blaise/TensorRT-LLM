@@ -47,3 +47,12 @@ def test_r20_manifest_has_no_helix_fallback():
     assert "cp_type: HELIX" not in manifest
     assert "layersplit_enabled: true" in manifest
     assert "allow_parallelism_fallback: false" in manifest
+
+
+def test_r20_overlay_carries_moondream_and_request_pinning_sources():
+    dockerfile = (DEPLOY_DIR / "Dockerfile.r20-overlay").read_text()
+
+    assert "tensorrt_llm/_torch/speculative/model_drafter.py" in dockerfile
+    assert "tensorrt_llm/_torch/speculative/smc.py" in dockerfile
+    assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
+    assert "tensorrt_llm/serve/openai_disagg_service.py" in dockerfile

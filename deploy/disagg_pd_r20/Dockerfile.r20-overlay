@@ -17,6 +17,8 @@ COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor_creator.py ${SI
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/model_engine.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/model_drafter.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/smc.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py
 COPY --chown=dynamo:0 tensorrt_llm/llmapi/llm_args.py ${SITE_PACKAGES}/tensorrt_llm/llmapi/llm_args.py
 
 # Custom sparse-attention, KVarN dense-MLA, WarpDecode, request pinning, and
@@ -48,6 +50,8 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py \
