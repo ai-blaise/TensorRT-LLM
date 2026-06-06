@@ -207,14 +207,14 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _record_request_pin(self, disagg_request_id: int, **fields: Any) -> None:
         pin = self._request_pins.setdefault(disagg_request_id, {})
         pin.update({key: value for key, value in fields.items() if value is not None})
-        logger.info("disagg request pin established: rid=%s pin=%s",
-                    disagg_request_id, pin)
+        logger.warning("disagg request pin established: rid=%s pin=%s",
+                       disagg_request_id, pin)
 
     def _clear_request_pin(self, disagg_request_id: int) -> None:
         pin = self._request_pins.pop(disagg_request_id, None)
         if pin is not None:
-            logger.info("disagg request pin cleared: rid=%s pin=%s",
-                        disagg_request_id, pin)
+            logger.warning("disagg request pin cleared: rid=%s pin=%s",
+                           disagg_request_id, pin)
 
     async def _cleanup_request_pin_on_stream_close(
             self, stream: AsyncIterator[Any],
