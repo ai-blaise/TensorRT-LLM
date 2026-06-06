@@ -24,6 +24,16 @@ DEFAULT_ODD_M = (1, 5, 25)
 DEFAULT_TRANSPORTS = ("ucx", "nixl", "mooncake", "mori")
 DEFAULT_RUNTIME_DTYPES = ("fp16", "bf16")
 DEFAULT_KV_LAYOUTS = ("compact", "paged")
+DENSE_MLA_CRITICAL_PATH = {
+    "prefill_topology": "TP2xCP2 LayerSplit",
+    "decode_topology": "TP4xCP1",
+    "transport": "nixl",
+    "request_pinning": True,
+    "moondream_pinning": True,
+    "dense_mla_kvarn_required": True,
+    "gqa_kvarn_promoted": False,
+    "mori_mode": "a/b-only",
+}
 DEFAULT_PARTIAL_BLOCKS = (
     {"sink_tokens": 0, "tail_tokens": 0},
     {"sink_tokens": 16, "tail_tokens": 7},
@@ -87,6 +97,7 @@ def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Ite
         "dtype": "kvarn_k2v2_g128",
         "dense_mla_dtype": "kvarn_k2v2",
         "dense_mla_amortize": True,
+        "dense_mla_critical_path": dict(DENSE_MLA_CRITICAL_PATH),
         "indexer_quantized_by_kvarn": False,
         "target_concurrency": concurrency,
         "min_tok_s_per_user": min_tok_s_per_user,
