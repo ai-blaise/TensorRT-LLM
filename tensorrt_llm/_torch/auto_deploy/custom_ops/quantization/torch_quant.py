@@ -638,6 +638,18 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32[:, :k_groups].contiguous()
 
 
+def _preload_ue8m0_scale_for_triton(
+    sf_packed: torch.Tensor,
+    weight_shape: tuple[int, int],
+    block_size: List[int],
+) -> torch.Tensor:
+    """Precompute Triton FP32 block scales without a GPU unpack kernel."""
+    device = sf_packed.device
+    sf_cpu = sf_packed.detach().cpu()
+    sf_fp32 = _unpack_ue8m0_scale_for_triton(sf_cpu, weight_shape, block_size)
+    return sf_fp32.to(device=device, non_blocking=True).contiguous()
+
+
 def _select_sglang_b200_w8a8_config(M: int, N: int,
                                     K: int) -> Dict[str, int]:
     """SGLang-shaped B200 fallback configs for small SMC draft batches."""
@@ -763,9 +775,9 @@ def _sglang_fp8_swap_ab_block_matmul(
     """SGLang-style W8A8 block-FP8 matmul for packed UE8M0 SwapAB weights."""
     weight_fp8 = weight.contiguous()
     if weight_scale.dtype == torch.int32:
-        weight_scale = _unpack_ue8m0_scale_for_triton(weight_scale,
-                                                      weight_fp8.shape,
-                                                      [128, 128])
+        weight_scale = _preload_ue8m0_scale_for_triton(weight_scale,
+                                                       weight_fp8.shape,
+                                                       [128, 128])
     qinput, input_scale = _safe_act_quant(input.contiguous(),
                                           128,
                                           scale_dtype=torch.float32)

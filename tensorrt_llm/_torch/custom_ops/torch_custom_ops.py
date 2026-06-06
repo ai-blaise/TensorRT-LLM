@@ -1623,7 +1623,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
             logger.warning_once(
                 "[fp8_swap_ab_gemm] Using Triton block-FP8 matmul for "
-                f"non-8-aligned SM100 packed-scale M={input.size(0)}; "
+                f"non-8-aligned SM100 M={input.size(0)}; "
                 "DeepGEMM SwapAB faults this warmup shape.",
                 key=("fp8_swap_ab_gemm",
                      "triton_block_fp8_non_8_aligned_sm100"),
@@ -1684,6 +1684,12 @@ def _is_non_8_aligned_sm100_packed_scale(input: torch.Tensor,
             and weight_scale.dtype == torch.int32)
 
 
+def _is_non_8_aligned_sm100_preloaded_triton_scale(
+        input: torch.Tensor, weight_scale: torch.Tensor) -> bool:
+    return (get_sm_version() >= 100 and input.size(0) % 8 != 0
+            and weight_scale.dtype == torch.float32)
+
+
 def _should_pad_fp8_swap_ab_odd_m(input: torch.Tensor,
                                   weight_scale: torch.Tensor) -> bool:
     return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
@@ -1699,7 +1705,7 @@ def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
 
 def _should_use_triton_block_fp8_swap_ab_odd_m(
         input: torch.Tensor, weight_scale: torch.Tensor) -> bool:
-    return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
+    return _is_non_8_aligned_sm100_preloaded_triton_scale(input, weight_scale)
 
 
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
@@ -1845,7 +1851,7 @@ def _fp8_swap_ab_triton_block_matmul(
     assert input.dim() == 2 and weight.dim() == 2
     assert input.dtype == torch.bfloat16
     assert weight.dtype == torch.float8_e4m3fn
-    assert weight_scale.dtype == torch.int32
+    assert weight_scale.dtype == torch.float32
     assert input.size(1) == weight.size(1)
 
     from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
@@ -1863,9 +1869,14 @@ def fp8_swap_ab_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
+    if _is_non_8_aligned_sm100_packed_scale(input, weight_scale):
+        raise RuntimeError(
+            "Odd-M SM100 packed-scale fp8_swap_ab_gemm requires preloaded "
+            "FP32 Triton block scales; runtime GPU unpack is disabled.")
+
     if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(
-            "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 packed-scale "
+            "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 "
             f"M={input.size(0)} to Triton block-FP8 matmul.",
             key=("fp8_swap_ab_gemm",
                  "direct_triton_block_fp8_non_8_aligned_sm100"),

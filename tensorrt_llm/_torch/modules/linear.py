@@ -34,6 +34,20 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
+def _is_sm100_odd_m_packed_scale_swap_ab(input: torch.Tensor,
+                                         weight_scale: torch.Tensor) -> bool:
+    return (get_sm_version() >= 100 and input.size(0) % 8 != 0
+            and weight_scale.dtype == torch.int32)
+
+
+def _set_buffer(module: nn.Module, name: str,
+                value: Optional[torch.Tensor]) -> None:
+    if name in module._buffers:
+        module._buffers[name] = value
+    else:
+        module.register_buffer(name, value, persistent=False)
+
+
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
     VANILLA = 'vanilla'
@@ -1111,6 +1125,15 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
+            elif _is_sm100_odd_m_packed_scale_swap_ab(
+                    input, module.weight_scale) and getattr(
+                        module, "weight_scale_triton_fp32", None) is not None:
+                output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                    input,
+                    module.weight,
+                    module.weight_scale_triton_fp32,
+                    disable_ue8m0_cast=True,
+                )
             else:
                 output = torch.ops.trtllm.fp8_swap_ab_gemm(
                     input,
@@ -1254,6 +1277,17 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 k=weight.shape[1],
                 recipe=(1, 128, 128),
                 is_sfa=False)
+            weight_scale_triton_fp32 = None
+            if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                     or module.disable_deep_gemm):
+                from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
+                    _preload_ue8m0_scale_for_triton
+
+                weight_scale_triton_fp32 = _preload_ue8m0_scale_for_triton(
+                    transformed_scale,
+                    weight.shape,
+                    [128, 128],
+                )
             replace_parameter_and_save_metadata(
                 module, "weight", nn.Parameter(weight, requires_grad=False),
                 module.rebuild_tensor_metadata)
@@ -1261,6 +1295,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module, "weight_scale",
                 nn.Parameter(transformed_scale, requires_grad=False),
                 module.rebuild_tensor_metadata)
+            _set_buffer(module, "weight_scale_triton_fp32",
+                        weight_scale_triton_fp32)
 
 
 class NVFP4LinearMethod(LinearMethodBase):
