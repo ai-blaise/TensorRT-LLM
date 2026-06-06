@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import torch
@@ -19,6 +20,7 @@ from tensorrt_llm._torch.speculative.utils import (
     get_spec_decoder,
     get_spec_metadata,
 )
+from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm.llmapi import SMCDecodingConfig
 
 
@@ -38,6 +40,12 @@ def test_smc_config_uses_gamma_draft_tokens_and_bonus_target_token():
 
 def test_smc_mode_admits_overlap_scheduler():
     assert SpeculativeDecodingMode.SMC.support_overlap_scheduler()
+
+
+def test_smc_creator_does_not_force_disable_overlap_scheduler():
+    source = inspect.getsource(py_executor_creator.create_py_executor)
+
+    assert "Disabling overlap scheduler for SMC-SD" not in source
 
 
 def test_smc_particle_choices_are_hidden_static_tree_paths():
