@@ -1687,7 +1687,10 @@ def _should_pad_fp8_swap_ab_odd_m(input: torch.Tensor,
 
 def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
                                           weight_scale: torch.Tensor) -> bool:
-    return _should_pad_fp8_swap_ab_odd_m(input, weight_scale)
+    # SM100 packed-scale odd-M shapes must use the padded DeepGEMM path below.
+    # Reading those CUDA tensors for a CPU dequant fallback can illegal-access
+    # during SMC draft warmup before initialization completes.
+    return False
 
 
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
@@ -1793,7 +1796,7 @@ def fp8_swap_ab_gemm(
     if _should_skip_fp8_swap_ab_gemm_tuning(input, weight_scale):
         logger.warning_once(
             "[fp8_swap_ab_gemm] Skipping GEMM autotune for non-8-aligned "
-            f"SM100 packed-scale M={input.size(0)}; using direct DeepGEMM "
+            f"SM100 packed-scale M={input.size(0)}; using padded DeepGEMM "
             "SwapAB runtime path.",
             key=("fp8_swap_ab_gemm", "skip_non_8_aligned_sm100_tuning"),
         )
