@@ -410,7 +410,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(
             self.llm_args.attn_backend,
-            sparse_attn_config=self.sparse_attention_config)
+            sparse_attn_config=self.sparse_attention_config,
+            quant_config=self.model.model_config.quant_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -607,8 +608,9 @@ class PyTorchModelEngine(ModelEngine):
         layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
         if layer_quant_mode.has_fp4_kv_cache():
             return 1 / 2
-        elif layer_quant_mode.has_fp8_kv_cache(
-        ) or layer_quant_mode.has_int8_kv_cache():
+        elif (layer_quant_mode.has_fp8_kv_cache()
+              or layer_quant_mode.has_int8_kv_cache()
+              or layer_quant_mode.has_kvarn_kv_cache()):
             return 1
         else:
             return 2

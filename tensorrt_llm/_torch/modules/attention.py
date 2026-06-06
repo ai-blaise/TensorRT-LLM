@@ -549,7 +549,8 @@ class Attention(nn.Module):
                 formula)
 
         attn_cls = get_attention_backend(self.attn_backend,
-                                         sparse_attn_config=sparse_attn_cfg)
+                                         sparse_attn_config=sparse_attn_cfg,
+                                         quant_config=self.quant_config)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora

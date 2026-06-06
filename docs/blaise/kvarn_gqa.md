@@ -39,6 +39,17 @@ Implemented:
   dtype parser, Huawei-compatible byte layout, 2/3/4-bit bitstream pack/unpack,
   Hadamard + variance-normalized store, dequant restore, a reference packed
   pool, and transfer-view metadata shape.
+- `tensorrt_llm/_torch/attention_backend/kvarn_gqa_attention.py` is the first
+  runnable GQA KVarN backend. It forces split Q/K/V, commits full context blocks
+  into packed KVarN records, keeps the first 128 sink tokens and speculative
+  generation tail in fp16, restores packed records for GQA SDPA, and rejects
+  sparse-indexed reads until a packed sparse read path exists.
+- `_util.py` allocates non-MLA KVarN GQA KV as an opaque UINT8 self-only page
+  pool. For k2v2/g128 it uses `tokens_per_block=128`, `head_dim=76`, and
+  `CacheType.SELFKONLY`, so each page is exactly one 9,728-byte KVarN record per
+  local KV head.
+- Resource/capacity accounting uses the packed slope
+  `layers * local_kv_heads * 76 bytes/token` rather than dense K+V bytes.
 - `kv_cache_config.dtype="kvarn_k2v2_g128"` is accepted only with
   `tokens_per_block=128`.
 - Hugging Face artifacts can request GQA KVarN explicitly through top-level
@@ -48,9 +59,6 @@ Implemented:
   `default_kvarn_gqa=true`, `smc_sd_gqa_kvarn=true`, or
   `quantization_config.kvarn.gqa.enabled=true` with no explicit dtype. The
   default dtype is `kvarn_k2v2_g128`.
-- Runtime validation still fail-closes before allocation because the production
-  generic paged K/V backend is not wired yet. This is intentional: there must be
-  no hidden fallback to fp16/fp8/nvfp4 when KVarN was requested.
 
 HF examples:
 
@@ -80,41 +88,39 @@ HF examples:
 Set `kv_cache_dtype` to `"auto"`, `"none"`, or set
 `quantization_config.kvarn.gqa.enabled=false` to disable the HF default.
 
-## Missing production pieces
+## Remaining production work
 
-The runtime fail-close can be removed only after all of these exist:
+The config-only fail-close is removed for the supported non-MLA GQA KVarN path,
+but these pieces still need native optimization before the deployment should be
+called complete:
 
-1. `tensorrt_llm/_torch/pyexecutor/_util.py`: map
-   `QuantMode.has_kvarn_kv_cache()` to a byte-backed KVarN allocation path.
-   For k2v2/g128 the packed pool can use `CacheType.SELFKONLY`,
-   `tokens_per_block=128`, and `head_dim=76` byte slots, plus fp16 sink/tail side
-   pools.
-2. `tensorrt_llm/_torch/pyexecutor/resource_manager.py`: expose packed KVarN
-   records per `(block, layer, kv_head)`, request-owned fp16 sink/tail buffers,
-   `valid`/`commit_gen` state, and correct byte/capacity accounting. This must
-   work with request pinning and block reuse.
-3. `tensorrt_llm/_torch/attention_backend/trtllm.py` or a dedicated KVarN GQA
-   backend: store full 128-token blocks, keep sink/tail in fp16, and route decode
-   through KVarN read/dequant instead of `torch.ops.trtllm.attention`'s fp8/nvfp4
-   dense-KV path.
-4. CUDA/Triton kernels: fused full-block store, packed 2-bit load, dequant/scaled
-   dot-product/value accumulation for generation and SMC draft/verify query
-   shapes, including odd M values such as 25. Python per-token restore loops are
-   not acceptable for production throughput.
-5. `tensorrt_llm/_torch/disaggregation/resource/kv_extractor.py` and
-   `kv_cache_transceiver.py`: transfer packed records and fp16 sink/tail state as
-   KVarN records, never as ordinary dense K/V tensors. UCX/NIXL/Mooncake choice
-   stays transport-level; the payload contract is the same.
-6. Scheduler/model-engine accounting: include packed bytes and fixed sink/tail
-   pool bytes so max-token estimation, CUDA graph warmup, LayerSplit, SMC draft
-   reservation, and request pinning see the real footprint.
+1. CUDA/Triton kernels: replace Python restore + SDPA with fused full-block
+   store, packed 2-bit load, dequant/scaled dot-product/value accumulation for
+   generation and SMC draft/verify query shapes, including odd M values such as
+   25. Python per-token/tile loops are functional but not acceptable for the
+   c16 throughput target.
+2. Disaggregated transfer: `kv_extractor.py` and `kv_cache_transceiver.py` must
+   transfer packed records plus fp16 sink/tail state as KVarN records. The
+   current runnable backend explicitly rejects connector mode rather than
+   falling back to dense K/V transfer.
+3. Sparse-indexed GQA reads: HISA/Indexer state remains separate and is not
+   quantized by KVarN, but sparse read selection over packed KVarN records needs
+   its own read/dequant path before `sparse_attn_config` can compose with this
+   backend.
+4. CUDA graph state: request-owned fp16 sink/tail state is Python-managed in the
+   reference backend. A production kernel path should preallocate graph-safe
+   side buffers and mirror commit generations on device.
+5. LayerSplit/CP proof: packed pages are byte pages and can be owner-split, but
+   the current code still needs a full LayerSplit run to verify non-owner scratch
+   routing for generic GQA KVarN, separate from dense MLA LayerSplit.
 
 ## Tests and benchmark harness
 
 Current focused coverage:
 
 - `tests/unittest/llmapi/test_kvarn_gqa_config.py`: dtype validation, HF explicit
-  request, HF default-on declaration, explicit disable, and startup fail-close.
+  request, HF default-on declaration, explicit disable, and KVARN quant-mode
+  selection.
 - `tests/unittest/_torch/attention/test_kvarn_gqa.py`: k2v2 record layout,
   2/3/4-bit pack/unpack, store/restore shape/finiteness/cosine, packed-pool
   commit state, and transfer-view shape.
@@ -143,6 +149,7 @@ python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --kv-heads 8 --i
 - Disaggregated transfer must move packed records plus fp16 sink/tail state and
   must fail if the selected backend only knows dense K/V tensors.
 
-Until the production backend pieces above are implemented, `kvarn_k2v2_g128` is
-HF-deployable and defaultable as configuration, and has tested byte-layout
-primitives, but remains intentionally not runnable end-to-end.
+`kvarn_k2v2_g128` is now HF-deployable/defaultable and has a runnable reference
+GQA KV backend for non-MLA models. It is still a correctness-first backend; the
+remaining work is native fused decode/store plus disaggregated transfer support
+before it can satisfy the production throughput target.

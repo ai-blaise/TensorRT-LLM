@@ -1357,6 +1357,15 @@ class KVCacheManager(BaseResourceManager):
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
         quant_config = model_config.quant_config
+        if (quant_config is not None
+                and quant_config.quant_mode.has_kvarn_kv_cache()
+                and not mla):
+            from tensorrt_llm._torch.attention_backend.kvarn_gqa import parse_kvarn_gqa_dtype
+            dtype = getattr(quant_config, "kv_cache_dtype", None) or "kvarn_k2v2_g128"
+            cfg = parse_kvarn_gqa_dtype(str(dtype), head_dim=128)
+            tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+            local_kv_heads = math.ceil(num_key_value_heads / tp_size)
+            return num_attention_layers * local_kv_heads * cfg.bytes_per_token_slot
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
             mem_per_token *= 1
@@ -1384,7 +1393,7 @@ class KVCacheManager(BaseResourceManager):
                 self.num_kv_heads_per_layer) * self.head_dim
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                              DataType.FLOAT, DataType.NVFP4):
+                              DataType.FLOAT, DataType.NVFP4, DataType.UINT8):
             raise ValueError(f'Cannot support {self.dtype} KV cache.')
 
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
@@ -3398,6 +3407,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 DataType.BF16,
                 DataType.FLOAT,
                 DataType.NVFP4,
+                DataType.UINT8,
         ):
             raise ValueError(f"Cannot support {self.dtype} KV cache.")
 

@@ -14,11 +14,25 @@ from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
 
 
+def _has_kvarn_gqa_quant(quant_config: Optional[QuantConfig]) -> bool:
+    return bool(quant_config is not None
+                and quant_config.layer_quant_mode.has_kvarn_kv_cache())
+
+
 def get_attention_backend(
     backend_name: str,
-    sparse_attn_config: Optional["SparseAttentionConfig"] = None
+    sparse_attn_config: Optional["SparseAttentionConfig"] = None,
+    quant_config: Optional[QuantConfig] = None,
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
+    if _has_kvarn_gqa_quant(quant_config):
+        if sparse_attn_config is not None:
+            raise NotImplementedError(
+                "KVarN GQA KV cache is not yet wired to sparse-attention "
+                "index selection; keep Indexer/HISA separate from GQA KVarN "
+                "or add a dedicated sparse KVarN read path.")
+        from .kvarn_gqa_attention import KVarNGQAAttention
+        return KVarNGQAAttention
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
@@ -69,7 +83,8 @@ def create_attention(
         raise ValueError(
             f"Backend {backend_name} does not support chunked attention.")
 
-    attn_cls = get_attention_backend(backend_name, sparse_attention_config)
+    attn_cls = get_attention_backend(backend_name, sparse_attention_config,
+                                     quant_config)
 
     if is_mla_enable:
         assert attn_cls.support_mla(

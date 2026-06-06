@@ -146,18 +146,6 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES or is_kvarn_gqa)
     mapped_pyt_quant = QuantAlgo.KVARN.value if is_kvarn_gqa else _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
 
-    if is_kvarn_gqa:
-        raise NotImplementedError(
-            "Generic/GQA KVarN KV cache was requested with "
-            f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}. op-trt now has "
-            "the KVarN GQA k2v2/g128 byte layout and reference store/restore "
-            "primitives, but the production generic paged K/V backend is still "
-            "missing: byte-backed SELF-only allocation, fp16 sink/tail request "
-            "state, fused KVarN dequant/scoring/value decode kernels, and "
-            "disaggregated-transfer metadata for packed records. Dense MLA KVarN "
-            "remains controlled by sparse_attention_config.mla_latent_kv_dtype."
-        )
-
     if pyt_kv_cache_dtype == "nvfp4":
         pretrained_config = model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", "")
@@ -196,6 +184,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
+    if is_kvarn_gqa:
+        model_config.quant_config.kv_cache_dtype = str(pyt_kv_cache_dtype).lower()
 
 
 def initialize_dummy_weights(

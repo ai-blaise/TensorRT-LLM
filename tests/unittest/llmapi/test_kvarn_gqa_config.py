@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def test_kvarn_gqa_dtype_requires_group128_block_size():
@@ -58,11 +59,13 @@ def test_hf_config_defaults_gqa_kvarn_when_model_declares_support():
     assert _hf_kvarn_gqa_kv_dtype(cfg) is None
 
 
-def test_gqa_kvarn_request_fails_until_generic_backend_exists():
+def test_gqa_kvarn_request_sets_kvarn_quant_mode():
     model_config = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
         pretrained_config=SimpleNamespace(),
     )
 
-    with pytest.raises(NotImplementedError, match="production generic paged K/V backend"):
-        validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
+    validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
+
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.KVARN.value
+    assert model_config.quant_config.kv_cache_dtype == "kvarn_k2v2_g128"

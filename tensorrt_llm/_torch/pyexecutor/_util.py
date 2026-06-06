@@ -27,6 +27,7 @@ from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
+from ..attention_backend.kvarn_gqa import is_kvarn_gqa_dtype, parse_kvarn_gqa_dtype
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
@@ -1204,7 +1205,21 @@ def _create_kv_cache_manager(
     # use cache_layer_idx to read from the target layer's cache slot via
     # Gemma4Attention. No layer_mask exclusion needed here.
 
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+    is_kvarn_gqa = bool(
+        quant_config is not None
+        and quant_config.quant_mode.has_kvarn_kv_cache()
+        and not is_mla(config))
+    kvarn_gqa_cfg = None
+    if is_kvarn_gqa:
+        kvarn_dtype = getattr(quant_config, "kv_cache_dtype", None) or kv_cache_config.dtype
+        if not is_kvarn_gqa_dtype(kvarn_dtype):
+            raise ValueError(
+                f"KVarN GQA quant mode requires a kvarn_k*v*_g128 dtype, got {kvarn_dtype!r}")
+        kvarn_gqa_cfg = parse_kvarn_gqa_dtype(str(kvarn_dtype), head_dim=head_dim)
+        kvarn_gqa_cfg.validate_runtime(tokens_per_block=tokens_per_block,
+                                       head_dim=head_dim)
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.UINT8
+    elif quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
     ):
@@ -1432,6 +1447,35 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             model_type="qwen3_next",
         )
+    elif is_kvarn_gqa:
+        if not estimating_kv_cache and kv_connector_manager is not None:
+            raise NotImplementedError(
+                "KVarN GQA disaggregated KV transfer needs packed-record plus "
+                "fp16 sink/tail metadata support before connector mode can run.")
+        kv_cache_manager = kv_cache_manager_cls(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=num_hidden_layers,
+            num_kv_heads=per_layer_num_kv_heads,
+            head_dim=kvarn_gqa_cfg.bytes_per_token_slot,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=spec_config,
+            vocab_size=config.vocab_size,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=max_beam_width,
+            is_draft=is_draft,
+            kv_connector_manager=None,
+            sparse_attn_config=sparse_attn_config,
+            is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
+            layer_mask=layer_mask,
+            is_disagg=is_disagg,
+        )
+        kv_cache_manager.kvarn_gqa_config = kvarn_gqa_cfg
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         # Only needed for V1; V2 handles per-layer windows natively via life cycles.
