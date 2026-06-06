@@ -723,7 +723,9 @@ def _w8a8_block_fp8_matmul_triton(
     N, K = B.shape
     assert B.ndim == 2 and B.is_contiguous()
     if Bs.dtype == torch.int32:
-        Bs = _unpack_ue8m0_scale_for_triton(Bs, (N, K), [block_n, block_k])
+        raise RuntimeError(
+            "W8A8 block-FP8 matmul requires preloaded FP32 block scales; "
+            "runtime unpack of packed UE8M0 scales is disabled.")
     assert Bs.ndim == 2
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
