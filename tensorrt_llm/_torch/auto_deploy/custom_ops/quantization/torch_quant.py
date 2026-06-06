@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Dict, List, Optional
 
 import torch
@@ -34,6 +35,17 @@ e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -
 
 
 # ===== Helpers =====
+def _smc_cuda_sync_probe(label: str) -> None:
+    if os.environ.get("SMC_CUDA_SYNC_PROBE", "0") != "1":
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        raise RuntimeError(f"SMC CUDA sync probe failed after {label}") from exc
+
+
 def _expect_single_scale(scales: List[Optional[torch.Tensor]], name: str) -> torch.Tensor:
     if len(scales) == 0 or scales[0] is None:
         raise ValueError(f"{name} must provide at least one scale tensor (scales[0]).")
@@ -887,13 +899,16 @@ def _sglang_fp8_swap_ab_block_matmul(
     qinput, input_scale = _safe_act_quant(input.contiguous(),
                                           128,
                                           scale_dtype=torch.float32)
-    return _w8a8_block_fp8_matmul_triton_strict_mask(
+    _smc_cuda_sync_probe("smc fp8_swap_ab activation quant")
+    output = _w8a8_block_fp8_matmul_triton_strict_mask(
         qinput,
         weight_fp8,
         input_scale,
         weight_scale,
         [128, 128],
         output_dtype=output_dtype)
+    _smc_cuda_sync_probe("smc fp8_swap_ab strict-mask matmul")
+    return output
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())

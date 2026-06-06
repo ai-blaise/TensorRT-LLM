@@ -1657,7 +1657,15 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # also force this local SGLang-derived Triton prefill path for the GLM
         # draft model; FlashInfer paged prefill is unstable for the warmup
         # first-draft GQA shape on SM100, while decode still uses FlashInfer.
-        # KV-shared layers (k is None) keep the causal fallback below.
+        # KV-shared layers (k is None) keep the causal fallback below unless
+        # SMC-SD explicitly forced Triton prefill; in that case fail closed so
+        # the draft path never silently falls back to FlashInfer prefill.
+        if self.force_triton_prefill and num_contexts > 0 and k is None:
+            raise RuntimeError(
+                "SMC Triton draft prefill was requested, but this layer "
+                "does not provide local K/V tensors for the Triton prefill "
+                "shim. Refusing hidden FlashInfer prefill fallback.")
+
         use_triton_prefill = (
             num_contexts > 0 and k is not None and
             ((self.flashinfer_backend == "trtllm-gen"

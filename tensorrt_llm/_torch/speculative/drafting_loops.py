@@ -9,6 +9,7 @@ for speculation can be launched as a single CUDA graph.
 """
 
 from abc import ABC, abstractmethod
+import os
 import math
 from contextlib import contextmanager
 from typing import Optional, final
@@ -22,6 +23,17 @@ from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
 # Enable capture_scalar_outputs to avoid graph breaks from Tensor.item() calls
 torch._dynamo.config.capture_scalar_outputs = True
+
+
+def _smc_cuda_sync_probe(label: str) -> None:
+    if os.environ.get("SMC_CUDA_SYNC_PROBE", "0") != "1":
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        raise RuntimeError(f"SMC CUDA sync probe failed after {label}") from exc
 
 
 class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
@@ -654,13 +666,16 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
                                           attn_metadata=attn_metadata,
                                           spec_metadata=spec_metadata,
                                           return_context_logits=True)
+        _smc_cuda_sync_probe("smc initial draft_model.forward")
         batch_size = attn_metadata.num_seqs
         logits = self._gather_logits_for_batch(
             logits, spec_metadata.gather_ids, batch_size,
             self.max_total_draft_tokens + 1)
+        _smc_cuda_sync_probe("smc initial gather_logits")
 
         new_draft_tokens = self.sample(logits=logits,
                                        max_top_k=spec_tree_manager.max_top_k)
+        _smc_cuda_sync_probe("smc initial sample")
         draft_log_prob_buffer = torch.empty(
             (batch_size, self.max_total_draft_tokens),
             dtype=torch.float32,
@@ -671,8 +686,10 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
             new_draft_tokens=new_draft_tokens,
             use_cuda_graph=attn_metadata.is_cuda_graph,
             spec_tree_manager=spec_tree_manager)
+        _smc_cuda_sync_probe("smc initial extract_real_draft_tokens")
         self._record_layer_draft_log_probs(draft_log_prob_buffer, logits,
                                            batch_size, 0, spec_tree_manager)
+        _smc_cuda_sync_probe("smc initial record_log_probs")
 
         with save_metadata_state(attn_metadata, spec_metadata):
             batch_size = attn_metadata.num_seqs
@@ -689,20 +706,27 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
                     position_ids=self.
                     position_ids_buffer[:batch_size, :self.
                                         max_total_draft_tokens + 1].reshape(-1),
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata,
-                    return_context_logits=True)
+                                          attn_metadata=attn_metadata,
+                                          spec_metadata=spec_metadata,
+                                          return_context_logits=True)
+                _smc_cuda_sync_probe(
+                    f"smc layer {layer_idx} draft_model.forward")
                 new_draft_tokens = self.sample(
                     logits=logits, max_top_k=spec_tree_manager.max_top_k)
+                _smc_cuda_sync_probe(f"smc layer {layer_idx} sample")
                 self.extract_real_draft_tokens(
                     cur_draft_idx=layer_idx,
                     batch_size=batch_size,
                     new_draft_tokens=new_draft_tokens,
                     use_cuda_graph=attn_metadata.is_cuda_graph,
                     spec_tree_manager=spec_tree_manager)
+                _smc_cuda_sync_probe(
+                    f"smc layer {layer_idx} extract_real_draft_tokens")
                 self._record_layer_draft_log_probs(draft_log_prob_buffer, logits,
                                                    batch_size, layer_idx,
                                                    spec_tree_manager)
+                _smc_cuda_sync_probe(
+                    f"smc layer {layer_idx} record_log_probs")
 
         return_new_draft_tokens = torch.transpose(
             self.draft_tokens_buffer[:batch_size, :-1], 0, 1)

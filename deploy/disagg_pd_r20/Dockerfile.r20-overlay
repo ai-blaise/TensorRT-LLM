@@ -21,6 +21,7 @@ COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKA
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/model_drafter.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/smc.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/drafting_loops.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py
 COPY --chown=dynamo:0 tensorrt_llm/llmapi/llm_args.py ${SITE_PACKAGES}/tensorrt_llm/llmapi/llm_args.py
 
 # Custom sparse-attention, KVarN dense-MLA, WarpDecode, request pinning, and
@@ -62,6 +63,7 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/triton_prefill.py \
