@@ -28,7 +28,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
-from tensorrt_llm.quantization.utils import fp8_quantize
+from tensorrt_llm.quantization.utils import fp8_quantize, fp8_utils
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
@@ -1538,7 +1538,9 @@ def _(
 # deep_gemm_gen_tuning_buckets is imported from ..utils
 
 
-def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
+def _fp8_quantize_1x128_ue8m0(input: torch.Tensor,
+                              tactic: int,
+                              use_python_scale_packer: bool = False):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
     TACTIC_TRITON = 1
     if tactic == TACTIC_TRITON and not input.is_contiguous():
@@ -1547,8 +1549,11 @@ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
         a, a_sf = fp8_quantize.triton_fp8_quantize_1x128(input, use_ue8m0=True)
     else:
         a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
-    a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-        a_sf.transpose(0, 1).contiguous())
+    a_sf_t = a_sf.transpose(0, 1).contiguous()
+    if use_python_scale_packer:
+        a_sf = fp8_utils.get_col_major_tma_aligned_packed_tensor(a_sf_t)
+    else:
+        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(a_sf_t)
     return a, a_sf
 
 
@@ -1632,11 +1637,11 @@ class fp8SwapABGemmRunner(TunableRunner):
             )
 
         quant_tactic = self.quant_tactic
-        if pad_m != 0:
-            # The odd-M input was padded to DeepGEMM's MN-major TMA scale
-            # boundary, so use the normal CUDA quantizer for the aligned case.
-            quant_tactic = Fp8QuantKernelRunner.TACTIC_CUDA
-        a, a_sf = _fp8_quantize_1x128_ue8m0(quant_input, quant_tactic)
+        use_python_scale_packer = pad_m != 0
+        a, a_sf = _fp8_quantize_1x128_ue8m0(
+            quant_input,
+            quant_tactic,
+            use_python_scale_packer=use_python_scale_packer)
         output = torch.empty(
             (quant_input.size(0), weight.size(0)),
             device=input.device,

@@ -37,7 +37,7 @@ from tensorrt_llm._torch.autotuner import autotune
 )
 @pytest.mark.parametrize(
     "m",
-    [7, 64, 128, 4096],
+    [7, 25, 64, 128, 4096],
 )
 @pytest.mark.parametrize(
     "dtype",
