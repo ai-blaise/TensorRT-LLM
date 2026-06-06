@@ -10,6 +10,7 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._torch.attention_backend.kvarn_gqa import is_kvarn_gqa_dtype
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
                                           ModelExpressConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
@@ -36,6 +37,7 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+_BLAISE_DEFAULT_GQA_KVARN_DTYPE = "kvarn_k2v2_g128"
 
 
 def _as_dict(value):
@@ -46,11 +48,38 @@ def _as_dict(value):
     return None
 
 
+def _is_disabled(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() in ("0", "false", "off", "disable", "disabled", "none")
+    return value is False
+
+
+def _hf_declares_gqa_kvarn_default(pretrained_config, quant_config: dict) -> bool:
+    """Whether a HF artifact declares the generic/GQA KVarN path supported.
+
+    This intentionally requires an explicit support bit. The SMC-SD draft model
+    is GLM/GQA-shaped, but not every GLM checkpoint should silently get packed
+    KVarN pages unless its artifact opts into the production contract.
+    """
+    for source in (pretrained_config, quant_config):
+        for field in ("supports_kvarn_gqa", "kvarn_gqa_supported",
+                      "default_kvarn_gqa", "smc_sd_gqa_kvarn"):
+            if isinstance(source, dict):
+                value = source.get(field)
+            else:
+                value = getattr(source, field, None)
+            if value is not None:
+                return bool(value)
+    return False
+
+
 def _hf_kvarn_gqa_kv_dtype(pretrained_config) -> Optional[str]:
-    """Return a generic GQA/MHA KVarN KV dtype requested by HF config."""
+    """Return a generic GQA/MHA KVarN KV dtype requested/defaulted by HF config."""
     top_dtype = getattr(pretrained_config, "kv_cache_dtype", None)
-    if isinstance(top_dtype, str) and top_dtype.startswith("kvarn_"):
-        return top_dtype.lower()
+    if _is_disabled(top_dtype):
+        return None
+    if is_kvarn_gqa_dtype(top_dtype):
+        return str(top_dtype).lower()
 
     quant_config = _as_dict(getattr(pretrained_config, "quantization_config", None)) or {}
     roots = [
@@ -63,13 +92,25 @@ def _hf_kvarn_gqa_kv_dtype(pretrained_config) -> Optional[str]:
     for root in (root for root in roots if root is not None):
         gqa = (_as_dict(root.get("gqa")) or _as_dict(root.get("gqa_kv"))
                or _as_dict(root.get("gqa_kv_cache")))
-        if gqa is not None and gqa.get("enabled", True):
+        if gqa is not None:
+            if _is_disabled(gqa.get("enabled", True)):
+                return None
             dtype = gqa.get("dtype") or gqa.get("kv_dtype") or gqa.get("kv_cache_dtype")
-            if isinstance(dtype, str) and dtype.startswith("kvarn_"):
-                return dtype.lower()
+            if _is_disabled(dtype):
+                return None
+            if is_kvarn_gqa_dtype(dtype):
+                return str(dtype).lower()
+            return _BLAISE_DEFAULT_GQA_KVARN_DTYPE
+
+        path = str(root.get("path", "")).lower()
         dtype = root.get("kv_cache_dtype") or root.get("dtype")
-        if isinstance(dtype, str) and dtype.startswith("kvarn_") and root.get("path") not in ("dense_mla", "mla"):
-            return dtype.lower()
+        if _is_disabled(dtype):
+            return None
+        if is_kvarn_gqa_dtype(dtype) and path not in ("dense_mla", "mla"):
+            return str(dtype).lower()
+
+    if _hf_declares_gqa_kvarn_default(pretrained_config, quant_config):
+        return _BLAISE_DEFAULT_GQA_KVARN_DTYPE
     return None
 
 
@@ -101,19 +142,20 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # Quantization from hf_quant_config.json
     kv_cache_quant = model_config.quant_config.kv_cache_quant_algo
     # PyTorch configuration quantization
-    is_kvarn_gqa = isinstance(pyt_kv_cache_dtype, str) and pyt_kv_cache_dtype.startswith("kvarn_")
+    is_kvarn_gqa = is_kvarn_gqa_dtype(pyt_kv_cache_dtype)
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES or is_kvarn_gqa)
     mapped_pyt_quant = QuantAlgo.KVARN.value if is_kvarn_gqa else _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
 
     if is_kvarn_gqa:
         raise NotImplementedError(
             "Generic/GQA KVarN KV cache was requested with "
-            f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}, but op-trt only "
-            "has the dense-MLA latent KVarN kernels today. Missing pieces are: "
-            "generic paged K/V KVarN tile allocation, full-block store/flush, "
-            "fp16 sink/tail pool, KVarN dequant/scoring/value decode kernels, "
-            "and cache-transfer metadata for packed KVarN records. Dense MLA "
-            "KVarN remains controlled by sparse_attention_config.mla_latent_kv_dtype."
+            f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}. op-trt now has "
+            "the KVarN GQA k2v2/g128 byte layout and reference store/restore "
+            "primitives, but the production generic paged K/V backend is still "
+            "missing: byte-backed SELF-only allocation, fp16 sink/tail request "
+            "state, fused KVarN dequant/scoring/value decode kernels, and "
+            "disaggregated-transfer metadata for packed records. Dense MLA KVarN "
+            "remains controlled by sparse_attention_config.mla_latent_kv_dtype."
         )
 
     if pyt_kv_cache_dtype == "nvfp4":

@@ -4818,6 +4818,9 @@ class TorchLlmArgs(BaseLlmArgs):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif (isinstance(self.kv_cache_config.dtype, str)
+              and self.kv_cache_config.dtype.startswith('kvarn_')):
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.KVARN
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
