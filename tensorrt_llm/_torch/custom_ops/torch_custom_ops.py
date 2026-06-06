@@ -1687,10 +1687,10 @@ def _should_pad_fp8_swap_ab_odd_m(input: torch.Tensor,
 
 def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
                                           weight_scale: torch.Tensor) -> bool:
-    # SM100 packed-scale odd-M shapes must use the padded DeepGEMM path below.
-    # Reading those CUDA tensors for a CPU dequant fallback can illegal-access
-    # during SMC draft warmup before initialization completes.
-    return False
+    # SM100 packed-scale odd-M SMC draft shapes fault in both direct and padded
+    # DeepGEMM SwapAB warmup. Keep this narrow safety path until the dedicated
+    # odd-M GPU kernel is available; aligned production batches stay on DeepGEMM.
+    return _should_pad_fp8_swap_ab_odd_m(input, weight_scale)
 
 
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
@@ -1709,6 +1709,7 @@ def _should_use_cuda_quant_after_swap_ab_pad(input: torch.Tensor,
 
 def _fp8_block_scale_for_swap_ab(weight: torch.Tensor,
                                  weight_scale: torch.Tensor) -> torch.Tensor:
+    weight_scale = weight_scale.detach().cpu()
     if weight_scale.dtype == torch.int32:
         return fp8_utils.inverse_transform_sf(
             weight_scale,
