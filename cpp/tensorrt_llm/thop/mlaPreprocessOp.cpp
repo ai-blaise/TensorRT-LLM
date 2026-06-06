@@ -41,7 +41,8 @@ namespace
 template <typename T, typename TCache>
 void loadPagedKVCacheForMLAHelper(torch::Tensor& compressed_kv, torch::Tensor& k_pe, KVBlockArray& kv_cache,
     int const num_contexts, torch::Tensor const& cu_ctx_cached_kv_lens, int const max_input_seq_len,
-    int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr)
+    int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, void const* kvarn_scale_pool_ptr,
+    int const kvarn_bits)
 {
     auto stream = at::cuda::getCurrentCUDAStream(compressed_kv.get_device());
 
@@ -49,7 +50,8 @@ void loadPagedKVCacheForMLAHelper(torch::Tensor& compressed_kv, torch::Tensor& k
     auto* k_pe_ptr = static_cast<T*>(k_pe.data_ptr());
     auto const* cu_ctx_cached_kv_lens_ptr = cu_ctx_cached_kv_lens.data_ptr<int64_t>();
     tensorrt_llm::kernels::invokeMLALoadPagedKV<T, TCache>(compressed_kv_ptr, k_pe_ptr, kv_cache, num_contexts,
-        cu_ctx_cached_kv_lens_ptr, max_input_seq_len, lora_size, rope_size, kv_scale_quant_orig_ptr, stream);
+        cu_ctx_cached_kv_lens_ptr, max_input_seq_len, lora_size, rope_size, kv_scale_quant_orig_ptr, stream,
+        kvarn_scale_pool_ptr, kvarn_bits);
 }
 
 template <typename T, typename TCache>
@@ -110,7 +112,8 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
     torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_pool_pointers,
     torch::Tensor const& host_kv_cache_pool_mapping, torch::optional<torch::Tensor> kv_scale_quant_orig,
     int64_t const layer_idx, int64_t const lora_size, int64_t const rope_size, int64_t const tokens_per_block,
-    int64_t const attention_window_size, int64_t const beam_width, int64_t const quant_mode)
+    int64_t const attention_window_size, int64_t const beam_width, int64_t const quant_mode,
+    torch::optional<torch::Tensor> kvarn_scale_pool, int64_t const kvarn_bits)
 {
     TORCH_CHECK(out_dtype == torch::kFloat16 || out_dtype == torch::kFloat32 || out_dtype == torch::kBFloat16,
         "out_dtype only support float16, float32, bfloat16");
@@ -138,6 +141,13 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
     {
         kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
     }
+    void const* kvarn_scale_pool_ptr = nullptr;
+    if (kvarn_scale_pool.has_value())
+    {
+        CHECK_INPUT(kvarn_scale_pool.value(), torch::kFloat16);
+        kvarn_scale_pool_ptr = kvarn_scale_pool.value().data_ptr();
+        TORCH_CHECK(kvarn_bits == 2 || kvarn_bits == 4, "kvarn_bits must be 2 or 4");
+    }
 
     std::vector<torch::Tensor> outputs;
     // compressed_kv {num_ctx_cached_tokens, lora_size}
@@ -152,12 +162,12 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
         if (kv_cache_quant_mode.hasFp8KvCache())
         {
             loadPagedKVCacheForMLAHelper<half, __nv_fp8_e4m3>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr);
+                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr, kvarn_scale_pool_ptr, kvarn_bits);
         }
         else
         {
             loadPagedKVCacheForMLAHelper<half, half>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr);
+                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr, kvarn_scale_pool_ptr, kvarn_bits);
         }
     }
     else if (out_dtype == torch::kFloat32)
@@ -165,12 +175,12 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
         if (kv_cache_quant_mode.hasFp8KvCache())
         {
             loadPagedKVCacheForMLAHelper<float, __nv_fp8_e4m3>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr);
+                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr, kvarn_scale_pool_ptr, kvarn_bits);
         }
         else
         {
             loadPagedKVCacheForMLAHelper<float, float>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr);
+                cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size, kv_scale_quant_orig_ptr, kvarn_scale_pool_ptr, kvarn_bits);
         }
     }
     else if (out_dtype == torch::kBFloat16)
@@ -179,13 +189,13 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
         {
             loadPagedKVCacheForMLAHelper<__nv_bfloat16, __nv_fp8_e4m3>(outputs[0], outputs[1], kv_cache_buffer,
                 num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size,
-                kv_scale_quant_orig_ptr);
+                kv_scale_quant_orig_ptr, kvarn_scale_pool_ptr, kvarn_bits);
         }
         else
         {
             loadPagedKVCacheForMLAHelper<__nv_bfloat16, __nv_bfloat16>(outputs[0], outputs[1], kv_cache_buffer,
                 num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size,
-                kv_scale_quant_orig_ptr);
+                kv_scale_quant_orig_ptr, kvarn_scale_pool_ptr, kvarn_bits);
         }
     }
 
@@ -435,6 +445,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int attention_window_size"
         ", int beam_width"
         ", int quant_mode"
+        ", Tensor? kvarn_scale_pool=None"
+        ", int kvarn_bits=4"
         ") -> Tensor[]");
 }
 
