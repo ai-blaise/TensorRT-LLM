@@ -677,6 +677,8 @@ class TestDisaggRequestPinning:
                 }
             },
         ))
+        service._gen_router.get_next_server = AsyncMock(
+            return_value=("gen:9001", {"server_info": {}}))
 
         async def _gen_response(*_args, **_kwargs):
             return _mock_streaming_response([b"data: gen-0\n\n"])
