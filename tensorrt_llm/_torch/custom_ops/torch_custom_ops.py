@@ -1663,10 +1663,8 @@ class fp8SwapABGemmRunner(TunableRunner):
             )
             _smc_cuda_sync_probe("smc fp8_swap_ab padded input")
 
-        a, a_sf = _fp8_quantize_1x128_ue8m0(
-            quant_input,
-            self.quant_tactic,
-            use_python_scale_packer=pad_m != 0)
+        a, a_sf = _fp8_quantize_1x128_ue8m0(quant_input,
+                                            self.quant_tactic)
         if pad_m != 0:
             _smc_cuda_sync_probe("smc fp8_swap_ab padded activation quant")
         output = torch.empty(

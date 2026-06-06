@@ -28,6 +28,22 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
     _preload_ue8m0_scale_for_triton
 
 
+def _make_swap_ab_inputs(dtype, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
+    act_b_sf = fp8_utils.transform_sf_into_required_layout(
+        act_b_sf,
+        mn=act_b_fp8.shape[0],
+        k=act_b_fp8.shape[1],
+        recipe=(1, 128, 128),
+        is_sfa=False,
+    )
+    return a, b, act_b_fp8, act_b_sf
+
+
 @pytest.mark.skipif(
     not isSM100Family(),
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
@@ -78,24 +94,73 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
     [torch.bfloat16],
 )
 def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_pads(dtype, m, k, n):
-    torch.random.manual_seed(0)
-    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
-    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
-
-    act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
-    act_b_sf = fp8_utils.transform_sf_into_required_layout(
-        act_b_sf,
-        mn=act_b_fp8.shape[0],
-        k=act_b_fp8.shape[1],
-        recipe=(1, 128, 128),
-        is_sfa=False,
-    )
+    a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(dtype, m, k, n)
 
     output_expected = a @ b.t()
     output = torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
 
     diff = calc_diff(output, output_expected)
     assert diff < 1e-2
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_cuda_graph_replay():
+    a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(torch.bfloat16, 25, 7168,
+                                                     2112)
+    output_expected = a @ b.t()
+
+    for _ in range(3):
+        output = torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = torch.ops.trtllm.fp8_swap_ab_gemm(
+            a, act_b_fp8, act_b_sf)
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    diff = calc_diff(graph_output, output_expected)
+    assert diff < 1e-2
+
+
+@pytest.mark.skipif(
+    not isSM100Family()
+    or os.environ.get("TRTLLM_RUN_SMC_SWAPAB_PERF", "0") != "1",
+    reason="Set TRTLLM_RUN_SMC_SWAPAB_PERF=1 on Blackwell to run this opt-in benchmark.",
+)
+def test_fp8_swap_ab_gemm_sm100_odd_m_padded_perf_smoke():
+    timings = {}
+    for m in (25, 128):
+        a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(
+            torch.bfloat16, m, 7168, 2112)
+        output_expected = a @ b.t()
+
+        for _ in range(10):
+            output = torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        iters = 100
+        for _ in range(iters):
+            output = torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
+        end.record()
+        torch.cuda.synchronize()
+
+        diff = calc_diff(output, output_expected)
+        assert diff < 1e-2
+        timings[m] = start.elapsed_time(end) / iters
+
+    print(
+        f"smc_swapab_padded_perf m25_ms={timings[25]:.6f} "
+        f"m128_ms={timings[128]:.6f} ratio={timings[25] / timings[128]:.3f}")
 
 
 @pytest.mark.skipif(
@@ -111,18 +176,7 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_packed_scale_pads(dtype, m, k, n):
     [torch.bfloat16],
 )
 def test_fp8_swap_ab_gemm_sm100_odd_m_preloaded_scale(dtype, m, k, n):
-    torch.random.manual_seed(0)
-    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
-    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
-
-    act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
-    act_b_sf = fp8_utils.transform_sf_into_required_layout(
-        act_b_sf,
-        mn=act_b_fp8.shape[0],
-        k=act_b_fp8.shape[1],
-        recipe=(1, 128, 128),
-        is_sfa=False,
-    )
+    a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(dtype, m, k, n)
     act_b_sf = _preload_ue8m0_scale_for_triton(act_b_sf, act_b_fp8.shape,
                                                [128, 128])
 
