@@ -1627,6 +1627,14 @@ class fp8SwapABGemmRunner(TunableRunner):
         return output
 
 
+def _should_skip_fp8_swap_ab_gemm_tuning(input: torch.Tensor,
+                                         weight_scale: torch.Tensor) -> bool:
+    # DeepGEMM handles these odd-M decode/draft shapes directly, but SM100
+    # cuda-graph profiling can trip an illegal access before startup completes.
+    return (get_sm_version() >= 100 and input.size(0) % 8 != 0
+            and weight_scale.dtype == torch.int32)
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
@@ -1654,6 +1662,18 @@ def fp8_swap_ab_gemm(
         disable_ue8m0_cast,
         quant_tactic=quant_tactic,
     )
+    if _should_skip_fp8_swap_ab_gemm_tuning(input, weight_scale):
+        logger.warning_once(
+            "[fp8_swap_ab_gemm] Skipping GEMM autotune for non-8-aligned "
+            f"SM100 packed-scale M={input.size(0)}; using direct DeepGEMM "
+            "SwapAB runtime path.",
+            key=("fp8_swap_ab_gemm", "skip_non_8_aligned_sm100_tuning"),
+        )
+        return gemm_runner(
+            inputs=[input, weight, weight_scale],
+            tactic=0,
+        )
+
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
         [gemm_runner],
