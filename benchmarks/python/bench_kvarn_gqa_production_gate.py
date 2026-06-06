@@ -22,6 +22,14 @@ from typing import Iterable
 DEFAULT_SEQ_LENS = (1024, 8192, 32768, 65536, 131072)
 DEFAULT_ODD_M = (1, 5, 25)
 DEFAULT_TRANSPORTS = ("ucx", "nixl", "mooncake", "mori")
+DEFAULT_RUNTIME_DTYPES = ("fp16", "bf16")
+DEFAULT_KV_LAYOUTS = ("compact", "paged")
+DEFAULT_PARTIAL_BLOCKS = (
+    {"sink_tokens": 0, "tail_tokens": 0},
+    {"sink_tokens": 16, "tail_tokens": 7},
+    {"sink_tokens": 128, "tail_tokens": 1},
+    {"sink_tokens": 128, "tail_tokens": 127},
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,12 @@ def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Ite
         "indexer_quantized_by_kvarn": False,
         "target_concurrency": concurrency,
         "min_tok_s_per_user": min_tok_s_per_user,
+        "runtime_dtypes": list(DEFAULT_RUNTIME_DTYPES),
+        "kv_layouts": list(DEFAULT_KV_LAYOUTS),
+        "partial_block_cases": list(DEFAULT_PARTIAL_BLOCKS),
+        "bf16_reference_required": True,
+        "paged_kv_required": True,
+        "abort_reuse_required": True,
         "cases": [asdict(case) for case in cases],
     }
 

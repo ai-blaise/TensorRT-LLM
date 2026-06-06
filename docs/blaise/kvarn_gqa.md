@@ -303,18 +303,43 @@ Current focused coverage:
   `torch.ops.trtllm.kvarn_gqa_decode` are registered and
   `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. `--try-store-op`,
   `--try-decode-op`, and `--try-side-op` are development-only parity checks for
-  the experimental ops against the Python KVarN oracle, including fp16 sink +
-  packed block + fp16 tail decode. They must be run only after a C++ build on an
-  idle GPU and do not imply production readiness while `backend_ready()` is false. Use the
-  default mode on CPU; it is a reference baseline, not the fused production-kernel
-  benchmark.
+  the experimental ops against the Python KVarN oracle. They cover FP16/BF16
+  runtime tensors, compact records, paged KV-cache layout, odd SMC query counts,
+  and fp16/bf16 sink + packed block + tail decode. They must be run only after a
+  C++ build on an idle GPU and do not imply production readiness while
+  `backend_ready()` is false. Use the default mode on CPU; it is a reference
+  baseline, not the fused production-kernel benchmark.
 
 Example:
 
 ```bash
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --kv-heads 8 --iters 100 --queries 1 5 25
+python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --runtime-dtype fp16 --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 --try-store-op --try-decode-op --try-side-op
+python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --runtime-dtype bf16 --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 --try-store-op --try-decode-op --try-side-op
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --require-fused
 ```
+
+
+
+### Next GPU-window proof command
+
+Run this from the VM worktree after building the TRT-LLM torch extension, on an
+idle B200 only:
+
+```bash
+for dt in fp16 bf16; do
+  python benchmarks/python/bench_kvarn_gqa_micro.py \
+    --device cuda --runtime-dtype ${dt} --kv-heads 8 --iters 100 \
+    --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 \
+    --sink-side-tokens 16 --tail-side-tokens 7 \
+    --try-store-op --try-decode-op --try-side-op
+done
+```
+
+Then repeat with `--sink-side-tokens 128 --tail-side-tokens 1` and
+`--sink-side-tokens 128 --tail-side-tokens 127` to cover nearly empty and nearly
+full partial blocks. Promotion still requires this parity evidence plus the
+production deployment benchmark and abort/reuse/disagg lifecycle gates.
 
 ## Composition contract
 

@@ -40,6 +40,13 @@ def test_gate_matrix_covers_post_gen56_composability_defaults():
     assert payload["indexer_quantized_by_kvarn"] is False
     assert payload["target_concurrency"] == 16
     assert payload["min_tok_s_per_user"] == 150.0
+    assert payload["runtime_dtypes"] == ["fp16", "bf16"]
+    assert payload["kv_layouts"] == ["compact", "paged"]
+    assert payload["bf16_reference_required"] is True
+    assert payload["paged_kv_required"] is True
+    assert payload["abort_reuse_required"] is True
+    assert {case["tail_tokens"] for case in payload["partial_block_cases"]} == {0, 1, 7, 127}
+    assert {case["sink_tokens"] for case in payload["partial_block_cases"]} == {0, 16, 128}
 
     cases = payload["cases"]
     assert len(cases) == len(_gate.DEFAULT_SEQ_LENS) * len(_gate.DEFAULT_ODD_M) * len(_gate.DEFAULT_TRANSPORTS)
