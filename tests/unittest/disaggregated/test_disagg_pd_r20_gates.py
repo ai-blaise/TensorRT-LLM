@@ -56,5 +56,20 @@ def test_r20_overlay_carries_moondream_and_request_pinning_sources():
     assert "tensorrt_llm/_torch/speculative/smc.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
     assert "tensorrt_llm/serve/openai_disagg_service.py" in dockerfile
+    assert "tensorrt_llm/serve/openai_client.py" in dockerfile
     assert "tensorrt_llm/serve/openai_protocol.py" in dockerfile
+    assert "tensorrt_llm/serve/openai_server.py" in dockerfile
     assert "tensorrt_llm/disaggregated_params.py" in dockerfile
+
+
+def test_r20_request_pinning_smoke_is_fail_closed():
+    script = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
+
+    assert "disagg request pin outbound" in script
+    assert "disagg request pin received" in script
+    assert "ctx_dp_rank" in script
+    assert "request_type=generation_only" in script
+    assert "request_type=context_only" in script
+    assert "Disable overlap scheduler.*SMC" in script
+    assert "mla_latent_kv_dtype: kvarn_k2v2" in script
+    assert "cp_type: HELIX" in script

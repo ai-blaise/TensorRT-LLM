@@ -39,6 +39,10 @@ back to an unknown-DP broadcast path before A/B testing.
   from `DataTransceiverState` and MLA/cache formatter rank layout; request
   pinning still supplies the stable producer request id and transfer metadata
   to the executor before `requestAndReceive*` starts.
+- The r20 canary emits request-pinning trace logs at both boundaries:
+  `disagg request pin outbound` from the frontend's OpenAI client before it
+  sends context/generation requests, and `disagg request pin received` from the
+  worker OpenAI server after prefill/decode deserialize the request body.
 
 ## Moondream-style overlap invariants
 
@@ -77,6 +81,14 @@ Collect these from the live rollout before A/B:
 
 - Frontend/request logs include `disagg request pin established` with
   `ctx_server`, `ctx_dp_rank`, and `gen_server`.
+- Frontend logs include `disagg request pin outbound` for a
+  `request_type=generation_only` request with matching `disagg_request_id` and
+  non-null `ctx_dp_rank`.
+- Prefill logs include `disagg request pin received` for
+  `request_type=context_only`.
+- Decode logs include `disagg request pin received` for
+  `request_type=generation_only` with matching `disagg_request_id` and
+  `ctx_dp_rank`.
 - Matching `disagg request pin cleared` appears for every established pin.
 - No `Request pinning requires ctx_dp_rank` errors.
 - No `ADP broadcast path` logs from native transfer in the target canary.
@@ -91,8 +103,15 @@ Collect these from the live rollout before A/B:
 ## Reproducible live smoke
 
 Run this only after the DGD is ready and the decode service has an endpoint. The
-first request proves the normal close path; the second opens a stream and closes
-it early to prove pin cleanup/abort safety without putting load on the canary.
+script refuses to run otherwise. The first request proves the normal close path;
+the second opens a stream and closes it early to prove pin cleanup/abort safety
+without putting load on the canary.
+
+```bash
+deploy/disagg_pd_r20/smoke_request_pinning.sh
+```
+
+Equivalent manual command sequence:
 
 ```bash
 KC='sudo -E /usr/local/bin/k3s kubectl -n dynamo-system'
@@ -144,11 +163,11 @@ DEC=$($KC get pods -o name | grep "${DGD}-0-decode" | tail -1)
 PRE=$($KC get pods -o name | grep "${DGD}-0-prefill" | tail -1)
 
 $KC logs "$FE" --since-time="$START" \
-  | egrep -i 'disagg request pin established|disagg request pin cleared|ctx_dp_rank|Request pinning requires|abort|stream'
+  | egrep -i 'disagg request pin established|disagg request pin cleared|disagg request pin outbound|ctx_dp_rank|Request pinning requires|abort|stream'
 $KC logs "$DEC" --since-time="$START" \
-  | egrep -i 'SMC|overlap|Disable overlap|HELIX|fallback|kvarn|WARPDECODE|illegal|Traceback|ERROR'
+  | egrep -i 'disagg request pin received|SMC|overlap|Disable overlap|HELIX|fallback|kvarn|WARPDECODE|illegal|Traceback|ERROR'
 $KC logs "$PRE" --since-time="$START" \
-  | egrep -i 'LAYERSPLIT|HELIX|kvarn|ctx_dp_rank|transfer|ERROR|Traceback'
+  | egrep -i 'disagg request pin received|LAYERSPLIT|HELIX|kvarn|ctx_dp_rank|transfer|ERROR|Traceback'
 ```
 
 Pass criteria:
@@ -157,6 +176,10 @@ Pass criteria:
   `disagg request pin cleared` for the same `rid`, including the early stream
   close.
 - The established pin includes `ctx_server`, `ctx_dp_rank`, and `gen_server`.
+- Frontend has matching `disagg request pin outbound` for generation; prefill
+  has matching context-only `disagg request pin received`; decode has matching
+  generation-only `disagg request pin received` with the same `rid` and
+  `ctx_dp_rank`.
 - No log contains `Request pinning requires`, `ctx_dp_rank is None`, HELIX
   selection, SMC overlap disable, WarpDecode backend fallback, or CUDA illegal
   memory access.

@@ -129,9 +129,24 @@ class OpenAIHttpClient(OpenAIClient):
         if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
-        logger.debug(
-            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
-        )
+        dp = getattr(request, "disaggregated_params", None)
+        if dp is not None:
+            logger.warning(
+                "disagg request pin outbound: role=%s server=%s request_type=%s "
+                "ctx_request_id=%s disagg_request_id=%s ctx_dp_rank=%s "
+                "ctx_info_endpoint=%s stream=%s",
+                self._role,
+                server,
+                dp.request_type,
+                dp.ctx_request_id,
+                dp.disagg_request_id,
+                dp.ctx_dp_rank,
+                dp.ctx_info_endpoint,
+                request.stream,
+            )
+        else:
+            logger.debug("Sending %s request without disaggregated params to %s",
+                         self._role, url)
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)

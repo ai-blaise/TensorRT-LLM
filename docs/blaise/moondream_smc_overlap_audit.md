@@ -37,9 +37,15 @@ gate that prevents unknown-DP KV receive fanout before A/B.
   exact rank fanout is formatter/layout driven, but the same stable
   `ContextPhaseParams` metadata is passed to the executor.
 - **Overlay/source parity:** the r20 overlay carries the request-pinning service,
-  OpenAI protocol conversion, and `DisaggregatedParams` dataclass together, so
-  `ctx_dp_rank` serialization is not dependent on whatever happens to be present
-  in the base runtime image.
+  OpenAI client/server trace points, OpenAI protocol conversion, and
+  `DisaggregatedParams` dataclass together, so `ctx_dp_rank` serialization is
+  not dependent on whatever happens to be present in the base runtime image.
+- **Live proof gate:** `deploy/disagg_pd_r20/smoke_request_pinning.sh` is the
+  canonical pre-A/B smoke. It refuses to run before DGD/endpoints are ready,
+  sends one normal request and one early-closed stream, then requires matching
+  frontend pin lifecycle, frontend outbound generation metadata, prefill
+  context receipt, decode generation receipt, no bad fallback/overlap logs, and
+  zero prefill/decode restarts.
 
 Focused tests added/maintained in
 `tests/unittest/_torch/speculative/hw_agnostic/test_smc.py`:
@@ -64,8 +70,10 @@ are in `tests/unittest/disaggregated/test_disagg_pd_r20_gates.py`.
   disaggregated KV transfer.
 - **Live E2E request-pinning proof is still required.** Unit tests and source
   audit prove fail-closed metadata handling; the rollout must still show paired
-  `disagg request pin established` / `disagg request pin cleared` logs and no
-  Python/native `ADP broadcast path` logs under target traffic.
+  `disagg request pin established` / `disagg request pin cleared` logs,
+  `disagg request pin outbound` from the frontend, `disagg request pin received`
+  in prefill and decode, and no Python/native `ADP broadcast path` logs under
+  target traffic.
 - **Generic GQA KVarN remains pre-production.** Dense MLA KVarN composability is
   covered by metadata preservation here; the GQA path now has packed-record
   primitives and HF config admission work, but still needs full production E2E
@@ -85,6 +93,8 @@ SMC-SD decode worker, verify:
 
 - Engine args show `disable_overlap_scheduler: False` with
   `speculative_config.decoding_type: "SMC"`.
+- `deploy/disagg_pd_r20/smoke_request_pinning.sh` passes without weakening its
+  fail-closed checks.
 - No warning says `Disable overlap scheduler for speculation mode SMC`.
 - No SMC error says `SMC-SD requires target token probabilities` or
   `SMC-SD requires selected draft token log probabilities`.

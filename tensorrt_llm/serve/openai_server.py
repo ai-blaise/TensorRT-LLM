@@ -338,6 +338,24 @@ class OpenAIServer(_VideoRoutesMixin):
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
+    def _log_disagg_request_received(self, request: Union[
+            ChatCompletionRequest, CompletionRequest]) -> None:
+        dp = getattr(request, "disaggregated_params", None)
+        if dp is None:
+            return
+        logger.warning(
+            "disagg request pin received: server_role=%s request_type=%s "
+            "ctx_request_id=%s disagg_request_id=%s ctx_dp_rank=%s "
+            "ctx_info_endpoint=%s stream=%s",
+            self.server_role,
+            dp.request_type,
+            dp.ctx_request_id,
+            dp.disagg_request_id,
+            dp.ctx_dp_rank,
+            dp.ctx_info_endpoint,
+            request.stream,
+        )
+
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
@@ -1099,6 +1117,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        self._log_disagg_request_received(request)
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -1381,6 +1400,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        self._log_disagg_request_received(request)
 
         async def completion_response(
                 promise: RequestOutput,

@@ -170,6 +170,9 @@ and compiling kernels.
   iterations and alternate-name canary deployments.
 - `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
   prewarm/validation job.
+- `smoke_request_pinning.sh` -- ready-only live gate for non-MORI request
+  pinning, Moondream overlap compatibility, normal close, and early stream
+  close cleanup before A/B.
 - `cache_report.sh` -- read-only VM report for persistent-cache growth, local
   registry availability, and k3s/containerd image residency.
 - `Dockerfile.r20-overlay.dockerignore` -- overlay-specific build-context
