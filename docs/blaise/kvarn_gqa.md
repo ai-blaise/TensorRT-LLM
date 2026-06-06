@@ -51,6 +51,21 @@ Dense MLA KVarN remains separate and production-owned by
 `sparse_attention_config.mla_latent_kv_dtype`; GQA KVarN never replaces the
 Indexer/HISA sparse K path.
 
+## Downtime audit checklist
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Packed 2-bit record format | **Implemented as primitives** | `kvarn_k2v2_g128` maps one 128-token block/head to a 9,728-byte record, hosted as 76 byte slots per token. Layout, bit pack/unpack, Hadamard/variance-normalized store, dequant restore, and transfer-view shapes are tested. |
+| Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
+| HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the reference env opt-in is set or a future production backend removes the gate. |
+| Disaggregated transfer compatibility | **Not production-ready** | Packed pages plus fp16 sink/tail side state need a connector payload contract. Current connector mode rejects rather than reinterpreting packed records as dense K/V. |
+| CUDA graph lifecycle | **Not production-ready** | Side tensors are preallocated, but request-slot assignment, slot recycling, and reference restore/scoring still use Python/host control. |
+| Sparse packed reads | **Missing** | HISA/Indexer sparse selection over packed KVarN records needs a dedicated read/dequant path. |
+| Fused B200 store/decode kernels | **Missing** | Current backend is Python-level restore plus SDPA; no `torch.ops.trtllm.kvarn_gqa_decode`/store kernel is registered. |
+| Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
+| Performance proof | **Missing** | Microbench has a correctness floor and `--require-fused` promotion guard, but no fused B200 numbers or c16 tok/s/user proof exist. |
+| Production enablement | **Blocked** | Requires fused kernels, disagg side-state transfer, sparse packed reads, graph-safe lifecycle, fp16/fp8 correctness proof, and c16 E2E performance proof. |
+
 ## Current op-trt status
 
 Implemented:
@@ -114,9 +129,9 @@ Set `kv_cache_dtype` to `"auto"`, `"none"`, or set
 
 ## Remaining production work
 
-The config-only fail-close is removed for the supported non-MLA GQA KVarN path,
-but these pieces still need native optimization before the deployment should be
-called complete:
+The production fail-close remains in place for GQA KVarN. The opt-in reference
+backend is useful for isolated correctness experiments, but these pieces must be
+finished before the deployment can be called complete:
 
 1. CUDA/Triton kernels: replace Python restore + SDPA with fused full-block
    store, packed 2-bit load, dequant/scaled dot-product/value accumulation for
@@ -147,8 +162,8 @@ called complete:
 Current focused coverage:
 
 - `tests/unittest/llmapi/test_kvarn_gqa_config.py`: dtype validation, HF explicit
-  request, HF default-on declaration, explicit disable, and KVARN quant-mode
-  selection.
+  request, HF default-on declaration, explicit disable, default startup
+  fail-close, and env-gated reference quant-mode selection.
 - `tests/unittest/_torch/attention/test_kvarn_gqa.py`: k2v2 record layout,
   2/3/4-bit pack/unpack, store/restore shape/finiteness/cosine, packed-pool
   commit state, transfer-view shape, fixed-capacity side-pool behavior, sink/tail
