@@ -1679,6 +1679,14 @@ def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
     return get_sm_version() >= 100 and input.size(0) % 8 != 0
 
 
+def _should_use_cuda_quant_after_swap_ab_pad(input: torch.Tensor,
+                                             weight_scale: torch.Tensor) -> bool:
+    # Once odd-M packed-scale SwapAB is padded to a 128-row quantization input,
+    # the CUDA quantizer sees an aligned shape. Avoid the original odd-M Triton
+    # branch, which can still trip SM100 illegal-address failures on this path.
+    return _should_pad_fp8_swap_ab_odd_m(input, weight_scale)
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
@@ -1691,7 +1699,15 @@ def fp8_swap_ab_gemm(
 
     # Step 1: Select best quantization kernel (CUDA vs Triton).
     # Profiles only _quantize (no GEMM), with empty M-buckets.
-    if _should_use_triton_fp8_quant_for_swap_ab(input):
+    if _should_use_cuda_quant_after_swap_ab_pad(input, weight_scale):
+        quant_tactic = Fp8QuantKernelRunner.TACTIC_CUDA
+        logger.warning_once(
+            "[fp8_swap_ab_gemm] Using CUDA FP8 quantizer after padding "
+            f"non-8-aligned SM100 packed-scale M={input.size(0)}.",
+            key=("fp8_swap_ab_gemm",
+                 "cuda_quant_after_pad_non_8_aligned_sm100"),
+        )
+    elif _should_use_triton_fp8_quant_for_swap_ab(input):
         quant_tactic = Fp8QuantKernelRunner.TACTIC_TRITON
         logger.warning_once(
             "[fp8_swap_ab_gemm] Using Triton FP8 quantizer for "
