@@ -393,7 +393,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Data type for the dense MLA latent KV cache (compressed_kv + k_pe). "
         "auto follows the model quant_config (fp8/nvfp4/fp16). A "
-        "kvarn_k<ckv>v<pe> string (e.g. kvarn_k4v4) selects the Blaise "
+        "kvarn_k<ckv>v<pe> string (e.g. kvarn_k2v2 or kvarn_k4v4) "
+        "selects the Blaise "
         "KVarN variance-normalized backend: per-block Hadamard + log-domain "
         "Sinkhorn var-norm + asymmetric RTN at <ckv> bits on the 512-d "
         "content latent and <pe> bits on the 64-d RoPE key, ~2.3-4.4 "
@@ -495,7 +496,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                 raise ValueError(
                     "mla_latent_kv_dtype KVarN values must use "
                     "'kvarn_k<ckv_bits>v<pe_bits>' (for example "
-                    "'kvarn_k4v4'). KVarN is dense MLA latent KV storage only; "
+                    "'kvarn_k2v2' or 'kvarn_k4v4'). KVarN is dense "
+                    "MLA latent KV storage only; "
                     "Indexer storage remains controlled by indexer_k_dtype.")
             try:
                 ckv_part, pe_part = latent_kv_dtype[len("kvarn_k"):].split("v", 1)

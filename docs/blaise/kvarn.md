@@ -8,13 +8,16 @@ reaches the **highest capacity (fewest bytes/token) of any tested format** at a
 fidelity on par with NVFP4.
 
 KVarN is validated by **reconstruction cosine vs an FP16 ground-truth latent**
-(not end-to-end text). It is **opt-in** behind a config flag; the production
-default is off until the dense-MLA decode read-path wiring lands.
+(not end-to-end text). It is **opt-in** behind a config flag. The SMC-SD canary
+configuration uses `mla_latent_kv_dtype="kvarn_k2v2"`; that means **2-bit
+content latent + 2-bit RoPE key for dense MLA latent KV only**. Indexer K stays
+on its own `indexer_k_dtype` path (`fp8`/`fp4`) and is never routed through
+KVarN.
 
 | # | Piece | File | Figure | Default |
 |---|-------|------|--------|---------|
-| 10 | Variance-normalized latent quant (k4v4) | `kvarn_core.py`, `kvarn_mla.py`, `kvarn_backend.py` | 314 B/tok, 3.67×, cos 0.99418 | opt-in (flag) |
-| 11 | BDR fold: amortized in-kernel dequant-on-read | `kvarn_inkernel/*.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady | opt-in (`mla_latent_kv_amortize`) |
+| 10 | Variance-normalized latent quant (k2v2/k4v4) | `kvarn_core.py`, `kvarn_mla.py`, `kvarn_backend.py` | k2v2 = 2.36 bits/elem @ group64; k4v4 = 314 B/tok, 3.67×, cos 0.99418 | opt-in (flag) |
+| 11 | BDR fold: amortized low-bit dequant-on-read | `mlaKernels.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady (INT4 measured; k2 path same packed helper with qmax=3) | opt-in (`mla_latent_kv_amortize`) |
 
 ---
 
@@ -140,8 +143,8 @@ should scale with **churn, not working-set**.
 ## Enabling KVarN
 
 ```python
-# Dense MLA latent KV dtype selects KVarN; resolve_kvarn_config parses "kvarn_k4v4".
-mla_latent_kv_dtype = "kvarn_k4v4"   # opt-in; default is auto/fp8/nvfp4
+# Dense MLA latent KV dtype selects KVarN; resolve_kvarn_config parses "kvarn_k2v2".
+mla_latent_kv_dtype = "kvarn_k2v2"   # opt-in; default is auto/fp8/nvfp4
 # Amortized restore (decode capacity unlock) is separately flag-gated:
 mla_latent_kv_amortize = True        # DEFAULT False
 ```
@@ -152,6 +155,49 @@ churn. Both are off by default pending the dense-MLA decode read-path
 integration (campaign tasks: wire KVarN read/dequant into the dense MLA decode
 attention path + `sparse_mla_decode_nvfp4` FlashMLA kernel; verify cos
 0.992–1.0 + decode tps @ c16 + the capacity unlock).
+
+
+## SMC-SD k2v2 deployment contract
+
+`kvarn_k2v2` is the dense-MLA storage mode used by the SMC-SD canary lane. The
+runtime contract is:
+
+- **Dense-only:** KVarN applies to the MLA latent cache (`compressed_kv + k_pe`)
+  after RoPE/append. It does not change `indexer_k_dtype`, IndexCache, HISA, or
+  sparse top-k scoring.
+- **Odd draft batches:** packing is along the latent channel axis. SMC verify
+  shapes such as `M=25` are valid because neither 2-bit pack/unpack nor the
+  side-pool layout requires the row count to be 8-aligned.
+- **LayerSplit / disagg:** the KVarN side-pool indexes the same physical dense
+  block ids that LayerSplit and cache transfer use. Request pinning must keep a
+  request's dense KV block ownership stable across prefill/decode transfer; no
+  HELIX fallback is part of this path.
+- **WarpDecode:** independent MoE path. Enabling KVarN must not disable or hide
+  WarpDecode; failures should be explicit rather than silently falling back.
+
+The low-level BDR CUDA helper in `cpp/tensorrt_llm/kernels/mlaKernels.cu` is
+bit-width-aware for 2-bit and 4-bit packed values. The Python side-pool remains
+the system integration point for `mla_latent_kv_dtype`; the C++ helper is the
+fused-kernel building block for eliminating the staging copy when the host is
+available for full CUDA validation.
+
+### Focused validation commands
+
+CPU-only shape/config validation (safe on protected hosts):
+
+```bash
+python3 -m pytest -q tests/unittest/_torch/attention/sparse/test_kvarn_k2v2.py
+```
+
+If the bare VM lacks `torch`/`pytest`, the file can still be syntax-checked with
+`python3 -m py_compile tests/unittest/_torch/attention/sparse/test_kvarn_k2v2.py`.
+
+On an isolated/free B200 GPU, run the microbench without touching serving GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/python/bench_kvarn_k2v2_micro.py \
+  --device cuda --blocks 128 --group 64 --iters 2 --repeat 20
+```
 
 ## Correctness validation summary
 
