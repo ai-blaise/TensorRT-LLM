@@ -158,7 +158,11 @@ def _get_blaise_kvarn_overrides(
     for source in (pretrained_config, quant_config, kvarn_config):
         if source is None:
             continue
-        getter = source.get if isinstance(source, dict) else getattr
+        if isinstance(source, dict):
+            getter = source.get
+        else:
+            getter = lambda key, default=None, source=source: getattr(
+                source, key, default)
         dtype = getter("mla_latent_kv_dtype", None)
         if dtype is None:
             dtype = getter("dense_mla_kv_dtype", None)
