@@ -74,6 +74,7 @@ def _make_completion_response(
     prompt_tokens=1,
     completion_tokens=1,
     cached_tokens=0,
+    ctx_dp_rank=0,
 ) -> CompletionResponse:
     if prompt_token_ids is None:
         prompt_token_ids = [1, 2, 3]
@@ -95,6 +96,7 @@ def _make_completion_response(
                     request_type="context_only" if context_only else "generation_only",
                     disagg_request_id=disagg_request_id,
                     ctx_request_id=disagg_request_id,
+                    ctx_dp_rank=ctx_dp_rank,
                 ),
             )
         ],
@@ -163,6 +165,7 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
                 "disaggregated_params": {
                     "encoded_opaque_state": opaque_state,
                     "ctx_info_endpoint": ["ctx:9000"],
+                    "ctx_dp_rank": 0,
                 }
             }
         }
@@ -264,7 +267,17 @@ async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule
     service = _make_service(schedule_style)
     service._ctx_client = AsyncMock()
     service._gen_client = AsyncMock()
-    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._ctx_router.get_next_server = AsyncMock(return_value=(
+        "ctx:9000",
+        {
+            "server_info": {
+                "disaggregated_params": {
+                    "ctx_info_endpoint": ["ctx:9000"],
+                    "ctx_dp_rank": 0,
+                }
+            }
+        },
+    ))
     service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
 
     async def _ctx_response(request, *_args, **_kwargs):
@@ -448,6 +461,14 @@ class TestVerifyCtxResponseDiagnostics:
         result = await svc._verify_ctx_response(resp)
         assert result is resp
 
+    @pytest.mark.asyncio
+    async def test_missing_ctx_dp_rank_blocks_unpinned_transfer(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=777)
+        resp.choices[0].disaggregated_params.ctx_dp_rank = None
+        with pytest.raises(ValueError, match=r"ctx_dp_rank.*777"):
+            await svc._verify_ctx_response(resp)
+
 
 class TestDisaggRequestPinning:
 
@@ -487,6 +508,7 @@ class TestDisaggRequestPinning:
         svc = _make_service("context_first")
         request = CompletionRequest(model="test-model", prompt="hello")
         ctx_response = _make_completion_response("", finish_reason="length")
+        ctx_response.choices[0].disaggregated_params.ctx_dp_rank = None
 
         gen_request = svc._get_gen_request(
             request,
@@ -504,6 +526,81 @@ class TestDisaggRequestPinning:
 
         assert gen_request.disaggregated_params.ctx_dp_rank == 2
         assert gen_request.disaggregated_params.ctx_info_endpoint == "tcp://server-info:5555"
+
+    def test_missing_pinning_metadata_fails_closed_before_gen_receive(self):
+        svc = _make_service("generation_first")
+        request = CompletionRequest(model="test-model", prompt="hello")
+
+        with pytest.raises(ValueError, match="ctx_dp_rank"):
+            svc._get_gen_request(
+                request,
+                ctx_response=None,
+                disagg_request_id=42,
+                ctx_server_info={"server_info": {"disaggregated_params": {}}},
+            )
+
+    @pytest.mark.asyncio
+    async def test_request_pin_lifecycle_clears_after_non_streaming_response(self):
+        service = _make_service("context_first")
+        service._ctx_client = AsyncMock()
+        service._gen_client = AsyncMock()
+        service._ctx_router.get_next_server = AsyncMock(
+            return_value=("ctx:9000", {"server_info": {}}))
+        service._gen_router.get_next_server = AsyncMock(
+            return_value=("gen:9001", {"server_info": {}}))
+
+        async def _ctx_response(request, *_args, **_kwargs):
+            return _make_completion_response(
+                "",
+                finish_reason="length",
+                disagg_request_id=request.disaggregated_params.disagg_request_id,
+            )
+
+        async def _gen_response(request, *_args, **_kwargs):
+            return _make_completion_response(
+                "done",
+                finish_reason="stop",
+                disagg_request_id=request.disaggregated_params.disagg_request_id,
+                context_only=False,
+            )
+
+        service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+        service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+
+        request = CompletionRequest(model="test-model", prompt="hello")
+        await service._send_disagg_request(request)
+
+        assert service._request_pins == {}
+
+    @pytest.mark.asyncio
+    async def test_request_pin_lifecycle_clears_on_gen_first_streaming_ctx_error(self):
+        service = _make_service("generation_first")
+        service._ctx_client = AsyncMock()
+        service._gen_client = AsyncMock()
+        service._ctx_router.get_next_server = AsyncMock(return_value=(
+            "ctx:9000",
+            {
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_info_endpoint": ["ctx:9000"],
+                        "ctx_dp_rank": 0,
+                    }
+                }
+            },
+        ))
+
+        async def _gen_response(*_args, **_kwargs):
+            return _mock_streaming_response([b"data: gen-0\n\n"])
+
+        service._ctx_client.send_request = AsyncMock(
+            side_effect=RuntimeError("ctx failed"))
+        service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+
+        request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+        with pytest.raises(RuntimeError, match="ctx failed"):
+            await service._send_disagg_request(request)
+
+        assert service._request_pins == {}
 
 
 class TestFirstGenLogProbsSerializeRoundtrip:

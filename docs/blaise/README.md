@@ -63,8 +63,10 @@ a correctness signal — see "Validation philosophy" below).
 4. [nvfp4_fusions.md](nvfp4_fusions.md) — the elementwise+quant fusions that
    remove launches and HBM round-trips on the MoE and RoPE paths.
 5. [kvarn.md](kvarn.md) — KV-cache capacity (variance-normalized latent KV).
-6. [warpdecode.md](warpdecode.md) — the MoE decode fast path.
-7. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
+6. [request_pinning.md](request_pinning.md) — disaggregated request pinning,
+   Moondream overlap gates, and rollout proof points.
+7. [warpdecode.md](warpdecode.md) — the MoE decode fast path.
+8. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
 
 ## Validation philosophy
 

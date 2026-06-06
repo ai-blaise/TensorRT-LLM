@@ -14,7 +14,7 @@
 
 import asyncio
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
@@ -78,6 +78,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_client = None
         self._disagg_cluster_manager = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self._request_pins: Dict[int, Dict[str, Any]] = {}
 
         match self._config.schedule_style:
             case "generation_first":
@@ -133,56 +134,113 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_response = None
         gen_req = request
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
-        if need_ctx:
-            ctx_req = self._get_ctx_request(request, disagg_request_id)
-            # ctx generator is empty
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
-                ctx_req, exclude_server=gen_server
-            )
-            ctx_response = await self._ctx_client.send_request(
-                ctx_req, server=ctx_server, hooks=hooks
-            )
-            await self._verify_ctx_response(ctx_response)
-            gen_req = self._get_gen_request(
-                request,
-                ctx_response,
-                disagg_request_id,
-                ctx_server_info=ctx_server_info,
-            )
-        else:
-            # Clear synthetic disaggregated_params that may have been
-            # injected by _extract_conversation_id (e.g. from the
-            # X-Correlation-ID header).  When need_ctx=False the gen
-            # server handles full generation and must not see a stale
-            # request_type="context_only".
-            # _check_gen_only_disagg already sets proper generation_only
-            # params when applicable, so only clear the synthetic ones.
-            if (
-                gen_req.disaggregated_params is not None
-                and gen_req.disaggregated_params.request_type == "context_only"
-            ):
-                gen_req.disaggregated_params = None
-        if ctx_response is None or self._need_gen(ctx_response):
-            if not gen_server:
-                gen_server, _ = await self._gen_router.get_next_server(
-                    gen_req, exclude_server=ctx_server
+        stream_result = False
+        try:
+            if need_ctx:
+                ctx_req = self._get_ctx_request(request, disagg_request_id)
+                # ctx generator is empty
+                ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                    ctx_req, exclude_server=gen_server
                 )
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks
-            )
-            return gen_response
-        else:
-            if request.stream:
-                # ctx client will never return a generator when streaming is requested
-                # make up for this by returning a done generator
-                return done_generator()
-            return ctx_response
+                self._record_request_pin(disagg_request_id, ctx_server=ctx_server)
+                ctx_response = await self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks
+                )
+                await self._verify_ctx_response(ctx_response)
+                gen_req = self._get_gen_request(
+                    request,
+                    ctx_response,
+                    disagg_request_id,
+                    ctx_server_info=ctx_server_info,
+                )
+                self._record_request_pin(
+                    disagg_request_id,
+                    ctx_dp_rank=gen_req.disaggregated_params.ctx_dp_rank,
+                    ctx_info_endpoint=gen_req.disaggregated_params.ctx_info_endpoint,
+                )
+            else:
+                # Clear synthetic disaggregated_params that may have been
+                # injected by _extract_conversation_id (e.g. from the
+                # X-Correlation-ID header).  When need_ctx=False the gen
+                # server handles full generation and must not see a stale
+                # request_type="context_only".
+                # _check_gen_only_disagg already sets proper generation_only
+                # params when applicable, so only clear the synthetic ones.
+                if (
+                    gen_req.disaggregated_params is not None
+                    and gen_req.disaggregated_params.request_type == "context_only"
+                ):
+                    gen_req.disaggregated_params = None
+            if ctx_response is None or self._need_gen(ctx_response):
+                if not gen_server:
+                    gen_server, _ = await self._gen_router.get_next_server(
+                        gen_req, exclude_server=ctx_server
+                    )
+                if need_ctx:
+                    self._record_request_pin(disagg_request_id, gen_server=gen_server)
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks
+                )
+                if hasattr(gen_response, "__aiter__"):
+                    stream_result = True
+                    return self._cleanup_request_pin_on_stream_close(
+                        gen_response, disagg_request_id)
+                return gen_response
+            else:
+                if request.stream:
+                    # ctx client will never return a generator when streaming is requested
+                    # make up for this by returning a done generator
+                    stream_result = True
+                    return self._cleanup_request_pin_on_stream_close(
+                        done_generator(), disagg_request_id)
+                return ctx_response
+        finally:
+            if not stream_result:
+                self._clear_request_pin(disagg_request_id)
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
             del response.choices[0].disaggregated_params
             return False
         return True
+
+    def _record_request_pin(self, disagg_request_id: int, **fields: Any) -> None:
+        pin = self._request_pins.setdefault(disagg_request_id, {})
+        pin.update({key: value for key, value in fields.items() if value is not None})
+        logger.info("disagg request pin established: rid=%s pin=%s",
+                    disagg_request_id, pin)
+
+    def _clear_request_pin(self, disagg_request_id: int) -> None:
+        pin = self._request_pins.pop(disagg_request_id, None)
+        if pin is not None:
+            logger.info("disagg request pin cleared: rid=%s pin=%s",
+                        disagg_request_id, pin)
+
+    async def _cleanup_request_pin_on_stream_close(
+            self, stream: AsyncIterator[Any],
+            disagg_request_id: int) -> AsyncIterator[Any]:
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            self._clear_request_pin(disagg_request_id)
+
+    @staticmethod
+    def _validate_request_pinning_params(params: DisaggregatedParams,
+                                         disagg_request_id: int) -> None:
+        if params.ctx_request_id is None:
+            raise ValueError(
+                "Request pinning requires ctx_request_id before generation KV "
+                f"receive. disagg_request_id={disagg_request_id!r}.")
+        if params.disagg_request_id is None:
+            raise ValueError(
+                "Request pinning requires disagg_request_id before generation KV "
+                f"receive. ctx_request_id={params.ctx_request_id!r}.")
+        if params.ctx_dp_rank is None:
+            raise ValueError(
+                "Request pinning requires ctx_dp_rank before generation KV "
+                f"receive. disagg_request_id={disagg_request_id!r}, "
+                f"ctx_request_id={params.ctx_request_id!r}.")
 
     @staticmethod
     def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
@@ -257,6 +315,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                     )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
+        if ctx_response is not None or ctx_server_info is not None:
+            self._validate_request_pinning_params(request.disaggregated_params,
+                                                 disagg_request_id)
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
@@ -419,6 +480,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                     f" finish_reason={choice.finish_reason!r},"
                     f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
                 )
+            self._validate_request_pinning_params(
+                choice.disaggregated_params,
+                choice.disaggregated_params.disagg_request_id)
             return ctx_response
 
     async def _send_disagg_request_gen_first(
@@ -434,6 +498,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
         if need_ctx:
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
+            self._record_request_pin(disagg_request_id, ctx_server=ctx_server)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
         gen_req = self._get_gen_request(
             request,
@@ -441,6 +506,14 @@ class OpenAIDisaggregatedService(OpenAIService):
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
         )
+        if need_ctx:
+            self._record_request_pin(
+                disagg_request_id,
+                ctx_dp_rank=gen_req.disaggregated_params.ctx_dp_rank,
+                ctx_info_endpoint=gen_req.disaggregated_params.ctx_info_endpoint,
+            )
+            gen_server, _ = await self._gen_router.get_next_server(gen_req)
+            self._record_request_pin(disagg_request_id, gen_server=gen_server)
 
         if request.stream and need_ctx:
             # For streaming gen_first requests, the gen client returns a lazy
@@ -477,6 +550,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     await consume_task
                 except (asyncio.CancelledError, Exception):
                     pass
+                self._clear_request_pin(disagg_request_id)
                 raise
 
             async def _yield_from_queue():
@@ -496,7 +570,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                     except asyncio.CancelledError:
                         pass
 
-            return _yield_from_queue()
+            return self._cleanup_request_pin_on_stream_close(
+                _yield_from_queue(), disagg_request_id)
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.
@@ -512,5 +587,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                     self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
                 )
             )
-            responses = await asyncio.gather(*tasks)
-            return responses[-1]
+            try:
+                responses = await asyncio.gather(*tasks)
+                return responses[-1]
+            finally:
+                self._clear_request_pin(disagg_request_id)
