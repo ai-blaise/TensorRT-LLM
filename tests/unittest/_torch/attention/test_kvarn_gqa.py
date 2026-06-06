@@ -151,3 +151,44 @@ def test_kvarn_gqa_side_pool_fails_closed_for_missing_sink_and_tail():
 
     with pytest.raises(RuntimeError, match="side pool exhausted"):
         pool.slot_for_request(10)
+
+
+
+def test_kvarn_gqa_side_pool_release_request_clears_abort_reuse_state():
+    torch = _TORCH
+    cfg = KVarNGQAConfig()
+    pool = _KVarNGQASidePool(
+        cfg,
+        num_layers=2,
+        max_batch_size=1,
+        max_blocks_per_seq=2,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    slot = pool.slot_for_request(41)
+    tok = torch.ones((1, cfg.head_dim), dtype=torch.float16)
+    pool.put_sink(0, slot, tok, tok, 0)
+    pool.put_tail(1, slot, cfg.group, 0, tok, tok)
+    pool.mark_committed(0, slot, 41, 0)
+
+    assert int(pool.sink_len[0, slot].item()) == 1
+    assert bool(pool.tail_filled[1, slot, 0].item())
+    assert pool.is_committed(0, slot, 0)
+    assert pool.request_block_to_slot_block[(0, 41, 0)] == 0
+
+    pool.release_request(41)
+
+    assert 41 not in pool.request_to_slot
+    assert slot not in pool.slot_to_request
+    assert int(pool.sink_len[:, slot].sum().item()) == 0
+    assert not bool(pool.tail_filled[:, slot].any().item())
+    assert torch.equal(pool.tail_block_start[:, slot], torch.full((2,), -1, dtype=torch.int64))
+    assert not bool(pool.committed[:, slot].any().item())
+    assert int(pool.commit_gen[:, slot].sum().item()) == 0
+    assert not pool.request_block_to_slot_block
+
+    reused = pool.slot_for_request(42)
+    assert reused == slot
+    with pytest.raises(RuntimeError, match="sink state incomplete"):
+        pool.sink_tensors(0, reused, 1)

@@ -45,6 +45,7 @@ def test_gate_matrix_covers_post_gen56_composability_defaults():
     assert payload["bf16_reference_required"] is True
     assert payload["paged_kv_required"] is True
     assert payload["abort_reuse_required"] is True
+    assert payload["side_pool_release_guard"] is True
     assert {case["tail_tokens"] for case in payload["partial_block_cases"]} == {0, 1, 7, 127}
     assert {case["sink_tokens"] for case in payload["partial_block_cases"]} == {0, 16, 128}
 

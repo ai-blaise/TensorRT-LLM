@@ -119,6 +119,26 @@ class _KVarNGQASidePool:
         self.tail_filled[layer, slot].zero_()
         self.tail_block_start[layer, slot] = -1
 
+    def clear_slot(self, slot: int) -> None:
+        """Reset all graph-stable side state for a reusable request slot."""
+        self.sink_len[:, slot].zero_()
+        self.tail_filled[:, slot].zero_()
+        self.tail_block_start[:, slot].fill_(-1)
+        self.committed[:, slot].zero_()
+        self.commit_gen[:, slot].zero_()
+
+    def release_request(self, request_id: int) -> None:
+        """Release slot ownership after abort/finish so reuse cannot see stale KV."""
+        slot = self.request_to_slot.pop(request_id, None)
+        if slot is None:
+            return
+        self.slot_to_request.pop(slot, None)
+        self.clear_slot(slot)
+        stale = [key for key in self.request_block_to_slot_block
+                 if key[1] == request_id]
+        for key in stale:
+            self.request_block_to_slot_block.pop(key, None)
+
     def mark_committed(self, layer: int, slot: int, request_id: int,
                        block_start: int) -> None:
         block_num = block_start // self.cfg.group

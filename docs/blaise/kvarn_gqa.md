@@ -61,7 +61,7 @@ Indexer/HISA sparse K path.
 | Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
 | HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the fused store/decode ops are registered and the production backend removes the gate. |
 | Disaggregated transfer compatibility | **Not production-ready** | Packed pages plus fp16 sink/tail side state need a connector payload contract. Current connector mode rejects rather than reinterpreting packed records as dense K/V. |
-| CUDA graph lifecycle | **Not production-ready** | Side tensors are preallocated, but request-slot assignment, slot recycling, and reference restore/scoring still use Python/host control. |
+| CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. End-to-end request lifecycle hooks and CUDA graph capture proof are still missing. |
 | Sparse packed reads | **Missing** | HISA/Indexer sparse selection over packed KVarN records needs a dedicated read/dequant path. |
 | Fused B200 store/decode kernels | **Store/decode prototypes only; not production-ready** | `torch.ops.trtllm.kvarn_gqa_store` and `torch.ops.trtllm.kvarn_gqa_decode` now have experimental serial correctness kernels. Store performs Hadamard rotation, KVarN variance normalization, 2-bit packing, and fp16 scale/zp writes; decode reads fp16 sink tokens, compact records or byte-page KV-cache layout, and fp16 tail tokens directly, then performs Hadamard-rotated K/V dequant plus softmax attention across the combined sequence. Disaggregated side-state transfer, sparse packed reads, graph lifecycle, runtime parity, and performance proof are still missing, so `kvarn_gqa_backend_ready()` remains false. |
 | Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
@@ -339,7 +339,7 @@ done
 Then repeat with `--sink-side-tokens 128 --tail-side-tokens 1` and
 `--sink-side-tokens 128 --tail-side-tokens 127` to cover nearly empty and nearly
 full partial blocks. Promotion still requires this parity evidence plus the
-production deployment benchmark and abort/reuse/disagg lifecycle gates.
+production deployment benchmark and abort/reuse side-pool cleanup plus disagg lifecycle gates.
 
 ## Composition contract
 

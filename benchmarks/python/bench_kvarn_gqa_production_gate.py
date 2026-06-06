@@ -80,6 +80,7 @@ def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Ite
         "bf16_reference_required": True,
         "paged_kv_required": True,
         "abort_reuse_required": True,
+        "side_pool_release_guard": True,
         "cases": [asdict(case) for case in cases],
     }
 
