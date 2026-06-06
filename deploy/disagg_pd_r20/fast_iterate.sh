@@ -80,6 +80,12 @@ cd "$ROOT_DIR"
 SHA="$(git rev-parse --short=12 HEAD)"
 STAMP="$(date -u +%Y%m%d%H%M%S)"
 IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:optrt-${SHA}-${TAG_SUFFIX}-${STAMP}}"
+DEPLOY_IMAGE_TAG="${DEPLOY_IMAGE_TAG:-$IMAGE_TAG}"
+if [[ "$USE_LOCAL_REGISTRY" == 1 && "$DEPLOY_IMAGE_TAG" != "$LOCAL_REGISTRY/"* ]]; then
+  image_path="${IMAGE_TAG#docker.io/}"
+  image_path="${image_path#${LOCAL_REGISTRY}/}"
+  DEPLOY_IMAGE_TAG="${LOCAL_REGISTRY}/${image_path}"
+fi
 SSH_TARGET="${VM_USER}@${VM_HOST}"
 
 if [[ "$SYNC" == 1 ]]; then
@@ -124,7 +130,7 @@ fi
 read -r -d '' REMOTE_SCRIPT <<'EOS' || true
 set -euo pipefail
 cd "$REMOTE_REPO"
-DEPLOY_IMAGE_TAG="$IMAGE_TAG"
+BUILD_IMAGE_TAG="$IMAGE_TAG"
 
 sudo mkdir -p \
   /var/lib/optrt-cache/hf_modules \
@@ -146,7 +152,17 @@ if [[ "$BUILD" == 1 ]]; then
     sudo nerdctl -n k8s.io build \
       --build-arg "BASE_IMAGE=$BASE_IMAGE" \
       -f deploy/disagg_pd_r20/Dockerfile.r20-overlay \
-      -t "$IMAGE_TAG" .
+      -t "$BUILD_IMAGE_TAG" .
+    if [[ "$USE_LOCAL_REGISTRY" == 1 && "$DEPLOY_IMAGE_TAG" != "$BUILD_IMAGE_TAG" ]]; then
+      if command -v docker >/dev/null 2>&1; then
+        if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
+          docker rm -f optrt-registry >/dev/null 2>&1 || true
+          docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
+        fi
+      fi
+      sudo nerdctl -n k8s.io tag "$BUILD_IMAGE_TAG" "$DEPLOY_IMAGE_TAG"
+      sudo nerdctl -n k8s.io push "$DEPLOY_IMAGE_TAG"
+    fi
   else
     if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
       tmp_base="/tmp/optrt-base-${BASE_IMAGE##*:}.tar"
@@ -157,19 +173,16 @@ if [[ "$BUILD" == 1 ]]; then
     DOCKER_BUILDKIT=1 docker build \
       --build-arg "BASE_IMAGE=$BASE_IMAGE" \
       -f deploy/disagg_pd_r20/Dockerfile.r20-overlay \
-      -t "$IMAGE_TAG" .
+      -t "$BUILD_IMAGE_TAG" .
     if [[ "$USE_LOCAL_REGISTRY" == 1 ]]; then
       if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
         docker rm -f optrt-registry >/dev/null 2>&1 || true
         docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
       fi
-      image_path="${IMAGE_TAG#docker.io/}"
-      image_path="${image_path#${LOCAL_REGISTRY}/}"
-      DEPLOY_IMAGE_TAG="${LOCAL_REGISTRY}/${image_path}"
-      docker tag "$IMAGE_TAG" "$DEPLOY_IMAGE_TAG"
+      docker tag "$BUILD_IMAGE_TAG" "$DEPLOY_IMAGE_TAG"
       docker push "$DEPLOY_IMAGE_TAG"
-    elif ! sudo /usr/local/bin/k3s ctr -n k8s.io images ls name=="$IMAGE_TAG" | grep -F "$IMAGE_TAG" >/dev/null 2>&1; then
-      docker save "$IMAGE_TAG" | sudo /usr/local/bin/k3s ctr -n k8s.io images import -
+    elif ! sudo /usr/local/bin/k3s ctr -n k8s.io images ls name=="$BUILD_IMAGE_TAG" | grep -F "$BUILD_IMAGE_TAG" >/dev/null 2>&1; then
+      docker save "$BUILD_IMAGE_TAG" | sudo /usr/local/bin/k3s ctr -n k8s.io images import -
     fi
   fi
 fi
@@ -292,14 +305,15 @@ PY
   sudo -E /usr/local/bin/k3s kubectl -n dynamo-system get dgd "$DGD_NAME" \
     -o jsonpath='generation={.metadata.generation} observed={.status.observedGeneration}'; echo
 else
-  echo "built_image=$IMAGE_TAG"
+  echo "built_image=$BUILD_IMAGE_TAG"
   echo "deploy_image=$DEPLOY_IMAGE_TAG"
   echo "deploy_skipped=1"
 fi
 EOS
 
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' OUT='/tmp/${DGD_NAME}-${IMAGE_TAG##*:}.yaml' bash -s" \
+  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
   <<<"$REMOTE_SCRIPT"
 
-echo "image=$IMAGE_TAG"
+echo "built_image=$IMAGE_TAG"
+echo "deploy_image=$DEPLOY_IMAGE_TAG"
