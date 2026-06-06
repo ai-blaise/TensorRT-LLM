@@ -11,14 +11,34 @@ back to an unknown-DP broadcast path before A/B testing.
 - `disagg_request_id` is the stable request identity across context and
   generation.
 - `ctx_request_id` is present before decode asks for KV.
+- `ctx_request_id` and `disagg_request_id` must both match the expected
+  disaggregated request id. A present-but-mismatched id is a hard error because
+  it can associate decode with the wrong prefill producer.
 - `ctx_dp_rank` is present before decode asks for KV. Missing `ctx_dp_rank` is
   a hard error because it would otherwise broadcast `REQUEST_DATA` across
   context DP groups.
 - `ctx_info_endpoint`, when provided by the transceiver runtime, is treated as
   request-local transfer metadata. Context response metadata wins over static
   server metadata; static server metadata only backfills missing fields.
-- Request pins are cleared on normal completion, error, or when a streaming
-  response is fully consumed.
+- Request pins are cleared on normal completion, error, generation-first
+  validation failure, generation-first context errors, and when a streaming
+  response is consumed or closed.
+
+## KV transfer integration
+
+- OpenAI protocol serialization preserves `ctx_request_id`,
+  `disagg_request_id`, `ctx_dp_rank`, and `ctx_info_endpoint`.
+- `DisaggregatedParams.get_context_phase_params()` forwards those fields into
+  executor `ContextPhaseParams`; it prefers `disagg_request_id` as the executor
+  request id so context and generation use the same stable request identity.
+- The Python/native NIXL receiver has an explicit ADP broadcast branch when
+  `ctx_dp_rank is None`. The service-level fail-closed gate prevents normal
+  non-MORI traffic from reaching that branch without an explicitly proven
+  override.
+- The r20 canary uses the C++ UCX transceiver. Its receive fanout is computed
+  from `DataTransceiverState` and MLA/cache formatter rank layout; request
+  pinning still supplies the stable producer request id and transfer metadata
+  to the executor before `requestAndReceive*` starts.
 
 ## Moondream-style overlap invariants
 

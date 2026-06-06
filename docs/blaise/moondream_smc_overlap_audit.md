@@ -2,10 +2,11 @@
 
 Audit date: 2026-06-06
 
-Scope: commit `f98885b` and current `origin/op-trt` head `a416a8f`. This audit
-checks the SMC-SD integration against the Moondream/Photon pipeline mechanics:
-pinned host buffers, event-gated D2H copy, deferred commit, zombie release,
-prefill sharing the overlap loop, and SMC draft payload preservation.
+Scope: current `origin/op-trt`. This audit checks the SMC-SD integration
+against the Moondream/Photon pipeline mechanics: pinned host buffers,
+event-gated D2H copy, deferred commit, zombie release, prefill sharing the
+overlap loop, SMC draft payload preservation, and the non-MORI request-pinning
+gate that prevents unknown-DP KV receive fanout before A/B.
 
 ## Proven in code and focused tests
 
@@ -28,6 +29,13 @@ prefill sharing the overlap loop, and SMC draft payload preservation.
   so prefill can ride the overlap loop without stale particle mutation.
 - **Metadata composability:** focused tests verify SMC overlap commit does not
   mutate request-pinning/disagg metadata, KVarN metadata, or SMC group identity.
+- **Non-MORI request pinning:** `OpenAIDisaggregatedService` now fails closed
+  unless `ctx_request_id`, `disagg_request_id`, and `ctx_dp_rank` are present
+  and tied to the expected disaggregated request id before decode asks for KV.
+  This prevents the Python/native ADP `REQUEST_DATA` broadcast path from being
+  reachable via an unpinned request; the current r20 canary uses C++ UCX, whose
+  exact rank fanout is formatter/layout driven, but the same stable
+  `ContextPhaseParams` metadata is passed to the executor.
 
 Focused tests added/maintained in
 `tests/unittest/_torch/speculative/hw_agnostic/test_smc.py`:
@@ -40,21 +48,24 @@ Focused tests added/maintained in
 - `test_smc_overlap_static_draft_commit_skips_aborted_or_zombie_request`
 - `test_smc_overlap_commit_preserves_disagg_pin_and_kvarn_metadata`
 
+Focused request-pinning tests are in
+`tests/unittest/disaggregated/test_openai_disagg_service.py`; deployment gates
+are in `tests/unittest/disaggregated/test_disagg_pd_r20_gates.py`.
+
 ## Remaining blockers / not yet production-proven
 
 - **Live E2E is still required.** These tests prove scheduler/drafter ordering
   and metadata safety, not a full SMC-SD deployment with LayerSplit prefill,
   dense MLA KVarN, WarpDecode TP/EP, HISA/indexcache, CUDA graphs, and real
   disaggregated KV transfer.
-- **Standard request pinning is not implemented by this patch.** The current
-  tree has disaggregated request ids, KV transfer sessions, and rank consensus,
-  but this audit did not find a complete deterministic producer/consumer
-  request-affinity layer that pins remote KV block ownership across prefill and
-  decode. Treat that as a pre-A/B blocker, especially with KVarN dense block
-  ownership and LayerSplit.
-- **Generic GQA KVarN remains documented as blocked.** Dense MLA KVarN
-  composability is covered by metadata preservation here; SMC-SD GQA KVarN
-  still needs its own storage/read kernel path before it can be claimed.
+- **Live E2E request-pinning proof is still required.** Unit tests and source
+  audit prove fail-closed metadata handling; the rollout must still show paired
+  `disagg request pin established` / `disagg request pin cleared` logs and no
+  Python/native `ADP broadcast path` logs under target traffic.
+- **Generic GQA KVarN remains pre-production.** Dense MLA KVarN composability is
+  covered by metadata preservation here; the GQA path now has packed-record
+  primitives and HF config admission work, but still needs full production E2E
+  proof before it can replace dense MLA KVarN in this canary.
 - **MORI/NIXL/Mooncake transport wins are not proven here.** This audit does not
   replace the separate transport benchmark/integration gate.
 

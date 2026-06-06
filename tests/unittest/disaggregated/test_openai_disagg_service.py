@@ -469,6 +469,22 @@ class TestVerifyCtxResponseDiagnostics:
         with pytest.raises(ValueError, match=r"ctx_dp_rank.*777"):
             await svc._verify_ctx_response(resp)
 
+    @pytest.mark.asyncio
+    async def test_mismatched_ctx_request_id_blocks_unpinned_transfer(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=777)
+        resp.choices[0].disaggregated_params.ctx_request_id = 778
+        with pytest.raises(ValueError, match=r"ctx_request_id.*778.*777"):
+            await svc._verify_ctx_response(resp)
+
+    @pytest.mark.asyncio
+    async def test_mismatched_disagg_request_id_blocks_unpinned_transfer(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=777)
+        resp.choices[0].disaggregated_params.disagg_request_id = 778
+        with pytest.raises(ValueError, match=r"ctx_request_id.*777.*778"):
+            await svc._verify_ctx_response(resp)
+
 
 class TestDisaggRequestPinning:
 
@@ -569,6 +585,79 @@ class TestDisaggRequestPinning:
 
         request = CompletionRequest(model="test-model", prompt="hello")
         await service._send_disagg_request(request)
+
+        assert service._request_pins == {}
+
+    @pytest.mark.asyncio
+    async def test_request_pin_lifecycle_clears_after_streaming_close(self):
+        service = _make_service("context_first")
+        service._ctx_client = AsyncMock()
+        service._gen_client = AsyncMock()
+        service._ctx_router.get_next_server = AsyncMock(
+            return_value=("ctx:9000", {"server_info": {}}))
+        service._gen_router.get_next_server = AsyncMock(
+            return_value=("gen:9001", {"server_info": {}}))
+
+        async def _ctx_response(request, *_args, **_kwargs):
+            return _make_completion_response(
+                "",
+                finish_reason="length",
+                disagg_request_id=request.disaggregated_params.disagg_request_id,
+            )
+
+        async def _gen_response(*_args, **_kwargs):
+            return _mock_streaming_response(
+                [b"data: gen-0\n\n", b"data: gen-1\n\n"])
+
+        service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+        service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+
+        request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+        result = await service._send_disagg_request(request)
+        assert service._request_pins
+        assert await result.__anext__() == b"data: gen-0\n\n"
+        await result.aclose()
+
+        assert service._request_pins == {}
+
+    @pytest.mark.asyncio
+    async def test_request_pin_lifecycle_clears_on_gen_first_validation_error(self):
+        service = _make_service("generation_first")
+        service._ctx_client = AsyncMock()
+        service._gen_client = AsyncMock()
+        service._ctx_router.get_next_server = AsyncMock(
+            return_value=("ctx:9000", {"server_info": {"disaggregated_params": {}}}))
+
+        request = CompletionRequest(model="test-model", prompt="hello")
+        with pytest.raises(ValueError, match="ctx_dp_rank"):
+            await service._send_disagg_request(request)
+
+        assert service._request_pins == {}
+
+    @pytest.mark.asyncio
+    async def test_request_pin_lifecycle_clears_on_gen_first_streaming_gen_error(self):
+        service = _make_service("generation_first")
+        service._ctx_client = AsyncMock()
+        service._gen_client = AsyncMock()
+        service._ctx_router.get_next_server = AsyncMock(return_value=(
+            "ctx:9000",
+            {
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_info_endpoint": ["ctx:9000"],
+                        "ctx_dp_rank": 0,
+                    }
+                }
+            },
+        ))
+        service._gen_router.get_next_server = AsyncMock(
+            return_value=("gen:9001", {"server_info": {}}))
+        service._gen_client.send_request = AsyncMock(
+            side_effect=RuntimeError("gen failed"))
+
+        request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+        with pytest.raises(RuntimeError, match="gen failed"):
+            await service._send_disagg_request(request)
 
         assert service._request_pins == {}
 

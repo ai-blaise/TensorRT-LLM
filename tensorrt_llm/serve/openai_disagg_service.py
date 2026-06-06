@@ -232,10 +232,21 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise ValueError(
                 "Request pinning requires ctx_request_id before generation KV "
                 f"receive. disagg_request_id={disagg_request_id!r}.")
+        if params.ctx_request_id != disagg_request_id:
+            raise ValueError(
+                "Request pinning requires ctx_request_id to match "
+                f"disagg_request_id before generation KV receive. "
+                f"ctx_request_id={params.ctx_request_id!r}, "
+                f"disagg_request_id={disagg_request_id!r}.")
         if params.disagg_request_id is None:
             raise ValueError(
                 "Request pinning requires disagg_request_id before generation KV "
                 f"receive. ctx_request_id={params.ctx_request_id!r}.")
+        if params.disagg_request_id != disagg_request_id:
+            raise ValueError(
+                "Request pinning requires stable disagg_request_id before "
+                f"generation KV receive. got={params.disagg_request_id!r}, "
+                f"expected={disagg_request_id!r}.")
         if params.ctx_dp_rank is None:
             raise ValueError(
                 "Request pinning requires ctx_dp_rank before generation KV "
@@ -496,99 +507,109 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server_info = None
         ctx_req, gen_req = None, None
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
-        if need_ctx:
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
-            self._record_request_pin(disagg_request_id, ctx_server=ctx_server)
-            ctx_req = self._get_ctx_request(request, disagg_request_id)
-        gen_req = self._get_gen_request(
-            request,
-            ctx_response=None,
-            disagg_request_id=disagg_request_id,
-            ctx_server_info=ctx_server_info,
-        )
-        if need_ctx:
-            self._record_request_pin(
-                disagg_request_id,
-                ctx_dp_rank=gen_req.disaggregated_params.ctx_dp_rank,
-                ctx_info_endpoint=gen_req.disaggregated_params.ctx_info_endpoint,
+        stream_result = False
+        try:
+            if need_ctx:
+                ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
+                self._record_request_pin(disagg_request_id, ctx_server=ctx_server)
+                ctx_req = self._get_ctx_request(request, disagg_request_id)
+            gen_req = self._get_gen_request(
+                request,
+                ctx_response=None,
+                disagg_request_id=disagg_request_id,
+                ctx_server_info=ctx_server_info,
             )
-            gen_server, _ = await self._gen_router.get_next_server(gen_req)
-            self._record_request_pin(disagg_request_id, gen_server=gen_server)
+            if need_ctx:
+                self._record_request_pin(
+                    disagg_request_id,
+                    ctx_dp_rank=gen_req.disaggregated_params.ctx_dp_rank,
+                    ctx_info_endpoint=gen_req.disaggregated_params.ctx_info_endpoint,
+                )
+                gen_server, _ = await self._gen_router.get_next_server(gen_req)
+                self._record_request_pin(disagg_request_id, gen_server=gen_server)
 
-        if request.stream and need_ctx:
-            # For streaming gen_first requests, the gen client returns a lazy
-            # async generator whose HTTP POST only fires when iterated. The ctx
-            # server blocks waiting for the gen server's rx session (gen_first
-            # protocol). Using asyncio.gather would deadlock: ctx waits for gen
-            # server, but gen POST is deferred until the generator is consumed,
-            # and the generator isn't consumed until gather returns.
-            #
-            # Fix: eagerly start consuming the gen generator in a background
-            # task so the HTTP POST fires, then pipe chunks through a queue.
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks
-            )
+            if request.stream and need_ctx:
+                # For streaming gen_first requests, the gen client returns a lazy
+                # async generator whose HTTP POST only fires when iterated. The ctx
+                # server blocks waiting for the gen server's rx session (gen_first
+                # protocol). Using asyncio.gather would deadlock: ctx waits for gen
+                # server, but gen POST is deferred until the generator is consumed,
+                # and the generator isn't consumed until gather returns.
+                #
+                # Fix: eagerly start consuming the gen generator in a background
+                # task so the HTTP POST fires, then pipe chunks through a queue.
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks
+                )
 
-            queue: asyncio.Queue = asyncio.Queue()
+                queue: asyncio.Queue = asyncio.Queue()
 
-            async def _consume_gen():
+                async def _consume_gen():
+                    try:
+                        async for chunk in gen_response:
+                            await queue.put(chunk)
+                    except Exception as e:
+                        await queue.put(e)
+                    await queue.put(None)  # sentinel
+
+                consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+
                 try:
-                    async for chunk in gen_response:
-                        await queue.put(chunk)
-                except Exception as e:
-                    await queue.put(e)
-                await queue.put(None)  # sentinel
-
-            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
-
-            # Now send ctx request — gen server has received its request
-            try:
-                await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
-            except Exception:
-                consume_task.cancel()
-                try:
-                    await consume_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                self._clear_request_pin(disagg_request_id)
-                raise
-
-            async def _yield_from_queue():
-                try:
-                    while True:
-                        item = await queue.get()
-                        if item is None:
-                            break
-                        if isinstance(item, Exception):
-                            raise item
-                        yield item
-                finally:
-                    if not consume_task.done():
-                        consume_task.cancel()
+                    # Now send ctx request — gen server has received its request
+                    await self._ctx_client.send_request(
+                        ctx_req, server=ctx_server, hooks=hooks)
+                except Exception:
+                    consume_task.cancel()
                     try:
                         await consume_task
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, Exception):
                         pass
+                    raise
 
-            return self._cleanup_request_pin_on_stream_close(
-                _yield_from_queue(), disagg_request_id)
-        else:
-            # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
-            # through generator consumption, so asyncio.gather works fine.
-            tasks = []
-            if need_ctx:
+                async def _yield_from_queue():
+                    try:
+                        while True:
+                            item = await queue.get()
+                            if item is None:
+                                break
+                            if isinstance(item, Exception):
+                                raise item
+                            yield item
+                    finally:
+                        if not consume_task.done():
+                            consume_task.cancel()
+                        try:
+                            await consume_task
+                        except asyncio.CancelledError:
+                            pass
+
+                stream_result = True
+                return self._cleanup_request_pin_on_stream_close(
+                    _yield_from_queue(), disagg_request_id)
+            else:
+                # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
+                # through generator consumption, so asyncio.gather works fine.
+                tasks = []
+                if need_ctx:
+                    tasks.append(
+                        asyncio.create_task(
+                            self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                        )
+                    )
                 tasks.append(
                     asyncio.create_task(
-                        self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                        self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
                     )
                 )
-            tasks.append(
-                asyncio.create_task(
-                    self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
-                )
-            )
-            try:
-                responses = await asyncio.gather(*tasks)
-                return responses[-1]
-            finally:
+                try:
+                    responses = await asyncio.gather(*tasks)
+                    return responses[-1]
+                except Exception:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
+        finally:
+            if not stream_result:
                 self._clear_request_pin(disagg_request_id)
