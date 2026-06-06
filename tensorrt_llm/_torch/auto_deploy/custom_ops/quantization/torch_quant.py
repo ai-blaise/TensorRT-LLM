@@ -650,53 +650,16 @@ def _preload_ue8m0_scale_for_triton(
     return sf_fp32.to(device=device, non_blocking=True).contiguous()
 
 
-def _select_sglang_b200_w8a8_config(M: int, N: int,
-                                    K: int) -> Dict[str, int]:
-    """SGLang-shaped B200 fallback configs for small SMC draft batches."""
-    del N, K
-    if M <= 16:
-        return {
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 32,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 4,
-        }
-    if M <= 32:
-        return {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 32,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 16,
-            "num_warps": 8,
-            "num_stages": 3,
-        }
-    if M <= 96:
-        return {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 16,
-            "num_warps": 8,
-            "num_stages": 4,
-        }
-    if M <= 256:
-        return {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 16,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+def _select_sglang_w8a8_default_config(block_n: int,
+                                       block_k: int) -> Dict[str, int]:
+    """SGLang default W8A8 config used when no tuned shape config exists."""
     return {
-        "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 16,
-        "num_warps": 8,
-        "num_stages": 2,
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": 32,
+        "num_warps": 4,
+        "num_stages": 3,
     }
 
 
@@ -733,9 +696,7 @@ def _w8a8_block_fp8_matmul_triton(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    config = _select_sglang_b200_w8a8_config(M, N, K)
-    if config["BLOCK_SIZE_K"] < block_k:
-        config = {**config, "BLOCK_SIZE_K": block_k}
+    config = _select_sglang_w8a8_default_config(block_n, block_k)
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
     def grid(META):
