@@ -1725,20 +1725,15 @@ def _fp8_swap_ab_dequantized_matmul(
     scale = _fp8_block_scale_for_swap_ab(weight, weight_scale)
     scale = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     scale = scale[:weight.size(0), :weight.size(1)]
-    input_float = input.float()
-    output = torch.empty((input.size(0), weight.size(0)),
-                         device=input.device,
-                         dtype=output_dtype)
-    # Avoid cuBLAS for this tiny unsupported warmup shape; cuBLAS can still
-    # fail after the SM100 odd-M packed-scale path has rejected DeepGEMM.
-    chunk_size = 128
-    for start in range(0, weight.size(0), chunk_size):
-        end = min(start + chunk_size, weight.size(0))
-        dequant_weight = weight[start:end].float() * scale[start:end]
-        chunk = (input_float.unsqueeze(1) *
-                 dequant_weight.unsqueeze(0)).sum(dim=2)
-        output[:, start:end] = chunk.to(output_dtype)
-    return output
+    # Avoid GPU math for this tiny unsupported warmup shape; both cuBLAS and
+    # generic CUDA elementwise reductions can trip illegal accesses after the
+    # SM100 odd-M packed-scale path has rejected DeepGEMM.
+    device = input.device
+    input_cpu = input.detach().cpu().float()
+    weight_cpu = weight.detach().cpu().float()
+    scale_cpu = scale.detach().cpu().float()
+    output_cpu = torch.matmul(input_cpu, (weight_cpu * scale_cpu).t())
+    return output_cpu.to(output_dtype).to(device=device)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
