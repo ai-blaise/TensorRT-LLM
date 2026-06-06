@@ -1700,7 +1700,7 @@ class fp8SwapABGemmRunner(TunableRunner):
 def _should_skip_fp8_swap_ab_gemm_tuning(input: torch.Tensor,
                                          weight_scale: torch.Tensor) -> bool:
     # Keep non-8-aligned packed-scale decode/draft shapes out of autotuning on
-    # SM100; the runtime runner pads them before quantize+DeepGEMM.
+    # SM100; the runtime runner routes them to the packed-scale Triton path.
     return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
 
 
@@ -1723,14 +1723,16 @@ def _allow_preloaded_triton_swap_ab_odd_m() -> bool:
 
 def _should_pad_fp8_swap_ab_odd_m(input: torch.Tensor,
                                   weight_scale: torch.Tensor) -> bool:
-    return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
+    # Padded DeepGEMM faults on the live SM100 SMC draft M=25 packed-scale
+    # shape.  Odd packed-scale SwapAB must route before this branch.
+    return False
 
 
 def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
                                           weight_scale: torch.Tensor) -> bool:
-    # Odd SM100 packed-scale shapes stay on the padded DeepGEMM path. CPU or
-    # generic GPU dequant fallbacks synchronize after earlier warmup kernels and
-    # have reproduced illegal-access failures on the live B200 rollout.
+    # CPU or generic GPU dequant fallbacks synchronize after earlier warmup
+    # kernels and have reproduced illegal-access failures on the live B200
+    # rollout.
     return False
 
 
@@ -1754,10 +1756,7 @@ def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
 
 def _should_use_cuda_quant_after_swap_ab_pad(input: torch.Tensor,
                                              weight_scale: torch.Tensor) -> bool:
-    # Once the odd-M input is padded to 128 rows, the CUDA quantizer sees an
-    # aligned shape; avoid routing the padded path through the odd-M Triton
-    # branch that faulted in the live gen47 rollout.
-    return _should_pad_fp8_swap_ab_odd_m(input, weight_scale)
+    return False
 
 
 def _fp8_block_scale_for_swap_ab(weight: torch.Tensor,
@@ -1906,19 +1905,50 @@ def _fp8_swap_ab_packed_scale_triton_matmul(
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     """SGLang-style odd-M SwapAB path that consumes packed UE8M0 scales."""
-    assert input.dim() == 2 and weight.dim() == 2
-    assert input.dtype == torch.bfloat16
-    assert weight.dtype == torch.float8_e4m3fn
-    assert weight_scale.dtype == torch.int32
-    assert input.size(1) == weight.size(1)
+    if input.dim() != 2 or weight.dim() != 2:
+        raise ValueError("Packed-scale SwapAB expects 2D input and weight.")
+    if input.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Packed-scale SwapAB expects BF16 input, got {input.dtype}.")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"Packed-scale SwapAB expects FP8 E4M3 weight, got {weight.dtype}."
+        )
+    if weight_scale.dtype != torch.int32 or weight_scale.dim() != 2:
+        raise ValueError("Packed-scale SwapAB expects 2D int32 weight scales.")
+    if input.size(1) != weight.size(1):
+        raise ValueError(
+            f"Packed-scale SwapAB K mismatch: input K={input.size(1)}, "
+            f"weight K={weight.size(1)}.")
+    if input.size(1) % 128 != 0:
+        raise ValueError(
+            f"Packed-scale SwapAB requires K divisible by 128, got {input.size(1)}."
+        )
+    if weight_scale.size(0) < weight.size(0):
+        raise ValueError(
+            f"Packed-scale SwapAB weight scale rows {weight_scale.size(0)} "
+            f"must cover N={weight.size(0)}.")
+    k_blocks = (input.size(1) + 127) // 128
+    expected_scale_cols = (k_blocks + 3) // 4
+    if weight_scale.size(1) < expected_scale_cols:
+        raise ValueError(
+            f"Packed-scale SwapAB weight scale cols {weight_scale.size(1)} "
+            f"must cover packed K-scale cols={expected_scale_cols}.")
 
-    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
-        _sglang_safe_act_quant
+    orig_m = input.size(0)
+    aligned_m = ((orig_m + 127) // 128) * 128
+    if aligned_m != orig_m:
+        quant_input = torch.cat(
+            [input.contiguous(),
+             input.new_zeros((aligned_m - orig_m, input.size(1)))],
+            dim=0,
+        )
+    else:
+        quant_input = input.contiguous()
 
-    qinput, input_scale = _sglang_safe_act_quant(input.contiguous(),
-                                                 128,
-                                                 scale_dtype=torch.float32)
-    _smc_cuda_sync_probe("smc fp8_swap_ab packed-scale activation quant")
+    qinput, input_scale = torch.ops.trtllm.fp8_quantize_1x128(
+        quant_input, use_ue8m0=True)
+    _smc_cuda_sync_probe("smc fp8_swap_ab packed-scale padded cuda quant")
 
     weight_fp8 = weight.contiguous()
     output = torch.empty((input.size(0), weight_fp8.size(0)),
@@ -1949,8 +1979,8 @@ def _fp8_swap_ab_packed_scale_triton_matmul(
         weight_fp8.stride(0),
         output.stride(0),
         output.stride(1),
-        input_scale.stride(0),
         input_scale.stride(1),
+        input_scale.stride(0),
         weight_scale.stride(0),
         weight_scale.stride(1),
         BLOCK_SIZE_M=block_m,
