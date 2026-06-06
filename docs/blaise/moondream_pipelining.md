@@ -52,16 +52,32 @@ SM90-only).
 
 ## Interaction with SMC-SD (important)
 
-SMC-SD **force-disables** the overlap scheduler at engine creation
-(`py_executor_creator.py:664-668`, loud warning): particle-weighted speculative
-verification is incompatible with the overlap path's greedy-rejection fallback. So
-on a decode worker with SMC-SD ON, the moondream overlap pipelining is OFF **by
-design** — SMC-SD's own draft/verify path supersedes it. The moondream pipelining
-benefits non-SMC decode (and prefill). This is a correctness requirement, not a defect.
+SMC-SD now participates in the overlap scheduler instead of force-disabling it.
+`SpeculativeDecodingMode.support_overlap_scheduler()` admits SMC via the
+two-model `has_draft_model()` path, and the SMC static-draft overlap payload is
+SMC-aware: it preserves `draft_token_log_probs` plus the event-gated pinned host
+copy of `new_draft_tokens` rather than assuming generic `draft_logits`.
 
-Note: the SMC deploy YAMLs declare `disable_overlap_scheduler: false`, but `is_smc()`
-overrides it to `true` at runtime — the declared value is cosmetic.
+The required invariants are:
+
+- **No greedy fallback.** SMC keeps particle-weighted verification;
+  `SMCModelDrafter.process_static_draft_outputs()` consumes SMC draft log-probs,
+  not generic draft logits.
+- **Ping-pong/deferred commit safe.** The delayed previous-draft commit waits on
+  `SampleState.sampler_event` before reading the pinned host token buffer, so
+  draft tokens cannot be read before the side-stream D2H copy lands.
+- **Zombie safe.** `SMCResourceManager.update_resources()` frees particle state
+  only after `GENERATION_COMPLETE`; already-finalized requests in the next
+  in-flight batch are skipped by sampler update and released on the late resource
+  update, matching the finalize-early/release-late rule.
+- **Prefill-in-pipeline.** Context requests remain admitted through the same
+  `_executor_loop_overlap` path; SMC draft preparation still skips context-init
+  requests until generation state, so prefill can occupy a slot without stale SMC
+  particle mutation.
 
 ## Verdict
 
-Correct and maximally optimized as shipped. No code fixes required.
+Correctness is now implemented for SMC-aware Moondream-style overlap at the
+scheduler/drafter boundary. Keep the focused SMC overlap tests green before
+starting A/B sweeps, and require runtime E2E on the SMC-SD deployment before
+claiming production completion.

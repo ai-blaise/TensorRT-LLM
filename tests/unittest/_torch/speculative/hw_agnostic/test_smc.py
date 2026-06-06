@@ -7,6 +7,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     TorchSampler,
     _CachingRequestGrouper,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.smc import (
     build_smc_particle_choices,
@@ -33,6 +34,10 @@ def test_smc_config_uses_gamma_draft_tokens_and_bonus_target_token():
     assert config.max_draft_len == 6
     assert config.max_total_draft_tokens == 24
     assert config.tokens_per_gen_step == 25
+
+
+def test_smc_mode_admits_overlap_scheduler():
+    assert SpeculativeDecodingMode.SMC.support_overlap_scheduler()
 
 
 def test_smc_particle_choices_are_hidden_static_tree_paths():
@@ -79,6 +84,92 @@ def test_smc_resource_manager_tracks_gpu_ess_and_acceptance():
 
     manager.record_logprob_diff(17, 2, torch.tensor(1.25, device="cuda"))
     assert torch.allclose(manager.log_weights[17][2], torch.tensor(1.25, device="cuda"))
+
+
+def test_smc_resource_manager_keeps_zombie_until_complete():
+    config = _smc_config()
+    manager = SMCResourceManager(config, max_num_requests=4)
+    manager.reset_request(17)
+
+    request = SimpleNamespace(
+        py_request_id=17,
+        state=LlmRequestState.GENERATION_TO_COMPLETE,
+    )
+    batch = SimpleNamespace(all_requests=lambda: [request])
+
+    manager.update_resources(batch)
+    assert 17 in manager.log_weights
+
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    manager.update_resources(batch)
+    assert 17 not in manager.log_weights
+
+
+def test_smc_overlap_static_draft_commit_uses_evented_host_tokens():
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 2
+
+    class Event:
+        def __init__(self):
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    event = Event()
+    host_tokens = torch.tensor([[11], [12]], dtype=torch.int64)
+    sample_state = SimpleNamespace(
+        host=SimpleNamespace(new_tokens=host_tokens),
+        sampler_event=event,
+    )
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99], [98]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1], [-0.2]]),
+        "sample_state": sample_state,
+    }
+    target_request = SimpleNamespace(
+        py_request_id=7,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_draft_tokens=[],
+    )
+    drafter.req_id_to_old_request = {7: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=7)])
+
+    drafter.process_static_draft_outputs(outputs, draft_batch)
+
+    assert event.synchronized
+    assert [int(token) for token in target_request.py_draft_tokens] == [11, 12]
+    assert torch.allclose(target_request.py_smc_draft_token_log_probs,
+                          torch.tensor([-0.1, -0.2]))
+    assert target_request.py_draft_logits is None
+
+
+def test_smc_overlap_static_draft_commit_skips_prefill_context():
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 1
+
+    sample_state = SimpleNamespace(
+        host=SimpleNamespace(new_tokens=torch.tensor([[11]], dtype=torch.int64)),
+        sampler_event=SimpleNamespace(synchronize=lambda: None),
+    )
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+        "sample_state": sample_state,
+    }
+    target_request = SimpleNamespace(
+        py_request_id=9,
+        state=LlmRequestState.CONTEXT_INIT,
+        py_draft_tokens=["unchanged"],
+    )
+    drafter.req_id_to_old_request = {9: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=9)])
+
+    drafter.process_static_draft_outputs(outputs, draft_batch)
+
+    assert target_request.py_draft_tokens == ["unchanged"]
 
 
 def _bare_smc_sampler(gamma=3, n_particles=2):

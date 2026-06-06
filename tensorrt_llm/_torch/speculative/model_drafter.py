@@ -786,6 +786,13 @@ class ModelDrafter(Drafter):
         self.pad_draft_tokens_for_cuda_graph(self.previous_scheduled_batch,
                                              resource_manager)
 
+    def _pack_static_draft_outputs_for_overlap(
+        self,
+        outputs: dict[str, torch.Tensor],
+        sample_state: SampleState,
+    ) -> Any:
+        return (outputs["draft_logits"], sample_state)
+
     def cleanup_previous_draft_resources(self) -> None:
         if self.previous_draft_batch is None:
             return
@@ -915,8 +922,13 @@ class ModelDrafter(Drafter):
                 draft_length=self.max_draft_len,
                 draft_batch=draft_batch)
 
-            new_tokens_host = outputs["new_draft_tokens"].to(device='cpu',
-                                                             non_blocking=True)
+            new_tokens_host = torch.empty_like(
+                outputs["new_draft_tokens"],
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            new_tokens_host.copy_(outputs["new_draft_tokens"],
+                                  non_blocking=True)
             sampler_event = torch.cuda.Event()
             sampler_event.record()
 
@@ -929,8 +941,8 @@ class ModelDrafter(Drafter):
 
             # Store current batch for processing in next iteration
             self.previous_draft_batch = draft_batch
-            self.previous_draft_outputs = (outputs["draft_logits"],
-                                           sample_state)
+            self.previous_draft_outputs = self._pack_static_draft_outputs_for_overlap(
+                outputs, sample_state)
             self.previous_scheduled_batch = scheduled_batch
 
             return

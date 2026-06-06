@@ -7,7 +7,7 @@ from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
                                            ResourceManagerType)
 from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, FinishReasonsList,
-                                  TorchSampler, add_token)
+                                  SampleState, TorchSampler, add_token)
 from .interface import SpecMetadata
 from .model_drafter import ModelDrafter
 from .spec_tree_manager import SpecTreeManager
@@ -220,12 +220,36 @@ class SMCResourceManager(BaseResourceManager):
 class SMCModelDrafter(ModelDrafter):
     """Two-model drafter for SMC-SD."""
 
+    def _pack_static_draft_outputs_for_overlap(
+        self,
+        outputs: dict[str, torch.Tensor],
+        sample_state: SampleState,
+    ) -> dict[str, torch.Tensor | SampleState]:
+        """Carry the SMC draft-logprob payload through the delayed commit.
+
+        The generic static-draft overlap path stores ``draft_logits`` plus an
+        event-gated host token copy. SMCStaticParticleDraftingLoopWrapper returns
+        per-token draft log-probs instead of logits, so preserve that payload and
+        let process_static_draft_outputs consume the same pinned/evented token
+        copy used by the Moondream-style ping-pong pipeline.
+        """
+        return {
+            "new_draft_tokens": outputs["new_draft_tokens"],
+            "draft_token_log_probs": outputs["draft_token_log_probs"],
+            "sample_state": sample_state,
+        }
+
     def process_static_draft_outputs(self, outputs, draft_batch) -> None:
         if not isinstance(outputs, dict) or "draft_token_log_probs" not in outputs:
             super().process_static_draft_outputs(outputs, draft_batch)
             return
 
-        draft_tokens_host = outputs["new_draft_tokens"].cpu()
+        sample_state = outputs.get("sample_state")
+        if sample_state is not None:
+            sample_state.sampler_event.synchronize()
+            draft_tokens_host = sample_state.host.new_tokens
+        else:
+            draft_tokens_host = outputs["new_draft_tokens"].cpu()
         draft_token_log_probs = outputs["draft_token_log_probs"]
 
         for req_idx, req in enumerate(draft_batch.all_requests()):
