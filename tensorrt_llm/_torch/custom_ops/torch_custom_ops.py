@@ -1629,8 +1629,10 @@ class fp8SwapABGemmRunner(TunableRunner):
             )
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
+            native_weight_scale = _fp8_block_scale_for_native_swap_ab(
+                weight, weight_scale)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, weight, act_input_sf, weight_scale)
+                act_input_fp8, weight, act_input_sf, native_weight_scale)
             return output.to(self.output_dtype)
 
         orig_m = input.size(0)
@@ -1707,6 +1709,18 @@ def _should_use_cuda_quant_after_swap_ab_pad(input: torch.Tensor,
     return _should_pad_fp8_swap_ab_odd_m(input, weight_scale)
 
 
+def _fp8_block_scale_for_native_swap_ab(weight: torch.Tensor,
+                                        weight_scale: torch.Tensor) -> torch.Tensor:
+    if weight_scale.dtype == torch.int32:
+        return fp8_utils.inverse_transform_sf(
+            weight_scale,
+            mn=weight.size(0),
+            k=weight.size(1),
+            block_size=128,
+        )
+    return weight_scale.float()
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
@@ -1725,8 +1739,10 @@ def fp8_swap_ab_gemm(
         )
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
             input)
+        native_weight_scale = _fp8_block_scale_for_native_swap_ab(
+            weight, weight_scale)
         output = torch.ops.trtllm.fp8_block_scaling_gemm(
-            act_input_fp8, weight, act_input_sf, weight_scale)
+            act_input_fp8, weight, act_input_sf, native_weight_scale)
         return output.to(output_dtype)
 
     tuner = AutoTuner.get()
