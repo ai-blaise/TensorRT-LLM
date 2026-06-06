@@ -36,6 +36,20 @@ def _smc_cuda_sync_probe(label: str) -> None:
         raise RuntimeError(f"SMC CUDA sync probe failed after {label}") from exc
 
 
+def _smc_probe_check_cuda_range(name: str, tensor: torch.Tensor, low: int,
+                                high: int) -> None:
+    if os.environ.get("SMC_CUDA_SYNC_PROBE", "0") != "1":
+        return
+    if tensor.numel() == 0:
+        raise RuntimeError(f"SMC probe {name}: empty tensor")
+    min_value = int(tensor.min().item())
+    max_value = int(tensor.max().item())
+    if min_value < low or max_value >= high:
+        raise RuntimeError(
+            f"SMC probe {name}: values out of range [{low}, {high}); "
+            f"min={min_value}, max={max_value}, shape={tuple(tensor.shape)}")
+
+
 class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
 
     @abstractmethod
@@ -364,6 +378,28 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
         # If using cuda graph, we need to use a torch op to implement this logic
         if use_cuda_graph:
+            if os.environ.get("SMC_CUDA_SYNC_PROBE", "0") == "1":
+                gather_idx = spec_tree_manager.tokens_gather_idx_for_drafter_model[
+                    cur_draft_idx]
+                top_k = spec_tree_manager.top_k_list_cuda[cur_draft_idx]
+                cumsum = spec_tree_manager.draft_tokens_indices_cumsum
+                if self.draft_tokens_buffer.size(0) < batch_size:
+                    raise RuntimeError(
+                        "SMC probe extract_real_draft_tokens: "
+                        f"draft_tokens_buffer batch dim {self.draft_tokens_buffer.size(0)} "
+                        f"is smaller than batch_size={batch_size}")
+                _smc_probe_check_cuda_range("tokens_gather_idx", gather_idx, 0,
+                                            new_draft_tokens.size(1))
+                _smc_probe_check_cuda_range("top_k_list", top_k, 1,
+                                            spec_tree_manager.max_top_k + 1)
+                _smc_probe_check_cuda_range(
+                    "draft_tokens_indices_cumsum", cumsum, 0,
+                    self.max_total_draft_tokens + 1)
+                if int(cumsum[-1].item()) != self.max_total_draft_tokens:
+                    raise RuntimeError(
+                        "SMC probe draft_tokens_indices_cumsum: final value "
+                        f"{int(cumsum[-1].item())} != max_total_draft_tokens "
+                        f"{self.max_total_draft_tokens}")
             torch.ops.trtllm.extract_real_draft_tokens_op(
                 new_draft_tokens, self.draft_tokens_buffer, spec_tree_manager.
                 tokens_gather_idx_for_drafter_model[cur_draft_idx],
@@ -373,6 +409,11 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 spec_tree_manager.max_top_k)
         else:
             # 1) Gather the real tokens processed by this layer
+            if os.environ.get("SMC_CUDA_SYNC_PROBE", "0") == "1":
+                gather_idx = spec_tree_manager.tokens_gather_idx_for_drafter_model[
+                    cur_draft_idx]
+                _smc_probe_check_cuda_range("tokens_gather_idx", gather_idx, 0,
+                                            new_draft_tokens.size(1))
             process_tokens = new_draft_tokens[:, spec_tree_manager.
                                               tokens_gather_idx_for_drafter_model[
                                                   cur_draft_idx], :]  # [batch_size, num_tokens_process_this_layer, max_top_k]
@@ -385,6 +426,8 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 cur_draft_idx].repeat(
                     batch_size)  # [batch_size * num_tokens_process_this_layer]
             assert top_k_list.shape[0] == process_tokens.shape[0]
+            _smc_probe_check_cuda_range("top_k_list", top_k_list, 1,
+                                        spec_tree_manager.max_top_k + 1)
 
             # [batch_size * num_tokens_process_this_layer, spec_tree_manager.max_top_k]
             col_indices = torch.arange(
