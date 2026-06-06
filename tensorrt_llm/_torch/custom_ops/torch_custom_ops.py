@@ -1635,6 +1635,12 @@ def _should_skip_fp8_swap_ab_gemm_tuning(input: torch.Tensor,
             and weight_scale.dtype == torch.int32)
 
 
+def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
+    # The CUDA quantizer can illegal-access on odd SMC draft batches on SM100,
+    # while the Triton quantizer handles the same shapes correctly.
+    return get_sm_version() >= 100 and input.size(0) % 8 != 0
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
@@ -1647,13 +1653,21 @@ def fp8_swap_ab_gemm(
 
     # Step 1: Select best quantization kernel (CUDA vs Triton).
     # Profiles only _quantize (no GEMM), with empty M-buckets.
-    quant_runner = Fp8QuantKernelRunner()
-    _, quant_tactic = tuner.choose_one(
-        "trtllm::fp8_quant_1x128_tactic",
-        [quant_runner],
-        Fp8QuantKernelRunner.tuning_config,
-        [input],
-    )
+    if _should_use_triton_fp8_quant_for_swap_ab(input):
+        quant_tactic = Fp8QuantKernelRunner.TACTIC_TRITON
+        logger.warning_once(
+            "[fp8_swap_ab_gemm] Using Triton FP8 quantizer for "
+            f"non-8-aligned SM100 M={input.size(0)}.",
+            key=("fp8_swap_ab_gemm", "triton_quant_non_8_aligned_sm100"),
+        )
+    else:
+        quant_runner = Fp8QuantKernelRunner()
+        _, quant_tactic = tuner.choose_one(
+            "trtllm::fp8_quant_1x128_tactic",
+            [quant_runner],
+            Fp8QuantKernelRunner.tuning_config,
+            [input],
+        )
 
     # Step 2: Run quantize + GEMM. Single tactic triggers DeepGemm JIT
     # warmup across M-buckets without re-profiling the quant kernel.
