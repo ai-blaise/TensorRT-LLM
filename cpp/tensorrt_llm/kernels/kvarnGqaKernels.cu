@@ -55,6 +55,17 @@ struct PackedRecordView
     std::int64_t strideByte;
 };
 
+
+struct PackedRecordWriteView
+{
+    std::uint8_t* ptr;
+    bool pageLayout;
+    std::int64_t strideBlock;
+    std::int64_t strideToken;
+    std::int64_t strideHead;
+    std::int64_t strideByte;
+};
+
 __device__ __forceinline__ int hadamardSign(int row, int col)
 {
     return (__popc(static_cast<unsigned>(row & col)) & 1) ? -1 : 1;
@@ -145,6 +156,209 @@ template <>
 __device__ __forceinline__ void storeScalar<__nv_bfloat16>(__nv_bfloat16* ptr, float value)
 {
     *ptr = __float2bfloat16(value);
+}
+
+
+__device__ __forceinline__ std::uint8_t recordByte(PackedRecordWriteView view, std::int64_t blockId, int kvHead, int byteIdx)
+{
+    if (view.pageLayout)
+    {
+        int tokenSlot = byteIdx / Layout::kBytesPerTokenSlot;
+        int byteInSlot = byteIdx - tokenSlot * Layout::kBytesPerTokenSlot;
+        return view.ptr[blockId * view.strideBlock + tokenSlot * view.strideToken + kvHead * view.strideHead
+            + byteInSlot * view.strideByte];
+    }
+    return view.ptr[blockId * view.strideBlock + kvHead * view.strideHead + byteIdx * view.strideByte];
+}
+
+__device__ __forceinline__ void writeRecordByte(
+    PackedRecordWriteView view, std::int64_t blockId, int kvHead, int byteIdx, std::uint8_t value)
+{
+    if (view.pageLayout)
+    {
+        int tokenSlot = byteIdx / Layout::kBytesPerTokenSlot;
+        int byteInSlot = byteIdx - tokenSlot * Layout::kBytesPerTokenSlot;
+        view.ptr[blockId * view.strideBlock + tokenSlot * view.strideToken + kvHead * view.strideHead
+            + byteInSlot * view.strideByte] = value;
+        return;
+    }
+    view.ptr[blockId * view.strideBlock + kvHead * view.strideHead + byteIdx * view.strideByte] = value;
+}
+
+__device__ __forceinline__ void writePackedFp16(
+    PackedRecordWriteView view, std::int64_t blockId, int kvHead, int byteOffset, float value)
+{
+    union
+    {
+        std::uint16_t u;
+        __half h;
+    } cvt;
+    cvt.h = __float2half_rn(value);
+    writeRecordByte(view, blockId, kvHead, byteOffset, static_cast<std::uint8_t>(cvt.u & 0xff));
+    writeRecordByte(view, blockId, kvHead, byteOffset + 1, static_cast<std::uint8_t>((cvt.u >> 8) & 0xff));
+}
+
+__device__ __forceinline__ float clampf(float x, float lo, float hi)
+{
+    return fminf(fmaxf(x, lo), hi);
+}
+
+__device__ float tileStd(float const* tile, float const* logCol, float const* logRow, bool byColumn, int idx)
+{
+    float sum = 0.0f;
+    float sumSq = 0.0f;
+    for (int i = 0; i < Layout::kGroupSize; ++i)
+    {
+        int r = byColumn ? i : idx;
+        int c = byColumn ? idx : i;
+        float x = tile[r * Layout::kHeadDim + c] / expf(logRow[r] + logCol[c]);
+        sum += x;
+        sumSq += x * x;
+    }
+    float n = static_cast<float>(Layout::kGroupSize);
+    float var = (sumSq - (sum * sum / n)) / (n - 1.0f);
+    return sqrtf(fmaxf(var, 0.0f));
+}
+
+__device__ float tileImbalance(float const* tile, float const* logCol, float const* logRow)
+{
+    float minCol = FLT_MAX;
+    float maxCol = 0.0f;
+    float minRow = FLT_MAX;
+    float maxRow = 0.0f;
+    for (int i = 0; i < Layout::kGroupSize; ++i)
+    {
+        float sc = tileStd(tile, logCol, logRow, true, i);
+        float sr = tileStd(tile, logCol, logRow, false, i);
+        minCol = fminf(minCol, sc);
+        maxCol = fmaxf(maxCol, sc);
+        minRow = fminf(minRow, sr);
+        maxRow = fmaxf(maxRow, sr);
+    }
+    return maxCol / fmaxf(minCol, 1e-8f) + maxRow / fmaxf(minRow, 1e-8f);
+}
+
+template <bool IsKey, typename T>
+__device__ void quantizeAndWriteTile(T const* src, PackedRecordWriteView view, std::int64_t blockId, int inputBlock, int kvHead,
+    int numKvHeads)
+{
+    float tile[Layout::kGroupSize * Layout::kHeadDim];
+    float logCol[Layout::kHeadDim];
+    float logRow[Layout::kGroupSize];
+    float bestCol[Layout::kHeadDim];
+    float bestRow[Layout::kGroupSize];
+
+    for (int i = 0; i < Layout::kHeadDim; ++i)
+    {
+        logCol[i] = 0.0f;
+        bestCol[i] = 1.0f;
+    }
+    for (int i = 0; i < Layout::kGroupSize; ++i)
+    {
+        logRow[i] = 0.0f;
+        bestRow[i] = 1.0f;
+    }
+
+    for (int r = 0; r < Layout::kGroupSize; ++r)
+    {
+        for (int c = 0; c < Layout::kHeadDim; ++c)
+        {
+            int token = IsKey ? c : r;
+            int rotDim = IsKey ? r : c;
+            float acc = 0.0f;
+            for (int j = 0; j < Layout::kHeadDim; ++j)
+            {
+                std::int64_t srcIdx
+                    = ((static_cast<std::int64_t>(inputBlock) * Layout::kGroupSize + token) * numKvHeads + kvHead)
+                    * Layout::kHeadDim + j;
+                acc += loadScalar(src + srcIdx) * static_cast<float>(hadamardSign(j, rotDim));
+            }
+            tile[r * Layout::kHeadDim + c] = acc * kHadamardScale;
+        }
+    }
+
+    float bestImbalance = tileImbalance(tile, logCol, logRow);
+    for (int iter = 0; iter < 16; ++iter)
+    {
+        for (int c = 0; c < Layout::kHeadDim; ++c)
+        {
+            float std = clampf(tileStd(tile, logCol, logRow, true, c), 1e-3f, 1e3f);
+            logCol[c] = clampf(logCol[c] + logf(std), -0.3f, 10.0f);
+        }
+        for (int r = 0; r < Layout::kGroupSize; ++r)
+        {
+            float std = clampf(tileStd(tile, logCol, logRow, false, r), 1e-3f, 1e3f);
+            logRow[r] = clampf(logRow[r] + logf(std), -0.3f, 10.0f);
+        }
+        float imb = tileImbalance(tile, logCol, logRow);
+        if (imb <= bestImbalance)
+        {
+            bestImbalance = imb;
+            for (int c = 0; c < Layout::kHeadDim; ++c)
+            {
+                bestCol[c] = expf(logCol[c]);
+            }
+            for (int r = 0; r < Layout::kGroupSize; ++r)
+            {
+                bestRow[r] = expf(logRow[r]);
+            }
+        }
+    }
+
+    int packedOffset = IsKey ? kKPackedOffset : kVPackedOffset;
+    int sRowOffset = IsKey ? kKSRowAbsOffset : kVSRowAbsOffset;
+    int zpOffset = IsKey ? kKZpAbsOffset : kVZpAbsOffset;
+    int sColOffset = IsKey ? kKSColOffset : kVSColOffset;
+    for (int i = 0; i < 4096; ++i)
+    {
+        writeRecordByte(view, blockId, kvHead, packedOffset + i, 0);
+    }
+
+    for (int r = 0; r < Layout::kGroupSize; ++r)
+    {
+        float lo = FLT_MAX;
+        float hi = -FLT_MAX;
+        for (int c = 0; c < Layout::kHeadDim; ++c)
+        {
+            float balanced = tile[r * Layout::kHeadDim + c] / bestRow[r] / bestCol[c];
+            lo = fminf(lo, balanced);
+            hi = fmaxf(hi, balanced);
+        }
+        float scale = fmaxf((hi - lo) / 3.0f, 1e-10f);
+        writePackedFp16(view, blockId, kvHead, sRowOffset + r * 2, bestRow[r] * scale);
+        writePackedFp16(view, blockId, kvHead, zpOffset + r * 2, bestRow[r] * lo);
+        for (int c = 0; c < Layout::kHeadDim; ++c)
+        {
+            float balanced = tile[r * Layout::kHeadDim + c] / bestRow[r] / bestCol[c];
+            int q = static_cast<int>(floorf((balanced - lo) / scale + 0.5f));
+            q = q < 0 ? 0 : (q > 3 ? 3 : q);
+            int valueIdx = r * Layout::kHeadDim + c;
+            int bit = valueIdx * 2;
+            int byteIdx = packedOffset + (bit >> 3);
+            int shift = bit & 7;
+            std::uint8_t old = recordByte(view, blockId, kvHead, byteIdx);
+            writeRecordByte(view, blockId, kvHead, byteIdx, old | static_cast<std::uint8_t>(q << shift));
+        }
+    }
+    for (int c = 0; c < Layout::kHeadDim; ++c)
+    {
+        writePackedFp16(view, blockId, kvHead, sColOffset + c * 2, bestCol[c]);
+    }
+}
+
+template <typename T>
+__global__ void kvarnGqaStoreReferenceKernel(T const* k, T const* v, PackedRecordWriteView records,
+    std::int64_t const* blockIds, int numBlocks, int numKvHeads)
+{
+    int inputBlock = blockIdx.x;
+    int kvHead = blockIdx.y;
+    if (inputBlock >= numBlocks || kvHead >= numKvHeads || threadIdx.x != 0)
+    {
+        return;
+    }
+    std::int64_t blockId = blockIds[inputBlock];
+    quantizeAndWriteTile<true>(k, records, blockId, inputBlock, kvHead, numKvHeads);
+    quantizeAndWriteTile<false>(v, records, blockId, inputBlock, kvHead, numKvHeads);
 }
 
 template <typename T>
@@ -244,19 +458,33 @@ __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView recor
 
 bool kvarnGqaBackendReady()
 {
-    // The decode kernel below is an experimental correctness path only: it is
-    // serial per query/head and ignores fp16 sink/tail side state. Readiness must
-    // stay false until store, side-state transfer, sparse reads, CUDA graph
-    // lifecycle, and B200 performance gates pass.
+    // The store/decode kernels below are experimental correctness paths only:
+    // they are serial per block/head or query/head and the decode side ignores
+    // fp16 sink/tail state. Readiness must stay false until side-state transfer,
+    // sparse reads, CUDA graph lifecycle, and B200 performance gates pass.
     return false;
 }
 
-void invokeKvarnGqaStoreK2V2G128(void const*, void const*, std::uint8_t*, std::int64_t const*, int, int, int, int,
-    int, bool, bool, std::int64_t, std::int64_t, std::int64_t, std::int64_t, cudaStream_t)
+void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* packedRecords,
+    std::int64_t const* blockIds, int, int numBlocks, int numKvHeads, int headDim, int groupSize, bool useBf16,
+    bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken, std::int64_t strideHead,
+    std::int64_t strideByte, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(false,
-        "kvarn_gqa_store k2v2_g128 is registered as a production integration boundary, but the fused B200 "
-        "store kernel is not implemented or validated yet");
+    TLLM_CHECK_WITH_INFO(headDim == Layout::kHeadDim && groupSize == Layout::kGroupSize,
+        "kvarn_gqa_store currently supports only k2v2_g128");
+    TLLM_CHECK_WITH_INFO(numBlocks >= 0 && numKvHeads > 0, "kvarn_gqa_store got invalid sizes");
+    PackedRecordWriteView view{packedRecords, pageLayout, strideBlock, strideToken, strideHead, strideByte};
+    dim3 grid(numBlocks, numKvHeads);
+    if (useBf16)
+    {
+        kvarnGqaStoreReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__nv_bfloat16 const*>(k),
+            static_cast<__nv_bfloat16 const*>(v), view, blockIds, numBlocks, numKvHeads);
+    }
+    else
+    {
+        kvarnGqaStoreReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__half const*>(k),
+            static_cast<__half const*>(v), view, blockIds, numBlocks, numKvHeads);
+    }
 }
 
 void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecords,

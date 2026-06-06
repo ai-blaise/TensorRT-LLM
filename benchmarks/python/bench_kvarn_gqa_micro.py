@@ -48,7 +48,10 @@ def main() -> None:
                         help="fail unless a fused KVarN GQA op is registered")
     parser.add_argument("--try-decode-op", action="store_true",
                         help="run the experimental decode op even while backend_ready() is false")
+    parser.add_argument("--try-store-op", action="store_true",
+                        help="run the experimental store op even while backend_ready() is false")
     parser.add_argument("--decode-op-atol", type=float, default=5e-2)
+    parser.add_argument("--store-op-atol", type=float, default=7.5e-2)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -89,14 +92,32 @@ def main() -> None:
             "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_store, "
             "kvarn_gqa_decode, and kvarn_gqa_backend_ready() are not all "
             "present and production-ready; do not promote the reference path as fused")
-    if args.try_decode_op:
+    if args.try_store_op or args.try_decode_op:
         if device.type != "cuda":
-            raise SystemExit("--try-decode-op requires a CUDA device")
-        if not hasattr(trtllm_ops, "kvarn_gqa_decode"):
-            raise SystemExit("torch.ops.trtllm.kvarn_gqa_decode is not registered")
+            raise SystemExit("--try-store-op/--try-decode-op require a CUDA device")
         packed_records = records.unsqueeze(0).contiguous()
         block_ids = torch.zeros((1,), device=device, dtype=torch.int64)
         empty_side = torch.empty((0,), device=device, dtype=torch.float16)
+    if args.try_store_op:
+        if not hasattr(trtllm_ops, "kvarn_gqa_store"):
+            raise SystemExit("torch.ops.trtllm.kvarn_gqa_store is not registered")
+        if cfg.sinkhorn_iters != 16:
+            raise SystemExit("--try-store-op compares against the C++ store preset and requires --sinkhorn-iters 16")
+        op_records = torch.zeros_like(packed_records)
+        trtllm_ops.kvarn_gqa_store(k.unsqueeze(0).contiguous(), v.unsqueeze(0).contiguous(),
+                                   op_records, block_ids, 0, cfg.head_dim, cfg.group)
+        op_k, op_v = dequantize_gqa_tile(op_records[0], cfg)
+        ref_k, ref_v = dequantize_gqa_tile(records, cfg)
+        store_max_abs = max((op_k - ref_k).abs().max().item(),
+                            (op_v - ref_v).abs().max().item())
+        if store_max_abs > args.store_op_atol:
+            raise SystemExit(
+                f"store op restore mismatch: max_abs={store_max_abs:.6f} "
+                f"atol={args.store_op_atol:.6f}")
+        print(f"store_op_restore_max_abs={store_max_abs:.6f}")
+    if args.try_decode_op:
+        if not hasattr(trtllm_ops, "kvarn_gqa_decode"):
+            raise SystemExit("torch.ops.trtllm.kvarn_gqa_decode is not registered")
         for m, q in q_by_m.items():
             seq_lens = torch.full((m,), cfg.group, device=device, dtype=torch.int32)
             op_out = trtllm_ops.kvarn_gqa_decode(
