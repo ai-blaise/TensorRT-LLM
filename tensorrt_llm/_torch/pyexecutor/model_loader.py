@@ -39,12 +39,22 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 _BLAISE_DEFAULT_GQA_KVARN_DTYPE = "kvarn_k2v2_g128"
 _KVARN_GQA_FUSED_OPS = ("kvarn_gqa_store", "kvarn_gqa_decode")
+_KVARN_GQA_READY_OP = "kvarn_gqa_backend_ready"
 
 
 def _has_kvarn_gqa_fused_backend() -> bool:
     trtllm_ops = getattr(torch.ops, "trtllm", None)
-    return trtllm_ops is not None and all(
-        hasattr(trtllm_ops, op_name) for op_name in _KVARN_GQA_FUSED_OPS)
+    if trtllm_ops is None:
+        return False
+    if not all(hasattr(trtllm_ops, op_name) for op_name in _KVARN_GQA_FUSED_OPS):
+        return False
+    ready_op = getattr(trtllm_ops, _KVARN_GQA_READY_OP, None)
+    if ready_op is None:
+        return False
+    try:
+        return bool(ready_op())
+    except Exception:
+        return False
 
 
 def _as_dict(value):
@@ -186,7 +196,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
         raise NotImplementedError(
             "Generic/GQA KVarN KV cache was requested with "
             f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}. The production fused "
-            f"GQA KVarN ops {_KVARN_GQA_FUSED_OPS!r} are not registered, so "
+            f"GQA KVarN ops {_KVARN_GQA_FUSED_OPS!r} are not registered or "
+            f"{_KVARN_GQA_READY_OP}() did not report production readiness, so "
             "startup fails closed instead of promoting the reference Python "
             "store/restore path or falling back to fp16/fp8/nvfp4 KV. Missing "
             "production pieces are fused B200 store/decode kernels, packed-record "

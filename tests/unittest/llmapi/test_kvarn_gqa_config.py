@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from tensorrt_llm._torch.pyexecutor import model_loader
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     _KVARN_GQA_FUSED_OPS,
+    _KVARN_GQA_READY_OP,
     _hf_kvarn_gqa_kv_dtype,
     validate_and_set_kv_cache_quant,
 )
@@ -81,6 +82,7 @@ def test_gqa_kvarn_fused_ops_gate_sets_kvarn_quant_mode(monkeypatch):
     validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
 
     assert _KVARN_GQA_FUSED_OPS == ("kvarn_gqa_store", "kvarn_gqa_decode")
+    assert _KVARN_GQA_READY_OP == "kvarn_gqa_backend_ready"
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.KVARN.value
     assert model_config.quant_config.kv_cache_dtype == "kvarn_k2v2_g128"
 
