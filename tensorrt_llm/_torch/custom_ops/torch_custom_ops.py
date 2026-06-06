@@ -1796,6 +1796,43 @@ def _fp8_swap_ab_dequantized_matmul(
     return output_cpu.to(output_dtype).to(device=device)
 
 
+_packed_scale_triton_cache_lock = threading.Lock()
+_packed_scale_triton_cache: dict[Tuple[int, int, int, int, int, int, int, int],
+                                 torch.Tensor] = {}
+
+
+def _preload_packed_swap_ab_scale_for_triton(
+        weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
+    """Convert DeepGEMM packed UE8M0 scales to SGLang Triton block scales."""
+    device_index = weight.device.index if weight.device.index is not None else -1
+    key = (
+        int(weight_scale.data_ptr()),
+        weight_scale.size(0),
+        weight_scale.size(1),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        weight.size(0),
+        weight.size(1),
+        device_index,
+    )
+    with _packed_scale_triton_cache_lock:
+        cached = _packed_scale_triton_cache.get(key)
+        if cached is not None and cached.device == weight.device:
+            return cached
+
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
+        _preload_ue8m0_scale_for_triton
+
+    preloaded = _preload_ue8m0_scale_for_triton(weight_scale,
+                                                (weight.size(0),
+                                                 weight.size(1)), [128, 128])
+    with _packed_scale_triton_cache_lock:
+        if len(_packed_scale_triton_cache) >= 256:
+            _packed_scale_triton_cache.pop(next(iter(_packed_scale_triton_cache)))
+        _packed_scale_triton_cache[key] = preloaded
+    return preloaded
+
+
 @triton.jit
 def _fp8_swap_ab_packed_scale_matmul_kernel(
     A,
@@ -1937,63 +1974,18 @@ def _fp8_swap_ab_packed_scale_triton_matmul(
             f"Packed-scale SwapAB weight scale cols {weight_scale.size(1)} "
             f"must cover packed K-scale cols={expected_scale_cols}.")
 
-    orig_m = input.size(0)
-    aligned_m = ((orig_m + 127) // 128) * 128
-    if aligned_m != orig_m:
-        quant_input = torch.cat(
-            [input.contiguous(),
-             input.new_zeros((aligned_m - orig_m, input.size(1)))],
-            dim=0,
-        )
-    else:
-        quant_input = input.contiguous()
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import \
+        _sglang_fp8_swap_ab_block_matmul
 
-    qinput, input_scale = torch.ops.trtllm.fp8_quantize_1x128(
-        quant_input, use_ue8m0=True)
-    _smc_cuda_sync_probe("smc fp8_swap_ab packed-scale padded cuda quant")
-
-    weight_fp8 = weight.contiguous()
-    output = torch.empty((input.size(0), weight_fp8.size(0)),
-                         device=input.device,
-                         dtype=output_dtype)
-
-    block_m = 64
-    block_n = 128
-    block_k = 128
-    group_m = 32
-
-    def grid(meta):
-        return (triton.cdiv(input.size(0), meta["BLOCK_SIZE_M"]) *
-                triton.cdiv(weight_fp8.size(0), meta["BLOCK_SIZE_N"]), )
-
-    _fp8_swap_ab_packed_scale_matmul_kernel[grid](
-        qinput,
-        weight_fp8,
-        output,
-        input_scale,
-        weight_scale,
-        input.size(0),
-        weight_fp8.size(0),
-        input.size(1),
-        qinput.stride(0),
-        qinput.stride(1),
-        weight_fp8.stride(1),
-        weight_fp8.stride(0),
-        output.stride(0),
-        output.stride(1),
-        input_scale.stride(1),
-        input_scale.stride(0),
-        weight_scale.stride(0),
-        weight_scale.stride(1),
-        BLOCK_SIZE_M=block_m,
-        BLOCK_SIZE_N=block_n,
-        BLOCK_SIZE_K=block_k,
-        GROUP_SIZE_M=group_m,
-        num_warps=4,
-        num_stages=3,
+    triton_scale = _preload_packed_swap_ab_scale_for_triton(
+        weight.contiguous(), weight_scale)
+    logger.warning_once(
+        "[fp8_swap_ab_gemm] Preloaded packed UE8M0 scales into SGLang "
+        "strict-mask Triton block-scale layout.",
+        key=("fp8_swap_ab_gemm", "preload_packed_ue8m0_for_sglang_triton"),
     )
-    _smc_cuda_sync_probe("smc fp8_swap_ab packed-scale triton matmul")
-    return output
+    return _sglang_fp8_swap_ab_block_matmul(input, weight, triton_scale,
+                                            output_dtype)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
