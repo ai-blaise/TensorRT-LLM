@@ -38,6 +38,7 @@ def test_gate_matrix_covers_post_gen56_composability_defaults():
     assert payload["dense_mla_dtype"] == "kvarn_k2v2"
     assert payload["dense_mla_amortize"] is True
     assert payload["indexer_quantized_by_kvarn"] is False
+    assert payload["target_concurrency"] == 16
     assert payload["min_tok_s_per_user"] == 150.0
 
     cases = payload["cases"]

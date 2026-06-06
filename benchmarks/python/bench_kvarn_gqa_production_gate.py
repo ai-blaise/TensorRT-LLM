@@ -64,6 +64,7 @@ def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Ite
         "dense_mla_dtype": "kvarn_k2v2",
         "dense_mla_amortize": True,
         "indexer_quantized_by_kvarn": False,
+        "target_concurrency": concurrency,
         "min_tok_s_per_user": min_tok_s_per_user,
         "cases": [asdict(case) for case in cases],
     }
