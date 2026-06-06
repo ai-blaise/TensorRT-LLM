@@ -211,6 +211,11 @@ false and keep SMC-SD/GQA KVarN out of production defaults.
 6. **Performance gates**
    - `benchmarks/python/bench_kvarn_gqa_micro.py --require-fused` must report the
      fused path present, ready, correct, and faster than the reference path.
+   - `benchmarks/python/bench_kvarn_gqa_production_gate.py --dry-run` emits the
+     required post-gen56 matrix for sequence length, odd-M, LayerSplit, request
+     pinning, Moondream overlap, SMC, WarpDecode, and transport variants. Run it
+     without `--dry-run` only in a fused-kernel test image; it fails closed unless
+     `kvarn_gqa_backend_ready()` returns true.
    - Deployment benchmark must meet or beat the baseline and target c16
      tok/s/user after first token across `{1k, 8k, 32k, 64k, 128k}`.
 
