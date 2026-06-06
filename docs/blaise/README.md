@@ -33,8 +33,8 @@ a correctness signal — see "Validation philosophy" below).
 | 7 | Sparse-MLA: MSA 2-stream head-split | [sparse_mla.md](sparse_mla.md#msa-2-stream-head-split) | −14.5…−19.5 % @ b1–4 | on @ small batch |
 | 8 | Sparse-MLA: `get_decoding_sched_meta` parallelize | [sparse_mla.md](sparse_mla.md#get_decoding_sched_meta-parallelization) | 2.5–3.3× the meta kernel | on |
 | 9 | Sparse-MLA: AB-swapped index-scoring (MSA #3) | [sparse_mla.md](sparse_mla.md#ab-swapped-index-scoring) | already-optimal on tcgen05 | on (tcgen05 path) |
-| 10 | KVarN: k2v2/k4v4 dense latent KV quant | [kvarn.md](kvarn.md) | ~2.3 bits @ FP16 accuracy, 3–5× capacity | opt-in (flag) |
-| 11 | KVarN: BDR fold (in-kernel dequant-on-read) | [kvarn.md](kvarn.md#bdr-fold-in-kernel-dequant-on-read) | amortized restore under budget | opt-in |
+| 10 | KVarN: k2v2/k4v4 dense latent KV quant | [kvarn.md](kvarn.md) | ~2.3 bits @ FP16 accuracy, 3–5× capacity | default k2v2 for production dense MLA |
+| 11 | KVarN: BDR fold (in-kernel dequant-on-read) | [kvarn.md](kvarn.md#bdr-fold-in-kernel-dequant-on-read) | amortized restore under budget | default with KVarN |
 | 12 | WarpDecode: retuned NVFP4 tactics + bridge | [warpdecode.md](warpdecode.md) | 1.20–1.36× vs native MoE | opt-in (env/config) |
 | 13 | NVFP4 fusion: add + RMSNorm + quant | [nvfp4_fusions.md](nvfp4_fusions.md#add--rmsnorm--quant-fusion) | −48…−54 % norm→quant sub-path | on (torch.compile) |
 | 14 | NVFP4 fusion: fused RoPE-cat-FP4 | [nvfp4_fusions.md](nvfp4_fusions.md#fused-rope-cat-fp4) | removes a cat + a quant launch | on when shape matches |

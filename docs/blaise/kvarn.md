@@ -8,16 +8,16 @@ reaches the **highest capacity (fewest bytes/token) of any tested format** at a
 fidelity on par with NVFP4.
 
 KVarN is validated by **reconstruction cosine vs an FP16 ground-truth latent**
-(not end-to-end text). It is **opt-in** behind a config flag. The SMC-SD canary
-configuration uses `mla_latent_kv_dtype="kvarn_k2v2"`; that means **2-bit
-content latent + 2-bit RoPE key for dense MLA latent KV only**. Indexer K stays
-on its own `indexer_k_dtype` path (`fp8`/`fp4`) and is never routed through
-KVarN.
+(not end-to-end text). For supported production dense-MLA lanes it is the
+default KV format: `mla_latent_kv_dtype="kvarn_k2v2"` plus amortized restore.
+That means **2-bit content latent + 2-bit RoPE key for dense MLA latent KV
+only**. Indexer K stays on its own `indexer_k_dtype` path (`fp8`/`fp4`) and is
+never routed through KVarN.
 
 | # | Piece | File | Figure | Default |
 |---|-------|------|--------|---------|
-| 10 | Variance-normalized latent quant (k2v2/k4v4) | `kvarn_core.py`, `kvarn_mla.py`, `kvarn_backend.py` | k2v2 = 2.36 bits/elem @ group64; k4v4 = 314 B/tok, 3.67×, cos 0.99418 | opt-in (flag) |
-| 11 | BDR fold: amortized low-bit dequant-on-read | `mlaKernels.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady (INT4 measured; k2 path same packed helper with qmax=3) | opt-in (`mla_latent_kv_amortize`) |
+| 10 | Variance-normalized latent quant (k2v2/k4v4) | `kvarn_core.py`, `kvarn_mla.py`, `kvarn_backend.py` | k2v2 = 2.36 bits/elem @ group64; k4v4 = 314 B/tok, 3.67×, cos 0.99418 | default `kvarn_k2v2` for production dense MLA |
+| 11 | BDR fold: amortized low-bit dequant-on-read | `mlaKernels.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady (INT4 measured; k2 path same packed helper with qmax=3) | default on with KVarN |
 
 ---
 
@@ -71,9 +71,12 @@ preserves this exactly (cos ≥ 1.0 vs the dequant reference,
   `packed_bytes`, `bits_per_elem`), `parse_kvarn_dtype` / `resolve_kvarn_config`
   (so `mla_latent_kv_dtype="kvarn_k4v4"` resolves), and `KVarNLatentPool`
   (`store_block`, `load_block`, `load_blocks`, the serialize/deserialize layout).
-- **Enable:** opt-in — set the dense MLA latent KV dtype to a KVarN config
-  with `mla_latent_kv_dtype` or `TRTLLM_MLA_LATENT_KV_DTYPE`
-  (`is_kvarn_dtype` / `parse_kvarn_dtype`). DEFAULT off.
+- **Enable:** production default — supported DeepSeek/SMC-SD dense-MLA model
+  cards resolve to `mla_latent_kv_dtype="kvarn_k2v2"` and
+  `mla_latent_kv_amortize=True`. HF configs may also set
+  `quantization_config.kvarn.mla_latent_kv_dtype`,
+  `quantization_config.kvarn.mla_latent_kv_amortize`, or top-level
+  `mla_latent_kv_dtype` / `mla_latent_kv_amortize`.
 - **Composes with:** the Indexer / sparse-MLA, which read the **dequantized
   dense MLA latent** — KVarN changes only dense MLA storage. It is not an
   Indexer K-cache dtype; Indexer storage remains `indexer_k_dtype="fp8"` or
@@ -130,8 +133,8 @@ should scale with **churn, not working-set**.
     effectively free → **NET WIN, +1.93× capacity vs fp8 @ cos 0.994**. At b32
     standalone it adds latency, which is exactly why the amortization is the
     lever (and drives it back under budget).
-- **Enable:** opt-in via `mla_latent_kv_amortize` (DEFAULT OFF). The in-kernel
-  CUDA path drives it to the 71.7 µs / 1.12 µs end-state.
+- **Enable:** default on whenever production dense-MLA KVarN is selected. The
+  in-kernel CUDA path drives it to the 71.7 µs / 1.12 µs end-state.
 - **Correctness:** `amortize == full-restore` within FP16 batch rounding,
   ground-truth **cos ≥ 1.0**, recycle re-commit re-restores correctly
   (`test_kvarn_amortize.py`, `test_kvarn_cycle.py`).
@@ -144,17 +147,17 @@ should scale with **churn, not working-set**.
 
 ```python
 # Dense MLA latent KV dtype selects KVarN; resolve_kvarn_config parses "kvarn_k2v2".
-mla_latent_kv_dtype = "kvarn_k2v2"   # opt-in; default is auto/fp8/nvfp4
-# Amortized restore (decode capacity unlock) is separately flag-gated:
-mla_latent_kv_amortize = True        # DEFAULT False
+mla_latent_kv_dtype = "kvarn_k2v2"   # production default for supported dense MLA
+# Amortized restore is default-on with KVarN:
+mla_latent_kv_amortize = True
 ```
 
 The component-level quant (#10) gives the capacity; the BDR-fold amortized
 restore (#11) makes decode affordable at batch by collapsing per-step cost to
-churn. Both are off by default pending the dense-MLA decode read-path
-integration (campaign tasks: wire KVarN read/dequant into the dense MLA decode
-attention path + `sparse_mla_decode_nvfp4` FlashMLA kernel; verify cos
-0.992–1.0 + decode tps @ c16 + the capacity unlock).
+churn. Dense-MLA deployment resolves through `ModelConfig.from_pretrained` from
+the HF model card or runtime sparse-attention config. Generic/GQA KVarN uses a
+separate KV-cache storage/read path and must not be silently mapped through
+`mla_latent_kv_dtype`.
 
 
 ## SMC-SD k2v2 deployment contract

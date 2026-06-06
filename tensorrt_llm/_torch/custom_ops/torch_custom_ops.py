@@ -1617,7 +1617,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         pad_m = 0
         quant_input = input
         if _should_pad_fp8_swap_ab_odd_m(input, weight_scale):
-            aligned_m = ((orig_m + 7) // 8) * 8
+            aligned_m = ((orig_m + 127) // 128) * 128
             pad_m = aligned_m - orig_m
             logger.warning_once(
                 "[fp8_swap_ab_gemm] Padding non-8-aligned SM100 packed-scale "
@@ -1631,7 +1631,12 @@ class fp8SwapABGemmRunner(TunableRunner):
                 dim=0,
             )
 
-        a, a_sf = _fp8_quantize_1x128_ue8m0(quant_input, self.quant_tactic)
+        quant_tactic = self.quant_tactic
+        if pad_m != 0:
+            # The odd-M input was padded to DeepGEMM's MN-major TMA scale
+            # boundary, so use the normal CUDA quantizer for the aligned case.
+            quant_tactic = Fp8QuantKernelRunner.TACTIC_CUDA
+        a, a_sf = _fp8_quantize_1x128_ue8m0(quant_input, quant_tactic)
         output = torch.empty(
             (quant_input.size(0), weight.size(0)),
             device=input.device,

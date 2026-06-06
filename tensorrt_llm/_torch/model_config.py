@@ -31,6 +31,8 @@ from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config, read_modelopt_quant_config,
     warn_if_inline_diverges)
 
+_BLAISE_DEFAULT_MLA_KVARN_DTYPE = "kvarn_k2v2"
+
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
@@ -131,6 +133,52 @@ def _get_blaise_indexer_overrides(
     # model card. Configure it through SparseAttentionConfig.layersplit_*
     # (e.g. --trtllm.sparse_attention_config.layersplit_enabled=true) so
     # production enablement always flows from explicit runtime config.
+
+    return overrides
+
+
+def _is_kvarn_dtype(value: Any) -> bool:
+    return isinstance(value, str) and value.lower().startswith("kvarn_")
+
+
+def _get_blaise_kvarn_overrides(
+        pretrained_config: transformers.PretrainedConfig) -> Dict[str, Any]:
+    """Resolve production dense-MLA KVarN defaults from HF model config.
+
+    KVarN here applies only to DeepSeek-style dense MLA latent KV. The generic
+    GQA KV-cache route must not be silently remapped through these fields.
+    """
+    quant_config = _get_quantization_config(pretrained_config) or {}
+    kvarn_config = _as_dict(quant_config.get("kvarn")) or {}
+    overrides: Dict[str, Any] = {
+        "mla_latent_kv_dtype": _BLAISE_DEFAULT_MLA_KVARN_DTYPE,
+        "mla_latent_kv_amortize": True,
+    }
+
+    for source in (pretrained_config, quant_config, kvarn_config):
+        if source is None:
+            continue
+        getter = source.get if isinstance(source, dict) else getattr
+        dtype = getter("mla_latent_kv_dtype", None)
+        if dtype is None:
+            dtype = getter("dense_mla_kv_dtype", None)
+        if _is_kvarn_dtype(dtype):
+            overrides["mla_latent_kv_dtype"] = str(dtype).lower()
+        amortize = getter("mla_latent_kv_amortize", None)
+        if amortize is None:
+            amortize = getter("amortize", None)
+        if amortize is not None:
+            overrides["mla_latent_kv_amortize"] = bool(amortize)
+
+    kv_cache_dtype = quant_config.get("kv_cache_dtype",
+                                      getattr(pretrained_config,
+                                              "kv_cache_dtype", None))
+    if _is_kvarn_dtype(kv_cache_dtype):
+        logger.warning(
+            f"HF kv_cache_dtype={kv_cache_dtype} requests generic/GQA KVarN KV cache. "
+            "Dense MLA uses mla_latent_kv_dtype instead; generic/GQA KVarN "
+            "requires the dedicated KV-cache read/write path and is not "
+            "silently mapped here.")
 
     return overrides
 
@@ -701,6 +749,8 @@ class ModelConfig(Generic[TConfig]):
                         'sparse_attention_config')
                     indexer_rope_interleave = getattr(
                         pretrained_config, 'indexer_rope_interleave', False)
+                    kvarn_overrides = _get_blaise_kvarn_overrides(
+                        pretrained_config)
                     if sparse_attention_config:
                         model_overrides = _get_blaise_indexer_overrides(
                             pretrained_config)
@@ -754,6 +804,24 @@ class ModelConfig(Generic[TConfig]):
                         layersplit_owner_local_alloc = getattr(
                             sparse_attention_config,
                             "layersplit_owner_local_alloc", False)
+                        mla_latent_kv_dtype = getattr(
+                            sparse_attention_config, "mla_latent_kv_dtype",
+                            "auto")
+                        if (mla_latent_kv_dtype is None
+                                or str(mla_latent_kv_dtype).lower() == "auto"):
+                            mla_latent_kv_dtype = kvarn_overrides[
+                                "mla_latent_kv_dtype"]
+                        else:
+                            mla_latent_kv_dtype = str(
+                                mla_latent_kv_dtype).lower()
+                        mla_latent_kv_amortize = getattr(
+                            sparse_attention_config, "mla_latent_kv_amortize",
+                            False)
+                        if _is_kvarn_dtype(mla_latent_kv_dtype):
+                            mla_latent_kv_amortize = bool(
+                                kvarn_overrides.get("mla_latent_kv_amortize",
+                                                    True)
+                                or mla_latent_kv_amortize)
                         if indexer_mode == "vanilla" and model_overrides.get(
                                 "indexer_mode") in ("indexcache",
                                                     "indexcache-hisa"):
@@ -816,6 +884,10 @@ class ModelConfig(Generic[TConfig]):
                             "hisa_min_seq_len", 32768)
                         hisa_execution_mode = model_overrides.get(
                             "hisa_execution_mode", "optimized")
+                        mla_latent_kv_dtype = kvarn_overrides[
+                            "mla_latent_kv_dtype"]
+                        mla_latent_kv_amortize = kvarn_overrides[
+                            "mla_latent_kv_amortize"]
                         # LayerSplit defaults stay off here; the HF model card cannot
                         # enable it. Production enablement flows only through
                         # SparseAttentionConfig.layersplit_* runtime config.
@@ -845,6 +917,8 @@ class ModelConfig(Generic[TConfig]):
                             layersplit_all_cp_ranks_transfer,
                             "layersplit_owner_local_alloc":
                             layersplit_owner_local_alloc,
+                            "mla_latent_kv_dtype": mla_latent_kv_dtype,
+                            "mla_latent_kv_amortize": mla_latent_kv_amortize,
                     }.items():
                         if value is not None:
                             setattr(pretrained_config, key, value)
@@ -886,7 +960,9 @@ class ModelConfig(Generic[TConfig]):
                             layersplit_all_cp_ranks_transfer=
                             layersplit_all_cp_ranks_transfer,
                             layersplit_owner_local_alloc=
-                            layersplit_owner_local_alloc)
+                            layersplit_owner_local_alloc,
+                            mla_latent_kv_dtype=mla_latent_kv_dtype,
+                            mla_latent_kv_amortize=mla_latent_kv_amortize)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
