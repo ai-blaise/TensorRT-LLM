@@ -50,16 +50,17 @@ exist on a4-us-002-rl9.
 
 ## Fast iteration path
 
-Use `fast_iterate.sh` for Python/config/doc/test iterations. It rsyncs only the
-overlay build subset (`tensorrt_llm`, `deploy`, and Docker metadata) by default,
-then falls back to tar-over-SSH when the VM does not have `rsync`. It builds the
-existing thin overlay image on the B200 VM and uses `nerdctl -n k8s.io build`
-when available so the image lands directly in k3s containerd. If `nerdctl` is
-unavailable, it falls back to Docker BuildKit plus a single `ctr images import`;
-if the requested base image is already in k3s containerd but not Docker, the
-script loads that base into Docker once. Use `--base-image` to layer on top of
-the latest known-good full image. Use `--full-sync` only when remote debugging
-needs the full repository.
+Use `fast_iterate.sh` for Python/config/doc/test iterations. By default, it
+derives the exact `tensorrt_llm/...` files copied by `Dockerfile.r20-overlay`,
+syncs only those files plus `deploy/` and Docker metadata, then falls back to
+tar-over-SSH when the VM does not have `rsync`. It builds the existing thin
+overlay image on the B200 VM and uses `nerdctl -n k8s.io build` when available so
+the image lands directly in k3s containerd. If `nerdctl` is unavailable, it falls
+back to Docker BuildKit plus a single `ctr images import`; if the requested base
+image is already in k3s containerd but not Docker, the script loads that base
+into Docker once. Use `--base-image` to layer on top of the latest known-good
+full image. Use `--full-sync` only when remote debugging needs the full
+repository.
 
 For the fastest image handoff, add `--use-local-registry`. The script starts or
 reuses a `registry:2` container on the VM, pushes the thin overlay to

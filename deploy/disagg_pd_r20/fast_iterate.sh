@@ -90,6 +90,20 @@ SSH_TARGET="${VM_USER}@${VM_HOST}"
 
 if [[ "$SYNC" == 1 ]]; then
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "mkdir -p '$REMOTE_REPO'"
+  OVERLAY_SYNC_PATHS=(deploy .dockerignore)
+  while IFS= read -r overlay_path; do
+    OVERLAY_SYNC_PATHS+=("$overlay_path")
+  done < <(
+    awk '
+      /^COPY[[:space:]]/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^tensorrt_llm\//) {
+            print $i
+          }
+        }
+      }
+    ' deploy/disagg_pd_r20/Dockerfile.r20-overlay
+  )
   if ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "command -v rsync >/dev/null 2>&1"; then
     if [[ "$FULL_SYNC" == 1 ]]; then
       rsync -az --delete \
@@ -103,9 +117,11 @@ if [[ "$SYNC" == 1 ]]; then
         --exclude '.ruff_cache' \
         ./ "$SSH_TARGET:$REMOTE_REPO/"
     else
+      ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+        "rm -rf '$REMOTE_REPO/tensorrt_llm' '$REMOTE_REPO/deploy' '$REMOTE_REPO/.dockerignore' && mkdir -p '$REMOTE_REPO'"
       rsync -az --delete \
         --relative \
-        tensorrt_llm deploy .dockerignore \
+        "${OVERLAY_SYNC_PATHS[@]}" \
         "$SSH_TARGET:$REMOTE_REPO/"
     fi
   elif [[ "$FULL_SYNC" == 1 ]]; then
@@ -122,7 +138,7 @@ if [[ "$SYNC" == 1 ]]; then
   else
     ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
       "rm -rf '$REMOTE_REPO/tensorrt_llm' '$REMOTE_REPO/deploy' '$REMOTE_REPO/.dockerignore' && mkdir -p '$REMOTE_REPO'"
-    tar -czf - tensorrt_llm deploy .dockerignore | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+    tar -czf - "${OVERLAY_SYNC_PATHS[@]}" | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
       "tar -xzf - -C '$REMOTE_REPO'"
   fi
 fi
