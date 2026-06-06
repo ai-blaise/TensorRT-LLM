@@ -118,8 +118,11 @@ as `/cache/optrt`. These paths persist across pod restarts:
 - `/cache/optrt/xdg` for generic Python/library caches.
 - `/cache/optrt/pip` for Python package/download cache.
 - `/cache/optrt/torch_extensions` for Torch extension builds.
+- `/cache/optrt/torchinductor` for TorchInductor graph/codegen artifacts.
 - `/cache/optrt/triton` for Triton kernel cache.
 - `/cache/optrt/cuda` for CUDA JIT cache.
+- `/cache/optrt/deep_gemm` for DeepGEMM JIT cubins generated via
+  `DG_JIT_CACHE_DIR`.
 - `/cache/optrt/tensorrt_llm/dg` for DeepGEMM/TRT-LLM generated artifacts.
 - `/cache/optrt/tensorrt_llm/llmapi_build` for `TLLM_LLMAPI_BUILD_CACHE`.
 

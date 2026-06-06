@@ -68,8 +68,10 @@ sudo mkdir -p \
   /var/lib/optrt-cache/xdg \
   /var/lib/optrt-cache/pip \
   /var/lib/optrt-cache/torch_extensions \
+  /var/lib/optrt-cache/torchinductor \
   /var/lib/optrt-cache/triton \
   /var/lib/optrt-cache/cuda \
+  /var/lib/optrt-cache/deep_gemm \
   /var/lib/optrt-cache/tensorrt_llm/dg \
   /var/lib/optrt-cache/tensorrt_llm/llmapi_build
 sudo chmod -R 0777 /var/lib/optrt-cache
@@ -108,12 +110,14 @@ spec:
           os.environ.setdefault("XDG_CACHE_HOME", "/cache/optrt/xdg")
           os.environ.setdefault("PIP_CACHE_DIR", "/cache/optrt/pip")
           os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/cache/optrt/torch_extensions")
+          os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/cache/optrt/torchinductor")
           os.environ.setdefault("TRITON_CACHE_DIR", "/cache/optrt/triton")
           os.environ.setdefault("CUDA_CACHE_PATH", "/cache/optrt/cuda")
+          os.environ.setdefault("DG_JIT_CACHE_DIR", "/cache/optrt/deep_gemm")
           os.environ.setdefault("TRTLLM_DG_CACHE_DIR", "/cache/optrt/tensorrt_llm/dg")
           os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE", "1")
           os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE_ROOT", "/cache/optrt/tensorrt_llm/llmapi_build")
-          for path in ["/cache/optrt/hf_modules", "/cache/optrt/transformers", "/cache/optrt/hf_datasets", "/cache/optrt/xdg", "/cache/optrt/pip", "/cache/optrt/torch_extensions", "/cache/optrt/triton", "/cache/optrt/cuda", "/cache/optrt/tensorrt_llm/dg", "/cache/optrt/tensorrt_llm/llmapi_build"]:
+          for path in ["/cache/optrt/hf_modules", "/cache/optrt/transformers", "/cache/optrt/hf_datasets", "/cache/optrt/xdg", "/cache/optrt/pip", "/cache/optrt/torch_extensions", "/cache/optrt/torchinductor", "/cache/optrt/triton", "/cache/optrt/cuda", "/cache/optrt/deep_gemm", "/cache/optrt/tensorrt_llm/dg", "/cache/optrt/tensorrt_llm/llmapi_build"]:
               Path(path).mkdir(parents=True, exist_ok=True)
           for module in ["torch", "transformers", "tensorrt_llm"]:
               importlib.import_module(module)
@@ -143,10 +147,14 @@ spec:
           value: /cache/optrt/pip
         - name: TORCH_EXTENSIONS_DIR
           value: /cache/optrt/torch_extensions
+        - name: TORCHINDUCTOR_CACHE_DIR
+          value: /cache/optrt/torchinductor
         - name: TRITON_CACHE_DIR
           value: /cache/optrt/triton
         - name: CUDA_CACHE_PATH
           value: /cache/optrt/cuda
+        - name: DG_JIT_CACHE_DIR
+          value: /cache/optrt/deep_gemm
         - name: TRTLLM_DG_CACHE_DIR
           value: /cache/optrt/tensorrt_llm/dg
         - name: TLLM_LLMAPI_BUILD_CACHE
