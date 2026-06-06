@@ -1831,7 +1831,7 @@ def _fp8_swap_ab_packed_scale_matmul_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -1842,16 +1842,18 @@ def _fp8_swap_ab_packed_scale_matmul_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_mask = offs_k < K - k * BLOCK_SIZE_K
         a = tl.load(a_ptrs,
-                    mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
+                    mask=(offs_am[:, None] < M) & k_mask[None, :],
                     other=0.0)
         b = tl.load(b_ptrs,
-                    mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
-                    & (offs_bn[None, :] < N),
+                    mask=k_mask[:, None] & (offs_bn[None, :] < N),
                     other=0.0)
 
         k_block = k
-        a_s = tl.load(As_ptrs + k_block * stride_As_k)
+        a_s = tl.load(As_ptrs + k_block * stride_As_k,
+                      mask=offs_am < M,
+                      other=0.0)
         bs_col = k_block // 4
         bs_shift = (k_block % 4) * 8
         bs_i32 = tl.load(BsPacked + bs_rows * stride_Bs_m +
