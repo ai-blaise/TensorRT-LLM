@@ -153,6 +153,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return True
 
         wrappers = self._plan_params_to_wrappers[plan_params]
+        if self.num_contexts > 0 and wrappers.prefill_wrapper is None:
+            return True
+        if self.num_generations > 0:
+            if wrappers.decode_wrapper is None:
+                return True
+            # FlashInfer stores dtype/kernel-selection state during decode
+            # plan(). A context-only warmup can cache the wrapper before that
+            # decode side has been planned.
+            if not hasattr(wrappers.decode_wrapper, "_cached_q_data_type"):
+                return True
         return not wrappers.is_planned
 
     def get_prefill_wrapper(
