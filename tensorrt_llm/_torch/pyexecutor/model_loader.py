@@ -38,6 +38,41 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
 
+def _as_dict(value):
+    if isinstance(value, dict):
+        return value
+    if value is not None and hasattr(value, "to_dict"):
+        return value.to_dict()
+    return None
+
+
+def _hf_kvarn_gqa_kv_dtype(pretrained_config) -> Optional[str]:
+    """Return a generic GQA/MHA KVarN KV dtype requested by HF config."""
+    top_dtype = getattr(pretrained_config, "kv_cache_dtype", None)
+    if isinstance(top_dtype, str) and top_dtype.startswith("kvarn_"):
+        return top_dtype.lower()
+
+    quant_config = _as_dict(getattr(pretrained_config, "quantization_config", None)) or {}
+    roots = [
+        _as_dict(getattr(pretrained_config, "kvarn_config", None)),
+        _as_dict(getattr(pretrained_config, "kvarn", None)),
+        _as_dict(quant_config.get("kvarn_config")),
+        _as_dict(quant_config.get("kvarn")),
+        _as_dict(quant_config.get("kv_cache_quantization")),
+    ]
+    for root in (root for root in roots if root is not None):
+        gqa = (_as_dict(root.get("gqa")) or _as_dict(root.get("gqa_kv"))
+               or _as_dict(root.get("gqa_kv_cache")))
+        if gqa is not None and gqa.get("enabled", True):
+            dtype = gqa.get("dtype") or gqa.get("kv_dtype") or gqa.get("kv_cache_dtype")
+            if isinstance(dtype, str) and dtype.startswith("kvarn_"):
+                return dtype.lower()
+        dtype = root.get("kv_cache_dtype") or root.get("dtype")
+        if isinstance(dtype, str) and dtype.startswith("kvarn_") and root.get("path") not in ("dense_mla", "mla"):
+            return dtype.lower()
+    return None
+
+
 def validate_and_set_mamba_ssm_cache_dtype(
         config: ModelConfig,
         mamba_ssm_cache_dtype: str,
@@ -66,8 +101,20 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # Quantization from hf_quant_config.json
     kv_cache_quant = model_config.quant_config.kv_cache_quant_algo
     # PyTorch configuration quantization
-    valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
-    mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+    is_kvarn_gqa = isinstance(pyt_kv_cache_dtype, str) and pyt_kv_cache_dtype.startswith("kvarn_")
+    valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES or is_kvarn_gqa)
+    mapped_pyt_quant = QuantAlgo.KVARN.value if is_kvarn_gqa else _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+
+    if is_kvarn_gqa:
+        raise NotImplementedError(
+            "Generic/GQA KVarN KV cache was requested with "
+            f"kv_cache_config.dtype={pyt_kv_cache_dtype!r}, but op-trt only "
+            "has the dense-MLA latent KVarN kernels today. Missing pieces are: "
+            "generic paged K/V KVarN tile allocation, full-block store/flush, "
+            "fp16 sink/tail pool, KVarN dequant/scoring/value decode kernels, "
+            "and cache-transfer metadata for packed KVarN records. Dense MLA "
+            "KVarN remains controlled by sparse_attention_config.mla_latent_kv_dtype."
+        )
 
     if pyt_kv_cache_dtype == "nvfp4":
         pretrained_config = model_config.pretrained_config
@@ -312,6 +359,22 @@ class ModelLoader:
             config_kwargs['spec_config'] = llm_args.speculative_config
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        hf_gqa_kvarn_dtype = _hf_kvarn_gqa_kv_dtype(config.pretrained_config)
+        if hf_gqa_kvarn_dtype:
+            user_overrides = llm_args.model_dump(exclude_unset=True)
+            kv_overrides = user_overrides.get('kv_cache_config', {})
+            if not isinstance(kv_overrides, dict):
+                kv_overrides = {}
+            if 'dtype' not in kv_overrides:
+                llm_args.kv_cache_config.dtype = hf_gqa_kvarn_dtype
+            if 'tokens_per_block' not in kv_overrides:
+                llm_args.kv_cache_config.tokens_per_block = 128
+            logger.info(
+                "Applied HF KVarN GQA KV cache request: "
+                f"dtype={llm_args.kv_cache_config.dtype}, "
+                f"tokens_per_block={llm_args.kv_cache_config.tokens_per_block}"
+            )
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
 

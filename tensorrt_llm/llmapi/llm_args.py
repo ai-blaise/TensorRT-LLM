@@ -2910,7 +2910,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(
         default="auto",
         description=
-        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
+        "The data type to use for the generic GQA/MHA KV cache. Use 'auto' "
+        "to follow checkpoint metadata, otherwise force the specified dtype. "
+        "KVarN GQA dtypes use 'kvarn_k<key_bits>v<value_bits>_g<group>' "
+        "(for example 'kvarn_k2v2_g128') and require a dedicated generic "
+        "KVarN attention backend; they are validated separately from dense "
+        "MLA mla_latent_kv_dtype."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
@@ -2995,10 +3000,36 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if v in ("auto", "fp8",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
+        if v.startswith("kvarn_"):
+            parts = v.split("_")
+            if len(parts) == 3 and parts[1].startswith("k") and "v" in parts[1] and parts[2].startswith("g"):
+                try:
+                    key_bits_s, value_bits_s = parts[1][1:].split("v", 1)
+                    key_bits = int(key_bits_s)
+                    value_bits = int(value_bits_s)
+                    group = int(parts[2][1:])
+                except ValueError as exc:
+                    raise ValueError(
+                        "kv_cache_config.dtype KVarN values must use "
+                        "'kvarn_k<key_bits>v<value_bits>_g<group>'.") from exc
+                if key_bits in (2, 3, 4) and value_bits in (2, 3, 4) and group == 128:
+                    return v
+            raise ValueError(
+                "kv_cache_config.dtype KVarN values must use "
+                "'kvarn_k<key_bits>v<value_bits>_g128' with 2/3/4-bit "
+                "key/value fields.")
 
         raise ValueError(
-            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
+            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", a valid torch.dtype string, or a KVarN GQA dtype such as "kvarn_k2v2_g128"'
         )
+
+    @model_validator(mode="after")
+    def validate_kvarn_gqa_block_size(self):
+        if self.dtype.startswith("kvarn_") and self.tokens_per_block != 128:
+            raise ValueError(
+                "kv_cache_config.dtype KVarN values require tokens_per_block=128 "
+                "so one paged KV block equals one KVarN variance-normalization tile.")
+        return self
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
