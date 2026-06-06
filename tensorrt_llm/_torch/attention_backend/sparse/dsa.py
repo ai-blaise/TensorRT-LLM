@@ -4157,6 +4157,8 @@ class DSATrtllmAttention(TrtllmAttention):
         mgr = self._kvarn_mgr(metadata)
         if mgr is None:
             return
+        if torch.cuda.is_current_stream_capturing():
+            return
         tpb = mgr.tokens_per_block
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
         kv_lens = metadata.kv_lens_runtime

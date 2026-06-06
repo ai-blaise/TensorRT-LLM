@@ -298,6 +298,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.model_is_wrapped = False
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
+        self._kvarn_restore_modules: Optional[List[Any]] = None
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -580,6 +581,24 @@ class PyTorchModelEngine(ModelEngine):
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
+
+    def _restore_kvarn_before_cuda_graph_replay(
+            self, attn_metadata: AttentionMetadata) -> None:
+        mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        if mgr is None or not getattr(mgr, "kvarn_enabled", False):
+            return
+        if self._kvarn_restore_modules is None:
+            modules = getattr(self.model, "modules", None)
+            if not callable(modules):
+                self._kvarn_restore_modules = []
+            else:
+                self._kvarn_restore_modules = [
+                    module for module in modules()
+                    if callable(getattr(module, "kvarn_restore_for_decode",
+                                        None))
+                ]
+        for module in self._kvarn_restore_modules:
+            module.kvarn_restore_for_decode(attn_metadata)
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
@@ -4179,6 +4198,8 @@ class PyTorchModelEngine(ModelEngine):
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
                         try:
+                            self._restore_kvarn_before_cuda_graph_replay(
+                                attn_metadata)
                             outputs = self.cuda_graph_runner.replay(key, inputs)
                         finally:
                             restore_attn_metadata_after_draft_replay(
@@ -4187,6 +4208,8 @@ class PyTorchModelEngine(ModelEngine):
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
                         try:
+                            self._restore_kvarn_before_cuda_graph_replay(
+                                attn_metadata)
                             with MoeLoadBalancerIterContext(moe_load_balancer):
                                 outputs = self.cuda_graph_runner.replay(
                                     key, inputs)
