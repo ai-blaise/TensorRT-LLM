@@ -1217,6 +1217,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         **kwargs,
     ):
         self.flashinfer_backend = kwargs.pop('flashinfer_backend', "fa2")
+        self.force_triton_prefill = os.environ.get(
+            "TRTLLM_FORCE_TRITON_PREFILL", "0") == "1"
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         if not skip_create_weights_in_init:
@@ -1651,13 +1653,16 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                         q_len_per_req=q_len_per_req)
 
         # Triton prefill fallback: trtllm-gen cannot handle custom
-        # (bidirectional) attention masks for head_dim>256 layers.  Use a
-        # Triton prefill kernel for those layers during multimodal prefill,
-        # while keeping FlashInfer for decode and all other cases.
+        # (bidirectional) attention masks for head_dim>256 layers.  SMC-SD can
+        # also force this local SGLang-derived Triton prefill path for the GLM
+        # draft model; FlashInfer paged prefill is unstable for the warmup
+        # first-draft GQA shape on SM100, while decode still uses FlashInfer.
         # KV-shared layers (k is None) keep the causal fallback below.
-        use_triton_prefill = (self.flashinfer_backend == "trtllm-gen"
-                              and attention_mask_data is not None
-                              and num_contexts > 0 and k is not None)
+        use_triton_prefill = (
+            num_contexts > 0 and k is not None and
+            ((self.flashinfer_backend == "trtllm-gen"
+              and attention_mask_data is not None) or self.force_triton_prefill)
+        )
 
         if use_triton_prefill:
             from .triton_prefill import triton_prefill_with_custom_mask

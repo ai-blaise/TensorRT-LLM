@@ -26,6 +26,8 @@ COPY --chown=dynamo:0 tensorrt_llm/llmapi/llm_args.py ${SITE_PACKAGES}/tensorrt_
 # Custom sparse-attention, KVarN dense-MLA, WarpDecode, request pinning, and
 # MPI-control fixes carried by the op-trt rollout branch.
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/trtllm.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/flashinfer.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/triton_prefill.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/triton_prefill.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/dsa.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py
@@ -59,6 +61,8 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/triton_prefill.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py \

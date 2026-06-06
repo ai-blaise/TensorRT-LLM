@@ -565,6 +565,7 @@ def create_py_executor(
                 drafting_loop_wrapper = None
 
             draft_llm_args = copy.copy(llm_args)
+            force_triton_prefill = False
             if spec_config.spec_dec_mode.is_smc():
                 draft_kv_cache_dtype = spec_config.draft_kv_cache_dtype
                 if draft_kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
@@ -592,8 +593,13 @@ def create_py_executor(
                     # an unfused MHA that allocates a per-batch O(num_q*max_kv)
                     # score scratch -> hundreds of GiB at max_seq_len during the
                     # generation CUDA-graph warmup. FlashInfer has a fused GQA
-                    # decode kernel for this shape, so route the draft there.
+                    # decode kernel for this shape, so route decode there. If
+                    # the SMC config requests "triton", force the local
+                    # SGLang-derived Triton prefill shim for draft prefill and
+                    # keep FlashInfer only for decode.
                     draft_llm_args.attn_backend = "FLASHINFER"
+                    force_triton_prefill = (
+                        spec_config.draft_attention_backend == "triton")
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
@@ -604,18 +610,30 @@ def create_py_executor(
                 model_weights_restore_mode = sleep_config.restore_modes[
                     ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]
 
-            draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model,
-                llm_args=draft_llm_args,
-                mapping=mapping,
-                attn_runtime_features=attn_runtime_features,
-                dist=dist,
-                spec_config=draft_spec_config,
-                is_draft_model=True,
-                drafting_loop_wrapper=drafting_loop_wrapper,
-                model_weights_memory_tag=model_weights_memory_tag,
-                model_weights_restore_mode=model_weights_restore_mode,
-            )
+            old_force_triton_prefill = os.environ.get(
+                "TRTLLM_FORCE_TRITON_PREFILL")
+            if spec_config.spec_dec_mode.is_smc() and force_triton_prefill:
+                os.environ["TRTLLM_FORCE_TRITON_PREFILL"] = "1"
+            try:
+                draft_model_engine = PyTorchModelEngine(
+                    model_path=spec_config.speculative_model,
+                    llm_args=draft_llm_args,
+                    mapping=mapping,
+                    attn_runtime_features=attn_runtime_features,
+                    dist=dist,
+                    spec_config=draft_spec_config,
+                    is_draft_model=True,
+                    drafting_loop_wrapper=drafting_loop_wrapper,
+                    model_weights_memory_tag=model_weights_memory_tag,
+                    model_weights_restore_mode=model_weights_restore_mode,
+                )
+            finally:
+                if spec_config.spec_dec_mode.is_smc() and force_triton_prefill:
+                    if old_force_triton_prefill is None:
+                        os.environ.pop("TRTLLM_FORCE_TRITON_PREFILL", None)
+                    else:
+                        os.environ["TRTLLM_FORCE_TRITON_PREFILL"] = (
+                            old_force_triton_prefill)
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
             if spec_config.spec_dec_mode.is_mtp_eagle():
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
