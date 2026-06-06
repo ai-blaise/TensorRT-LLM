@@ -22,7 +22,7 @@ cp_config:
 enable_attention_dp: false
 trust_remote_code: true
 enable_chunked_prefill: true
-disable_overlap_scheduler: true     # prefill: overlap scheduler off (matches reference prefill.yaml)
+disable_overlap_scheduler: false    # Moondream-style prefill pipeline overlap ON.
 allreduce_strategy: AUTO
 use_cute_dsl_blockscaling_bmm: true
 use_cute_dsl_bf16_bmm: true

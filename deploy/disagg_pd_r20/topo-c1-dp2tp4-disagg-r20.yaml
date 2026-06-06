@@ -47,7 +47,7 @@ data:
     enable_attention_dp: false
     trust_remote_code: true
     enable_chunked_prefill: true
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     allreduce_strategy: AUTO
     use_cute_dsl_blockscaling_bmm: true
     use_cute_dsl_bf16_bmm: true
