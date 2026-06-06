@@ -120,7 +120,13 @@ spec:
           for path in ["/cache/optrt/hf_modules", "/cache/optrt/transformers", "/cache/optrt/hf_datasets", "/cache/optrt/xdg", "/cache/optrt/pip", "/cache/optrt/torch_extensions", "/cache/optrt/torchinductor", "/cache/optrt/triton", "/cache/optrt/cuda", "/cache/optrt/deep_gemm", "/cache/optrt/tensorrt_llm/dg", "/cache/optrt/tensorrt_llm/llmapi_build"]:
               Path(path).mkdir(parents=True, exist_ok=True)
           for module in ["torch", "transformers", "tensorrt_llm"]:
-              importlib.import_module(module)
+              try:
+                  importlib.import_module(module)
+              except ImportError as exc:
+                  if module == "tensorrt_llm" and "libcuda.so.1" in str(exc):
+                      print(f"prewarm_import_warning={module}: {exc}")
+                      continue
+                  raise
           from transformers import AutoConfig, AutoTokenizer
           for model in ["$MODEL_PATH", "$DRAFT_MODEL_PATH"]:
               print(f"prewarm_model={model}")

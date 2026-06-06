@@ -231,7 +231,13 @@ spec:
           ]:
               Path(path).mkdir(parents=True, exist_ok=True)
           for module in ["torch", "transformers", "tensorrt_llm"]:
-              importlib.import_module(module)
+              try:
+                  importlib.import_module(module)
+              except ImportError as exc:
+                  if module == "tensorrt_llm" and "libcuda.so.1" in str(exc):
+                      print(f"prewarm_import_warning={module}: {exc}")
+                      continue
+                  raise
           from transformers import AutoConfig, AutoTokenizer
           for model in [
               "/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft",
