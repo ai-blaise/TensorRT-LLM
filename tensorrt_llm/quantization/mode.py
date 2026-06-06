@@ -100,7 +100,7 @@ class QuantMode(IntFlag):
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
     W4A16_MXFP4 = auto()
-    # KVarN/BDR: block-diagonal Hadamard + per-(token,sub-block) INT4 dense MLA latent KV.
+    # KVarN/BDR: block-diagonal Hadamard + per-(token,sub-block) low-bit dense MLA latent KV.
     # Bit 17 -- MUST match cpp/.../common/quantization.h kvarnKvCache() (1u << 17).
     KVARN_KV_CACHE = auto()
 

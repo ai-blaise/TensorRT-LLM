@@ -89,7 +89,7 @@ public:
         return QuantMode(BaseType(1u) << 7);
     }
 
-    // KVarN/BDR: block-diagonal Hadamard rotation + per-(token,sub-block) INT4 RTN
+    // KVarN/BDR: block-diagonal Hadamard rotation + per-(token,sub-block) low-bit RTN
     // on the dense MLA latent. Bit 18 -- matches tensorrt_llm/quantization/mode.py
     // QuantMode.KVARN_KV_CACHE auto() position (W4A16_MXFP4 occupies bit 17 in the
     // python enum; C++ w4a16Mxfp4 is bit 16, so 17 is skipped here to keep the

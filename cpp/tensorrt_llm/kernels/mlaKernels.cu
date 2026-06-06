@@ -226,7 +226,7 @@ inline __device__ void dequantCopy(
 }
 
 // ============================ KVarN / BDR ============================
-// Block-diagonal-Hadamard + per-token-INT4 dense MLA latent KV (KvCacheDataType::KVARN).
+// Block-diagonal-Hadamard + per-token low-bit dense MLA latent KV (KvCacheDataType::KVARN).
 //
 // Design (validated: kvarn_inkernel/bdr_inkernel_bench.cu, bdr_vs_kvarn_verdict.log):
 //   * order-128 block-diagonal Hadamard on the 512-d compressed_kv (4 sub-blocks)
@@ -282,25 +282,27 @@ inline __device__ void bdRotate128InWarp(float (&reg)[ELTS], int laneInBlock, un
         reg[i] *= kInvSqrt128;
 }
 
-// KVarN dequant-on-read: unpack ELTS INT4 codes from the 4-byte vec slot and apply
-// the per-token (scale, zp). Output is the ROTATED-frame value (Q-side fold
-// un-rotates downstream). Drop-in alongside dequantCopy at the read site.
-template <typename DstType, int ELTS>
+// KVarN dequant-on-read: unpack ELTS low-bit codes from the vec slot and apply
+// the per-token/sub-block (scale, zp). Output is the ROTATED-frame value
+// (Q-side fold un-rotates downstream). Drop-in alongside dequantCopy.
+template <typename DstType, int ELTS, int BITS>
 inline __device__ void dequantCopyKVarN(
-    DstType* dst_global_ptr, uint8_t const* packed4, float scale, float zp)
+    DstType* dst_global_ptr, uint8_t const* packed, float scale, float zp)
 {
-    static_assert(ELTS % 2 == 0, "ELTS must be even for INT4 packing");
+    static_assert(BITS == 2 || BITS == 4, "KVarN BDR supports 2-bit or 4-bit packing");
+    static_assert((ELTS * BITS) % 8 == 0, "ELTS must pack to whole bytes");
+    constexpr int kValsPerByte = 8 / BITS;
+    constexpr int kMask = (1 << BITS) - 1;
     using DstVecType = typename VecType<DstType>::Type;
     DstVecType frag;
     DstType* fragElts = reinterpret_cast<DstType*>(&frag);
 #pragma unroll
-    for (int i = 0; i < ELTS / 2; ++i)
+    for (int i = 0; i < ELTS; ++i)
     {
-        uint8_t b = packed4[i];
-        int q0 = b & 0xF;
-        int q1 = (b >> 4) & 0xF;
-        fragElts[2 * i + 0] = cuda_cast<DstType>(static_cast<float>(q0) * scale + zp);
-        fragElts[2 * i + 1] = cuda_cast<DstType>(static_cast<float>(q1) * scale + zp);
+        uint8_t const b = packed[i / kValsPerByte];
+        int const shift = (i % kValsPerByte) * BITS;
+        int const q = (b >> shift) & kMask;
+        fragElts[i] = cuda_cast<DstType>(static_cast<float>(q) * scale + zp);
     }
     *reinterpret_cast<DstVecType*>(dst_global_ptr) = frag;
 }
@@ -364,19 +366,28 @@ inline __device__ void bdrFwhtSubblockWarp(float (&reg)[ELTS], int laneInBlk, un
 
 // KVarN write of one ELTS-wide vec of a 128-ch sub-block: the caller has the
 // post-rotate reg[] (via bdrFwhtSubblockWarp) and the sub-block (scale,zp) from
-// a 16-lane min/max reduction. Packs ELTS INT4 nibbles to packed4 (ELTS/2 bytes).
-template <int ELTS>
-inline __device__ void bdrPackInt4Vec(uint8_t* packed4, float const (&reg)[ELTS], float scale, float zp)
+// a 16-lane min/max reduction. Packs ELTS values low-first into whole bytes.
+template <int ELTS, int BITS>
+inline __device__ void bdrPackLowBitVec(uint8_t* packed, float const (&reg)[ELTS], float scale, float zp)
 {
+    static_assert(BITS == 2 || BITS == 4, "KVarN BDR supports 2-bit or 4-bit packing");
+    static_assert((ELTS * BITS) % 8 == 0, "ELTS must pack to whole bytes");
+    constexpr int kValsPerByte = 8 / BITS;
+    constexpr int kQMax = (1 << BITS) - 1;
     float inv = 1.0f / scale;
 #pragma unroll
-    for (int i = 0; i < ELTS / 2; ++i)
+    for (int byteIdx = 0; byteIdx < (ELTS * BITS) / 8; ++byteIdx)
     {
-        int q0 = __float2int_rn((reg[2 * i + 0] - zp) * inv);
-        int q1 = __float2int_rn((reg[2 * i + 1] - zp) * inv);
-        q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
-        q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
-        packed4[i] = static_cast<uint8_t>(q0 | (q1 << 4));
+        uint8_t out = 0;
+#pragma unroll
+        for (int j = 0; j < kValsPerByte; ++j)
+        {
+            int const elt = byteIdx * kValsPerByte + j;
+            int q = __float2int_rn((reg[elt] - zp) * inv);
+            q = q < 0 ? 0 : (q > kQMax ? kQMax : q);
+            out |= static_cast<uint8_t>(q << (j * BITS));
+        }
+        packed[byteIdx] = out;
     }
 }
 
@@ -875,7 +886,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 template <typename T, typename TCache>
 __global__ void loadPagedKVCacheForMLAKernel(T* compressed_kv_ptr, T* k_pe_ptr,
     tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_cached_kv_lens, int max_input_seq_len,
-    float const* kv_scale_quant_orig_ptr, __half const* kvarn_scale_pool_ptr = nullptr)
+    float const* kv_scale_quant_orig_ptr, __half const* kvarn_scale_pool_ptr = nullptr, int const kvarn_bits = 4)
 {
     static_assert(std::is_same_v<T, TCache> || std::is_same_v<TCache, __nv_fp8_e4m3>,
         "TCache must be either the same type as T or __nv_fp8_e4m3");
@@ -937,9 +948,17 @@ __global__ void loadPagedKVCacheForMLAKernel(T* compressed_kv_ptr, T* k_pe_ptr,
                             + static_cast<size_t>(global_token_idx) * kKvarnScaleStride;
                         float const scale = __half2float(sc[sub]);
                         float const zp = __half2float(sc[kKvarnNSub + sub]);
-                        // src_data holds KT::kElemPerLoad INT4 codes packed 2/byte.
-                        dequantCopyKVarN<T, KT::kElemPerLoad>(compressed_kv_ptr + dstIdx,
-                            reinterpret_cast<uint8_t const*>(&src_data), scale, zp);
+                        // src_data holds KT::kElemPerLoad low-bit codes, packed low-first.
+                        if (kvarn_bits == 2)
+                        {
+                            dequantCopyKVarN<T, KT::kElemPerLoad, 2>(compressed_kv_ptr + dstIdx,
+                                reinterpret_cast<uint8_t const*>(&src_data), scale, zp);
+                        }
+                        else
+                        {
+                            dequantCopyKVarN<T, KT::kElemPerLoad, 4>(compressed_kv_ptr + dstIdx,
+                                reinterpret_cast<uint8_t const*>(&src_data), scale, zp);
+                        }
                     }
                     else
                     {
@@ -1411,8 +1430,10 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
 template <typename T, typename TCache>
 void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
     int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
-    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr)
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr, int const kvarn_bits)
 {
+    TLLM_CHECK_WITH_INFO(kvarn_bits == 2 || kvarn_bits == 4,
+        "KVarN BDR paged MLA read supports bits=2 or bits=4, got %d.", kvarn_bits);
     using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<TCache>;
     // {seq_len / token_per_block, batch_size, head_num}
     TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora_size should be equal to %d", KT::kLoraSize);
@@ -1431,19 +1452,20 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
 // the post-RoPE dense MLA latent ckv. Warp-cooperative: one warp-half (16 lanes)
 // owns one 128-d sub-block; rotation + min/max scale are pure __shfl (no smem,
 // no cross-warp). Launch right after the RoPE kernel = zero host round-trip and
-// no fp16 staging pool. Validated: kvarn_inkernel/bdr_persub_inkernel_validate.cu
-// cos_ckv 0.995, read 0.46-1.0x fp8, write < fp8-read at N>=8.
+// no fp16 staging pool. INT4 is validated by kvarn_inkernel; INT2 is the same
+// packed low-bit path with qmax=3 for kvarn_k2v2 dense MLA storage.
 //   ckv_in : [num_tokens, DCKV] post-RoPE fp16 latent (rotated frame written out)
-//   data   : INT4 packed cache, NSUB*(DCKV/NSUB/2) bytes/token, by global token
+//   data   : low-bit packed cache, NSUB*(DCKV/NSUB*BITS/8) bytes/token, by token
 //   scale  : per-(token,sub-block) {scale[NSUB], zp[NSUB]} __half, stride 2*NSUB
-template <typename T, int DCKV, int HORDER>
+template <typename T, int DCKV, int HORDER, int BITS>
 __global__ void mlaBdrQuantizeLatentKernel(
     T const* __restrict__ ckv_in, uint8_t* __restrict__ data, __half* __restrict__ scale, int num_tokens)
 {
+    static_assert(BITS == 2 || BITS == 4, "KVarN BDR supports 2-bit or 4-bit packing");
     constexpr int kNSub = DCKV / HORDER;          // 4
     constexpr int kVecPerSub = HORDER / 8;        // 16 lanes (8 ch/lane)
     constexpr int kVecs = DCKV / 8;               // 64 lanes / token
-    constexpr int kBytesPerTok = kNSub * (HORDER / 2);
+    constexpr int kBytesPerTok = kNSub * (HORDER * BITS / 8);
     int const tok = blockIdx.x;
     if (tok >= num_tokens)
         return;
@@ -1458,10 +1480,12 @@ __global__ void mlaBdrQuantizeLatentKernel(
     bdrFwhtSubblockWarp<8>(reg, laneInBlk, mask);
     float lo, hi;
     bdrSubblockMinMax<8>(reg, laneInBlk, mask, lo, hi);
-    float const sc = fmaxf((hi - lo) / 15.0f, 1e-10f);
+    constexpr int kQMax = (1 << BITS) - 1;
+    float const sc = fmaxf((hi - lo) / static_cast<float>(kQMax), 1e-10f);
     __half const hsc = __float2half(sc), hzp = __float2half(lo);
     uint8_t* tokData = data + static_cast<size_t>(tok) * kBytesPerTok;
-    bdrPackInt4Vec<8>(tokData + lane * 4, reg, __half2float(hsc), __half2float(hzp));
+    constexpr int kBytesPerVec = 8 * BITS / 8;
+    bdrPackLowBitVec<8, BITS>(tokData + lane * kBytesPerVec, reg, __half2float(hsc), __half2float(hzp));
     if (laneInBlk == 0)
     {
         __half* tokScale = scale + static_cast<size_t>(tok) * (2 * kNSub);
@@ -1472,12 +1496,21 @@ __global__ void mlaBdrQuantizeLatentKernel(
 
 template <typename T>
 void invokeMLABdrQuantizeLatent(
-    T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, cudaStream_t stream)
+    T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, int bits, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(dckv == 512, "KVarN BDR latent quantize currently supports DCKV=512.");
+    TLLM_CHECK_WITH_INFO(bits == 2 || bits == 4, "KVarN BDR latent quantize supports bits=2 or bits=4, got %d.", bits);
     constexpr int kVecs = 512 / 8; // 64 lanes/token
-    mlaBdrQuantizeLatentKernel<T, 512, 128><<<num_tokens, kVecs, 0, stream>>>(
-        ckv_in, data, reinterpret_cast<__half*>(scale_pool), num_tokens);
+    if (bits == 2)
+    {
+        mlaBdrQuantizeLatentKernel<T, 512, 128, 2><<<num_tokens, kVecs, 0, stream>>>(
+            ckv_in, data, reinterpret_cast<__half*>(scale_pool), num_tokens);
+    }
+    else
+    {
+        mlaBdrQuantizeLatentKernel<T, 512, 128, 4><<<num_tokens, kVecs, 0, stream>>>(
+            ckv_in, data, reinterpret_cast<__half*>(scale_pool), num_tokens);
+    }
 }
 // ===========================================================================
 
@@ -1526,7 +1559,7 @@ INSTANTIATE_MLA_QUANTIZE(__nv_bfloat16);
     template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \
         int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
         int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream,           \
-        void const* kvarn_scale_pool_ptr);                                                                             \
+        void const* kvarn_scale_pool_ptr, int const kvarn_bits);                                                       \
     template void invokeMLARopeAppendPagedKVAssignQ<T, TCache>(KVBlockArray & kv_cache,                               \
         KVBlockArray & kv_scale_cache, T * q_ptr, T * latent_cache_ptr, int const num_requests,                       \
         int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,        \
@@ -1542,7 +1575,7 @@ INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
 
 #define INSTANTIATE_MLA_BDR_QUANTIZE(T)                                                                                \
     template void invokeMLABdrQuantizeLatent<T>(                                                                        \
-        T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, cudaStream_t stream);
+        T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, int bits, cudaStream_t stream);
 INSTANTIATE_MLA_BDR_QUANTIZE(float);
 INSTANTIATE_MLA_BDR_QUANTIZE(half);
 INSTANTIATE_MLA_BDR_QUANTIZE(__nv_bfloat16);
