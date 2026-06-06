@@ -2,6 +2,8 @@ ARG BASE_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-2026
 FROM ${BASE_IMAGE}
 USER root
 
+LABEL ai.blaise.r20-overlay="true"
+
 ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages
 
 # First-class LayerSplit CP support.  Keep this overlay ABI-conservative: the

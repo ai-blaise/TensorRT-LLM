@@ -15,6 +15,7 @@ BUILD=1
 PREWARM=0
 USE_LOCAL_REGISTRY=0
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
+ALLOW_CHAINED_OVERLAY="${ALLOW_CHAINED_OVERLAY:-0}"
 TAG_SUFFIX="${TAG_SUFFIX:-fast}"
 SSH_OPTS=(
   -o BatchMode=yes
@@ -44,6 +45,8 @@ Options:
                         after build and before deploy
   --use-local-registry  Push the thin image to a VM-local registry and pull it
   --local-registry HOST Registry host:port (default: $LOCAL_REGISTRY)
+  --allow-chained-overlay
+                        Allow using a previous r20 overlay image as the base
   --full-sync           Sync the whole repo instead of the overlay build subset
   --no-sync             Reuse the existing remote repo
   --no-build            Reuse the computed image tag and only apply when --deploy
@@ -67,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --prewarm) PREWARM=1; shift ;;
     --use-local-registry) USE_LOCAL_REGISTRY=1; shift ;;
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
+    --allow-chained-overlay) ALLOW_CHAINED_OVERLAY=1; shift ;;
     --full-sync) FULL_SYNC=1; shift ;;
     --no-sync) SYNC=0; shift ;;
     --no-build) BUILD=0; shift ;;
@@ -164,6 +168,21 @@ sudo mkdir -p \
 sudo chmod -R 0777 /var/lib/optrt-cache
 
 if [[ "$BUILD" == 1 ]]; then
+  if [[ "$ALLOW_CHAINED_OVERLAY" != 1 ]]; then
+    base_overlay_label=""
+    if command -v nerdctl >/dev/null 2>&1; then
+      base_overlay_label="$(sudo nerdctl -n k8s.io image inspect "$BASE_IMAGE" \
+        --format '{{ index .Config.Labels "ai.blaise.r20-overlay" }}' 2>/dev/null || true)"
+    elif command -v docker >/dev/null 2>&1 && docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+      base_overlay_label="$(docker image inspect "$BASE_IMAGE" \
+        --format '{{ index .Config.Labels "ai.blaise.r20-overlay" }}' 2>/dev/null || true)"
+    fi
+    if [[ "$base_overlay_label" == "true" ]]; then
+      echo "refusing chained r20 overlay base: $BASE_IMAGE" >&2
+      echo "Use a stable runtime/canonical base, or pass --allow-chained-overlay after checking containerd mount limits." >&2
+      exit 2
+    fi
+  fi
   if command -v nerdctl >/dev/null 2>&1; then
     sudo nerdctl -n k8s.io build \
       --build-arg "BASE_IMAGE=$BASE_IMAGE" \

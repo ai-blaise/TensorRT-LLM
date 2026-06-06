@@ -59,8 +59,11 @@ the image lands directly in k3s containerd. If `nerdctl` is unavailable, it fall
 back to Docker BuildKit plus a single `ctr images import`; if the requested base
 image is already in k3s containerd but not Docker, the script loads that base
 into Docker once. Use `--base-image` to layer on top of the latest known-good
-full image. Use `--full-sync` only when remote debugging needs the full
-repository.
+full image. Do not chain thin overlays on top of earlier thin overlays: the
+extra layer depth can exceed containerd rootfs mount option limits. New r20
+overlay images are labeled and `fast_iterate.sh` refuses them as a base unless
+`--allow-chained-overlay` is passed deliberately. Use `--full-sync` only when
+remote debugging needs the full repository.
 
 For the fastest image handoff, add `--use-local-registry`. The script starts or
 reuses a `registry:2` container on the VM, pushes the thin overlay to
