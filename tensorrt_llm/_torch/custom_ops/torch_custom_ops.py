@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
@@ -55,6 +56,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+
+def _smc_cuda_sync_probe(label: str) -> None:
+    if os.environ.get("SMC_CUDA_SYNC_PROBE", "0") != "1":
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        raise RuntimeError(f"SMC CUDA sync probe failed after {label}") from exc
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1649,11 +1661,14 @@ class fp8SwapABGemmRunner(TunableRunner):
                  input.new_zeros((pad_m, input.size(1)))],
                 dim=0,
             )
+            _smc_cuda_sync_probe("smc fp8_swap_ab padded input")
 
         a, a_sf = _fp8_quantize_1x128_ue8m0(
             quant_input,
             self.quant_tactic,
             use_python_scale_packer=pad_m != 0)
+        if pad_m != 0:
+            _smc_cuda_sync_probe("smc fp8_swap_ab padded activation quant")
         output = torch.empty(
             (quant_input.size(0), weight.size(0)),
             device=input.device,
@@ -1666,6 +1681,8 @@ class fp8SwapABGemmRunner(TunableRunner):
             output,
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
+        if pad_m != 0:
+            _smc_cuda_sync_probe("smc fp8_swap_ab padded deepgemm")
         if pad_m != 0:
             return output[:orig_m]
         return output
