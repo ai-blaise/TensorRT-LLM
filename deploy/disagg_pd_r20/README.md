@@ -61,6 +61,13 @@ script loads that base into Docker once. Use `--base-image` to layer on top of
 the latest known-good full image. Use `--full-sync` only when remote debugging
 needs the full repository.
 
+For the fastest image handoff, add `--use-local-registry`. The script starts or
+reuses a `registry:2` container on the VM, pushes the thin overlay to
+`localhost:5000`, and renders the DGD with `imagePullPolicy: IfNotPresent`. That
+lets k3s/containerd pull only missing thin layers instead of importing a full
+`docker save` archive. Keep the default import path when you need the most
+conservative `imagePullPolicy: Never` behavior.
+
 Build only:
 
 ```bash
@@ -79,6 +86,7 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --base-image docker.io/local/dynamo-trtllm-optrt-custom:optrt-2b0ec68-swapab-host-pinharden-20260606 \
   --target-node a4-us-001-rl9 \
   --tag-suffix swapab-host \
+  --use-local-registry \
   --deploy
 ```
 

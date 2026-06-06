@@ -12,6 +12,8 @@ DEPLOY=0
 SYNC=1
 FULL_SYNC=0
 BUILD=1
+USE_LOCAL_REGISTRY=0
+LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 TAG_SUFFIX="${TAG_SUFFIX:-fast}"
 SSH_OPTS=(
   -o BatchMode=yes
@@ -37,6 +39,8 @@ Options:
   --dgd-name NAME       DGD/ConfigMap name; use a suffix for warm canaries
   --tag-suffix TEXT     Human suffix added after the git sha (default: fast)
   --deploy              Apply the DGD after build/import
+  --use-local-registry  Push the thin image to a VM-local registry and pull it
+  --local-registry HOST Registry host:port (default: $LOCAL_REGISTRY)
   --full-sync           Sync the whole repo instead of the overlay build subset
   --no-sync             Reuse the existing remote repo
   --no-build            Reuse the computed image tag and only apply when --deploy
@@ -57,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
     --tag-suffix) TAG_SUFFIX="$2"; shift 2 ;;
     --deploy) DEPLOY=1; shift ;;
+    --use-local-registry) USE_LOCAL_REGISTRY=1; shift ;;
+    --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --full-sync) FULL_SYNC=1; shift ;;
     --no-sync) SYNC=0; shift ;;
     --no-build) BUILD=0; shift ;;
@@ -114,6 +120,7 @@ fi
 read -r -d '' REMOTE_SCRIPT <<'EOS' || true
 set -euo pipefail
 cd "$REMOTE_REPO"
+DEPLOY_IMAGE_TAG="$IMAGE_TAG"
 
 sudo mkdir -p \
   /var/lib/optrt-cache/hf_modules \
@@ -142,15 +149,25 @@ if [[ "$BUILD" == 1 ]]; then
       --build-arg "BASE_IMAGE=$BASE_IMAGE" \
       -f deploy/disagg_pd_r20/Dockerfile.r20-overlay \
       -t "$IMAGE_TAG" .
-    if ! sudo /usr/local/bin/k3s ctr -n k8s.io images ls name=="$IMAGE_TAG" | grep -F "$IMAGE_TAG" >/dev/null 2>&1; then
+    if [[ "$USE_LOCAL_REGISTRY" == 1 ]]; then
+      if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
+        docker rm -f optrt-registry >/dev/null 2>&1 || true
+        docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
+      fi
+      image_path="${IMAGE_TAG#docker.io/}"
+      image_path="${image_path#${LOCAL_REGISTRY}/}"
+      DEPLOY_IMAGE_TAG="${LOCAL_REGISTRY}/${image_path}"
+      docker tag "$IMAGE_TAG" "$DEPLOY_IMAGE_TAG"
+      docker push "$DEPLOY_IMAGE_TAG"
+    elif ! sudo /usr/local/bin/k3s ctr -n k8s.io images ls name=="$IMAGE_TAG" | grep -F "$IMAGE_TAG" >/dev/null 2>&1; then
       docker save "$IMAGE_TAG" | sudo /usr/local/bin/k3s ctr -n k8s.io images import -
     fi
   fi
 fi
 
 if [[ "$DEPLOY" == 1 ]]; then
-  OUT="/tmp/${DGD_NAME}-${IMAGE_TAG##*:}.yaml"
-  TARGET_NODE="$TARGET_NODE" UNIFIED_IMAGE="$IMAGE_TAG" DGD_NAME="$DGD_NAME" python3 - <<'PY'
+  OUT="/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml"
+  TARGET_NODE="$TARGET_NODE" UNIFIED_IMAGE="$DEPLOY_IMAGE_TAG" DGD_NAME="$DGD_NAME" USE_LOCAL_REGISTRY="$USE_LOCAL_REGISTRY" python3 - <<'PY'
 import os
 from pathlib import Path
 
@@ -159,6 +176,8 @@ text = src.read_text()
 text = text.replace("${TARGET_NODE}", os.environ["TARGET_NODE"])
 text = text.replace("${UNIFIED_IMAGE}", os.environ["UNIFIED_IMAGE"])
 text = text.replace("topo-c1-dp2tp4-disagg-r20", os.environ["DGD_NAME"])
+if os.environ.get("USE_LOCAL_REGISTRY") == "1":
+    text = text.replace("imagePullPolicy: Never", "imagePullPolicy: IfNotPresent")
 Path(os.environ["OUT"]).write_text(text)
 PY
   sudo -E /usr/local/bin/k3s kubectl -n dynamo-system apply --dry-run=server -f "$OUT"
@@ -167,12 +186,13 @@ PY
     -o jsonpath='generation={.metadata.generation} observed={.status.observedGeneration}'; echo
 else
   echo "built_image=$IMAGE_TAG"
+  echo "deploy_image=$DEPLOY_IMAGE_TAG"
   echo "deploy_skipped=1"
 fi
 EOS
 
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' OUT='/tmp/${DGD_NAME}-${IMAGE_TAG##*:}.yaml' bash -s" \
+  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' DEPLOY='$DEPLOY' BUILD='$BUILD' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' OUT='/tmp/${DGD_NAME}-${IMAGE_TAG##*:}.yaml' bash -s" \
   <<<"$REMOTE_SCRIPT"
 
 echo "image=$IMAGE_TAG"
