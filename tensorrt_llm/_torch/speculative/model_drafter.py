@@ -694,7 +694,11 @@ class ModelDrafter(Drafter):
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])
 
-            # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
+            # Generic static-draft overlap does not carry rejection-sampling
+            # logits through the delayed commit. Keep py_draft_logits unset for
+            # those modes. SMC overrides the overlap payload and consumes
+            # draft_token_log_probs directly, so it does not use this generic
+            # greedy/spec fallback path.
             if self.disable_overlap_scheduler:
                 target_model_req.py_draft_logits = torch.stack(py_draft_logits)
 

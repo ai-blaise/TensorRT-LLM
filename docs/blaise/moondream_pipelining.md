@@ -80,4 +80,5 @@ The required invariants are:
 Correctness is now implemented for SMC-aware Moondream-style overlap at the
 scheduler/drafter boundary. Keep the focused SMC overlap tests green before
 starting A/B sweeps, and require runtime E2E on the SMC-SD deployment before
-claiming production completion.
+claiming production completion. See `moondream_smc_overlap_audit.md` for the
+current proven-vs-E2E checklist and rollout log signals.

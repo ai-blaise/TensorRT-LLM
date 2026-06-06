@@ -145,6 +145,26 @@ def test_smc_overlap_static_draft_commit_uses_evented_host_tokens():
     assert target_request.py_draft_logits is None
 
 
+def test_smc_overlap_pack_does_not_require_generic_draft_logits():
+    drafter = object.__new__(SMCModelDrafter)
+    sample_state = SimpleNamespace(
+        host=SimpleNamespace(new_tokens=torch.tensor([[11]], dtype=torch.int64)),
+        sampler_event=SimpleNamespace(synchronize=lambda: None),
+    )
+    log_probs = torch.tensor([[-0.1]])
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": log_probs,
+    }
+
+    packed = drafter._pack_static_draft_outputs_for_overlap(
+        outputs, sample_state)
+
+    assert packed["sample_state"] is sample_state
+    assert packed["draft_token_log_probs"] is log_probs
+    assert "draft_logits" not in packed
+
+
 def test_smc_overlap_static_draft_commit_skips_prefill_context():
     drafter = object.__new__(SMCModelDrafter)
     drafter.max_total_draft_tokens = 1
@@ -170,6 +190,83 @@ def test_smc_overlap_static_draft_commit_skips_prefill_context():
     drafter.process_static_draft_outputs(outputs, draft_batch)
 
     assert target_request.py_draft_tokens == ["unchanged"]
+
+
+def test_smc_overlap_static_draft_commit_skips_aborted_or_zombie_request():
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 1
+    event = SimpleNamespace(synchronize=lambda: None)
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+        "sample_state": SimpleNamespace(
+            host=SimpleNamespace(new_tokens=torch.tensor([[11]],
+                                                        dtype=torch.int64)),
+            sampler_event=event,
+        ),
+    }
+    target_request = SimpleNamespace(
+        py_request_id=10,
+        state=LlmRequestState.GENERATION_COMPLETE,
+        py_draft_tokens=["old"],
+        py_draft_logits="old_logits",
+        py_smc_draft_token_log_probs="old_log_probs",
+    )
+    drafter.req_id_to_old_request = {10: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=10)])
+
+    drafter.process_static_draft_outputs(outputs, draft_batch)
+
+    assert target_request.py_draft_tokens == ["old"]
+    assert target_request.py_draft_logits == "old_logits"
+    assert target_request.py_smc_draft_token_log_probs == "old_log_probs"
+
+
+def test_smc_overlap_commit_preserves_disagg_pin_and_kvarn_metadata():
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 1
+    event = SimpleNamespace(synchronize=lambda: None)
+    pin_metadata = SimpleNamespace(
+        disagg_request_id="ctx-42",
+        prefill_worker="prefill-a",
+        decode_worker="decode-b",
+        remote_block_ids=(3, 5, 8),
+    )
+    kvarn_metadata = {
+        "mla_latent_kv_dtype": "kvarn_k2v2",
+        "mla_latent_kv_amortize": True,
+    }
+    target_request = SimpleNamespace(
+        py_request_id=11,
+        py_smc_group_id=211,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_draft_tokens=[],
+        py_disaggregated_params=pin_metadata,
+        py_kvarn_metadata=kvarn_metadata,
+    )
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+        "sample_state": SimpleNamespace(
+            host=SimpleNamespace(new_tokens=torch.tensor([[11]],
+                                                        dtype=torch.int64)),
+            sampler_event=event,
+        ),
+    }
+    drafter.req_id_to_old_request = {11: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=11)])
+
+    drafter.process_static_draft_outputs(outputs, draft_batch)
+
+    assert target_request.py_disaggregated_params is pin_metadata
+    assert target_request.py_kvarn_metadata is kvarn_metadata
+    assert target_request.py_smc_group_id == 211
+    assert target_request.py_draft_logits is None
+    assert [int(token) for token in target_request.py_draft_tokens] == [11]
+    assert torch.allclose(target_request.py_smc_draft_token_log_probs,
+                          torch.tensor([-0.1]))
 
 
 def _bare_smc_sampler(gamma=3, n_particles=2):
