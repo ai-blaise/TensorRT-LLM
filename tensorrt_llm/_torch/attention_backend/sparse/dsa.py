@@ -4359,6 +4359,14 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
 
+        # Accessors can be called during construction (for example KVarN uses
+        # get_buffers to choose the dense side-pool device), so LayerSplit
+        # scratch state must exist before any base/KVarN setup path can read it.
+        self._layersplit_indexer_k_scratch = None
+        self._layersplit_dense_kv_scratch = None
+        self._layersplit_hisa_pagerep_scratch = None
+        self._layersplit_hisa_pagecount_scratch = None
+
         super().__init__(
             kv_cache_config,
             kv_cache_type,
