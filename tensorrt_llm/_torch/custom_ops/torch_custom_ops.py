@@ -1705,6 +1705,11 @@ def _is_non_8_aligned_sm100_preloaded_triton_scale(
             and weight_scale.dtype == torch.float32)
 
 
+def _allow_preloaded_triton_swap_ab_odd_m() -> bool:
+    return os.environ.get("TRTLLM_USE_PRELOADED_TRITON_SWAPAB_ODD_M",
+                          "0") == "1"
+
+
 def _should_pad_fp8_swap_ab_odd_m(input: torch.Tensor,
                                   weight_scale: torch.Tensor) -> bool:
     return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
@@ -1720,7 +1725,9 @@ def _should_use_dequantized_swap_ab_odd_m(input: torch.Tensor,
 
 def _should_use_triton_block_fp8_swap_ab_odd_m(
         input: torch.Tensor, weight_scale: torch.Tensor) -> bool:
-    return _is_non_8_aligned_sm100_preloaded_triton_scale(input, weight_scale)
+    return (_allow_preloaded_triton_swap_ab_odd_m()
+            and _is_non_8_aligned_sm100_preloaded_triton_scale(
+                input, weight_scale))
 
 
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
@@ -1884,6 +1891,13 @@ def fp8_swap_ab_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
+    if (_is_non_8_aligned_sm100_preloaded_triton_scale(input, weight_scale)
+            and not _allow_preloaded_triton_swap_ab_odd_m()):
+        raise RuntimeError(
+            "Odd-M SM100 SwapAB with preloaded FP32 Triton scales is disabled. "
+            "Pass packed int32 scales for the padded DeepGEMM route, or set "
+            "TRTLLM_USE_PRELOADED_TRITON_SWAPAB_ODD_M=1 to opt in.")
+
     if _should_use_triton_block_fp8_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(
             "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 "

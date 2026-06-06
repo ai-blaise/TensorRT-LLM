@@ -175,7 +175,9 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_padded_perf_smoke():
     "dtype",
     [torch.bfloat16],
 )
-def test_fp8_swap_ab_gemm_sm100_odd_m_preloaded_scale(dtype, m, k, n):
+def test_fp8_swap_ab_gemm_sm100_odd_m_preloaded_scale(dtype, m, k, n,
+                                                      monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_PRELOADED_TRITON_SWAPAB_ODD_M", "1")
     a, b, act_b_fp8, act_b_sf = _make_swap_ab_inputs(dtype, m, k, n)
     act_b_sf = _preload_ue8m0_scale_for_triton(act_b_sf, act_b_fp8.shape,
                                                [128, 128])
@@ -185,6 +187,24 @@ def test_fp8_swap_ab_gemm_sm100_odd_m_preloaded_scale(dtype, m, k, n):
 
     diff = calc_diff(output, output_expected)
     assert diff < 1e-2
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+def test_fp8_swap_ab_gemm_sm100_odd_m_preloaded_scale_requires_opt_in(
+        monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_PRELOADED_TRITON_SWAPAB_ODD_M",
+                       raising=False)
+    a, _, act_b_fp8, act_b_sf = _make_swap_ab_inputs(torch.bfloat16, 25, 7168,
+                                                     2112)
+    act_b_sf = _preload_ue8m0_scale_for_triton(act_b_sf, act_b_fp8.shape,
+                                               [128, 128])
+
+    with pytest.raises(RuntimeError,
+                       match="preloaded FP32 Triton scales is disabled"):
+        torch.ops.trtllm.fp8_swap_ab_gemm(a, act_b_fp8, act_b_sf)
 
 
 @pytest.mark.skipif(
