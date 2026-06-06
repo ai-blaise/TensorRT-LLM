@@ -107,6 +107,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _kv_indptr: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
     _kv_lens_cuda: torch.Tensor = field(init=False)
+    host_request_types: torch.Tensor = field(init=False)
+    host_request_types_runtime: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
 
@@ -486,6 +488,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._kv_lens_cuda = torch.empty((self.max_num_requests, ),
                                          dtype=torch.int,
                                          device='cuda')
+        self.host_request_types = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.int,
+                                              device='cpu',
+                                              pin_memory=prefer_pinned())
+        self.host_request_types_runtime = self.host_request_types[:0]
         self._batch_indices = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -698,6 +705,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._cached_token_lens[:n].zero_()
             self._kv_lens_cuda[:n].copy_(self.seq_lens_kv_cuda[:n],
                                          non_blocking=True)
+            self.host_request_types[:self.num_contexts].fill_(0)
+            self.host_request_types[self.num_contexts:n].fill_(1)
+            self.host_request_types_runtime = self.host_request_types[:n]
             self.num_ctx_cached_tokens = 0
             for plan_params in list(self._plan_params_to_wrappers.keys()):
                 if plan_params.attention_mask_data is None:
@@ -730,6 +740,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._kv_lens_cuda[:kv_lens.size(0)].copy_(kv_lens,
                                                    non_blocking=True)
         kv_lens = self.kv_lens_cuda
+        n = self.num_contexts + self.num_generations
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:n].fill_(1)
+        self.host_request_types_runtime = self.host_request_types[:n]
 
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
