@@ -35,6 +35,7 @@ a correctness signal — see "Validation philosophy" below).
 | 9 | Sparse-MLA: AB-swapped index-scoring (MSA #3) | [sparse_mla.md](sparse_mla.md#ab-swapped-index-scoring) | already-optimal on tcgen05 | on (tcgen05 path) |
 | 10 | KVarN: k2v2/k4v4 dense latent KV quant | [kvarn.md](kvarn.md) | ~2.3 bits @ FP16 accuracy, 3–5× capacity | default k2v2 for production dense MLA |
 | 11 | KVarN: BDR fold (in-kernel dequant-on-read) | [kvarn.md](kvarn.md#bdr-fold-in-kernel-dequant-on-read) | amortized restore under budget | default with KVarN |
+| 11b | KVarN GQA: SMC-SD generic KV path | [kvarn_gqa.md](kvarn_gqa.md) | HF/default + byte-layout primitives; runtime blocked | fail-closed until backend |
 | 12 | WarpDecode: retuned NVFP4 tactics + bridge | [warpdecode.md](warpdecode.md) | 1.20–1.36× vs native MoE | opt-in (env/config) |
 | 13 | NVFP4 fusion: add + RMSNorm + quant | [nvfp4_fusions.md](nvfp4_fusions.md#add--rmsnorm--quant-fusion) | −48…−54 % norm→quant sub-path | on (torch.compile) |
 | 14 | NVFP4 fusion: fused RoPE-cat-FP4 | [nvfp4_fusions.md](nvfp4_fusions.md#fused-rope-cat-fp4) | removes a cat + a quant launch | on when shape matches |
@@ -62,11 +63,12 @@ a correctness signal — see "Validation philosophy" below).
    consumes the Indexer's top-k (MSA streams + scheduler-meta + scoring).
 4. [nvfp4_fusions.md](nvfp4_fusions.md) — the elementwise+quant fusions that
    remove launches and HBM round-trips on the MoE and RoPE paths.
-5. [kvarn.md](kvarn.md) — KV-cache capacity (variance-normalized latent KV).
-6. [request_pinning.md](request_pinning.md) — disaggregated request pinning,
+5. [kvarn.md](kvarn.md) — KV-cache capacity (variance-normalized dense MLA latent KV).
+6. [kvarn_gqa.md](kvarn_gqa.md) — SMC-SD GQA KVarN KV-cache path and current backend blockers.
+7. [request_pinning.md](request_pinning.md) — disaggregated request pinning,
    Moondream overlap gates, and rollout proof points.
-7. [warpdecode.md](warpdecode.md) — the MoE decode fast path.
-8. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
+8. [warpdecode.md](warpdecode.md) — the MoE decode fast path.
+9. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
 
 ## Validation philosophy
 
@@ -97,6 +99,7 @@ of each doc. The campaign-level composition matrix:
 | **Sparse-MLA (7–9)** | consumes top-k | — | independent | reads latent | independent | CP-broadcast | per-draft |
 | **NVFP4-fusion (13–15)** | independent | independent | — | BDR-fold path | MoE path | independent | per-draft |
 | **KVarN (10–11)** | dense MLA latent only; not Indexer K | reads latent | BDR-fold path | — | independent | LayerSplit dense KV pool | per-draft |
+| **KVarN GQA (11b)** | not Indexer K | generic GQA KV path | independent | separate from MLA KVarN | independent | packed-page ownership pending backend | SMC-SD target path |
 | **WarpDecode (12)** | independent | independent | MoE path | independent | — | orthogonal (MoE vs KV) | per-draft |
 | **LayerSplit (17)** | shares KV pool | CP-broadcast | independent | shares pool | orthogonal | — | per-draft |
 | **SMC-SD (16)** | per-draft | per-draft | per-draft | per-draft | per-draft | per-draft | — |
