@@ -986,14 +986,14 @@ def _sglang_fp8_swap_ab_block_matmul(
                                                  128,
                                                  scale_dtype=torch.float32)
     _smc_cuda_sync_probe("smc fp8_swap_ab activation quant")
-    output = _w8a8_block_fp8_matmul_triton_strict_mask(
+    output = _w8a8_block_fp8_matmul_triton(
         qinput,
         weight_fp8,
         input_scale,
         weight_scale,
         [128, 128],
         output_dtype=output_dtype)
-    _smc_cuda_sync_probe("smc fp8_swap_ab strict-mask matmul")
+    _smc_cuda_sync_probe("smc fp8_swap_ab sglang matmul")
     return output
 
 
