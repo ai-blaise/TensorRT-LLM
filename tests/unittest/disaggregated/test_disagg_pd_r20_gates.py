@@ -56,3 +56,5 @@ def test_r20_overlay_carries_moondream_and_request_pinning_sources():
     assert "tensorrt_llm/_torch/speculative/smc.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
     assert "tensorrt_llm/serve/openai_disagg_service.py" in dockerfile
+    assert "tensorrt_llm/serve/openai_protocol.py" in dockerfile
+    assert "tensorrt_llm/disaggregated_params.py" in dockerfile

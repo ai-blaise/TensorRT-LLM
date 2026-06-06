@@ -36,6 +36,10 @@ gate that prevents unknown-DP KV receive fanout before A/B.
   reachable via an unpinned request; the current r20 canary uses C++ UCX, whose
   exact rank fanout is formatter/layout driven, but the same stable
   `ContextPhaseParams` metadata is passed to the executor.
+- **Overlay/source parity:** the r20 overlay carries the request-pinning service,
+  OpenAI protocol conversion, and `DisaggregatedParams` dataclass together, so
+  `ctx_dp_rank` serialization is not dependent on whatever happens to be present
+  in the base runtime image.
 
 Focused tests added/maintained in
 `tests/unittest/_torch/speculative/hw_agnostic/test_smc.py`:
@@ -68,6 +72,11 @@ are in `tests/unittest/disaggregated/test_disagg_pd_r20_gates.py`.
   proof before it can replace dense MLA KVarN in this canary.
 - **MORI/NIXL/Mooncake transport wins are not proven here.** This audit does not
   replace the separate transport benchmark/integration gate.
+- **Current gen56 live blocker:** the `dcbf218` rollout had the right installed
+  request-pinning and SMC overlap sources, but decode had not become ready before
+  smoke. The observed restart was in C++ `CacheTransceiver` teardown with
+  `cudaStreamDestroy(... illegal memory access)`, so live request-pin proof must
+  wait for a ready decode endpoint and zero-restart smoke.
 
 ## Rollout log signals to check
 
@@ -89,6 +98,12 @@ SMC-SD decode worker, verify:
 - KVarN remains selected for dense MLA (`mla_latent_kv_dtype="kvarn_k2v2"`,
   `mla_latent_kv_amortize=True`) and WarpDecode remains forced with TP/EP active
   and no kernel-backend fallback.
+- For transport variants, keep the same request-pinning proof (`rid`,
+  `ctx_dp_rank`, cleanup on close/abort) and repeat it under the UCX baseline,
+  Python/C++ NIXL, Mooncake, and MORI-IO images before accepting any throughput
+  win. Request pinning is service/protocol-level and should be transport
+  independent; transfer-backend replacement is only accepted after E2E proves
+  the backend wrapper preserves the same metadata and cleanup behavior.
 
 Do not mark this production-complete until live E2E passes with the full custom
 stack and request-pinning/transport gates satisfied.

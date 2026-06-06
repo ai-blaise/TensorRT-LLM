@@ -87,3 +87,77 @@ Collect these from the live rollout before A/B:
   `policy='force'`, and no backend fallback.
 - KVarN dense MLA shows `mla_latent_kv_dtype='kvarn_k2v2'` and amortized restore.
 - Worker pods have zero restarts through smoke and 16-concurrency warmup.
+
+## Reproducible live smoke
+
+Run this only after the DGD is ready and the decode service has an endpoint. The
+first request proves the normal close path; the second opens a stream and closes
+it early to prove pin cleanup/abort safety without putting load on the canary.
+
+```bash
+KC='sudo -E /usr/local/bin/k3s kubectl -n dynamo-system'
+DGD=topo-c1-dp2tp4-disagg-r20
+MODEL=BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft
+
+$KC get dgd "$DGD"
+$KC get endpoints "${DGD}-decode" "${DGD}-prefill" "${DGD}-frontend"
+START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+FE=$($KC get pods -o name | grep "${DGD}-0-frontend" | tail -1)
+
+$KC exec "$FE" -- python3 - <<PY
+import json, urllib.request
+payload = {
+    "model": "$MODEL",
+    "prompt": "Request pinning smoke. Count to five.",
+    "max_tokens": 32,
+    "temperature": 0,
+    "stream": False,
+}
+req = urllib.request.Request(
+    "http://127.0.0.1:8000/v1/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+print(urllib.request.urlopen(req, timeout=300).read().decode()[:1000])
+PY
+
+$KC exec "$FE" -- python3 - <<PY
+import json, urllib.request
+payload = {
+    "model": "$MODEL",
+    "prompt": "Streaming request pinning abort smoke. Continue briefly.",
+    "max_tokens": 128,
+    "temperature": 0,
+    "stream": True,
+}
+req = urllib.request.Request(
+    "http://127.0.0.1:8000/v1/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+response = urllib.request.urlopen(req, timeout=300)
+print(response.readline().decode(errors="ignore")[:500])
+response.close()
+PY
+
+DEC=$($KC get pods -o name | grep "${DGD}-0-decode" | tail -1)
+PRE=$($KC get pods -o name | grep "${DGD}-0-prefill" | tail -1)
+
+$KC logs "$FE" --since-time="$START" \
+  | egrep -i 'disagg request pin established|disagg request pin cleared|ctx_dp_rank|Request pinning requires|abort|stream'
+$KC logs "$DEC" --since-time="$START" \
+  | egrep -i 'SMC|overlap|Disable overlap|HELIX|fallback|kvarn|WARPDECODE|illegal|Traceback|ERROR'
+$KC logs "$PRE" --since-time="$START" \
+  | egrep -i 'LAYERSPLIT|HELIX|kvarn|ctx_dp_rank|transfer|ERROR|Traceback'
+```
+
+Pass criteria:
+
+- Each `disagg request pin established` has a matching
+  `disagg request pin cleared` for the same `rid`, including the early stream
+  close.
+- The established pin includes `ctx_server`, `ctx_dp_rank`, and `gen_server`.
+- No log contains `Request pinning requires`, `ctx_dp_rank is None`, HELIX
+  selection, SMC overlap disable, WarpDecode backend fallback, or CUDA illegal
+  memory access.
+- Decode and prefill remain ready with zero restarts after the two requests.
