@@ -4,26 +4,27 @@
 # Topology (exact): single 8xB200 node.
 #   * 1 PREFILL worker -- TP2xCP2 LayerSplit / EP4, enable_attention_dp=false, 4 GPUs,
 #       LayerSplit ON   (prefill.yaml: sparse_attention_config.layersplit_enabled=true)
-#   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=false, GPUs 4-7,
+#   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=true, GPUs 4-7,
 #       WarpDecode ON   (decode.yaml: moe_config.warp_decode.enabled=true, tile_mode=decode_1cta
 #                        + env TRTLLM_WARP_DECODE_FIXED_TACTIC=1)
 #       SMC-SD ON       (decode.yaml: speculative_config.decoding_type=SMC, GLM-4-9B-FP8 draft
 #                        + env NCCL_NET_PLUGIN=none)
 #   * 1 Frontend (KV router) -- dynamo.frontend, http :8000
 #
-# Target node: a4-us-002-rl9 (k3s) -- the more-validated disagg P/D path. The 001
-# docker path (deploy/smcsd_fiport/r12_001/smc_launch_001.sh) is AGGREGATED (single
-# trtllm-serve, no P/D split); the disaggregated prefill/decode artifact is this
-# DynamoGraphDeployment CRD (nvidia.com/v1alpha1) which is k3s-native and is the
-# pattern the validated topo-c1-dp2tp4-disagg-smc deploy already used on 002.
+# Target node: set TARGET_NODE before envsubst. The 001 VM is the canary/build
+# lane before this manifest is rolled onto the more-validated 002 live path.
+# The disaggregated prefill/decode artifact is this DynamoGraphDeployment CRD
+# (nvidia.com/v1alpha1), which is k3s-native and matches the validated
+# topo-c1-dp2tp4-disagg-smc deploy pattern.
 #
 # Image: BOTH workers + frontend run the UNIFIED wins+SMC image. Parameterized as
 # ${UNIFIED_IMAGE}; the build agent (branch op-trt-canonical-smc-r20, build container
 # r20-unified-build, FROM local/dynamo-trtllm-optrt-custom:canonical-r17-wins-20260605)
 # sets the final tag. Expected tag (record only -- confirm with build agent before apply):
-#   local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn-pinfix-20260605
+#   docker.io/local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn2-ls-mlp-cutedsl-pyexec-20260605
 # Substitute at deploy time, e.g.:
-#   UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn-pinfix-20260605 \
+#   TARGET_NODE=a4-us-002-rl9 \
+#   UNIFIED_IMAGE=docker.io/local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn2-ls-mlp-cutedsl-pyexec-20260605 \
 #     envsubst < topo-c1-dp2tp4-disagg-r20.yaml | \
 #     KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
 #
@@ -66,7 +67,10 @@ data:
       free_gpu_memory_fraction: 0.7
       tokens_per_block: 64
     cache_transceiver_config:
-      backend: NIXL
+      # Current r20 image ships the C++ UCX wrapper, not the C++ NIXL/Mooncake
+      # wrappers. Keep this explicit so the non-MORI baseline is functional and
+      # does not silently select a missing transfer-agent library.
+      backend: UCX
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE
@@ -85,6 +89,10 @@ data:
       index_topk_pattern: FSSS
       index_topk_freq: 4
       indexer_k_dtype: fp4
+      # Dense MLA latent KV uses 2-bit KVarN. This is intentionally separate
+      # from Indexer K above; KVarN is dense compressed_kv+k_pe storage only.
+      mla_latent_kv_dtype: kvarn_k2v2
+      mla_latent_kv_amortize: true
       enable_nvfp4_hisa: true
       hisa_block_size: 128
       hisa_block_topk: 64
@@ -93,13 +101,14 @@ data:
       hisa_execution_mode: optimized
       use_cute_dsl_topk: true
       use_cute_dsl_paged_mqa_logits: true
-      # MORI-IO-shaped handoff, implemented by TRT-LLM NIXL transfer: prefill
+      # MORI-IO-shaped handoff, implemented by TRT-LLM UCX transfer in this
+      # non-MORI baseline: prefill
       # owns LayerSplit's CP-sharded DSA KV/indexer-K cache, then the transceiver
       # writes/reassembles it into decode's pre-allocated TP4/CP1 cache. Keep all
       # CP ranks participating until a partial-rank protocol is implemented.
       layersplit_enabled: true
       layersplit_owner_assignment: contiguous
-      layersplit_transfer_backend: auto
+      layersplit_transfer_backend: ucx
       layersplit_all_cp_ranks_transfer: true
       layersplit_owner_local_alloc: false
   decode.yaml: |
@@ -107,11 +116,13 @@ data:
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     context_parallel_size: 1
-    enable_attention_dp: false
+    enable_attention_dp: true
     trust_remote_code: true
     enable_chunked_prefill: true
     disable_overlap_scheduler: false
-    allreduce_strategy: AUTO
+    # DeepSeek decode should run attention-DP/local dense MLP ownership rather
+    # than exercising the dense MLP TP allreduce path during warmup.
+    allreduce_strategy: MNNVL
     use_cute_dsl_blockscaling_bmm: true
     use_cute_dsl_bf16_bmm: true
     max_batch_size: 64
@@ -130,7 +141,9 @@ data:
       free_gpu_memory_fraction: 0.45
       tokens_per_block: 64
     cache_transceiver_config:
-      backend: NIXL
+      # Explicit C++ UCX transceiver for the current r20 image. Do not set NIXL
+      # here unless the image also carries libtensorrt_llm_nixl_wrapper.so.
+      backend: UCX
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE
@@ -152,6 +165,9 @@ data:
       index_topk_pattern: FSSS
       index_topk_freq: 4
       indexer_k_dtype: fp4
+      # Dense MLA latent KV uses 2-bit KVarN. Indexer K remains fp4.
+      mla_latent_kv_dtype: kvarn_k2v2
+      mla_latent_kv_amortize: true
       enable_nvfp4_hisa: true
       hisa_block_size: 128
       hisa_block_topk: 64
@@ -195,7 +211,7 @@ spec:
         value: fastokens
       extraPodSpec:
         nodeSelector:
-          kubernetes.io/hostname: a4-us-002-rl9
+          kubernetes.io/hostname: ${TARGET_NODE}
         tolerations:
         - operator: Exists
         mainContainer:
@@ -244,7 +260,10 @@ spec:
       - name: NCCL_CUMEM_ENABLE
         value: '1'
       - name: NCCL_NVLS_ENABLE
-        value: '1'
+        # LayerSplit prefill uses TP and CP subgroup allreduces. On the tested
+        # B200/K3s stack, NCCL NVLS multicast binding fails for those subgroups
+        # with CUDA error 999, while CUMEM/P2P completes cleanly.
+        value: '0'
       - name: NCCL_GRAPH_MIXING_SUPPORT
         value: '0'
       - name: NCCL_NET_PLUGIN
@@ -253,8 +272,6 @@ spec:
         value: '1'
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
         value: '0'
-      - name: TRTLLM_NIXL_KVCACHE_BACKEND
-        value: UCX
       - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
         value: '1'
       - name: TRTLLM_ENABLE_PDL
@@ -279,7 +296,7 @@ spec:
         value: '1'
       extraPodSpec:
         nodeSelector:
-          kubernetes.io/hostname: a4-us-002-rl9
+          kubernetes.io/hostname: ${TARGET_NODE}
         tolerations:
         - operator: Exists
         mainContainer:
@@ -389,8 +406,6 @@ spec:
         value: '1'
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
         value: '0'
-      - name: TRTLLM_NIXL_KVCACHE_BACKEND
-        value: UCX
       - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
         value: '1'
       - name: TRTLLM_ENABLE_PDL
@@ -420,7 +435,7 @@ spec:
         value: '1'
       extraPodSpec:
         nodeSelector:
-          kubernetes.io/hostname: a4-us-002-rl9
+          kubernetes.io/hostname: ${TARGET_NODE}
         tolerations:
         - operator: Exists
         mainContainer:

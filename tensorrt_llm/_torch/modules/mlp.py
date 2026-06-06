@@ -39,17 +39,24 @@ class MLP(nn.Module):
         config = config or ModelConfig()
         self.mapping = config.mapping
         if overridden_tp_size is not None:
-            assert config.mapping.tp_size % overridden_tp_size == 0
+            base_mapping = config.mapping
+            if base_mapping.has_cp_block_token():
+                base_mapping = base_mapping.repurpose_cp_to_tp()
+            assert base_mapping.tp_size % overridden_tp_size == 0
             tp_size = overridden_tp_size
             # "Misuse" pp_size here to perform all-reduce within smaller groups
-            pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
+            pp_size = base_mapping.pp_size * base_mapping.tp_size // overridden_tp_size
             mapping = Mapping(
                 world_size=tp_size * pp_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
+                rank=base_mapping.rank,
+                gpus_per_node=base_mapping.gpus_per_node,
                 tp_size=tp_size,
                 pp_size=pp_size,
             )
+            original_mapping = getattr(base_mapping,
+                                       "_block_token_original_mapping", None)
+            if original_mapping is not None:
+                mapping._block_token_original_mapping = original_mapping
         else:
             mapping = config.mapping
 

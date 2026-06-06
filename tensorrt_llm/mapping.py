@@ -545,7 +545,7 @@ class Mapping(MappingBase):
         # In block-token CP, CP is relevant only for the attention layer. These ranks are repurposed to TP
         # for FFN layers.
         assert self.has_cp_block_token()
-        return Mapping(
+        mapping = Mapping(
             world_size=self.world_size,
             rank=self.rank,
             gpus_per_node=self.gpus_per_node,
@@ -560,6 +560,8 @@ class Mapping(MappingBase):
             # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
+        mapping._block_token_original_mapping = self
+        return mapping
 
     def repurpose_helix_cp_to_tp(self):
         # Backward-compatible alias for callers that predate has_cp_block_token.

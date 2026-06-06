@@ -42,7 +42,10 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.7
   tokens_per_block: 64
 cache_transceiver_config:
-  backend: NIXL
+  # Current r20 image ships the C++ UCX wrapper, not the C++ NIXL/Mooncake
+  # wrappers. Keep this explicit so the non-MORI baseline is functional and
+  # does not silently select a missing transfer-agent library.
+  backend: UCX
   max_tokens_in_buffer: 131072
 moe_config:
   backend: WARPDECODE
@@ -61,6 +64,10 @@ sparse_attention_config:
   index_topk_pattern: FSSS
   index_topk_freq: 4
   indexer_k_dtype: fp4
+  # Dense MLA latent KV uses 2-bit KVarN. This is intentionally separate from
+  # Indexer K above; KVarN is dense compressed_kv+k_pe storage only.
+  mla_latent_kv_dtype: kvarn_k2v2
+  mla_latent_kv_amortize: true
   enable_nvfp4_hisa: true
   hisa_block_size: 128
   hisa_block_topk: 64
@@ -70,11 +77,12 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   # ---- LayerSplit ON (prefill custom piece) ----
-  # MORI-IO-shaped handoff, implemented by TRT-LLM NIXL transfer: producer-side
+  # MORI-IO-shaped handoff, implemented by TRT-LLM UCX transfer in this
+  # non-MORI baseline: producer-side
   # layer KV is transferred into decode's pre-allocated cache, with CP shards
   # reassembled for TP4/CP1.
   layersplit_enabled: true
   layersplit_owner_assignment: contiguous       # required by CP handoff reassembly inference
-  layersplit_transfer_backend: auto              # auto -> UCX/NIXL per cache-transceiver
+  layersplit_transfer_backend: ucx               # explicit; no implicit NIXL fallback
   layersplit_all_cp_ranks_transfer: true         # validator REQUIRES true (partial-rank not implemented)
   layersplit_owner_local_alloc: false            # keep replicated pools (dense-MLA reads C++ pool ptr)

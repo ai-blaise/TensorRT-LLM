@@ -1,0 +1,63 @@
+FROM local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-20260605
+USER root
+
+ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages
+
+# First-class LayerSplit CP support.  Keep this overlay ABI-conservative: the
+# base r20 image carries the compiled TRT-LLM runtime and core distributed
+# Python surfaces; replacing communicator/model/attention internals without a
+# matching C++ rebuild can break executor creation.  The LayerSplit pieces below
+# are the first-class config/mapping surface, the LayerSplit-aware executor
+# guards, plus the request-merge and sparse runtime code that owns the custom
+# behavior.
+COPY --chown=dynamo:0 tensorrt_llm/mapping.py ${SITE_PACKAGES}/tensorrt_llm/mapping.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/request_utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/request_utils.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/model_engine.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
+COPY --chown=dynamo:0 tensorrt_llm/llmapi/llm_args.py ${SITE_PACKAGES}/tensorrt_llm/llmapi/llm_args.py
+
+# Custom sparse-attention, KVarN dense-MLA, WarpDecode, request pinning, and
+# MPI-control fixes carried by the op-trt rollout branch.
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/trtllm.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/dsa.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_mla.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_mla.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/attention.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/attention.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/gated_mlp.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/gated_mlp.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/mlp.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/mlp.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/distributed/ops.py ${SITE_PACKAGES}/tensorrt_llm/_torch/distributed/ops.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/fused_moe/warp_decode.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/fused_moe/warp_decode.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/hang_detector.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/hang_detector.py
+COPY --chown=dynamo:0 tensorrt_llm/serve/openai_disagg_service.py ${SITE_PACKAGES}/tensorrt_llm/serve/openai_disagg_service.py
+COPY --chown=dynamo:0 tensorrt_llm/executor/base_worker.py ${SITE_PACKAGES}/tensorrt_llm/executor/base_worker.py
+COPY --chown=dynamo:0 tensorrt_llm/executor/proxy.py ${SITE_PACKAGES}/tensorrt_llm/executor/proxy.py
+COPY --chown=dynamo:0 tensorrt_llm/executor/rpc_proxy.py ${SITE_PACKAGES}/tensorrt_llm/executor/rpc_proxy.py
+COPY --chown=dynamo:0 tensorrt_llm/executor/rpc_worker_mixin.py ${SITE_PACKAGES}/tensorrt_llm/executor/rpc_worker_mixin.py
+COPY --chown=dynamo:0 tensorrt_llm/executor/worker.py ${SITE_PACKAGES}/tensorrt_llm/executor/worker.py
+
+RUN /opt/dynamo/venv/bin/python -m py_compile \
+	    ${SITE_PACKAGES}/tensorrt_llm/mapping.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/request_utils.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_mla.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/attention.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/gated_mlp.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/mlp.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/distributed/ops.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py \
+    ${SITE_PACKAGES}/tensorrt_llm/llmapi/llm_args.py \
+    ${SITE_PACKAGES}/tensorrt_llm/serve/openai_disagg_service.py \
+    ${SITE_PACKAGES}/tensorrt_llm/executor/proxy.py \
+    ${SITE_PACKAGES}/tensorrt_llm/executor/rpc_worker_mixin.py \
+    ${SITE_PACKAGES}/tensorrt_llm/executor/worker.py
+
+USER dynamo

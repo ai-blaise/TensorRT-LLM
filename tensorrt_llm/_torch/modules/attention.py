@@ -225,7 +225,7 @@ def _helix_cp_allgather_input(hidden_states: torch.Tensor,
     The first layer already has the full input from the embedding.
     Subsequent layers need to undo the previous layer's reduce-scatter.
     """
-    if (mapping.has_cp_block_token() and mapping.enable_attention_dp
+    if (mapping.has_cp_helix() and mapping.enable_attention_dp
             and layer_idx > 0):
         hidden_states = cp_allgather(hidden_states, mapping, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
@@ -248,7 +248,7 @@ def _helix_cp_output_projection(
     result so each CP rank processes a distinct token chunk through the MLP.
     Falls back to the standard AllReduce path otherwise.
     """
-    if mapping.has_cp_block_token() and mapping.enable_attention_dp:
+    if mapping.has_cp_helix() and mapping.enable_attention_dp:
         attn_output = o_proj(
             attn_output,
             all_reduce_params=AllReduceParams(enable_allreduce=False),
@@ -282,7 +282,7 @@ def maybe_slice_for_helix_cp(tensor: torch.Tensor,
     Call this in the decoder layer on the residual *after* the attention
     forward, so that Attention/MLA forward signatures stay unchanged.
     """
-    if (mapping_with_cp is not None and mapping_with_cp.has_cp_block_token()
+    if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
             and mapping_with_cp.enable_attention_dp and layer_idx == 0):
         tensor, chunk_size = _helix_cp_pad(tensor, attn_metadata.num_tokens,
                                            mapping_with_cp.cp_size)
@@ -304,7 +304,7 @@ def maybe_allgather_for_helix_cp(
     Should be called at the end of the model's ``forward()`` method,
     after the decoder layer loop.
     """
-    if (mapping_with_cp is not None and mapping_with_cp.has_cp_block_token()
+    if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
             and mapping_with_cp.enable_attention_dp):
         hidden_states = cp_allgather(hidden_states, mapping_with_cp, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
@@ -507,6 +507,8 @@ class Attention(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        if self.mapping.has_cp_layersplit():
+            mapping_o._block_token_original_mapping = self.mapping
         self.mapping_o = mapping_o
 
         self.o_proj = Linear(
@@ -715,7 +717,7 @@ class Attention(nn.Module):
         # We intentionally skip passing out_scale to FMHA here
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
-        if self.mapping.has_cp_block_token() and attn_metadata.num_contexts == 0:
+        if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
             assert output is None, (
                 "Helix produces BF16 partial outputs which may not match a pre-allocated FP8/NVFP4 buffer for torch.compile inplace output."
             )
@@ -1400,6 +1402,8 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        if self.mapping.has_cp_layersplit():
+            mapping_o._block_token_original_mapping = self.mapping
         self.mapping_o = mapping_o
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
@@ -1620,11 +1624,50 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
+    def _select_layersplit_local_heads(
+            self, attn_out_latent: torch.Tensor) -> torch.Tensor:
+        """Select this CP rank's latent-head shard for LayerSplit.
+
+        LayerSplit keeps the full prompt visible on every CP rank and does not
+        use HELIX token all-to-all/post-processing.  The current TRT attention
+        backend still returns the full TP head set, while the downstream MLA
+        value projection is sharded over TP*CP.  Slice the local CP head range
+        explicitly so the normal row-parallel output projection can reduce the
+        shard without entering HELIX.
+        """
+        if (not self.mapping.has_cp_layersplit()
+                or self.num_heads_tp == self.num_heads_tp_cp):
+            return attn_out_latent
+
+        local_heads = self.num_heads_tp_cp
+        start = self.mapping.cp_rank * local_heads
+        end = start + local_heads
+
+        if attn_out_latent.dim() == 2:
+            local_width = local_heads * self.kv_lora_rank
+            full_width = self.num_heads_tp * self.kv_lora_rank
+            if attn_out_latent.shape[1] == local_width:
+                return attn_out_latent
+            if attn_out_latent.shape[1] != full_width:
+                return attn_out_latent
+            attn_out_latent = attn_out_latent.view(
+                -1, self.num_heads_tp, self.kv_lora_rank)
+            attn_out_latent = attn_out_latent[:, start:end, :].contiguous()
+            return attn_out_latent.view(-1, local_width)
+
+        if attn_out_latent.dim() == 3:
+            if attn_out_latent.shape[1] == local_heads:
+                return attn_out_latent
+            if attn_out_latent.shape[1] == self.num_heads_tp:
+                return attn_out_latent[:, start:end, :].contiguous()
+
+        return attn_out_latent
+
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
-        if self.mapping.has_cp_block_token():
+        if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
@@ -2721,6 +2764,7 @@ class MLA(nn.Module):
                 quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
             )
         fused_q = None
+        attn_out_latent = self._select_layersplit_local_heads(attn_out_latent)
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (attn_out_latent.shape[0] == q.shape[0]
@@ -2831,6 +2875,7 @@ class MLA(nn.Module):
             topk_indices=topk_indices,  # used by DSA attention
         )
         fused_q = None
+        attn_out_latent = self._select_layersplit_local_heads(attn_out_latent)
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (attn_out_latent.shape[0] == q.shape[0]

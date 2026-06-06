@@ -1,6 +1,6 @@
 # =============================================================================
 # Disagg P/D r20 -- DECODE worker engine config (cell1 DP2/TP4-disagg winner)
-# 1 decode worker, TP4 / EP4, enable_attention_dp=false, GPUs 4-7.
+# 1 decode worker, TP4 / EP4, enable_attention_dp=true, MNNVL, GPUs 4-7.
 # Custom pieces ON for decode: WarpDecode (NVFP4 MoE decode fast path) + SMC-SD
 # (Sequential Monte-Carlo speculative decoding, GLM-4-9B-FP8 draft).
 # Derived from the validated topo-c1-dp2tp4-disagg-smc ConfigMap decode.yaml
@@ -23,11 +23,13 @@ backend: pytorch
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
 context_parallel_size: 1
-enable_attention_dp: false
+enable_attention_dp: true
 trust_remote_code: true
 enable_chunked_prefill: true
 disable_overlap_scheduler: false
-allreduce_strategy: AUTO
+# DeepSeek decode should run attention-DP/local dense MLP ownership rather than
+# exercising the dense MLP TP allreduce path during warmup.
+allreduce_strategy: MNNVL
 use_cute_dsl_blockscaling_bmm: true
 use_cute_dsl_bf16_bmm: true
 max_batch_size: 64
@@ -46,7 +48,9 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.45
   tokens_per_block: 64
 cache_transceiver_config:
-  backend: NIXL
+  # Explicit C++ UCX transceiver for the current r20 image. Do not set NIXL
+  # here unless the image also carries libtensorrt_llm_nixl_wrapper.so.
+  backend: UCX
   max_tokens_in_buffer: 131072
 moe_config:
   backend: WARPDECODE
@@ -68,6 +72,9 @@ sparse_attention_config:
   index_topk_pattern: FSSS
   index_topk_freq: 4
   indexer_k_dtype: fp4
+  # Dense MLA latent KV uses 2-bit KVarN. Indexer K remains fp4.
+  mla_latent_kv_dtype: kvarn_k2v2
+  mla_latent_kv_amortize: true
   enable_nvfp4_hisa: true
   hisa_block_size: 128
   hisa_block_topk: 64

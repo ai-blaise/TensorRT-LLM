@@ -7,8 +7,8 @@ with the custom pieces toggled ON.
 
 | Worker   | GPUs  | Parallelism            | Custom piece ON                              |
 |----------|-------|------------------------|----------------------------------------------|
-| prefill  | 4 GPUs | TP2xCP2 LayerSplit / EP4, ADP=false | **LayerSplit** (`layersplit_enabled: true`) |
-| decode   | 4 GPUs | TP4 / EP4, ADP=false | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **SMC-SD** (`speculative_config.decoding_type: SMC`) |
+| prefill  | 4 GPUs | TP2xCP2 LayerSplit / EP4, ADP=false | **LayerSplit** (`layersplit_enabled: true`) + **2-bit KVarN dense MLA latent KV** (`mla_latent_kv_dtype: kvarn_k2v2`) |
+| decode   | 4 GPUs | TP4 / EP4, ADP=true, MNNVL | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **SMC-SD** (`speculative_config.decoding_type: SMC`) + **2-bit KVarN dense MLA latent KV** |
 | Frontend | -     | KV router (`--router-mode kv`) | -                                  |
 
 This is 1P x 4GPU + 1D x 4GPU disaggregated serving with real LayerSplit on
@@ -30,12 +30,17 @@ container `r20-unified-build`, `FROM
 local/dynamo-trtllm-optrt-custom:canonical-r17-wins-20260605`) sets the final tag.
 
 **Expected tag (confirm with the build agent before apply):**
-`local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn-pinfix-20260605`
+`docker.io/local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn2-ls-mlp-cutedsl-pyexec-20260605`
+
+For TP2xCP2 prefill -> TP4xCP1 decode, use a full source-built runtime image,
+not a Python-only overlay over an older base. The C++ MLA cache formatter must
+include the CP-domain reassembly path (`mDomainCPSize > 1`) or decode KV receive
+will reject the LayerSplit handoff.
 
 ## Deploy (orchestrator only -- gated)
 
 ```bash
-export UNIFIED_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn-pinfix-20260605   # from build agent
+export UNIFIED_IMAGE=docker.io/local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-mpirpc-kvarn2-ls-mlp-cutedsl-pyexec-20260605   # from build agent
 envsubst '$UNIFIED_IMAGE' < topo-c1-dp2tp4-disagg-r20.yaml | \
   KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
 ```
@@ -59,10 +64,17 @@ exist on a4-us-002-rl9.
   decode worker) + `TRTLLM_ENABLE_PDL=1`.
 - LayerSplit: `BaseSparseAttentionConfig.layersplit_*`,
   `docs/source/features/layersplit.md`.
+- KVarN: `BaseSparseAttentionConfig.mla_latent_kv_dtype` and
+  `mla_latent_kv_amortize`, `docs/blaise/kvarn.md`. This deployment uses
+  `kvarn_k2v2` for **dense MLA latent KV only**; `indexer_k_dtype` remains
+  `fp4` and is not replaced by KVarN.
 - SMC-SD: `SMCDecodingConfig`, `docs/blaise/smc_sd.md`. Decode env needs
   `NCCL_NET_PLUGIN=none` (per `deploy/smcsd_fiport/r12_001/smc_launch_001.sh`).
 - Base manifest pattern: `deploy/smcsd_fiport/dgd_smc_on.yaml` +
   `deploy/smcsd_fiport/smc_configmap.yaml` (the validated `topo-c1-dp2tp4-disagg-smc`).
+- Prefill NCCL: `NCCL_NVLS_ENABLE=0`. LayerSplit prefill uses native TP/CP
+  subgroup allreduces; on the tested B200/K3s stack, NCCL NVLS multicast
+  binding fails for those subgroups while NCCL CUMEM/P2P completes correctly.
 
 ## LayerSplit TP2xCP2 prefill
 
@@ -79,8 +91,14 @@ the reassembled KV through the LayerSplit KV handoff path.
 The deployment uses the TRT-LLM disaggregated KV transceiver, not vLLM MORI-IO.
 The MORI-IO write-mode shape is only the handoff reference: prefill is the KV
 producer, decode owns pre-allocated KV blocks, and transfer metadata must
-describe block and layer layout precisely. In this setup, NIXL is the TRT-LLM
-cache transceiver, pinned to the UCX NIXL communication backend, LayerSplit owns
-the prefill-side CP-sharded DSA KV/indexer-K layout, and the LayerSplit handoff
-reassembles those shards into the decode worker's TP4/CP1 KV layout before
-decode generation.
+describe block and layer layout precisely. In this r20 image the shipped C++
+transfer wrapper is UCX (`libtensorrt_llm_ucx_wrapper.so`), while the C++ NIXL
+and Mooncake transfer-agent wrapper libraries are not present. Therefore this
+canary pins `cache_transceiver_config.backend: UCX` and
+`layersplit_transfer_backend: ucx` explicitly rather than selecting a broken
+NIXL path. This is a functionality baseline, not the target optimum. Dynamo's
+preferred disaggregated-transfer direction is NIXL-mediated GPU-to-GPU KV
+transfer; the follow-up optimized image must ship and validate the TRT-LLM C++
+NIXL and/or Mooncake wrapper before replacing UCX. LayerSplit owns the
+prefill-side CP-sharded DSA KV/indexer-K layout, and the handoff reassembles
+those shards into the decode worker's TP4/CP1 KV layout before decode generation.

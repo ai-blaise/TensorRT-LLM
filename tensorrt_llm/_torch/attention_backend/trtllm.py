@@ -238,7 +238,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.enable_helix = self.mapping.has_cp_block_token(
+        self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
         self.use_paged_context_fmha = (
             self.runtime_features.chunked_prefill

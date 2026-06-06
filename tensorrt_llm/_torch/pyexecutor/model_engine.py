@@ -845,12 +845,11 @@ class PyTorchModelEngine(ModelEngine):
                 # Memory pool will be warmed up later.
                 gc.collect()
                 torch.cuda.empty_cache()
-        # Autotuner warmup uses context-only requests. Helix CP
-        # is decode-only and runs into issues with autotuner warmup.
+        # Block-token CP modes use CP-specific cache ownership and communicator
+        # contracts. Avoid synthetic warmup traffic until each CP mode has a
+        # dedicated warmup batch builder; live request execution remains enabled.
         if not self.mapping.has_cp_block_token():
             self._run_autotuner_warmup(resource_manager)
-        # Block-token CP currently has decode/generation warmup shapes that do not
-        # match the regular TRT-LLM attention backend's capture assumptions.
         if self.mapping.has_cp_block_token():
             logger.info(
                 "[ModelEngine::warmup] Skipping CUDA graph warmup for block-token CP."
@@ -907,7 +906,7 @@ class PyTorchModelEngine(ModelEngine):
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
             # Helix CP does not support warmup with context requests.
-            if self.mapping.has_cp_block_token() and num_tokens != num_gen_tokens:
+            if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
                 continue
             try:
                 with self._release_batch_context(
@@ -1092,9 +1091,10 @@ class PyTorchModelEngine(ModelEngine):
         # self.max_seq_len is the global max sequence length. For Helix CP each
         # rank only holds max_seq_len / cp_size tokens, so scale accordingly to
         # avoid creating warmup requests whose position_ids exceed the RoPE
-        # table (max_position_embeddings).
+        # table (max_position_embeddings). LayerSplit keeps full tokens on
+        # every CP rank and must not be scaled here.
         effective_max_seq_len = self.max_seq_len
-        if self.mapping is not None and self.mapping.has_cp_block_token():
+        if self.mapping is not None and self.mapping.has_cp_helix():
             effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
 
         sparse_config = self.sparse_attention_config
@@ -1858,7 +1858,7 @@ class PyTorchModelEngine(ModelEngine):
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
             num_tokens = attn_metadata.num_tokens
-            if self.mapping.has_cp_block_token():
+            if self.mapping.has_cp_helix():
                 # With CP, attention uses reduce-scatter to divide tokens
                 # among CP ranks. Report the post-RS token count.
                 # Use tp_cp_allgather so MoE (which sees the repurposed
@@ -2505,7 +2505,7 @@ class PyTorchModelEngine(ModelEngine):
 
         helix_is_inactive_rank, helix_position_offsets = [], []
         # Cache invariant method result to avoid repeated calls per-request.
-        _has_block_token_cp = self.mapping.has_cp_block_token()
+        _has_helix_cp = self.mapping.has_cp_helix()
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -2517,7 +2517,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_position_ids = range(begin_compute,
                                         begin_compute + len(prompt_tokens))
             position_ids.extend(prompt_position_ids)
-            if _has_block_token_cp:
+            if _has_helix_cp:
                 # Context steps must have all CP ranks participate in attention
                 # collectives. Inactive-rank masking is a generation-phase
                 # concern after decode ownership rotates by block.
@@ -2827,7 +2827,7 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num = request.max_beam_num_tokens
 
                 position_id = past_seen_token_num
-                if _has_block_token_cp:
+                if _has_helix_cp:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
@@ -3193,7 +3193,7 @@ class PyTorchModelEngine(ModelEngine):
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] += accepted_tokens
 
-        if self.mapping.has_cp_block_token():
+        if self.mapping.has_cp_helix():
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,

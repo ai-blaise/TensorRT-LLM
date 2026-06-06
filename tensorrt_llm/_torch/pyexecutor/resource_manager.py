@@ -1037,7 +1037,7 @@ class KVCacheManager(BaseResourceManager):
                             req, block_ids)
 
             for req in scheduled_batch.generation_requests:
-                if self.mapping.has_cp_block_token():
+                if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -
                                        1) // self.tokens_per_block
@@ -1121,7 +1121,7 @@ class KVCacheManager(BaseResourceManager):
                 i] if token_nums is not None else 1 + max_num_draft_tokens
             # Helix active rank sets past_seen_token_num = seqlen_this_rank_cp - 1
             # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
-            if self.mapping.has_cp_block_token():
+            if self.mapping.has_cp_helix():
                 token_num = max(token_num, 2)
             encoder_input_tokens = [
                 1
@@ -1173,12 +1173,12 @@ class KVCacheManager(BaseResourceManager):
             for i, req in enumerate(requests):
                 token_num = token_nums[
                     i] if token_nums is not None else 1 + max_num_draft_tokens
-                if self.mapping.has_cp_block_token():
+                if self.mapping.has_cp_helix():
                     token_num = max(token_num, 2)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
-                if self.mapping.has_cp_block_token():
+                if self.mapping.has_cp_helix():
                     if self.mapping.cp_size - 1 == self.mapping.cp_rank:
                         req.py_helix_is_inactive_rank = False
                         req.prompt_len = token_num - 1

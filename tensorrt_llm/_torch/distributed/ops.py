@@ -699,6 +699,13 @@ class AllReduce(nn.Module):
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
+        self._block_token_original_mapping = getattr(
+            mapping, "_block_token_original_mapping", None)
+        self._use_block_token_two_stage_allreduce = (
+            self._block_token_original_mapping is not None
+            and self._block_token_original_mapping.has_cp_layersplit()
+            and os.environ.get("TRTLLM_LAYERSPLIT_TWO_STAGE_ALLREDUCE", "1")
+            == "1")
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
@@ -839,10 +846,13 @@ class AllReduce(nn.Module):
 
         input = input.contiguous()  # Underlying op requires contiguous input
 
-        allreduce_strategy = self.strategy
-
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
+
+        if self._use_block_token_two_stage_allreduce:
+            return self._forward_block_token_two_stage(input, all_reduce_params)
+
+        allreduce_strategy = self.strategy
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
@@ -922,6 +932,84 @@ class AllReduce(nn.Module):
             )
 
         return output if len(output) > 1 else output[0]
+
+    def _raw_allreduce(self, input: torch.Tensor, group: List[int],
+                       all_reduce_params: AllReduceParams,
+                       strategy: AllReduceStrategy,
+                       stage: str = ""):
+        additional_args = {}
+        if self._disable_mpi:
+            raise NotImplementedError(
+                "LayerSplit two-stage allreduce currently requires the MPI "
+                "runtime path; ProcessGroup-backed block-token two-stage "
+                "allreduce is not wired yet.")
+        if os.environ.get("TRTLLM_LAYERSPLIT_DEBUG_ALLREDUCE", "0") == "1":
+            logger.warning(
+                f"LayerSplit two-stage allreduce stage={stage} rank={self.mapping.rank} "
+                f"group={list(group)} input_shape={tuple(input.shape)} "
+                f"fusion_op={all_reduce_params.fusion_op}")
+        if os.environ.get("TRTLLM_LAYERSPLIT_DEBUG_SYNC", "0") == "1":
+            torch.cuda.synchronize(input.device)
+
+        output = self.all_reduce_op(
+            input=input,
+            residual=all_reduce_params.residual,
+            norm_weight=all_reduce_params.norm_weight,
+            scale=all_reduce_params.scale,
+            bias=all_reduce_params.bias,
+            workspace=None,
+            group=group,
+            strategy=strategy,
+            op=all_reduce_params.fusion_op,
+            eps=all_reduce_params.eps,
+            trigger_completion_at_end=all_reduce_params.
+            trigger_completion_at_end,
+            **additional_args,
+        )
+        return output if len(output) > 1 else output[0]
+
+    def _forward_block_token_two_stage(
+            self, input: torch.Tensor,
+            all_reduce_params: AllReduceParams
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Reduce virtual TP over original TP, then original CP.
+
+        LayerSplit repurposes CP ranks into FFN/attention-output TP ranks. Some
+        MPI TRT-LLM allreduce paths are initialized from the original TP/CP
+        topology and reject the synthetic TP*CP group. The two-stage reduction is
+        mathematically equivalent to one allreduce over TP*CP, while using only
+        topology-native groups.
+        """
+        original_mapping = self._block_token_original_mapping
+        assert original_mapping is not None
+
+        def reduce_tp(tensor: torch.Tensor) -> torch.Tensor:
+            if len(original_mapping.tp_group) <= 1:
+                return tensor
+            first_params = AllReduceParams(
+                fusion_op=AllReduceFusionOp.NONE,
+                trigger_completion_at_end=False)
+            return self._raw_allreduce(tensor, original_mapping.tp_group,
+                                       first_params, AllReduceStrategy.NCCL,
+                                       "tp")
+
+        def reduce_cp(tensor: torch.Tensor,
+                      params: AllReduceParams) -> torch.Tensor:
+            if len(original_mapping.cp_group) <= 1:
+                return tensor
+            return self._raw_allreduce(tensor, original_mapping.cp_group,
+                                       params, AllReduceStrategy.NCCL, "cp")
+
+        reduced = input
+        if os.environ.get("TRTLLM_LAYERSPLIT_TWO_STAGE_ORDER",
+                          "tp_cp") == "cp_tp":
+            cp_params = AllReduceParams(fusion_op=AllReduceFusionOp.NONE,
+                                        trigger_completion_at_end=False)
+            reduced = reduce_cp(reduced, cp_params)
+            return reduce_tp(reduced)
+
+        reduced = reduce_tp(reduced)
+        return reduce_cp(reduced, all_reduce_params)
 
 
 class MoEAllReduce(nn.Module):
