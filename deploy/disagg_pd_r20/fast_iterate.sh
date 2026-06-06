@@ -248,11 +248,11 @@ done
 exit "$missing"
 '
   if command -v nerdctl >/dev/null 2>&1; then
-    sudo nerdctl -n k8s.io run --rm --entrypoint /bin/bash \
+    sudo nerdctl -n k8s.io run --rm --user root --entrypoint /bin/bash \
       -e REQUIRED_TRANSPORT_WRAPPERS="$REQUIRED_TRANSPORT_WRAPPERS" \
       "$check_image" -lc "$check_script"
   elif command -v docker >/dev/null 2>&1 && docker image inspect "$check_image" >/dev/null 2>&1; then
-    docker run --rm --entrypoint /bin/bash \
+    docker run --rm --user root --entrypoint /bin/bash \
       -e REQUIRED_TRANSPORT_WRAPPERS="$REQUIRED_TRANSPORT_WRAPPERS" \
       "$check_image" -lc "$check_script"
   else
