@@ -1618,6 +1618,19 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
+        if _should_use_cute_dsl_fp8_swap_ab_odd_m(input, weight_scale):
+            logger.warning_once(
+                "[fp8_swap_ab_gemm] Using CuteDSL FP8 GEMM for "
+                f"non-8-aligned SM100 packed-scale M={input.size(0)}; "
+                "DeepGEMM SwapAB faults this warmup shape.",
+                key=("fp8_swap_ab_gemm", "cutedsl_non_8_aligned_sm100"),
+            )
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                input)
+            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                act_input_fp8, weight, act_input_sf, weight_scale)
+            return output.to(self.output_dtype)
+
         orig_m = input.size(0)
         pad_m = 0
         quant_input = input
@@ -1673,6 +1686,11 @@ def _should_pad_fp8_swap_ab_odd_m(input: torch.Tensor,
             and weight_scale.dtype == torch.int32)
 
 
+def _should_use_cute_dsl_fp8_swap_ab_odd_m(input: torch.Tensor,
+                                           weight_scale: torch.Tensor) -> bool:
+    return _should_pad_fp8_swap_ab_odd_m(input, weight_scale)
+
+
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
     # The CUDA quantizer can illegal-access on odd SMC draft batches on SM100,
     # while the Triton quantizer handles the same shapes correctly.
@@ -1695,6 +1713,19 @@ def fp8_swap_ab_gemm(
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
+    if _should_use_cute_dsl_fp8_swap_ab_odd_m(input, weight_scale):
+        logger.warning_once(
+            "[fp8_swap_ab_gemm] Bypassing DeepGEMM SwapAB for "
+            f"non-8-aligned SM100 packed-scale M={input.size(0)}; using "
+            "CuteDSL FP8 GEMM for this unsupported warmup shape.",
+            key=("fp8_swap_ab_gemm", "direct_cutedsl_non_8_aligned_sm100"),
+        )
+        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+            input)
+        output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            act_input_fp8, weight, act_input_sf, weight_scale)
+        return output.to(output_dtype)
+
     tuner = AutoTuner.get()
 
     # Step 1: Select best quantization kernel (CUDA vs Triton).
