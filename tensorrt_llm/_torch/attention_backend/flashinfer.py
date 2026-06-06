@@ -1636,9 +1636,19 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         def decode_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_decode_wrapper(plan_params)
-            wrapper.run(q[num_ctx_tokens:],
+            q_decode = q[num_ctx_tokens:]
+            q_len_per_req = 1
+            if num_generations > 0:
+                if q_decode.shape[0] % num_generations != 0:
+                    raise ValueError(
+                        "FlashInfer decode query rows must be evenly split "
+                        f"across generation requests, got {q_decode.shape[0]} "
+                        f"rows for {num_generations} requests.")
+                q_len_per_req = q_decode.shape[0] // num_generations
+            wrapper.run(q_decode,
                         kv_cache,
-                        out=out.view(-1, self.num_heads, self.head_dim))
+                        out=out.view(-1, self.num_heads, self.head_dim),
+                        q_len_per_req=q_len_per_req)
 
         # Triton prefill fallback: trtllm-gen cannot handle custom
         # (bidirectional) attention masks for head_dim>256 layers.  Use a
