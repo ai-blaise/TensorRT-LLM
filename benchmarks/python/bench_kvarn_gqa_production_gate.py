@@ -64,6 +64,22 @@ def build_matrix(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Iter
     return cases
 
 
+def build_microbench_commands() -> list[str]:
+    commands: list[str] = []
+    for runtime_dtype in DEFAULT_RUNTIME_DTYPES:
+        for partial in DEFAULT_PARTIAL_BLOCKS:
+            commands.append(
+                "python benchmarks/python/bench_kvarn_gqa_micro.py "
+                "--device cuda "
+                f"--runtime-dtype {runtime_dtype} "
+                "--kv-heads 8 --iters 100 --sinkhorn-iters 16 "
+                "--layouts compact paged --queries 1 5 25 "
+                f"--sink-side-tokens {partial['sink_tokens']} "
+                f"--tail-side-tokens {partial['tail_tokens']} "
+                "--try-store-op --try-decode-op --try-side-op")
+    return commands
+
+
 def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Iterable[str], concurrency: int,
                   min_tok_s_per_user: float) -> dict[str, object]:
     cases = build_matrix(seq_lens, odd_m, transports, concurrency)
@@ -81,6 +97,7 @@ def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Ite
         "paged_kv_required": True,
         "abort_reuse_required": True,
         "side_pool_release_guard": True,
+        "next_gpu_window_commands": build_microbench_commands(),
         "cases": [asdict(case) for case in cases],
     }
 

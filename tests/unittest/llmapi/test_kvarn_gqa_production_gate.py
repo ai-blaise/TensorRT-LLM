@@ -48,6 +48,14 @@ def test_gate_matrix_covers_post_gen56_composability_defaults():
     assert payload["side_pool_release_guard"] is True
     assert {case["tail_tokens"] for case in payload["partial_block_cases"]} == {0, 1, 7, 127}
     assert {case["sink_tokens"] for case in payload["partial_block_cases"]} == {0, 16, 128}
+    commands = payload["next_gpu_window_commands"]
+    assert len(commands) == len(_gate.DEFAULT_RUNTIME_DTYPES) * len(_gate.DEFAULT_PARTIAL_BLOCKS)
+    assert any("--runtime-dtype fp16" in command for command in commands)
+    assert any("--runtime-dtype bf16" in command for command in commands)
+    assert all("--layouts compact paged" in command for command in commands)
+    assert all("--queries 1 5 25" in command for command in commands)
+    assert all("--try-store-op --try-decode-op --try-side-op" in command for command in commands)
+    assert any("--sink-side-tokens 128 --tail-side-tokens 127" in command for command in commands)
 
     cases = payload["cases"]
     assert len(cases) == len(_gate.DEFAULT_SEQ_LENS) * len(_gate.DEFAULT_ODD_M) * len(_gate.DEFAULT_TRANSPORTS)
