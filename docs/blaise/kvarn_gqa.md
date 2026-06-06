@@ -161,6 +161,60 @@ deployment can be called complete:
    the current code still needs a full LayerSplit run to verify non-owner scratch
    routing for generic GQA KVarN, separate from dense MLA LayerSplit.
 
+## Post-gen56 integration test plan
+
+Run this matrix only after the active gen56 rollout is healthy and an explicit GPU
+window is available. Until every item passes, keep `kvarn_gqa_backend_ready()`
+false and keep SMC-SD/GQA KVarN out of production defaults.
+
+1. **Config and HF defaults**
+   - Dense MLA artifacts: verify supported dense-MLA configs resolve
+     `mla_latent_kv_dtype="kvarn_k2v2"` and `mla_latent_kv_amortize=True`.
+   - GQA artifacts: verify `kv_cache_dtype="kvarn_k2v2_g128"` and
+     `quantization_config.kvarn.gqa` are accepted but startup fails closed while
+     `kvarn_gqa_backend_ready()` is false.
+   - Indexer configs: verify `indexer_k_dtype` / HISA/indexcache remain separate
+     and no Indexer K tensor is routed through GQA KVarN.
+
+2. **Single-node fused-kernel correctness**
+   - Build with `torch.ops.trtllm.kvarn_gqa_store`,
+     `torch.ops.trtllm.kvarn_gqa_decode`, and `kvarn_gqa_backend_ready()` still
+     false. Run op-level shape/error tests for unsupported head/group sizes.
+   - Enable readiness only in a test image and compare fused GQA logits/output
+     with fp16/fp8 KV for `M in {1, 5, 25}`, batch 1 and 16, and sequence
+     lengths `{1k, 8k, 32k, 64k, 128k}`.
+   - Include odd-M SMC draft/verify shapes from the SGLang block-FP8 draft path;
+     storage remains 128-token K/V tiles, odd M only affects decode scoring.
+
+3. **LayerSplit and request pinning**
+   - Prefill CP2 LayerSplit with decode CP1: verify packed pages follow the same
+     physical block ids as dense KV and that non-owner ranks never read stale or
+     missing GQA KVarN records.
+   - Disaggregated prefill/decode: verify every request has matching
+     `disagg request pin established` and `disagg request pin cleared` logs and
+     no unpinned non-MORI request reaches decode.
+
+4. **Moondream overlap, SMC, and WarpDecode**
+   - Enable SMC overlap and verify overlap commit preserves KVarN metadata, SMC
+     group identity, and request-pinning metadata.
+   - Keep WarpDecode forced with TP/EP and verify GQA KVarN failure paths are
+     explicit; no hidden fallback to fp16/fp8/nvfp4 KV and no HELIX routing.
+
+5. **Transport variants**
+   - UCX baseline: transfer packed records plus fp16 sink/tail side-state as
+     typed KVarN payloads, not dense K/V reinterpretations.
+   - NIXL and Mooncake: repeat the same transfer metadata checks once wrappers
+     are available.
+   - MORI: run only after request pinning and non-MORI transport gates pass;
+     require a faster-than-UCX proof before promotion.
+
+6. **Performance gates**
+   - `benchmarks/python/bench_kvarn_gqa_micro.py --require-fused` must report the
+     fused path present, ready, correct, and faster than the reference path.
+   - Deployment benchmark must meet or beat the baseline and target c16
+     tok/s/user after first token across `{1k, 8k, 32k, 64k, 128k}`.
+
+
 ## Fused B200 implementation plan
 
 The next production patch should land a real fused path, not another reference

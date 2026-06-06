@@ -87,6 +87,42 @@ def test_gqa_kvarn_fused_ops_gate_sets_kvarn_quant_mode(monkeypatch):
     assert model_config.quant_config.kv_cache_dtype == "kvarn_k2v2_g128"
 
 
+def test_gqa_kvarn_fused_backend_probe_requires_ready_op(monkeypatch):
+    class Ready:
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self):
+            return self.value
+
+    trtllm = SimpleNamespace(
+        kvarn_gqa_store=object(),
+        kvarn_gqa_decode=object(),
+    )
+    monkeypatch.setattr(model_loader.torch, "ops", SimpleNamespace(trtllm=trtllm))
+    assert model_loader._has_kvarn_gqa_fused_backend() is False
+
+    trtllm.kvarn_gqa_backend_ready = Ready(False)
+    assert model_loader._has_kvarn_gqa_fused_backend() is False
+
+    trtllm.kvarn_gqa_backend_ready = Ready(True)
+    assert model_loader._has_kvarn_gqa_fused_backend() is True
+
+
+def test_gqa_kvarn_fused_backend_probe_fails_closed_on_ready_error(monkeypatch):
+    def raises():
+        raise RuntimeError("backend probe failed")
+
+    trtllm = SimpleNamespace(
+        kvarn_gqa_store=object(),
+        kvarn_gqa_decode=object(),
+        kvarn_gqa_backend_ready=raises,
+    )
+    monkeypatch.setattr(model_loader.torch, "ops", SimpleNamespace(trtllm=trtllm))
+
+    assert model_loader._has_kvarn_gqa_fused_backend() is False
+
+
 def test_hf_dense_mla_kvarn_config_does_not_enable_gqa_kvarn():
     cfg = SimpleNamespace(
         quantization_config={
