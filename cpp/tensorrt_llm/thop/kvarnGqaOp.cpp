@@ -79,6 +79,37 @@ void check_group_shape(int64_t headDim, int64_t groupSize)
         "kvarn_gqa k2v2_g128 requires group_size=128, got ", groupSize);
 }
 
+
+int64_t side_tokens(th::Tensor const& tensor, int64_t numQueries, int64_t numKvHeads, int64_t headDim, char const* name)
+{
+    if (tensor.numel() == 0)
+    {
+        return 0;
+    }
+    TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Half || tensor.scalar_type() == at::ScalarType::BFloat16,
+        name, " must be fp16/bf16 when present");
+    if (tensor.dim() == 3)
+    {
+        TORCH_CHECK(tensor.size(1) == numKvHeads && tensor.size(2) == headDim,
+            name, " must be [tokens, num_kv_heads, head_dim]");
+        return tensor.size(0);
+    }
+    if (tensor.dim() == 4)
+    {
+        TORCH_CHECK(tensor.size(0) == 1 || tensor.size(0) == numQueries,
+            name, " batch dim must be 1 or num_queries");
+        TORCH_CHECK(tensor.size(2) == numKvHeads && tensor.size(3) == headDim,
+            name, " must be [batch, tokens, num_kv_heads, head_dim]");
+        return tensor.size(1);
+    }
+    TORCH_CHECK(false, name, " must be empty, [tokens, num_kv_heads, head_dim], or [batch, tokens, num_kv_heads, head_dim]");
+}
+
+int64_t side_batch(th::Tensor const& tensor)
+{
+    return tensor.dim() == 4 ? tensor.size(0) : 1;
+}
+
 } // namespace
 
 bool kvarn_gqa_backend_ready()
@@ -139,6 +170,16 @@ th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords
     TORCH_CHECK(numHeads % numKvHeads == 0, "num_heads must be divisible by num_kv_heads");
     TORCH_CHECK(seqLens.dim() == 1 && (seqLens.size(0) == 1 || seqLens.size(0) == q.size(0)),
         "seq_lens must be [1] or [num_queries]");
+    TORCH_CHECK(sinkK.scalar_type() == sinkV.scalar_type(), "sink_k/sink_v dtypes must match");
+    TORCH_CHECK(tailK.scalar_type() == tailV.scalar_type(), "tail_k/tail_v dtypes must match");
+    TORCH_CHECK(sinkK.numel() == sinkV.numel(), "sink_k/sink_v must have matching element counts");
+    TORCH_CHECK(tailK.numel() == tailV.numel(), "tail_k/tail_v must have matching element counts");
+    auto sinkTokens = side_tokens(sinkK, q.size(0), numKvHeads, headDim, "sink_k");
+    auto sinkVTokens = side_tokens(sinkV, q.size(0), numKvHeads, headDim, "sink_v");
+    auto tailTokens = side_tokens(tailK, q.size(0), numKvHeads, headDim, "tail_k");
+    auto tailVTokens = side_tokens(tailV, q.size(0), numKvHeads, headDim, "tail_v");
+    TORCH_CHECK(sinkTokens == sinkVTokens, "sink_k/sink_v token counts must match");
+    TORCH_CHECK(tailTokens == tailVTokens, "tail_k/tail_v token counts must match");
     auto strides = get_packed_record_strides(packedRecords, numKvHeads, "kvarn_gqa_decode");
 
     auto output = th::empty_like(q);
@@ -147,8 +188,9 @@ th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords
         blockIds.data_ptr<std::int64_t>(), sinkK.data_ptr(), sinkV.data_ptr(), tailK.data_ptr(), tailV.data_ptr(),
         seqLens.data_ptr<std::int32_t>(), output.data_ptr(), static_cast<int>(q.size(0)), static_cast<int>(blockIds.size(0)),
         static_cast<int>(numHeads), static_cast<int>(numKvHeads), static_cast<int>(headDim), static_cast<int>(groupSize),
-        q.scalar_type() == at::ScalarType::BFloat16, static_cast<int>(seqLens.size(0)), strides.pageLayout,
-        strides.strideBlock, strides.strideToken, strides.strideHead, strides.strideByte, stream);
+        q.scalar_type() == at::ScalarType::BFloat16, static_cast<int>(seqLens.size(0)), static_cast<int>(sinkTokens),
+        static_cast<int>(side_batch(sinkK)), static_cast<int>(tailTokens), static_cast<int>(side_batch(tailK)),
+        strides.pageLayout, strides.strideBlock, strides.strideToken, strides.strideHead, strides.strideByte, stream);
     return output;
 }
 

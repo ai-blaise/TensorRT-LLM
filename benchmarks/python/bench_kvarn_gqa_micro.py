@@ -50,6 +50,8 @@ def main() -> None:
                         help="run the experimental decode op even while backend_ready() is false")
     parser.add_argument("--try-store-op", action="store_true",
                         help="run the experimental store op even while backend_ready() is false")
+    parser.add_argument("--try-side-op", action="store_true",
+                        help="exercise decode over fp16 sink + packed full block + fp16 tail")
     parser.add_argument("--decode-op-atol", type=float, default=5e-2)
     parser.add_argument("--store-op-atol", type=float, default=7.5e-2)
     args = parser.parse_args()
@@ -92,9 +94,9 @@ def main() -> None:
             "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_store, "
             "kvarn_gqa_decode, and kvarn_gqa_backend_ready() are not all "
             "present and production-ready; do not promote the reference path as fused")
-    if args.try_store_op or args.try_decode_op:
+    if args.try_store_op or args.try_decode_op or args.try_side_op:
         if device.type != "cuda":
-            raise SystemExit("--try-store-op/--try-decode-op require a CUDA device")
+            raise SystemExit("--try-store-op/--try-decode-op/--try-side-op require a CUDA device")
         packed_records = records.unsqueeze(0).contiguous()
         block_ids = torch.zeros((1,), device=device, dtype=torch.int64)
         empty_side = torch.empty((0,), device=device, dtype=torch.float16)
@@ -115,9 +117,10 @@ def main() -> None:
                 f"store op restore mismatch: max_abs={store_max_abs:.6f} "
                 f"atol={args.store_op_atol:.6f}")
         print(f"store_op_restore_max_abs={store_max_abs:.6f}")
-    if args.try_decode_op:
+    if args.try_decode_op or args.try_side_op:
         if not hasattr(trtllm_ops, "kvarn_gqa_decode"):
             raise SystemExit("torch.ops.trtllm.kvarn_gqa_decode is not registered")
+    if args.try_decode_op:
         for m, q in q_by_m.items():
             seq_lens = torch.full((m,), cfg.group, device=device, dtype=torch.int32)
             op_out = trtllm_ops.kvarn_gqa_decode(
@@ -134,6 +137,33 @@ def main() -> None:
                     f"decode op mismatch for odd_m={m}: max_abs={max_abs:.6f} "
                     f"atol={args.decode_op_atol:.6f}")
             print(f"decode_op_odd_m={m} max_abs={max_abs:.6f}")
+    if args.try_side_op:
+        sink_tokens = min(16, cfg.sink_tokens)
+        tail_tokens = 7
+        sink_k = torch.randn(1, sink_tokens, args.kv_heads, cfg.head_dim, device=device, dtype=torch.float16)
+        sink_v = torch.randn_like(sink_k)
+        tail_k = torch.randn(1, tail_tokens, args.kv_heads, cfg.head_dim, device=device, dtype=torch.float16)
+        tail_v = torch.randn_like(tail_k)
+        k_ref, v_ref = dequantize_gqa_tile(records, cfg)
+        all_k = torch.cat([sink_k[0].float(), k_ref.float(), tail_k[0].float()], dim=0)
+        all_v = torch.cat([sink_v[0].float(), v_ref.float(), tail_v[0].float()], dim=0)
+        side_seq_len = sink_tokens + cfg.group + tail_tokens
+        for m, q in q_by_m.items():
+            seq_lens = torch.full((m,), side_seq_len, device=device, dtype=torch.int32)
+            op_out = trtllm_ops.kvarn_gqa_decode(
+                q.contiguous(), packed_records, block_ids, sink_k.expand(m, -1, -1, -1).contiguous(),
+                sink_v.expand(m, -1, -1, -1).contiguous(), tail_k.expand(m, -1, -1, -1).contiguous(),
+                tail_v.expand(m, -1, -1, -1).contiguous(), seq_lens, args.kv_heads, args.kv_heads,
+                cfg.head_dim, cfg.group)
+            logits = torch.einsum("mhd,thd->hmt", q.float(), all_k)
+            probs = torch.softmax(logits / (cfg.head_dim ** 0.5), dim=-1)
+            ref_out = torch.einsum("hmt,thd->mhd", probs, all_v)
+            max_abs = (op_out.float() - ref_out.float()).abs().max().item()
+            if max_abs > args.decode_op_atol:
+                raise SystemExit(
+                    f"side decode op mismatch for odd_m={m}: max_abs={max_abs:.6f} "
+                    f"atol={args.decode_op_atol:.6f}")
+            print(f"side_decode_op_odd_m={m} max_abs={max_abs:.6f} seq_len={side_seq_len}")
 
     print(f"dtype={cfg.dtype} tile_bytes={cfg.tile_bytes_aligned} bytes_per_token_slot={cfg.bytes_per_token_slot}")
     print(f"restore_cosine_k={k_cos:.4f} restore_cosine_v={v_cos:.4f}")

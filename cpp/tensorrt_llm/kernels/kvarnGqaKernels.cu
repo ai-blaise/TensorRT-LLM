@@ -362,9 +362,73 @@ __global__ void kvarnGqaStoreReferenceKernel(T const* k, T const* v, PackedRecor
 }
 
 template <typename T>
+__device__ __forceinline__ float loadSideScalar(
+    T const* side, int query, int batch, int token, int kvHead, int dim, int tokens, int numKvHeads)
+{
+    int sideBatch = batch == 1 ? 0 : query;
+    std::int64_t idx = ((static_cast<std::int64_t>(sideBatch) * tokens + token) * numKvHeads + kvHead)
+        * Layout::kHeadDim + dim;
+    return loadScalar(side + idx);
+}
+
+template <typename T>
+__device__ float loadSideRotated(
+    T const* side, int query, int batch, int token, int kvHead, int rotDim, int tokens, int numKvHeads)
+{
+    float acc = 0.0f;
+    for (int j = 0; j < Layout::kHeadDim; ++j)
+    {
+        acc += loadSideScalar(side, query, batch, token, kvHead, j, tokens, numKvHeads)
+            * static_cast<float>(hadamardSign(j, rotDim));
+    }
+    return acc * kHadamardScale;
+}
+
+template <typename T>
+__device__ float loadKRotatedForLogicalToken(T const* sinkK, T const* tailK, PackedRecordView records,
+    std::int64_t const* blockIds, int query, int kvHead, int dim, int logicalToken, int sinkCount, int packedCount,
+    int sinkTokens, int sinkBatch, int tailTokens, int tailBatch, int numKvHeads)
+{
+    if (logicalToken < sinkCount)
+    {
+        return loadSideRotated(sinkK, query, sinkBatch, logicalToken, kvHead, dim, sinkTokens, numKvHeads);
+    }
+    int afterSink = logicalToken - sinkCount;
+    if (afterSink < packedCount)
+    {
+        int block = afterSink / Layout::kGroupSize;
+        int token = afterSink - block * Layout::kGroupSize;
+        return dequantKRot(records, blockIds[block], kvHead, token, dim);
+    }
+    int tailToken = afterSink - packedCount;
+    return loadSideRotated(tailK, query, tailBatch, tailToken, kvHead, dim, tailTokens, numKvHeads);
+}
+
+template <typename T>
+__device__ float loadVRotatedForLogicalToken(T const* sinkV, T const* tailV, PackedRecordView records,
+    std::int64_t const* blockIds, int query, int kvHead, int dim, int logicalToken, int sinkCount, int packedCount,
+    int sinkTokens, int sinkBatch, int tailTokens, int tailBatch, int numKvHeads)
+{
+    if (logicalToken < sinkCount)
+    {
+        return loadSideRotated(sinkV, query, sinkBatch, logicalToken, kvHead, dim, sinkTokens, numKvHeads);
+    }
+    int afterSink = logicalToken - sinkCount;
+    if (afterSink < packedCount)
+    {
+        int block = afterSink / Layout::kGroupSize;
+        int token = afterSink - block * Layout::kGroupSize;
+        return dequantVRot(records, blockIds[block], kvHead, token, dim);
+    }
+    int tailToken = afterSink - packedCount;
+    return loadSideRotated(tailV, query, tailBatch, tailToken, kvHead, dim, tailTokens, numKvHeads);
+}
+
+template <typename T>
 __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView records, std::int64_t const* blockIds,
-    std::int32_t const* seqLens, T* output, int numQueries, int numBlocks, int numHeads, int numKvHeads,
-    int seqLensCount)
+    T const* sinkK, T const* sinkV, T const* tailK, T const* tailV, std::int32_t const* seqLens, T* output,
+    int numQueries, int numBlocks, int numHeads, int numKvHeads, int seqLensCount, int sinkTokens, int sinkBatch,
+    int tailTokens, int tailBatch)
 {
     int query = blockIdx.x;
     int head = blockIdx.y;
@@ -377,8 +441,13 @@ __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView recor
     int kvHead = head / groups;
     int seqLen = seqLensCount == 1 ? seqLens[0] : seqLens[query];
     int cappedSeqLen = seqLen > 0 ? seqLen : 0;
+    int sinkCount = sinkTokens > 0 ? (cappedSeqLen < sinkTokens ? cappedSeqLen : sinkTokens) : 0;
+    int remainingAfterSink = cappedSeqLen - sinkCount;
     int maxPackedTokens = numBlocks * Layout::kGroupSize;
-    int totalTokens = cappedSeqLen < maxPackedTokens ? cappedSeqLen : maxPackedTokens;
+    int packedCount = remainingAfterSink < maxPackedTokens ? remainingAfterSink : maxPackedTokens;
+    int remainingAfterPacked = remainingAfterSink - packedCount;
+    int tailCount = tailTokens > 0 ? (remainingAfterPacked < tailTokens ? remainingAfterPacked : tailTokens) : 0;
+    int totalTokens = sinkCount + packedCount + tailCount;
     T const* qBase = q + (static_cast<std::int64_t>(query) * numHeads + head) * Layout::kHeadDim;
     T* outBase = output + (static_cast<std::int64_t>(query) * numHeads + head) * Layout::kHeadDim;
 
@@ -405,13 +474,11 @@ __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView recor
     float maxLogit = -FLT_MAX;
     for (int linearToken = 0; linearToken < totalTokens; ++linearToken)
     {
-        int block = linearToken / Layout::kGroupSize;
-        int token = linearToken - block * Layout::kGroupSize;
-        std::int64_t blockId = blockIds[block];
         float dot = 0.0f;
         for (int d = 0; d < Layout::kHeadDim; ++d)
         {
-            dot += qRot[d] * dequantKRot(records, blockId, kvHead, token, d);
+            dot += qRot[d] * loadKRotatedForLogicalToken(sinkK, tailK, records, blockIds, query, kvHead, d,
+                linearToken, sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
         }
         float logit = dot * kHadamardScale;
         maxLogit = fmaxf(maxLogit, logit);
@@ -426,19 +493,18 @@ __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView recor
 
     for (int linearToken = 0; linearToken < totalTokens; ++linearToken)
     {
-        int block = linearToken / Layout::kGroupSize;
-        int token = linearToken - block * Layout::kGroupSize;
-        std::int64_t blockId = blockIds[block];
         float dot = 0.0f;
         for (int d = 0; d < Layout::kHeadDim; ++d)
         {
-            dot += qRot[d] * dequantKRot(records, blockId, kvHead, token, d);
+            dot += qRot[d] * loadKRotatedForLogicalToken(sinkK, tailK, records, blockIds, query, kvHead, d,
+                linearToken, sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
         }
         float weight = expf(dot * kHadamardScale - maxLogit);
         denom += weight;
         for (int d = 0; d < Layout::kHeadDim; ++d)
         {
-            accRot[d] += weight * dequantVRot(records, blockId, kvHead, token, d);
+            accRot[d] += weight * loadVRotatedForLogicalToken(sinkV, tailV, records, blockIds, query, kvHead, d,
+                linearToken, sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
         }
     }
 
@@ -459,9 +525,9 @@ __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView recor
 bool kvarnGqaBackendReady()
 {
     // The store/decode kernels below are experimental correctness paths only:
-    // they are serial per block/head or query/head and the decode side ignores
-    // fp16 sink/tail state. Readiness must stay false until side-state transfer,
-    // sparse reads, CUDA graph lifecycle, and B200 performance gates pass.
+    // they are serial per block/head or query/head. Readiness must stay false
+    // until disaggregated side-state transfer, sparse reads, CUDA graph lifecycle,
+    // runtime correctness, and B200 performance gates pass.
     return false;
 }
 
@@ -488,10 +554,11 @@ void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* pac
 }
 
 void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecords,
-    std::int64_t const* blockIds, void const*, void const*, void const*, void const*, std::int32_t const* seqLens,
-    void* output, int numQueries, int numBlocks, int numHeads, int numKvHeads, int headDim, int groupSize, bool useBf16,
-    int seqLensCount, bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken, std::int64_t strideHead,
-    std::int64_t strideByte, cudaStream_t stream)
+    std::int64_t const* blockIds, void const* sinkK, void const* sinkV, void const* tailK, void const* tailV,
+    std::int32_t const* seqLens, void* output, int numQueries, int numBlocks, int numHeads, int numKvHeads, int headDim,
+    int groupSize, bool useBf16, int seqLensCount, int sinkTokens, int sinkBatch, int tailTokens, int tailBatch,
+    bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken, std::int64_t strideHead, std::int64_t strideByte,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(headDim == Layout::kHeadDim && groupSize == Layout::kGroupSize,
         "kvarn_gqa_decode currently supports only k2v2_g128");
@@ -503,12 +570,17 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
     if (useBf16)
     {
         kvarnGqaDecodeReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__nv_bfloat16 const*>(q), view, blockIds,
-            seqLens, static_cast<__nv_bfloat16*>(output), numQueries, numBlocks, numHeads, numKvHeads, seqLensCount);
+            static_cast<__nv_bfloat16 const*>(sinkK), static_cast<__nv_bfloat16 const*>(sinkV),
+            static_cast<__nv_bfloat16 const*>(tailK), static_cast<__nv_bfloat16 const*>(tailV), seqLens,
+            static_cast<__nv_bfloat16*>(output), numQueries, numBlocks, numHeads, numKvHeads, seqLensCount, sinkTokens,
+            sinkBatch, tailTokens, tailBatch);
     }
     else
     {
-        kvarnGqaDecodeReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__half const*>(q), view, blockIds, seqLens,
-            static_cast<__half*>(output), numQueries, numBlocks, numHeads, numKvHeads, seqLensCount);
+        kvarnGqaDecodeReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__half const*>(q), view, blockIds,
+            static_cast<__half const*>(sinkK), static_cast<__half const*>(sinkV), static_cast<__half const*>(tailK),
+            static_cast<__half const*>(tailV), seqLens, static_cast<__half*>(output), numQueries, numBlocks, numHeads,
+            numKvHeads, seqLensCount, sinkTokens, sinkBatch, tailTokens, tailBatch);
     }
 }
 
