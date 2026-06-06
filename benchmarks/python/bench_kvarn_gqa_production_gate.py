@@ -56,6 +56,19 @@ def build_matrix(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Iter
     return cases
 
 
+def build_payload(seq_lens: Iterable[int], odd_m: Iterable[int], transports: Iterable[str], concurrency: int,
+                  min_tok_s_per_user: float) -> dict[str, object]:
+    cases = build_matrix(seq_lens, odd_m, transports, concurrency)
+    return {
+        "dtype": "kvarn_k2v2_g128",
+        "dense_mla_dtype": "kvarn_k2v2",
+        "dense_mla_amortize": True,
+        "indexer_quantized_by_kvarn": False,
+        "min_tok_s_per_user": min_tok_s_per_user,
+        "cases": [asdict(case) for case in cases],
+    }
+
+
 def _write_json(path: str | None, payload: object) -> None:
     if path is None:
         return
@@ -100,15 +113,7 @@ def main() -> None:
     parser.add_argument("--json-output")
     args = parser.parse_args()
 
-    cases = build_matrix(args.seq_lens, args.odd_m, args.transports, args.concurrency)
-    payload = {
-        "dtype": "kvarn_k2v2_g128",
-        "dense_mla_dtype": "kvarn_k2v2",
-        "dense_mla_amortize": True,
-        "indexer_quantized_by_kvarn": False,
-        "min_tok_s_per_user": args.min_tok_s_per_user,
-        "cases": [asdict(case) for case in cases],
-    }
+    payload = build_payload(args.seq_lens, args.odd_m, args.transports, args.concurrency, args.min_tok_s_per_user)
     _write_json(args.json_output, payload)
 
     if args.dry_run:
