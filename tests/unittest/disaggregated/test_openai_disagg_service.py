@@ -75,6 +75,7 @@ def _make_completion_response(
     completion_tokens=1,
     cached_tokens=0,
     ctx_dp_rank=0,
+    ctx_info_endpoint="ctx:9000",
 ) -> CompletionResponse:
     if prompt_token_ids is None:
         prompt_token_ids = [1, 2, 3]
@@ -97,6 +98,7 @@ def _make_completion_response(
                     disagg_request_id=disagg_request_id,
                     ctx_request_id=disagg_request_id,
                     ctx_dp_rank=ctx_dp_rank,
+                    ctx_info_endpoint=ctx_info_endpoint,
                 ),
             )
         ],
@@ -319,6 +321,47 @@ async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule
         b'{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,'
         b'"prompt_tokens_details":{"cached_tokens":3}}}\n\n'
     )
+
+
+@pytest.mark.asyncio
+async def test_stream_close_drains_gen_stream_before_cancel(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service."
+        "_STREAM_CLOSE_DRAIN_GRACE_S", 1)
+    service = _make_service("generation_first")
+    task_started = asyncio.Event()
+
+    async def _background_gen_consumer():
+        task_started.set()
+        await asyncio.sleep(0)
+
+    consume_task = asyncio.create_task(_background_gen_consumer())
+    await task_started.wait()
+
+    await service._drain_or_cancel_gen_stream(consume_task, 123)
+
+    assert consume_task.done()
+    assert not consume_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_stream_close_cancels_gen_stream_after_drain_timeout(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service."
+        "_STREAM_CLOSE_DRAIN_GRACE_S", 0.01)
+    service = _make_service("generation_first")
+    task_started = asyncio.Event()
+
+    async def _background_gen_consumer():
+        task_started.set()
+        await asyncio.sleep(60)
+
+    consume_task = asyncio.create_task(_background_gen_consumer())
+    await task_started.wait()
+
+    await service._drain_or_cancel_gen_stream(consume_task, 123)
+
+    assert consume_task.cancelled()
 
 
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():

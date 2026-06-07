@@ -46,6 +46,9 @@ from tensorrt_llm.serve.responses_utils import (
 )
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
+_STREAM_CLOSE_DRAIN_GRACE_S = float(
+    os.getenv("TRTLLM_DISAGG_STREAM_CLOSE_DRAIN_GRACE_S", "30"))
+
 
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
@@ -224,6 +227,31 @@ class OpenAIDisaggregatedService(OpenAIService):
                 yield chunk
         finally:
             self._clear_request_pin(disagg_request_id)
+
+    async def _drain_or_cancel_gen_stream(
+            self, consume_task: asyncio.Task,
+            disagg_request_id: int) -> None:
+        if not consume_task.done() and _STREAM_CLOSE_DRAIN_GRACE_S > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(consume_task),
+                                       _STREAM_CLOSE_DRAIN_GRACE_S)
+                logger.warning(
+                    "disagg stream close drained background gen stream before "
+                    "cancelling: rid=%s",
+                    disagg_request_id)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "disagg stream close timed out draining background gen "
+                    "stream before cancelling: "
+                    "rid=%s timeout_s=%s",
+                    disagg_request_id, _STREAM_CLOSE_DRAIN_GRACE_S)
+
+        if not consume_task.done():
+            consume_task.cancel()
+        try:
+            await consume_task
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     def _validate_request_pinning_params(params: DisaggregatedParams,
@@ -550,7 +578,6 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
 
                 queue: asyncio.Queue = asyncio.Queue()
-
                 async def _consume_gen():
                     try:
                         async for chunk in gen_response:
@@ -583,12 +610,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                                 raise item
                             yield item
                     finally:
-                        if not consume_task.done():
-                            consume_task.cancel()
-                        try:
-                            await consume_task
-                        except asyncio.CancelledError:
-                            pass
+                        await self._drain_or_cancel_gen_stream(
+                            consume_task, disagg_request_id)
 
                 stream_result = True
                 return self._cleanup_request_pin_on_stream_close(

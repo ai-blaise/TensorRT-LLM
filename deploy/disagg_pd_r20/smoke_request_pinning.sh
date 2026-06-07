@@ -12,6 +12,13 @@ REQUIRE_DYNAMO_PIN_MARKERS="${REQUIRE_DYNAMO_PIN_MARKERS:-1}"
 REQUIRE_POSITIVE_TRANSFER_METRICS="${REQUIRE_POSITIVE_TRANSFER_METRICS:-1}"
 REQUIRE_ABORT_CLEANUP_MARKER="${REQUIRE_ABORT_CLEANUP_MARKER:-1}"
 SMC_GATE_MODE="${SMC_GATE_MODE:-deferred}"
+SMOKE_TMPDIR=""
+
+cleanup() {
+  if [[ -n "${SMOKE_TMPDIR:-}" ]]; then
+    rm -rf "$SMOKE_TMPDIR"
+  fi
+}
 
 die() {
   echo "request-pinning smoke failed: $*" >&2
@@ -427,6 +434,17 @@ proof_gen_complete = set(re.findall(
     r"OPTRT_NIXL_TRANSFER_PROOF.*phase=gen_recv_complete.*request_id=(\S+)",
     all_logs,
 ))
+incomplete_transfer_proof_ids = {
+    rid: blocks for rid, blocks in proof_starts.items()
+    if blocks > 0 and rid not in proof_ctx_complete and rid not in proof_gen_complete
+}
+if require_positive_transfer_metrics and incomplete_transfer_proof_ids:
+    raise SystemExit(
+        "incomplete KV transfer proof: context_send_start without matching "
+        "context_send_complete/gen_recv_complete in smoke window; "
+        f"incomplete={incomplete_transfer_proof_ids} "
+        f"ctx_complete={proof_ctx_complete} gen_complete={proof_gen_complete}"
+    )
 positive_transfer_proof_ids = {
     rid for rid, blocks in proof_starts.items()
     if blocks > 0 and (rid in proof_ctx_complete or rid in proof_gen_complete)
@@ -488,19 +506,19 @@ main() {
   pre_restart="$(restart_count "$pre")"
   dec_restart="$(restart_count "$dec")"
 
-  local start tmpdir
+  local start
   start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  SMOKE_TMPDIR="$(mktemp -d)"
+  trap cleanup EXIT
 
-  run_non_streaming_smoke "$fe" "$tmpdir/response.json"
+  run_non_streaming_smoke "$fe" "$SMOKE_TMPDIR/response.json"
   run_stream_abort_smoke "$fe"
-  fetch_perf_metrics "$fe" "$tmpdir/perf_metrics.json"
+  fetch_perf_metrics "$fe" "$SMOKE_TMPDIR/perf_metrics.json"
 
-  $KC logs "$fe" --since-time="$start" >"$tmpdir/frontend.log"
-  $KC logs "$pre" --since-time="$start" >"$tmpdir/prefill.log"
-  $KC logs "$dec" --since-time="$start" >"$tmpdir/decode.log"
-  parse_logs "$tmpdir/frontend.log" "$tmpdir/prefill.log" "$tmpdir/decode.log" "$tmpdir/response.json" "$tmpdir/perf_metrics.json"
+  $KC logs "$fe" --since-time="$start" >"$SMOKE_TMPDIR/frontend.log"
+  $KC logs "$pre" --since-time="$start" >"$SMOKE_TMPDIR/prefill.log"
+  $KC logs "$dec" --since-time="$start" >"$SMOKE_TMPDIR/decode.log"
+  parse_logs "$SMOKE_TMPDIR/frontend.log" "$SMOKE_TMPDIR/prefill.log" "$SMOKE_TMPDIR/decode.log" "$SMOKE_TMPDIR/response.json" "$SMOKE_TMPDIR/perf_metrics.json"
 
   [[ "$(restart_count "$pre")" == "$pre_restart" ]] || die "prefill restarted during smoke"
   [[ "$(restart_count "$dec")" == "$dec_restart" ]] || die "decode restarted during smoke"

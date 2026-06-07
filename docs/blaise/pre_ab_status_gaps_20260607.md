@@ -8,20 +8,22 @@ smoke-response, readiness result, or partial marker as production completion.
 ## Live deployment snapshot
 
 - Repo/branch: `ai-blaise/TensorRT-LLM`, branch `op-trt`.
-- Current pushed head before this doc refresh: `0ce15ea7f`
-  (`docs(r20): tighten snapshot composition gates`). This includes
+- Current pushed head before this doc refresh: `16daf92b3`
+  (`test(r20): accept quoted pin handoff markers`). This includes
   `10d304924` (`fix(nixl): stamp C++ prefill pin endpoint`) plus the later
   NIXL fail-closed, SMC/Moondream pinned-handoff, image-reuse, prewarm
-  dry-run, and snapshot-composition commits.
+  dry-run, snapshot-composition, gap-status, and strict-smoke parsing commits.
 - Live DGD: `topo-c1-dp2tp4-disagg-r20` in namespace `dynamo-system`.
-- Current DGD generation/observed generation: `95/95`; state `successful`.
+- Current DGD generation/observed generation: `99/99`; state `successful`.
 - Current live image:
-  `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-082db1d80-dynrouterpin-63319d9684-20260607T070644Z`.
-- Important image caveat: the live image carries the newer Dynamo router wheel,
-  but the TensorRT-LLM runtime layer was built before the C++ completed-prefill
-  endpoint fix. The next NIXL/request-pinning proof image must be a full
-  source-built TensorRT-LLM image containing the latest `op-trt` head, not a
-  Python-only overlay over this live base.
+  `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-16daf92b33fc-idlepoll-streamdrain-nixlpin-overlay-20260607111918`.
+- Current live image digest:
+  `sha256:4f28e00ed645bd02f309507d7079b8c3debefde509fcc604149358f76e8535d5`.
+- Important image caveat: this is an endpoint-fixed full-source TensorRT-LLM
+  base plus a Python/config overlay for the stream-drain, idle-transfer-poll,
+  and stricter-smoke fixes. That is acceptable for this gate because the latest
+  changes are Python/shell/test/doc only. ABI-affecting C++/CUDA changes still
+  require a new full source build rather than a thin overlay.
 - Topology: one prefill worker on four B200 GPUs and one decode worker on four
   B200 GPUs, plus the Dynamo KV frontend.
 - Live readiness: frontend, prefill, and decode are `1/1 Running` with zero
@@ -54,20 +56,34 @@ SMC_GATE_MODE=deferred \
 ./deploy/disagg_pd_r20/smoke_request_pinning.sh
 ```
 
-Latest live result: the NIXL live audit passed on generation 95, but strict
-request-pinning smoke failed with HTTP 500 because the completed-prefill
-response did not include `ctx_info_endpoint`. That is now traced to the C++
-`CacheTransceiver::setContextState()` path constructing `ContextPhaseParams`
-without `disagg_info_endpoint`. Source commit `10d304924` stamps the concrete
-`CommState` identity into `ContextPhaseParams.disagg_info_endpoint` and adds a
-static audit. This is not green until a full source-built runtime containing
-that C++ fix is deployed.
+Latest live result: green for the NIXL/request-pinning pre-A/B correctness
+gate on generation 99.
+
+- Live NIXL audit passed:
+  `/tmp/nixl_gate_audit_live_20260607T112933Z_1651232`.
+- Strict smoke passed with:
+  `prefill=('8004734197287829', '0')`,
+  `decode=('5083464766601898', '1')`,
+  `dynamo_required=True`,
+  `established=2`,
+  `outbound=2`,
+  `cleared=4`,
+  `cleanup_scheduled=1`,
+  `positive_transfer_metrics=2`.
+- The checked pod set was ready and zero-restart:
+  `topo-c1-dp2tp4-disagg-r20-0-frontend-qgsng`,
+  `topo-c1-dp2tp4-disagg-r20-0-prefill-5k7jw`, and
+  `topo-c1-dp2tp4-disagg-r20-0-decode-rkwqf`.
+- Final log sanity after the smoke showed both smoke request ids had
+  `context_send_start` and `context_send_complete` on prefill, `gen_recv_start`
+  on decode, and no `KV cache transfer timeout` in the checked window.
 
 The previous gen88/gen89 `KV cache transfer timeout` bug remains a historical
-hard dependency; it was addressed by completing cancelled/not-ready sender
-promises before erasing ready-response entries. The current observed blocker is
-not that timeout path; it is missing completed-prefill endpoint metadata in the
-deployed TensorRT-LLM runtime.
+hard dependency. It is now covered by two fixes: cancelled/not-ready sender
+promises are completed before ready-response entries are erased, and the
+prefill executor keeps polling in-flight disaggregated transfers while idle so
+context-only sends can complete even if an early-closed stream leaves no next
+request to wake the rank-0 broadcast loop.
 
 The strict smoke must prove all of the following in one request lifecycle:
 
@@ -101,9 +117,10 @@ rank layer span for MLA contiguous CP shards while preserving the physical pool
 stride. This keeps the implementation aligned with Z.ai LayerSplit semantics:
 layer ownership is by layer shard, not HELIX-style token-block partitioning.
 
-Remaining LayerSplit gap: the end-to-end NIXL transfer proof must pass under the
-strict smoke, including the request-pinned handoff from TP2xCP2 prefill into
-TP4xCP1 decode. The live readiness proves bootability, not full transfer proof.
+Current LayerSplit gate state: strict smoke now proves the request-pinned
+handoff from TP2xCP2 prefill into TP4xCP1 decode with positive NIXL transfer
+proof. Remaining work is performance validation across the A/B matrix and the
+SMC-SD decode path, not the non-SMC LayerSplit/NIXL correctness gate.
 
 Reference: https://z.ai/blog/scaling-pain
 Reference doc: `docs/source/features/layersplit.md`
@@ -115,17 +132,16 @@ backend. The live config uses NIXL for both `cache_transceiver_config.backend`
 and `layersplit_transfer_backend`. The code path is fail-closed against implicit
 legacy backend selector conflicts.
 
-Remaining NIXL gaps:
+Current NIXL gate state:
 
-- Build and deploy a full source image that contains the current `op-trt` head,
-  including `10d304924`, the NIXL timeout fix, NIXL plugin fail-closed behavior,
-  and the current r20 LayerSplit/KVarN/request-pinning sources.
-- Prove positive nonzero NIXL KV transfer under strict smoke.
-- Ensure request-pinning metadata is actually propagated into the NIXL handoff,
-  including a non-empty completed-prefill `ctx_info_endpoint`, not only logged
-  by the scheduler route-selection path.
-- Keep UCX, Mooncake, and MORI-IO only for later A/B comparisons until NIXL is
-  green.
+- Endpoint-fixed full-source base plus Python overlay is deployed and ready.
+- Positive nonzero NIXL KV transfer is proven under strict smoke.
+- Request-pinning metadata reaches the NIXL handoff, including non-empty
+  completed-prefill endpoint metadata.
+- UCX remains only the current NIXL plugin backend (`TRTLLM_NIXL_KVCACHE_BACKEND=UCX`),
+  not a direct UCX cache-transceiver gate. Native NIXL plugin alternatives such
+  as LIBFABRIC, Mooncake, and MORI-IO remain A/B-only until they prove equal or
+  better correctness and throughput under the same custom stack.
 
 Reference: https://github.com/ai-blaise/dynamo-prod-k8s/tree/main/docs/api/nixl-connect
 
@@ -136,8 +152,9 @@ prefill/decode configs. The MLA load-path ABI now preserves all historical
 `invokeMLALoadPagedKV` overloads so the KVarN/bits-aware path can coexist with
 older native extension call sites.
 
-Remaining dense MLA KVarN gap: strict transfer proof and post-first-token
-throughput proof are still required before A/B.
+Remaining dense MLA KVarN gap: strict transfer proof is green in the non-SMC
+r20 gate, but post-first-token throughput proof is still required before A/B is
+accepted.
 
 Reference: https://github.com/huawei-csl/KVarN
 Reference doc: `docs/blaise/kvarn.md`
@@ -295,25 +312,26 @@ References:
 
 ### Request pinning and MORI/Mooncake/NIXL transport composition
 
-Request pinning is partially live: route selection and cleanup are logged, and
-normal/early-close paths clear pins. Dynamo now fails closed if completed
-prefill lacks endpoint metadata. The source fix for the C++ transceiver endpoint
-is committed, but the live image does not contain it yet.
+Request pinning is live for the current non-SMC r20 gate. Route selection,
+pin-establish, outbound-to-decode, cleanup, early stream close, positive NIXL
+transfer, and completion markers are all proven in the generation-99 strict
+smoke. Dynamo still fails closed if completed prefill lacks endpoint metadata.
 
 Required completion:
 
-- Deploy a full source image containing the latest `op-trt` head, then emit the
-  full pin-established and outbound-to-decode lifecycle markers from the
-  router/front-end path.
-- Ensure the same request id and non-null `ctx_dp_rank` reach prefill and decode.
-- Ensure completed-prefill metadata includes non-empty `ctx_info_endpoint`; the
-  router must continue to reject unpinned decode if this field is missing.
+- Keep the full pin-established and outbound decode lifecycle markers in every
+  production manifest and benchmark run.
+- Ensure the same request id and non-null `ctx_dp_rank` continue to reach
+  prefill and decode across all A/B variants.
+- Ensure completed-prefill metadata continues to include non-empty
+  `ctx_info_endpoint`; the router must continue to reject unpinned decode if
+  this field is missing.
 - Keep pinning transport-independent so NIXL, Mooncake, UCX, and MORI-IO can be
   compared later without changing correctness semantics.
 - Keep MORI-IO out of the pre-A/B gate for now; use it in A/B only after NIXL is
   proven.
 - NIXL replaces UCX as the pre-A/B KV-pool gate. UCX, Mooncake, and MORI-IO are
-  comparison candidates only after the NIXL correctness gate is green.
+  comparison candidates only after this now-green NIXL correctness gate.
 
 ### Optimized disaggregated deployment
 
@@ -323,7 +341,8 @@ but not yet accepted as the final optimized production config.
 
 Required completion:
 
-- Prove strict NIXL/request-pinning smoke.
+- Keep strict NIXL/request-pinning smoke green after every production-path
+  integration.
 - Verify every custom piece is active, composable, and no implicit fallback is
   being used.
 - Confirm the exact r20 custom stack in the accepted manifest: prefill TP2xCP2
@@ -373,14 +392,14 @@ Required A/B axes include at minimum:
   handoff cases, passes.
 - [x] Cached DGD render/server-dry-run validation passes with the active image.
 - [x] Live NIXL gate readiness audit passes on the current generation.
-- [ ] Full source image containing the latest `op-trt` head is built,
-  imported/resident, and deployed.
-- [ ] Routerpin emits full pin-established/outbound decode lifecycle markers
+- [x] Endpoint-fixed full-source base plus latest Python/shell overlay is built,
+  pushed to the local registry, imported/resident, and deployed.
+- [x] Routerpin emits full pin-established/outbound decode lifecycle markers
   with non-empty completed-prefill `ctx_info_endpoint`.
-- [ ] Strict request-pinning smoke passes.
-- [ ] Positive nonzero NIXL KV transfer proof passes.
-- [ ] Prior KV transfer timeout warning stays absent after the endpoint-fixed
-  full-source rollout.
+- [x] Strict request-pinning smoke passes.
+- [x] Positive nonzero NIXL KV transfer proof passes.
+- [x] Prior KV transfer timeout warning stays absent after the endpoint-fixed
+  rollout and idle-transfer-poll overlay.
 - [ ] SMC-SD live E2E with GLM draft model passes.
 - [ ] Remaining SGLang GLM kernels are ported/adapted for
   `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`.

@@ -90,6 +90,9 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+_IDLE_DISAGG_TRANSFER_POLL_S = float(
+    os.getenv("TRTLLM_DISAGG_IDLE_TRANSFER_POLL_S", "0.1"))
+
 
 class PPCommTag(IntEnum):
     """
@@ -3308,10 +3311,19 @@ class PyExecutor:
         # Calculate timeout
         idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
         if idle:
-            # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
-            # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
-            timeout = datetime.timedelta(
-                seconds=1200) if self._disable_mpi else None
+            if (self.kv_cache_transceiver
+                    and self.async_transfer_manager.has_any_inflight_requests()
+                    and _IDLE_DISAGG_TRANSFER_POLL_S > 0):
+                # Context-only disagg sends can remain in flight after an early
+                # stream close. Keep rank 0 reaching the broadcast path so the
+                # executor can reap completed sends while otherwise idle.
+                timeout = datetime.timedelta(
+                    seconds=_IDLE_DISAGG_TRANSFER_POLL_S)
+            else:
+                # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
+                # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
+                timeout = datetime.timedelta(
+                    seconds=1200) if self._disable_mpi else None
         else:
             timeout = datetime.timedelta(0)
 
