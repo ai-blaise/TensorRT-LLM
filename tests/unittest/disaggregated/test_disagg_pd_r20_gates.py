@@ -87,6 +87,13 @@ def test_r20_overlay_carries_moondream_smc_overlap_sources():
         assert source in dockerfile
 
 
+def test_r20_overlay_py_compile_block_is_docker_parseable():
+    dockerfile = (DEPLOY_DIR / "Dockerfile.r20-overlay").read_text()
+
+    assert "\\\\\n" not in dockerfile
+    assert "RUN /opt/dynamo/venv/bin/python -m py_compile \\\n" in dockerfile
+
+
 def test_r20_transceiver_backend_selection_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
 

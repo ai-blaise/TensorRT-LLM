@@ -69,12 +69,12 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py \
 		    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py \
-    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py \\
-    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/guided_decoder.py \\
-    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/interface.py \\
-    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \\
-    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \\
-    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py \\
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/guided_decoder.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/interface.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/model_config.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py \
