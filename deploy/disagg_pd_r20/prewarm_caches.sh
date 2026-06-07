@@ -8,6 +8,7 @@ IMAGE="${IMAGE:-}"
 IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Never}"
 MODEL_PATH="${MODEL_PATH:-/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft}"
 DRY_RUN=0
+SERVER_DRY_RUN=0
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -33,6 +34,8 @@ Options:
   --target-node NAME     Kubernetes nodeSelector hostname (default: $TARGET_NODE)
   --model PATH           Main model path (default: production DeepSeek path)
   --dry-run              Render the prewarm Job YAML and exit without applying it
+  --server-dry-run       Validate the Job with kubectl apply --dry-run=server
+                         without creating a pod or touching cache dirs
   -h, --help             Show this help
 EOF
 }
@@ -46,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --target-node) TARGET_NODE="$2"; shift 2 ;;
     --model) MODEL_PATH="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --server-dry-run) SERVER_DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -62,7 +66,7 @@ JOB_NAME="optrt-cache-prewarm-$(date -u +%Y%m%d%H%M%S)"
 read -r -d '' REMOTE_SCRIPT <<'EOS' || true
 set -euo pipefail
 
-if [[ "$DRY_RUN" != 1 ]]; then
+if [[ "$DRY_RUN" != 1 && "$SERVER_DRY_RUN" != 1 ]]; then
   sudo mkdir -p \
     /var/lib/optrt-cache/hf_modules \
     /var/lib/optrt-cache/transformers \
@@ -193,6 +197,12 @@ if [[ "$DRY_RUN" == 1 ]]; then
   exit 0
 fi
 
+if [[ "$SERVER_DRY_RUN" == 1 ]]; then
+  sudo -E /usr/local/bin/k3s kubectl -n dynamo-system apply --dry-run=server -f /tmp/"$JOB_NAME".yaml
+  rm -f /tmp/"$JOB_NAME".yaml
+  exit 0
+fi
+
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system apply -f /tmp/"$JOB_NAME".yaml
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system wait --for=condition=complete --timeout=300s job/"$JOB_NAME"
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system logs job/"$JOB_NAME"
@@ -201,9 +211,9 @@ EOS
 
 if [[ "$VM_HOST" == "local" ]]; then
   IMAGE="$IMAGE" IMAGE_PULL_POLICY="$IMAGE_PULL_POLICY" TARGET_NODE="$TARGET_NODE" \
-    MODEL_PATH="$MODEL_PATH" JOB_NAME="$JOB_NAME" DRY_RUN="$DRY_RUN" bash -s <<<"$REMOTE_SCRIPT"
+    MODEL_PATH="$MODEL_PATH" JOB_NAME="$JOB_NAME" DRY_RUN="$DRY_RUN" SERVER_DRY_RUN="$SERVER_DRY_RUN" bash -s <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' DRY_RUN='$DRY_RUN' bash -s" \
+    "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' DRY_RUN='$DRY_RUN' SERVER_DRY_RUN='$SERVER_DRY_RUN' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi

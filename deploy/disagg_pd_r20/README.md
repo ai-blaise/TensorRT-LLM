@@ -257,6 +257,17 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
   --image-pull-policy IfNotPresent
 ```
 
+Validate the prewarm Job against the live API server without creating a Job or
+prewarm pod:
+
+```bash
+deploy/disagg_pd_r20/prewarm_caches.sh \
+  --vm local \
+  --server-dry-run \
+  --image localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-<sha>-<suffix> \
+  --image-pull-policy IfNotPresent
+```
+
 ## Files
 
 - `topo-c1-dp2tp4-disagg-r20.yaml` -- the deployable manifest: a `ConfigMap`
