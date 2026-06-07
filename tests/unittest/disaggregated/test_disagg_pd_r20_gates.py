@@ -183,6 +183,7 @@ def test_r20_nixl_gate_readiness_audit_is_read_only_and_fail_closed():
     assert "NIXL_AUDIT_MODE" in script
     assert "CHECK_RUNTIME_LIBS" in script
     assert "MIN_MAX_TOKENS_IN_BUFFER" in script
+    assert "nixl_gate_audit_${MODE}" in script
     assert "TRTLLM_NIXL_KVCACHE_BACKEND" in script
     assert "TRTLLM_NIXL_ENABLE_COALESCE" in script
     assert "max_tokens_in_buffer must be at least" in script

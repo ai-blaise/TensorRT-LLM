@@ -7,7 +7,7 @@ MODE="${NIXL_AUDIT_MODE:-live}"
 MIN_MAX_TOKENS_IN_BUFFER="${MIN_MAX_TOKENS_IN_BUFFER:-131072}"
 CHECK_RUNTIME_LIBS="${CHECK_RUNTIME_LIBS:-1}"
 SMC_GATE_MODE="${SMC_GATE_MODE:-deferred}"
-OUTPUT_DIR="${NIXL_AUDIT_OUT:-/tmp/nixl_gate_audit_$(date -u +%Y%m%dT%H%M%SZ)}"
+OUTPUT_DIR="${NIXL_AUDIT_OUT:-/tmp/nixl_gate_audit_${MODE}_$(date -u +%Y%m%dT%H%M%SZ)_$$}"
 
 mkdir -p "$OUTPUT_DIR"
 
