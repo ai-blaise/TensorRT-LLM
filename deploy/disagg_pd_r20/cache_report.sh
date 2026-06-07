@@ -5,6 +5,8 @@ VM_HOST="${VM_HOST:-34.106.33.128}"
 VM_USER="${VM_USER:-spencergarnets}"
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 IMAGE_FILTER="${IMAGE_FILTER:-dynamo-trtllm-optrt-custom}"
+REGISTRY_REPO="${REGISTRY_REPO:-local/dynamo-trtllm-optrt-custom}"
+REGISTRY_TAG_TAIL="${REGISTRY_TAG_TAIL:-12}"
 DGD_NAME="${DGD_NAME:-topo-c1-dp2tp4-disagg-r20}"
 REQUIRE_POPULATED="${REQUIRE_POPULATED:-}"
 SSH_OPTS=(
@@ -27,6 +29,8 @@ Options:
   --user USER            SSH user (default: $VM_USER)
   --local-registry HOST  Registry host:port to probe (default: $LOCAL_REGISTRY)
   --image-filter TEXT    Image substring for k3s/containerd listing
+  --registry-repo NAME  Local registry repository for tag summary
+  --registry-tag-tail N Number of recent-looking registry tags to print
   --dgd-name NAME        DGD/pod-name prefix to report active image residency
   --require-populated L  Comma-separated cache subdirs that must contain files
   -h, --help             Show this help
@@ -39,6 +43,8 @@ while [[ $# -gt 0 ]]; do
     --user) VM_USER="$2"; shift 2 ;;
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --image-filter) IMAGE_FILTER="$2"; shift 2 ;;
+    --registry-repo) REGISTRY_REPO="$2"; shift 2 ;;
+    --registry-tag-tail) REGISTRY_TAG_TAIL="$2"; shift 2 ;;
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
     --require-populated) REQUIRE_POPULATED="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -82,7 +88,49 @@ if command -v docker >/dev/null 2>&1; then
   docker ps --filter name=optrt-registry --format 'registry={{.Names}} status={{.Status}} ports={{.Ports}}' || true
 fi
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS "http://${LOCAL_REGISTRY}/v2/_catalog" 2>/dev/null || echo "registry_catalog_unavailable"
+  catalog="$(curl -fsS "http://${LOCAL_REGISTRY}/v2/_catalog" 2>/dev/null || true)"
+  if [[ -n "$catalog" ]]; then
+    printf '%s\n' "$catalog"
+    tags_json="$(curl -fsS "http://${LOCAL_REGISTRY}/v2/${REGISTRY_REPO}/tags/list" 2>/dev/null || true)"
+    if [[ -n "$tags_json" ]]; then
+      REGISTRY_TAGS_JSON="$tags_json" python3 - "$REGISTRY_REPO" "$REGISTRY_TAG_TAIL" <<'PYTAG'
+import json
+import os
+import re
+import sys
+
+repo = sys.argv[1]
+try:
+    tail = max(0, int(sys.argv[2]))
+except ValueError:
+    tail = 12
+try:
+    payload = json.loads(os.environ.get("REGISTRY_TAGS_JSON", "{}"))
+except json.JSONDecodeError as exc:
+    print(f"registry_tags_parse_error={exc}")
+    raise SystemExit(0)
+
+def tag_sort_key(tag):
+    matches = re.findall(r"(20[0-9]{6}T?[0-9]{6}Z?)", tag)
+    if not matches:
+        return ("", tag)
+    return (matches[-1].replace("T", "").rstrip("Z"), tag)
+
+tags = sorted(payload.get("tags") or [], key=tag_sort_key)
+print(f"registry_repo={repo}")
+print(f"registry_tag_count={len(tags)}")
+if tags:
+    print(f"registry_tag_latest={tags[-1]}")
+    if tail:
+        print("registry_tags_tail=" + " ".join(tags[-tail:]))
+PYTAG
+    else
+      printf 'registry_repo=%s\n' "$REGISTRY_REPO"
+      printf 'registry_tags_unavailable=1\n'
+    fi
+  else
+    echo "registry_catalog_unavailable"
+  fi
   echo
 fi
 
@@ -144,10 +192,14 @@ fi
 echo
 echo "== k3s/containerd image residency =="
 if command -v nerdctl >/dev/null 2>&1; then
-  sudo nerdctl -n k8s.io images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' 2>/dev/null | grep -F "$IMAGE_FILTER" | tail -20 || true
+  image_lines="$(sudo nerdctl -n k8s.io images --format '{{.Repository}}:{{.Tag}}	{{.Size}}' 2>/dev/null | grep -F "$IMAGE_FILTER" || true)"
 else
-  sudo /usr/local/bin/k3s ctr -n k8s.io images ls 2>/dev/null | grep -F "$IMAGE_FILTER" | tail -20 || true
+  image_lines="$(sudo /usr/local/bin/k3s ctr -n k8s.io images ls 2>/dev/null | grep -F "$IMAGE_FILTER" || true)"
 fi
+image_count="$(printf '%s\n' "$image_lines" | sed '/^$/d' | wc -l | tr -d ' ')"
+printf 'containerd_image_filter=%s\n' "$IMAGE_FILTER"
+printf 'containerd_image_filter_count=%s\n' "${image_count:-0}"
+printf '%s\n' "$image_lines" | tail -20
 
 if [[ -n "$REQUIRE_POPULATED" ]]; then
   echo
@@ -176,9 +228,9 @@ fi
 EOS
 
 if [[ "$VM_HOST" == "local" ]]; then
-  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" DGD_NAME="$DGD_NAME" REQUIRE_POPULATED="$REQUIRE_POPULATED" bash -s <<<"$REMOTE_SCRIPT"
+  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" REGISTRY_REPO="$REGISTRY_REPO" REGISTRY_TAG_TAIL="$REGISTRY_TAG_TAIL" DGD_NAME="$DGD_NAME" REQUIRE_POPULATED="$REQUIRE_POPULATED" bash -s <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' DGD_NAME='$DGD_NAME' REQUIRE_POPULATED='$REQUIRE_POPULATED' bash -s" \
+    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' REGISTRY_REPO='$REGISTRY_REPO' REGISTRY_TAG_TAIL='$REGISTRY_TAG_TAIL' DGD_NAME='$DGD_NAME' REQUIRE_POPULATED='$REQUIRE_POPULATED' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi

@@ -118,10 +118,31 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --vm local \
   --deploy-image localhost:5000/local/dynamo-trtllm-optrt-custom:<known-good-tag> \
   --use-local-registry \
+  --require-image-handoff \
   --prewarm \
   --deploy \
   --dry-run
 ```
+
+Add `--require-image-handoff` when using `--deploy-image` or when the handoff is
+the risky part of the loop. It runs the read-only exact-image residency/registry
+check inside the VM before transport wrapper checks, prewarm jobs, or DGD apply.
+For `--use-local-registry --local-registry-mode push`, the gate requires the tag
+to be visible from the VM-local registry. For resident/single-node handoff, it
+requires the exact tag in k3s/containerd. The flag is opt-in so normal thin-sync
+and full-source builds keep their existing behavior.
+
+```bash
+deploy/disagg_pd_r20/fast_iterate.sh \
+  --vm local \
+  --deploy-image localhost:5000/local/dynamo-trtllm-optrt-custom:<tag> \
+  --use-local-registry \
+  --require-image-handoff \
+  --dry-run
+```
+
+The dry run prints `require_image_handoff=1` and `image_handoff_mode=registry` or
+`resident`, which should match the expected `imagePullPolicy` for the deployment.
 
 Render and API-server-validate the DGD with the currently active image, without
 building/importing a new image and without applying the DGD. This is the fastest
@@ -170,6 +191,18 @@ Use the emitted image tag for prewarm/DGD rendering. Do not use the thin overlay
 path for fixes such as C++ LayerSplit handoff or
 `ContextPhaseParams.disagg_info_endpoint` stamping; those require rebuilt native
 libraries in the runtime image.
+
+Run the full non-mutating strict-smoke/C16 preflight bundle. It chains exact
+image handoff, DGD server dry-run, prewarm Job server dry-run with image handoff,
+and persistent cache requirements into one proof directory plus next commands:
+
+```bash
+deploy/disagg_pd_r20/strict_smoke_preflight.sh \
+  --vm local \
+  --image-from-dgd topo-c1-dp2tp4-disagg-r20 \
+  --target-node a4-us-001-rl9 \
+  --require-caches triton,deep_gemm
+```
 
 Build and apply the main DGD:
 
@@ -258,12 +291,14 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
 ```
 
 Validate the prewarm Job against the live API server without creating a Job or
-prewarm pod:
+prewarm pod. Add `--require-image-handoff` to fail in under a second when the
+exact image is neither resident nor available from the VM-local registry:
 
 ```bash
 deploy/disagg_pd_r20/prewarm_caches.sh \
   --vm local \
   --server-dry-run \
+  --require-image-handoff \
   --image localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-<sha>-<suffix> \
   --image-pull-policy IfNotPresent
 ```
@@ -287,6 +322,9 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
   residency, VM-local registry availability, and recommended pull policy.
 - `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
   prewarm/validation job.
+- `strict_smoke_preflight.sh` -- non-mutating R20 strict-smoke/C16 handoff
+  bundle that writes proof logs, registry/cache pressure, exact image-handoff
+  checks, and exact next commands.
 - `smoke_request_pinning.sh` -- ready-only live gate for non-MORI request
   pinning, Moondream overlap compatibility, normal close, and early stream
   close cleanup before A/B.
@@ -305,7 +343,9 @@ Inspect cache/image residency without touching pods. From the B200 VM itself,
 deploy/disagg_pd_r20/cache_report.sh \
   --vm local \
   --dgd-name topo-c1-dp2tp4-disagg-r20 \
-  --image-filter dynamo-trtllm-optrt-custom
+  --image-filter dynamo-trtllm-optrt-custom \
+  --registry-repo local/dynamo-trtllm-optrt-custom \
+  --registry-tag-tail 12
 ```
 
 After warmup, fail closed if expected persistent artifact caches are still empty:
@@ -319,11 +359,14 @@ deploy/disagg_pd_r20/cache_report.sh \
 
 Run this after the first cold rollout and again after the next overlay rollout.
 The useful signal is whether active prefill/decode images are already resident
-in k3s/containerd with the intended pull policy, and whether `triton`, `cuda`,
+in k3s/containerd with the intended pull policy, how many matching resident images
+and VM-local registry tags have accumulated, and whether `triton`, `cuda`,
 `deep_gemm`, and `tensorrt_llm/*` grow and then stabilize. If the persistent
 cache directories remain empty, the workers are not writing to the intended
 cache paths. If an active image is not resident, a resident-mode deploy will not
-be reproducible without a registry push or explicit image import.
+be reproducible without a registry push or explicit image import. If registry tag
+counts grow quickly, prefer resident mode for single-node throwaway canaries or
+coordinate a deliberate registry prune during downtime.
 
 Inspect CRIU snapshot composition readiness without touching pods:
 

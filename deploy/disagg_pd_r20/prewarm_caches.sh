@@ -9,6 +9,8 @@ IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Never}"
 MODEL_PATH="${MODEL_PATH:-/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft}"
 DRY_RUN=0
 SERVER_DRY_RUN=0
+REQUIRE_IMAGE_HANDOFF=0
+LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -36,6 +38,10 @@ Options:
   --dry-run              Render the prewarm Job YAML and exit without applying it
   --server-dry-run       Validate the Job with kubectl apply --dry-run=server
                          without creating a pod or touching cache dirs
+  --require-image-handoff
+                         Fail before prewarm if IMAGE is not resident/registry-ready
+  --local-registry HOST  Registry host:port for image handoff checks
+                         (default: $LOCAL_REGISTRY)
   -h, --help             Show this help
 EOF
 }
@@ -50,6 +56,8 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL_PATH="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --server-dry-run) SERVER_DRY_RUN=1; shift ;;
+    --require-image-handoff) REQUIRE_IMAGE_HANDOFF=1; shift ;;
+    --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -65,6 +73,89 @@ JOB_NAME="optrt-cache-prewarm-$(date -u +%Y%m%d%H%M%S)"
 
 read -r -d '' REMOTE_SCRIPT <<'EOS' || true
 set -euo pipefail
+
+if [[ "$REQUIRE_IMAGE_HANDOFF" == 1 ]]; then
+  containerd_detail=""
+  if command -v nerdctl >/dev/null 2>&1; then
+    containerd_detail="$(
+      sudo nerdctl -n k8s.io images --format '{{.Repository}}:{{.Tag}}	{{.Size}}	{{.Digest}}' 2>/dev/null \
+        | awk -F '\t' -v img="$IMAGE" '$1 == img {print; found=1} END {exit found ? 0 : 1}' \
+        || true
+    )"
+  else
+    containerd_detail="$(
+      sudo /usr/local/bin/k3s ctr -n k8s.io images ls 2>/dev/null \
+        | awk -v img="$IMAGE" '$1 == img {print; found=1} END {exit found ? 0 : 1}' \
+        || true
+    )"
+  fi
+
+  containerd_resident=no
+  if [[ -n "$containerd_detail" ]]; then
+    containerd_resident=yes
+  fi
+
+  registry_available=unknown
+  registry_tag_available=not_applicable
+  registry_ref=none
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS "http://${LOCAL_REGISTRY}/v2/" >/dev/null 2>&1; then
+      registry_available=yes
+    else
+      registry_available=no
+    fi
+  fi
+  if [[ "$IMAGE" == "$LOCAL_REGISTRY/"* ]]; then
+    registry_ref="${IMAGE#${LOCAL_REGISTRY}/}"
+    if [[ "$registry_ref" == *@sha256:* ]]; then
+      registry_repo="${registry_ref%@sha256:*}"
+      registry_ref_name="sha256:${registry_ref##*@sha256:}"
+    else
+      registry_repo="${registry_ref%:*}"
+      registry_ref_name="${registry_ref##*:}"
+    fi
+    if [[ "$registry_available" == yes ]]; then
+      if curl -fsSI \
+        -H 'Accept: application/vnd.oci.image.index.v1+json' \
+        -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+        "http://${LOCAL_REGISTRY}/v2/${registry_repo}/manifests/${registry_ref_name}" >/dev/null 2>&1; then
+        registry_tag_available=yes
+      else
+        registry_tag_available=no
+      fi
+    elif [[ "$registry_available" == no ]]; then
+      registry_tag_available=no
+    fi
+  fi
+
+  handoff_ready=no
+  reason="image_not_resident_or_registry_available"
+  if [[ "$IMAGE_PULL_POLICY" == Never ]]; then
+    if [[ "$containerd_resident" == yes ]]; then
+      handoff_ready=yes
+      reason=""
+    else
+      reason="image_not_resident_in_containerd"
+    fi
+  elif [[ "$registry_tag_available" == yes || "$containerd_resident" == yes ]]; then
+    handoff_ready=yes
+    reason=""
+  fi
+
+  printf 'image_handoff_check=1\n'
+  printf 'image=%s\n' "$IMAGE"
+  printf 'image_pull_policy=%s\n' "$IMAGE_PULL_POLICY"
+  printf 'containerd_resident=%s\n' "$containerd_resident"
+  printf 'registry_available=%s\n' "$registry_available"
+  printf 'registry_ref=%s\n' "$registry_ref"
+  printf 'registry_tag_available=%s\n' "$registry_tag_available"
+  printf 'handoff_ready=%s\n' "$handoff_ready"
+  if [[ -n "$reason" ]]; then
+    printf 'reason=%s\n' "$reason"
+    exit 3
+  fi
+fi
+
 
 if [[ "$DRY_RUN" != 1 && "$SERVER_DRY_RUN" != 1 ]]; then
   sudo mkdir -p \
@@ -211,9 +302,10 @@ EOS
 
 if [[ "$VM_HOST" == "local" ]]; then
   IMAGE="$IMAGE" IMAGE_PULL_POLICY="$IMAGE_PULL_POLICY" TARGET_NODE="$TARGET_NODE" \
-    MODEL_PATH="$MODEL_PATH" JOB_NAME="$JOB_NAME" DRY_RUN="$DRY_RUN" SERVER_DRY_RUN="$SERVER_DRY_RUN" bash -s <<<"$REMOTE_SCRIPT"
+    MODEL_PATH="$MODEL_PATH" JOB_NAME="$JOB_NAME" DRY_RUN="$DRY_RUN" SERVER_DRY_RUN="$SERVER_DRY_RUN" \
+    REQUIRE_IMAGE_HANDOFF="$REQUIRE_IMAGE_HANDOFF" LOCAL_REGISTRY="$LOCAL_REGISTRY" bash -s <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' DRY_RUN='$DRY_RUN' SERVER_DRY_RUN='$SERVER_DRY_RUN' bash -s" \
+    "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' DRY_RUN='$DRY_RUN' SERVER_DRY_RUN='$SERVER_DRY_RUN' REQUIRE_IMAGE_HANDOFF='$REQUIRE_IMAGE_HANDOFF' LOCAL_REGISTRY='$LOCAL_REGISTRY' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi

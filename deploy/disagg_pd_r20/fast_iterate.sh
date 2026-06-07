@@ -19,6 +19,7 @@ USE_LOCAL_REGISTRY=0
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 LOCAL_REGISTRY_MODE="${LOCAL_REGISTRY_MODE:-push}"
 ALLOW_CHAINED_OVERLAY="${ALLOW_CHAINED_OVERLAY:-0}"
+REQUIRE_IMAGE_HANDOFF="${REQUIRE_IMAGE_HANDOFF:-0}"
 TAG_SUFFIX="${TAG_SUFFIX:-fast}"
 SSH_OPTS=(
   -o BatchMode=yes
@@ -62,6 +63,9 @@ Options:
                         skip registry push (single-node iteration only)
   --allow-chained-overlay
                         Allow using a previous r20 overlay image as the base
+  --require-image-handoff
+                        Before transport checks, prewarm, or deploy, fail unless
+                        the exact deploy image is resident/registry-ready
   --full-sync           Sync the whole repo instead of the overlay build subset
   --no-sync             Reuse the existing remote repo
   --no-build            Reuse the computed image tag and only apply when --deploy
@@ -90,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --local-registry-mode) LOCAL_REGISTRY_MODE="$2"; shift 2 ;;
     --allow-chained-overlay) ALLOW_CHAINED_OVERLAY=1; shift ;;
+    --require-image-handoff) REQUIRE_IMAGE_HANDOFF=1; shift ;;
     --full-sync) FULL_SYNC=1; shift ;;
     --no-sync) SYNC=0; shift ;;
     --no-build) BUILD=0; shift ;;
@@ -120,6 +125,10 @@ esac
 if [[ "$LOCAL_REGISTRY_MODE" == "resident" && "$USE_LOCAL_REGISTRY" != 1 ]]; then
   echo "--local-registry-mode=resident requires --use-local-registry" >&2
   exit 2
+fi
+IMAGE_HANDOFF_MODE=resident
+if [[ "$USE_LOCAL_REGISTRY" == 1 && "$LOCAL_REGISTRY_MODE" == "push" ]]; then
+  IMAGE_HANDOFF_MODE=registry
 fi
 if (( ${#DGD_NAME} + 8 > 45 )); then
   echo "DGD name too long for r20 Frontend pod naming: ${#DGD_NAME}+8 > 45 ($DGD_NAME)" >&2
@@ -166,6 +175,8 @@ image_pull_policy=$image_pull_policy
 use_local_registry=$USE_LOCAL_REGISTRY
 local_registry=$LOCAL_REGISTRY
 local_registry_mode=$LOCAL_REGISTRY_MODE
+require_image_handoff=$REQUIRE_IMAGE_HANDOFF
+image_handoff_mode=$IMAGE_HANDOFF_MODE
 allow_chained_overlay=$ALLOW_CHAINED_OVERLAY
 required_transport_wrappers=$REQUIRED_TRANSPORT_WRAPPERS
 transport_check_image=$DEPLOY_IMAGE_TAG
@@ -246,20 +257,22 @@ if [[ -f "$OVERLAY_DOCKERIGNORE" ]]; then
   fi
 fi
 
-sudo mkdir -p \
-  /var/lib/optrt-cache/hf_modules \
-  /var/lib/optrt-cache/transformers \
-  /var/lib/optrt-cache/hf_datasets \
-  /var/lib/optrt-cache/xdg \
-  /var/lib/optrt-cache/pip \
-  /var/lib/optrt-cache/torch_extensions \
-  /var/lib/optrt-cache/torchinductor \
-  /var/lib/optrt-cache/triton \
-  /var/lib/optrt-cache/cuda \
-  /var/lib/optrt-cache/deep_gemm \
-  /var/lib/optrt-cache/tensorrt_llm/dg \
-  /var/lib/optrt-cache/tensorrt_llm/llmapi_build
-sudo chmod -R 0777 /var/lib/optrt-cache
+if [[ "$PREWARM" == 1 || "$DEPLOY" == 1 ]]; then
+  sudo mkdir -p \
+    /var/lib/optrt-cache/hf_modules \
+    /var/lib/optrt-cache/transformers \
+    /var/lib/optrt-cache/hf_datasets \
+    /var/lib/optrt-cache/xdg \
+    /var/lib/optrt-cache/pip \
+    /var/lib/optrt-cache/torch_extensions \
+    /var/lib/optrt-cache/torchinductor \
+    /var/lib/optrt-cache/triton \
+    /var/lib/optrt-cache/cuda \
+    /var/lib/optrt-cache/deep_gemm \
+    /var/lib/optrt-cache/tensorrt_llm/dg \
+    /var/lib/optrt-cache/tensorrt_llm/llmapi_build
+  sudo chmod -R 0777 /var/lib/optrt-cache
+fi
 
 if [[ "$BUILD" == 1 ]]; then
   if [[ "$ALLOW_CHAINED_OVERLAY" != 1 ]]; then
@@ -325,6 +338,16 @@ if [[ "$BUILD" == 1 ]]; then
       docker save "$BUILD_IMAGE_TAG" | sudo /usr/local/bin/k3s ctr -n k8s.io images import -
     fi
   fi
+fi
+
+if [[ "$REQUIRE_IMAGE_HANDOFF" == 1 ]]; then
+  echo "image_handoff_required=1"
+  deploy/disagg_pd_r20/check_image_handoff.sh \
+    --vm local \
+    --image "$DEPLOY_IMAGE_TAG" \
+    --mode "$IMAGE_HANDOFF_MODE" \
+    --local-registry "$LOCAL_REGISTRY" \
+    --require
 fi
 
 if [[ -n "$REQUIRED_TRANSPORT_WRAPPERS" ]]; then
@@ -490,11 +513,12 @@ if [[ "$VM_HOST" == "local" ]]; then
     REQUIRED_TRANSPORT_WRAPPERS="$REQUIRED_TRANSPORT_WRAPPERS" DEPLOY="$DEPLOY" \
     BUILD="$BUILD" PREWARM="$PREWARM" USE_LOCAL_REGISTRY="$USE_LOCAL_REGISTRY" \
     LOCAL_REGISTRY="$LOCAL_REGISTRY" LOCAL_REGISTRY_MODE="$LOCAL_REGISTRY_MODE" \
-    ALLOW_CHAINED_OVERLAY="$ALLOW_CHAINED_OVERLAY" \
+    ALLOW_CHAINED_OVERLAY="$ALLOW_CHAINED_OVERLAY" REQUIRE_IMAGE_HANDOFF="$REQUIRE_IMAGE_HANDOFF" \
+    IMAGE_HANDOFF_MODE="$IMAGE_HANDOFF_MODE" \
     OUT="/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml" bash -s <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' REQUIRED_TRANSPORT_WRAPPERS='$REQUIRED_TRANSPORT_WRAPPERS' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' LOCAL_REGISTRY_MODE='$LOCAL_REGISTRY_MODE' ALLOW_CHAINED_OVERLAY='$ALLOW_CHAINED_OVERLAY' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
+    "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' REQUIRED_TRANSPORT_WRAPPERS='$REQUIRED_TRANSPORT_WRAPPERS' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' LOCAL_REGISTRY_MODE='$LOCAL_REGISTRY_MODE' ALLOW_CHAINED_OVERLAY='$ALLOW_CHAINED_OVERLAY' REQUIRE_IMAGE_HANDOFF='$REQUIRE_IMAGE_HANDOFF' IMAGE_HANDOFF_MODE='$IMAGE_HANDOFF_MODE' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi
 
