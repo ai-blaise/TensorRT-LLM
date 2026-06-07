@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     _hf_kvarn_gqa_kv_dtype,
     validate_and_set_kv_cache_quant,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SMCDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
@@ -60,6 +60,55 @@ def test_hf_config_defaults_gqa_kvarn_when_model_declares_support():
     cfg = SimpleNamespace(quantization_config={"kvarn": {"gqa": {"enabled": False}}})
     assert _hf_kvarn_gqa_kv_dtype(cfg) is None
 
+
+
+
+def test_smc_draft_kv_cache_dtype_accepts_gqa_kvarn():
+    cfg = SMCDecodingConfig(
+        speculative_model="BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+        draft_kv_cache_dtype="kvarn_k2v2_g128",
+    )
+
+    assert cfg.draft_kv_cache_dtype == "kvarn_k2v2_g128"
+
+    with pytest.raises(ValidationError, match="g128"):
+        SMCDecodingConfig(
+            speculative_model="BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+            draft_kv_cache_dtype="kvarn_k2v2_g64",
+        )
+
+
+def test_hf_gqa_kvarn_default_sets_block_size_unless_user_overrides(monkeypatch):
+    class Loader:
+        def load_config(self, checkpoint_dir, **kwargs):
+            del checkpoint_dir, kwargs
+            return SimpleNamespace(pretrained_config=SimpleNamespace(supports_kvarn_gqa=True))
+
+    class Args:
+        trust_remote_code = False
+        mm_encoder_only = False
+        parallel_config = None
+        speculative_config = None
+
+        def __init__(self, overrides):
+            self.kv_cache_config = SimpleNamespace(dtype="auto", tokens_per_block=32)
+            self._overrides = overrides
+
+        def model_dump(self, exclude_unset=True):
+            del exclude_unset
+            return self._overrides
+
+    monkeypatch.setattr(model_loader.AutoModelForCausalLM, "_resolve_class", lambda config: None)
+
+    args = Args(overrides={})
+    model_loader.ModelLoader.load_config_and_apply_defaults("/fake", args, Loader())
+    assert args.kv_cache_config.dtype == "kvarn_k2v2_g128"
+    assert args.kv_cache_config.tokens_per_block == 128
+
+    args = Args(overrides={"kv_cache_config": {"dtype": "fp8", "tokens_per_block": 64}})
+    model_loader.ModelLoader.load_config_and_apply_defaults("/fake", args, Loader())
+    assert args.kv_cache_config.dtype == "auto"
+    assert args.kv_cache_config.tokens_per_block == 32
 
 def test_gqa_kvarn_request_fails_closed_without_fused_ops(monkeypatch):
     model_config = SimpleNamespace(

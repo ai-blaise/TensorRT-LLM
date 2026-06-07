@@ -584,6 +584,11 @@ def create_py_executor(
                 draft_llm_args.kv_cache_config = copy.copy(
                     llm_args.kv_cache_config)
                 draft_llm_args.kv_cache_config.dtype = draft_kv_cache_dtype
+                if isinstance(draft_kv_cache_dtype, str) and draft_kv_cache_dtype.startswith("kvarn_"):
+                    # One generic/GQA KVarN record is one 128-token variance-normalization tile.
+                    # Keep this explicit so an SMC draft config cannot silently inherit a
+                    # target-model block size that would make packed records non-composable.
+                    draft_llm_args.kv_cache_config.tokens_per_block = 128
                 if spec_config.draft_attention_backend == "trtllm_mha":
                     draft_llm_args.attn_backend = "TRTLLM"
                 else:

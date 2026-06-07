@@ -58,7 +58,7 @@ Indexer/HISA sparse K path.
 |---|---|---|
 | Packed 2-bit record format | **Implemented as primitives** | `kvarn_k2v2_g128` maps one 128-token block/head to a 9,728-byte record, hosted as 76 byte slots per token. Layout, bit pack/unpack, Hadamard/variance-normalized store, dequant restore, and transfer-view shapes are tested. |
 | Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
-| HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the fused store/decode ops are registered and the production backend removes the gate. |
+| HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype`, `quantization_config.kvarn.gqa`, or explicit SMC `draft_kv_cache_dtype="kvarn_k2v2_g128"`; startup rejects GQA KVarN unless the fused store/decode/sparse-decode/dequant ops are registered and the readiness gate passes. |
 | Disaggregated transfer compatibility | **Implemented as metadata/fragments; E2E proof pending** | Packed pages move through the existing byte-backed KV pool as opaque `UINT8` self-only blocks. KVarN GQA side-state now has explicit NIXL metadata (`kvarn_gqa_side_meta`) and final-slice transfer fragments for sink/tail/commit tensors keyed by request-pinned side-pool slots. Unit coverage checks nonzero sender/receiver slot pointer offsets and `RecvReqInfo` serialization. Full multi-rank NIXL proof is still pending, so backend readiness remains false. |
 | CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. V1/V2 KV cache manager `free_resources()` calls release side-pool state before block removal. The BDR readable pool and `restored_gen`/`physical_commit_gen` tensors are preallocated/lazy-grown outside the hot restore. The sparse/store bench now has `--graph-replay` to capture/replay store, dense decode, and sparse decode, but B200 graph proof is still pending. |
 | Sparse packed reads | **Fused candidate implemented, proof pending** | `sparse_kv_indices`/offsets compose by restoring through KVarN BDR/readable state and gathering selected tokens per KV head. `sparse_attn_indices` top-k scoring now has `torch.ops.trtllm.kvarn_gqa_decode_sparse`, a packed 2-bit in-kernel dequant/scoring path for top-k<=256 with -1 padding. Static SM100 compile and a runnable B200 harness exist, but GPU parity/perf, sparse offsets semantics, graph replay, and E2E HISA composition proof are still pending, so backend readiness remains false. |
@@ -364,8 +364,9 @@ Current focused coverage:
   `blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py` is the focused low-memory
   B200 harness for the new packed sparse top-k op: it builds the THOP extension
   from the checkout, times store/dense decode/sparse-full/sparse-topk, optionally
-  runs `--graph-replay`, and checks sparse-full equality against dense packed
-  decode for odd M values. The earlier
+  runs `--graph-replay`, accepts `--blocks` to compare fixed top-k against larger
+  resident packed KV, and checks sparse-full equality against dense packed decode
+  for odd M values when the resident set is <=256 tokens. The earlier
   `--try-store-op`, `--try-decode-op`, and `--try-side-op` development parity
   checks cover FP16/BF16 runtime tensors, compact records, paged KV-cache layout,
   odd SMC query counts, and fp16/bf16 sink + packed block + tail decode. They

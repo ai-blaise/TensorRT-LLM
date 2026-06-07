@@ -323,7 +323,9 @@ Required completion:
   than zeroing and read/OR/writing every byte, but post-optimization store timing
   still needs to be measured.
 - Validate HF-config deployability and default selection for both dense MLA and
-  SMC-SD GQA model paths.
+  SMC-SD GQA model paths. The integration branch accepts explicit SMC
+  `draft_kv_cache_dtype="kvarn_k2v2_g128"`, forces 128-token draft KV blocks for
+  that dtype, and keeps the runtime fail-closed until fused readiness is proven.
 
 References:
 

@@ -2079,10 +2079,41 @@ class SMCDecodingConfig(DecodingBaseConfig):
                                          default="triton",
                                          description=
                                          "Draft attention backend preference.")
-    draft_kv_cache_dtype: Literal["auto", "bfloat16", "fp8_e4m3",
-                                  "fp8_e5m2"] = Field(
-                                      default="auto",
-                                      description="Draft KV cache dtype.")
+    draft_kv_cache_dtype: str = Field(
+        default="auto",
+        description=(
+            "Draft KV cache dtype. Supports auto, bfloat16, fp8_e4m3, "
+            "fp8_e5m2, and GQA KVarN dtypes such as kvarn_k2v2_g128 for "
+            "the SMC-SD GLM draft KV path."))
+
+    @field_validator('draft_kv_cache_dtype')
+    @classmethod
+    def validate_draft_kv_cache_dtype(cls, v: str):
+        v = str(v).lower()
+        if v in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2"):
+            return v
+        if v.startswith("kvarn_"):
+            parts = v.split("_")
+            if len(parts) == 3 and parts[1].startswith("k") and "v" in parts[1] and parts[2].startswith("g"):
+                try:
+                    key_bits_s, value_bits_s = parts[1][1:].split("v", 1)
+                    key_bits = int(key_bits_s)
+                    value_bits = int(value_bits_s)
+                    group = int(parts[2][1:])
+                except ValueError as exc:
+                    raise ValueError(
+                        "draft_kv_cache_dtype KVarN values must use "
+                        "'kvarn_k<key_bits>v<value_bits>_g<group>'.") from exc
+                if key_bits in (2, 3, 4) and value_bits in (2, 3, 4) and group == 128:
+                    return v
+            raise ValueError(
+                "draft_kv_cache_dtype KVarN values must use "
+                "'kvarn_k<key_bits>v<value_bits>_g128' with 2/3/4-bit "
+                "key/value fields.")
+        raise ValueError(
+            'draft_kv_cache_dtype must be one of "auto", "bfloat16", '
+            '"fp8_e4m3", "fp8_e5m2", or a KVarN GQA dtype such as '
+            '"kvarn_k2v2_g128"')
 
     @model_validator(mode="after")
     def validate_smc_config(self):
