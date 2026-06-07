@@ -259,6 +259,15 @@ deploy/disagg_pd_r20/cache_report.sh \
   --image-filter dynamo-trtllm-optrt-custom
 ```
 
+After warmup, fail closed if expected persistent artifact caches are still empty:
+
+```bash
+deploy/disagg_pd_r20/cache_report.sh \
+  --vm local \
+  --require-populated triton,deep_gemm \
+  --image-filter dynamo-trtllm-optrt-custom
+```
+
 Run this after the first cold rollout and again after the next overlay rollout.
 The useful signal is whether active prefill/decode images are already resident
 in k3s/containerd with the intended pull policy, and whether `triton`, `cuda`,

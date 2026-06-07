@@ -6,6 +6,7 @@ VM_USER="${VM_USER:-spencergarnets}"
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 IMAGE_FILTER="${IMAGE_FILTER:-dynamo-trtllm-optrt-custom}"
 DGD_NAME="${DGD_NAME:-topo-c1-dp2tp4-disagg-r20}"
+REQUIRE_POPULATED="${REQUIRE_POPULATED:-}"
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -27,6 +28,7 @@ Options:
   --local-registry HOST  Registry host:port to probe (default: $LOCAL_REGISTRY)
   --image-filter TEXT    Image substring for k3s/containerd listing
   --dgd-name NAME        DGD/pod-name prefix to report active image residency
+  --require-populated L  Comma-separated cache subdirs that must contain files
   -h, --help             Show this help
 EOF
 }
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --image-filter) IMAGE_FILTER="$2"; shift 2 ;;
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
+    --require-populated) REQUIRE_POPULATED="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -145,12 +148,37 @@ if command -v nerdctl >/dev/null 2>&1; then
 else
   sudo /usr/local/bin/k3s ctr -n k8s.io images ls 2>/dev/null | grep -F "$IMAGE_FILTER" | tail -20 || true
 fi
+
+if [[ -n "$REQUIRE_POPULATED" ]]; then
+  echo
+  echo "== cache population requirements =="
+  requirement_failed=0
+  IFS=',' read -ra required_paths <<<"$REQUIRE_POPULATED"
+  for required_path in "${required_paths[@]}"; do
+    required_path="${required_path//[[:space:]]/}"
+    [[ -z "$required_path" ]] && continue
+    full="/var/lib/optrt-cache/$required_path"
+    files=0
+    if [[ -d "$full" ]]; then
+      files="$(sudo find "$full" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    if [[ "${files:-0}" -gt 0 ]]; then
+      printf 'cache_requirement_ok=%s files=%s\n' "$required_path" "$files"
+    else
+      printf 'cache_requirement_missing=%s files=%s\n' "$required_path" "${files:-0}"
+      requirement_failed=1
+    fi
+  done
+  if [[ "$requirement_failed" == 1 ]]; then
+    exit 3
+  fi
+fi
 EOS
 
 if [[ "$VM_HOST" == "local" ]]; then
-  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" DGD_NAME="$DGD_NAME" bash -s <<<"$REMOTE_SCRIPT"
+  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" DGD_NAME="$DGD_NAME" REQUIRE_POPULATED="$REQUIRE_POPULATED" bash -s <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' DGD_NAME='$DGD_NAME' bash -s" \
+    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' DGD_NAME='$DGD_NAME' REQUIRE_POPULATED='$REQUIRE_POPULATED' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi
