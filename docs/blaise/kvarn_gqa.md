@@ -397,6 +397,12 @@ Current focused coverage:
   C++ build on an idle GPU and do not imply production readiness while
   `backend_ready()` is false. Use the default mode on CPU; it is a reference
   baseline, not the fused production-kernel benchmark.
+  The focused side-state transfer harness is
+  blaise_perf/kvarn_gqa/probe_kvarn_gqa_nixl_side_state.py. It dry-runs the
+  request-slot keyed side-state fragment matrix and can attempt LIBFABRIC or UCX
+  NIXL transfer of a nonzero source slot into a nonzero destination slot. A
+  failing runtime probe is blocker evidence and must not be treated as backend
+  readiness.
 
 Example:
 

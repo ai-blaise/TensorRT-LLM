@@ -85,6 +85,18 @@ REQUIRED_DISAGG_SNIPPETS = (
     "self._agent.register_memory(reg_side_desc)",
 )
 
+REQUIRED_NIXL_SIDE_PROBE_SNIPPETS = (
+    "KVARN_GQA_NIXL_SIDE_DRY_RUN",
+    "KVARN_GQA_NIXL_SIDE_RESULT",
+    "KVARN_GQA_NIXL_SIDE_OK",
+    "src_slot",
+    "dst_slot",
+    "RegMemoryDescs",
+    "TransferOp.WRITE",
+    "TransferOp.READ",
+    "mismatches",
+)
+
 REQUIRED_BENCH_SNIPPETS = (
     'parser.add_argument("--sparse-topk"',
     'parser.add_argument("--blocks"',
@@ -127,6 +139,7 @@ def main() -> None:
     rank_info = (repo / "tensorrt_llm/_torch/disaggregation/native/rank_info.py").read_text()
     transfer = (repo / "tensorrt_llm/_torch/disaggregation/native/transfer.py").read_text()
     bench = (repo / "blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py").read_text()
+    side_probe = (repo / "blaise_perf/kvarn_gqa/probe_kvarn_gqa_nixl_side_state.py").read_text()
     docs = (repo / "docs/blaise/kvarn_gqa.md").read_text()
 
     for schema in REQUIRED_THOP_SCHEMA_FRAGMENTS:
@@ -146,6 +159,8 @@ def main() -> None:
         require_contains(disagg, snippet, "GQA disaggregated transfer path")
     for snippet in REQUIRED_BENCH_SNIPPETS:
         require_contains(bench, snippet, "GQA benchmark gate")
+    for snippet in REQUIRED_NIXL_SIDE_PROBE_SNIPPETS:
+        require_contains(side_probe, snippet, "GQA NIXL side-state probe")
 
     require_contains(kernels, "bool kvarnGqaBackendReady()", "readiness symbol")
     require_contains(kernels, "return false;", "fail-closed readiness guard")
