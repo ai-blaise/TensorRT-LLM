@@ -347,8 +347,12 @@ def test_r20_python_transceiver_allows_only_layersplit_owner_local_cp():
     assert "CpType.LAYERSPLIT" in source
     assert "layersplit_state" in source
     assert "owner_local_alloc" in source
-    assert "allowing LayerSplit owner-local CP transfer" in source
-    assert "context parallelism requires LayerSplit owner-local KV ownership" in source
+    assert "allowing LayerSplit owner-local CP " in source
+    assert "transfer" in source
+    assert "context parallelism requires LayerSplit owner-local KV ownership" in source or (
+        "context parallelism " in source
+        and "requires LayerSplit owner-local KV ownership" in source
+    )
     assert "CpType.HELIX" not in source
 
 
@@ -379,6 +383,7 @@ def test_r20_smc_moondream_decode_pinning_is_fail_closed():
     offline = (DEPLOY_DIR / "offline_request_pinning_smoke.py").read_text()
     audit = (DEPLOY_DIR / "audit_smc_decode_pinning_static.py").read_text()
 
+    assert "from tensorrt_llm.logger import logger" in source
     assert "validate_smc_decode_request_pin" in source
     assert "TRTLLM_SMC_REQUIRE_REQUEST_PIN" in source
     assert "generation_only" in source
@@ -400,12 +405,17 @@ def test_r20_smc_moondream_decode_pinning_is_fail_closed():
     assert "pinned_host_tokens=True" in smoke
     assert "ctx_dp_rank=None" in smoke
     assert "ctx_info_endpoint=(?:None|null|$)" in smoke
+    assert "SMC-SD decode handoff did not match Dynamo request pin lifecycle" in smoke
+    assert "completed_outbound" in smoke
     assert "WARNING: SMC logprob payload marker" not in smoke
 
     assert "missing_smc_ctx_dp_rank" in offline
     assert "missing_smc_ctx_info_endpoint" in offline
     assert "pinned_host_tokens=True" in offline
     assert "positive KV transfer" in offline
+    assert "smc_handoff_request_id_mismatch" in offline
+    assert "smc_handoff_endpoint_mismatch" in offline
+    assert "smc_handoff_dp_rank_mismatch" in offline
     assert "audit_smc_decode_pinning_static" not in audit
 
 

@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
                                            ResourceManagerType)

@@ -2090,7 +2090,8 @@ class SMCDecodingConfig(DecodingBaseConfig):
     @classmethod
     def validate_draft_kv_cache_dtype(cls, v: str):
         v = str(v).lower()
-        if v in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2"):
+        if v in ("auto", "bfloat16", "bf16", "fp8_e4m3", "fp8_e5m2",
+                 "higgs_2bit"):
             return v
         if v.startswith("kvarn_"):
             parts = v.split("_")
@@ -2119,6 +2120,10 @@ class SMCDecodingConfig(DecodingBaseConfig):
     def validate_smc_config(self):
         if self.speculative_model is None:
             raise ValueError("speculative_model must be specified for SMC")
+        if self.draft_kv_cache_dtype == "bf16":
+            self.draft_kv_cache_dtype = "bfloat16"
+        elif self.draft_kv_cache_dtype == "higgs_2bit":
+            self.draft_kv_cache_dtype = "kvarn_k2v2_g128"
         if not 0 < self.resample_threshold <= 1.0:
             raise ValueError("resample_threshold must be in (0, 1].")
         if self.max_draft_len is not None and self.max_draft_len != self.gamma:

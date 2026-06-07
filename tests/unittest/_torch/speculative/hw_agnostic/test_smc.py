@@ -38,6 +38,26 @@ def test_smc_config_uses_gamma_draft_tokens_and_bonus_target_token():
     assert config.tokens_per_gen_step == 25
 
 
+def test_smc_config_ports_sglang_draft_kv_dtype_aliases():
+    bf16 = SMCDecodingConfig(
+        speculative_model="BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+        draft_kv_cache_dtype="bf16")
+    higgs = SMCDecodingConfig(
+        speculative_model="BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+        draft_kv_cache_dtype="higgs_2bit")
+
+    assert bf16.draft_kv_cache_dtype == "bfloat16"
+    assert higgs.draft_kv_cache_dtype == "kvarn_k2v2_g128"
+
+
+def test_smc_config_accepts_explicit_optrt_gqa_kvarn_dtype():
+    config = SMCDecodingConfig(
+        speculative_model="BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
+        draft_kv_cache_dtype="kvarn_k2v2_g128")
+
+    assert config.draft_kv_cache_dtype == "kvarn_k2v2_g128"
+
+
 def test_smc_mode_admits_overlap_scheduler():
     assert SpeculativeDecodingMode.SMC.support_overlap_scheduler()
 
@@ -46,6 +66,13 @@ def test_smc_creator_does_not_force_disable_overlap_scheduler():
     source = inspect.getsource(py_executor_creator.create_py_executor)
 
     assert "Disabling overlap scheduler for SMC-SD" not in source
+
+
+def test_smc_creator_preserves_gqa_kvarn_draft_kv_dispatch():
+    source = inspect.getsource(py_executor_creator.create_py_executor)
+
+    assert 'startswith("kvarn_")' in source
+    assert "draft_llm_args.kv_cache_config.tokens_per_block = 128" in source
 
 
 def test_smc_particle_choices_are_hidden_static_tree_paths():
@@ -275,6 +302,120 @@ def test_smc_overlap_commit_preserves_disagg_pin_and_kvarn_metadata():
     assert [int(token) for token in target_request.py_draft_tokens] == [11]
     assert torch.allclose(target_request.py_smc_draft_token_log_probs,
                           torch.tensor([-0.1]))
+
+
+def test_smc_overlap_commit_requires_generation_pin_before_mutation(monkeypatch):
+    monkeypatch.delenv("TRTLLM_SMC_REQUIRE_REQUEST_PIN", raising=False)
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 1
+    target_request = SimpleNamespace(
+        py_request_id=12,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_draft_tokens=["old"],
+        py_draft_logits="old_logits",
+        py_smc_draft_token_log_probs="old_log_probs",
+        py_disaggregated_params=SimpleNamespace(
+            request_type="generation_only",
+            disagg_request_id="ctx-12",
+            ctx_dp_rank=None,
+            ctx_info_endpoint="nixl://ctx/12",
+        ),
+        is_generation_only_request=lambda: True,
+    )
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+        "sample_state": SimpleNamespace(
+            host=SimpleNamespace(new_tokens=torch.tensor([[11]], dtype=torch.int64)),
+            sampler_event=SimpleNamespace(synchronize=lambda: None),
+        ),
+    }
+    drafter.req_id_to_old_request = {12: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=12)])
+
+    try:
+        drafter.process_static_draft_outputs(outputs, draft_batch)
+    except RuntimeError as exc:
+        assert "missing ctx_dp_rank" in str(exc)
+    else:
+        raise AssertionError("missing ctx_dp_rank did not fail closed")
+
+    assert target_request.py_draft_tokens == ["old"]
+    assert target_request.py_draft_logits == "old_logits"
+    assert target_request.py_smc_draft_token_log_probs == "old_log_probs"
+
+
+def test_smc_overlap_commit_preserves_valid_generation_pin_metadata(monkeypatch):
+    monkeypatch.delenv("TRTLLM_SMC_REQUIRE_REQUEST_PIN", raising=False)
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 1
+    pin_metadata = SimpleNamespace(
+        request_type="generation_only",
+        disagg_request_id="ctx-13",
+        ctx_request_id="ctx-13",
+        ctx_dp_rank=2,
+        ctx_info_endpoint=("nixl://ctx/13",),
+    )
+    target_request = SimpleNamespace(
+        py_request_id=13,
+        py_smc_group_id=213,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_draft_tokens=[],
+        py_disaggregated_params=pin_metadata,
+        py_kvarn_metadata={"mla_latent_kv_dtype": "kvarn_k2v2"},
+        is_generation_only_request=lambda: True,
+    )
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+        "sample_state": SimpleNamespace(
+            host=SimpleNamespace(new_tokens=torch.tensor([[11]], dtype=torch.int64)),
+            sampler_event=SimpleNamespace(synchronize=lambda: None),
+        ),
+    }
+    drafter.req_id_to_old_request = {13: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=13)])
+
+    drafter.process_static_draft_outputs(outputs, draft_batch)
+
+    assert target_request.py_disaggregated_params is pin_metadata
+    assert target_request.py_smc_group_id == 213
+    assert [int(token) for token in target_request.py_draft_tokens] == [11]
+    assert torch.allclose(target_request.py_smc_draft_token_log_probs,
+                          torch.tensor([-0.1]))
+
+
+def test_smc_overlap_commit_requires_evented_pinned_sample_state(monkeypatch):
+    monkeypatch.delenv("TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT", raising=False)
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.max_total_draft_tokens = 1
+    target_request = SimpleNamespace(
+        py_request_id=14,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_draft_tokens=["old"],
+        py_draft_logits="old_logits",
+        py_smc_draft_token_log_probs="old_log_probs",
+    )
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+    }
+    drafter.req_id_to_old_request = {14: target_request}
+    draft_batch = SimpleNamespace(
+        all_requests=lambda: [SimpleNamespace(py_request_id=14)])
+
+    try:
+        drafter.process_static_draft_outputs(outputs, draft_batch)
+    except RuntimeError as exc:
+        assert "requires evented pinned host" in str(exc)
+    else:
+        raise AssertionError("missing pinned sample_state did not fail closed")
+
+    assert target_request.py_draft_tokens == ["old"]
+    assert target_request.py_draft_logits == "old_logits"
+    assert target_request.py_smc_draft_token_log_probs == "old_log_probs"
 
 
 def _bare_smc_sampler(gamma=3, n_particles=2):

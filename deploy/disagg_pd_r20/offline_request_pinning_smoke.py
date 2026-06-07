@@ -155,6 +155,13 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
             fixture.frontend,
         )
     )
+    completed_outbound = {
+        rid: (ctx_dp_rank, ctx_info_endpoint)
+        for rid, ctx_info_endpoint, ctx_dp_rank in re.findall(
+            r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*ctx_dp_rank[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+            fixture.frontend,
+        )
+    }
     cleared = re.findall(r"dynamo request pin cleared|disagg request pin cleared", all_logs)
     cleanup_scheduled = re.findall(r"dynamo request pin cleanup scheduled", all_logs)
     if not established:
@@ -198,6 +205,30 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
         for token in ("SMC Moondream decode handoff preserved", "draft_token_log_probs", "sample_state.sampler_event", "pinned_host_tokens=True", "ctx_dp_rank=", "ctx_info_endpoint="):
             if token not in all_logs:
                 raise AssertionError(f"missing SMC/Moondream decode handoff marker: {token}")
+        smc_handoffs = re.findall(
+            r"SMC Moondream decode handoff preserved.*request_id=(\S+).*disagg_request_id=(\S+).*ctx_dp_rank=([^\s]+).*ctx_info_endpoint=([^\s]+)",
+            all_logs,
+        )
+        if not smc_handoffs:
+            raise AssertionError("missing parseable SMC/Moondream decode handoff marker")
+        matched = []
+        mismatched = []
+        for request_id, disagg_request_id, smc_ctx_dp_rank, smc_ctx_info_endpoint in smc_handoffs:
+            pin_rid = request_id if request_id in shared_pin_rids else disagg_request_id
+            if pin_rid not in shared_pin_rids:
+                mismatched.append((request_id, disagg_request_id, "missing pin lifecycle"))
+                continue
+            outbound_meta = completed_outbound.get(pin_rid)
+            if outbound_meta is not None and outbound_meta != (smc_ctx_dp_rank, smc_ctx_info_endpoint):
+                mismatched.append((request_id, disagg_request_id, (smc_ctx_dp_rank, smc_ctx_info_endpoint), outbound_meta))
+                continue
+            matched.append((request_id, disagg_request_id, smc_ctx_dp_rank, smc_ctx_info_endpoint))
+        if not matched:
+            raise AssertionError(
+                "SMC/Moondream decode handoff did not match pin lifecycle: "
+                f"handoffs={smc_handoffs} shared_pin_rids={shared_pin_rids} "
+                f"completed_outbound={completed_outbound} mismatched={mismatched}"
+            )
 
 
 def expect_failure(name: str, fixture: Fixture, needle: str | None = None) -> None:
@@ -243,6 +274,18 @@ def main() -> None:
     bad = copy.deepcopy(good)
     bad.decode = bad.decode.replace("pinned_host_tokens=True", "pinned_host_tokens=False")
     expect_failure("missing_smc_pinned_host_tokens", bad, "pinned_host_tokens=True")
+
+    bad = copy.deepcopy(good)
+    bad.decode = bad.decode.replace("request_id=req-pin-123", "request_id=req-smc-other")
+    expect_failure("smc_handoff_request_id_mismatch", bad, "pin lifecycle")
+
+    bad = copy.deepcopy(good)
+    bad.decode = bad.decode.replace("ctx_info_endpoint=nixl://ctx/0", "ctx_info_endpoint=nixl://ctx/9")
+    expect_failure("smc_handoff_endpoint_mismatch", bad, "completed_outbound")
+
+    bad = copy.deepcopy(good)
+    bad.decode = bad.decode.replace("ctx_dp_rank=0", "ctx_dp_rank=9")
+    expect_failure("smc_handoff_dp_rank_mismatch", bad, "completed_outbound")
 
     bad = copy.deepcopy(good)
     bad.prefill += "\nhost_pinned_blocks=0"

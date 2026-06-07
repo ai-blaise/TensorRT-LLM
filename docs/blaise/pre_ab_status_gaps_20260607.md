@@ -191,7 +191,10 @@ explicit diagnostic override `TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT=1`.
 Remaining Moondream gap: live SMC-SD E2E is still required. Run the strict smoke
 with `SMC_GATE_MODE=required` only after the NIXL/LayerSplit gate is green and
 SMC-SD is explicitly enabled; that mode now fails if the decode handoff marker,
-pinned host-token proof, ctx DP rank, or ctx endpoint is missing.
+pinned host-token proof, ctx DP rank, or ctx endpoint is missing. The required
+SMC marker must also correlate to the same request id and completed-prefill
+`ctx_info_endpoint`/`ctx_dp_rank` that Dynamo pinned and sent outbound to decode,
+so a generic SMC log line cannot satisfy the gate.
 
 Reference: https://moondream.ai/blog/popping-the-gpu-bubble
 Reference doc: `docs/blaise/moondream_pipelining.md`

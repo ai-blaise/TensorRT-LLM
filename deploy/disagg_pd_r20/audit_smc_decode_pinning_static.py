@@ -33,6 +33,7 @@ def main() -> None:
     offline = (REPO_ROOT / "deploy" / "disagg_pd_r20" / "offline_request_pinning_smoke.py").read_text()
 
     for needle in [
+        "from tensorrt_llm.logger import logger",
         "validate_smc_decode_request_pin",
         "TRTLLM_SMC_REQUIRE_REQUEST_PIN",
         "is_generation_only_request",
@@ -77,12 +78,18 @@ def main() -> None:
         "ctx_info_endpoint=",
         "ctx_dp_rank=None",
         "ctx_info_endpoint=(?:None|null|$)",
+        "SMC-SD decode handoff did not match Dynamo request pin lifecycle",
+        "completed_outbound",
     ]:
         require(smoke, needle, "live smoke SMC-required gate")
 
     for needle in [
         "missing_smc_ctx_dp_rank",
         "missing_smc_ctx_info_endpoint",
+        "missing_smc_pinned_host_tokens",
+        "smc_handoff_request_id_mismatch",
+        "smc_handoff_endpoint_mismatch",
+        "smc_handoff_dp_rank_mismatch",
         "SMC Moondream decode handoff preserved",
         "pinned_host_tokens=True",
         "positive KV transfer",

@@ -51,7 +51,25 @@ gate that prevents unknown-DP KV receive fanout before A/B.
   sends one normal request and one early-closed stream, then requires matching
   frontend pin lifecycle, frontend outbound generation metadata, prefill
   context receipt, decode generation receipt, no bad fallback/overlap logs, and
-  zero prefill/decode restarts.
+  zero prefill/decode restarts. In `SMC_GATE_MODE=required`, the SMC handoff
+  marker must also correlate to the same pinned request id and completed-prefill
+  `ctx_dp_rank` / `ctx_info_endpoint` that Dynamo emitted outbound to decode;
+  unrelated SMC log lines cannot satisfy the gate.
+- **SGLang/GLM kernel assumptions are below the scheduler contract.** The GLM
+  draft path can choose FlashInfer decode or the SGLang-derived Triton prefill
+  shim for draft attention, but the Moondream scheduler only consumes the
+  wrapper contract: `SMCStaticParticleDraftingLoopWrapper` must return
+  `draft_token_log_probs`, `SMCModelDrafter` must carry those through delayed
+  commit, and the commit must use the evented pinned host token buffer. If a
+  remaining GLM kernel port changes logits layout, draft attention backend, or
+  warmup behavior, it must preserve that wrapper contract and cannot bypass the
+  request-pin validation or unpinned-commit guard.
+- **Runtime-focused proof:** the CPU-safe SMC/Moondream drafter tests were run
+  inside the TRT-LLM runtime image with the patched `smc.py` overlaid into
+  site-packages. This caught the missing `logger` import for the live handoff
+  marker and now proves the evented pinned commit path, generation-only request
+  pin validation before mutation, valid pin metadata preservation, and the
+  fail-closed unpinned fallback guard without launching model traffic.
 
 Focused tests added/maintained in
 `tests/unittest/_torch/speculative/hw_agnostic/test_smc.py`:

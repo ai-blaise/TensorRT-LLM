@@ -305,6 +305,14 @@ outbound.extend(
         frontend,
     )
 )
+completed_outbound = {
+    rid: (ctx_dp_rank, ctx_info_endpoint)
+    for rid, ctx_info_endpoint, ctx_dp_rank in re.findall(
+        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*ctx_dp_rank[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+        frontend,
+    )
+}
+lifecycle_rids = set()
 cleared = re.findall(r"dynamo request pin cleared|disagg request pin cleared", all_logs)
 cleared_rids = set(re.findall(
     r"dynamo request pin cleared.*request_id[= ]([^, ]+)|disagg request pin cleared.*request_id[= ]([^, ]+)",
@@ -494,6 +502,31 @@ if smc_gate_mode == "required":
         raise SystemExit("SMC-SD decode handoff marker has ctx_dp_rank=None")
     if re.search(r"SMC Moondream decode handoff preserved.*ctx_info_endpoint=(?:None|null|$)", all_logs):
         raise SystemExit("SMC-SD decode handoff marker has empty ctx_info_endpoint")
+    smc_handoffs = re.findall(
+        r"SMC Moondream decode handoff preserved.*request_id=(\S+).*disagg_request_id=(\S+).*ctx_dp_rank=([^\s]+).*ctx_info_endpoint=([^\s]+)",
+        all_logs,
+    )
+    if not smc_handoffs:
+        raise SystemExit("SMC-SD required but no parseable Moondream decode handoff marker was found")
+    if require_dynamo:
+        matched = []
+        mismatched = []
+        for request_id, disagg_request_id, smc_ctx_dp_rank, smc_ctx_info_endpoint in smc_handoffs:
+            pin_rid = request_id if request_id in lifecycle_rids else disagg_request_id
+            if pin_rid not in lifecycle_rids:
+                mismatched.append((request_id, disagg_request_id, smc_ctx_dp_rank, smc_ctx_info_endpoint, "missing pin lifecycle"))
+                continue
+            outbound_meta = completed_outbound.get(pin_rid)
+            if outbound_meta is not None and outbound_meta != (smc_ctx_dp_rank, smc_ctx_info_endpoint):
+                mismatched.append((request_id, disagg_request_id, smc_ctx_dp_rank, smc_ctx_info_endpoint, f"outbound={outbound_meta}"))
+                continue
+            matched.append((request_id, disagg_request_id, smc_ctx_dp_rank, smc_ctx_info_endpoint))
+        if not matched:
+            raise SystemExit(
+                "SMC-SD decode handoff did not match Dynamo request pin lifecycle: "
+                f"handoffs={smc_handoffs} lifecycle_rids={lifecycle_rids} "
+                f"completed_outbound={completed_outbound} mismatched={mismatched}"
+            )
 
 print(
     "request pinning live proof ok: "
