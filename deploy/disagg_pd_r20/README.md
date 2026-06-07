@@ -82,7 +82,7 @@ Build only:
 
 ```bash
 deploy/disagg_pd_r20/fast_iterate.sh \
-  --vm 34.106.33.128 \
+  --vm local \
   --target-node a4-us-001-rl9 \
   --tag-suffix swapab-host
 ```
@@ -161,6 +161,18 @@ production model paths are visible under `/models`, and offline HF config/tokeni
 loading works before the full prefill/decode workers spend time loading weights
 and compiling kernels.
 
+When running directly on the B200 VM, use `--vm local` to bypass SSH setup. Use
+`--dry-run` to render the prewarm Job YAML without applying it or touching the
+persistent cache directories:
+
+```bash
+deploy/disagg_pd_r20/prewarm_caches.sh \
+  --vm local \
+  --dry-run \
+  --image localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-<sha>-<suffix> \
+  --image-pull-policy IfNotPresent
+```
+
 ## Files
 
 - `topo-c1-dp2tp4-disagg-r20.yaml` -- the deployable manifest: a `ConfigMap`
@@ -182,11 +194,12 @@ and compiling kernels.
 - `Dockerfile.r20-overlay.dockerignore` -- overlay-specific build-context
   allowlist so thin-image rebuilds do not ship the full repo to Docker/BuildKit.
 
-Inspect cache/image residency without touching pods:
+Inspect cache/image residency without touching pods. From the B200 VM itself,
+`--vm local` avoids SSH and just runs the read-only report locally:
 
 ```bash
 deploy/disagg_pd_r20/cache_report.sh \
-  --vm 34.106.33.128 \
+  --vm local \
   --image-filter dynamo-trtllm-optrt-custom
 ```
 

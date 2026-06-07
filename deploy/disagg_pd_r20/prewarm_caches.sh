@@ -7,6 +7,7 @@ TARGET_NODE="${TARGET_NODE:-a4-us-001-rl9}"
 IMAGE="${IMAGE:-}"
 IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Never}"
 MODEL_PATH="${MODEL_PATH:-/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft}"
+DRY_RUN=0
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -26,10 +27,12 @@ Options:
   --image IMAGE          Image already present in k3s containerd
   --image-pull-policy P  Kubernetes image pull policy (default: Never;
                          use IfNotPresent for VM-local registry images)
-  --vm HOST              Target VM IP or hostname (default: $VM_HOST)
+  --vm HOST              Target VM IP or hostname (default: $VM_HOST);
+                         use local to run directly from the current VM
   --user USER            SSH user (default: $VM_USER)
   --target-node NAME     Kubernetes nodeSelector hostname (default: $TARGET_NODE)
   --model PATH           Main model path (default: production DeepSeek path)
+  --dry-run              Render the prewarm Job YAML and exit without applying it
   -h, --help             Show this help
 EOF
 }
@@ -42,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --user) VM_USER="$2"; shift 2 ;;
     --target-node) TARGET_NODE="$2"; shift 2 ;;
     --model) MODEL_PATH="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -58,20 +62,22 @@ JOB_NAME="optrt-cache-prewarm-$(date -u +%Y%m%d%H%M%S)"
 read -r -d '' REMOTE_SCRIPT <<'EOS' || true
 set -euo pipefail
 
-sudo mkdir -p \
-  /var/lib/optrt-cache/hf_modules \
-  /var/lib/optrt-cache/transformers \
-  /var/lib/optrt-cache/hf_datasets \
-  /var/lib/optrt-cache/xdg \
-  /var/lib/optrt-cache/pip \
-  /var/lib/optrt-cache/torch_extensions \
-  /var/lib/optrt-cache/torchinductor \
-  /var/lib/optrt-cache/triton \
-  /var/lib/optrt-cache/cuda \
-  /var/lib/optrt-cache/deep_gemm \
-  /var/lib/optrt-cache/tensorrt_llm/dg \
-  /var/lib/optrt-cache/tensorrt_llm/llmapi_build
-sudo chmod -R 0777 /var/lib/optrt-cache
+if [[ "$DRY_RUN" != 1 ]]; then
+  sudo mkdir -p \
+    /var/lib/optrt-cache/hf_modules \
+    /var/lib/optrt-cache/transformers \
+    /var/lib/optrt-cache/hf_datasets \
+    /var/lib/optrt-cache/xdg \
+    /var/lib/optrt-cache/pip \
+    /var/lib/optrt-cache/torch_extensions \
+    /var/lib/optrt-cache/torchinductor \
+    /var/lib/optrt-cache/triton \
+    /var/lib/optrt-cache/cuda \
+    /var/lib/optrt-cache/deep_gemm \
+    /var/lib/optrt-cache/tensorrt_llm/dg \
+    /var/lib/optrt-cache/tensorrt_llm/llmapi_build
+  sudo chmod -R 0777 /var/lib/optrt-cache
+fi
 
 cat >/tmp/"$JOB_NAME".yaml <<YAML
 apiVersion: batch/v1
@@ -181,12 +187,23 @@ spec:
           type: DirectoryOrCreate
 YAML
 
+if [[ "$DRY_RUN" == 1 ]]; then
+  cat /tmp/"$JOB_NAME".yaml
+  rm -f /tmp/"$JOB_NAME".yaml
+  exit 0
+fi
+
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system apply -f /tmp/"$JOB_NAME".yaml
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system wait --for=condition=complete --timeout=300s job/"$JOB_NAME"
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system logs job/"$JOB_NAME"
 sudo -E /usr/local/bin/k3s kubectl -n dynamo-system delete job "$JOB_NAME" --ignore-not-found=true >/dev/null
 EOS
 
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' bash -s" \
-  <<<"$REMOTE_SCRIPT"
+if [[ "$VM_HOST" == "local" ]]; then
+  IMAGE="$IMAGE" IMAGE_PULL_POLICY="$IMAGE_PULL_POLICY" TARGET_NODE="$TARGET_NODE" \
+    MODEL_PATH="$MODEL_PATH" JOB_NAME="$JOB_NAME" DRY_RUN="$DRY_RUN" bash -s <<<"$REMOTE_SCRIPT"
+else
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+    "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' DRY_RUN='$DRY_RUN' bash -s" \
+    <<<"$REMOTE_SCRIPT"
+fi

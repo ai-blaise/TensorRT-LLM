@@ -20,7 +20,8 @@ Print a read-only cache/image residency report from the target B200 VM. This is
 safe to run while a DGD is warming; it does not mutate pods, images, or caches.
 
 Options:
-  --vm HOST              Target VM IP or hostname (default: $VM_HOST)
+  --vm HOST              Target VM IP or hostname (default: $VM_HOST);
+                         use local to run directly from the current VM
   --user USER            SSH user (default: $VM_USER)
   --local-registry HOST  Registry host:port to probe (default: $LOCAL_REGISTRY)
   --image-filter TEXT    Image substring for k3s/containerd listing
@@ -88,6 +89,10 @@ else
 fi
 EOS
 
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' bash -s" \
-  <<<"$REMOTE_SCRIPT"
+if [[ "$VM_HOST" == "local" ]]; then
+  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" bash -s <<<"$REMOTE_SCRIPT"
+else
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' bash -s" \
+    <<<"$REMOTE_SCRIPT"
+fi
