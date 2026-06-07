@@ -614,6 +614,50 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             physical_blocks.append(int(block_ids[logical_block]))
         return torch.tensor(physical_blocks, device=state.device, dtype=torch.long)
 
+    def _gather_sparse_kv_for_sample(self, k_states: torch.Tensor,
+                                     v_states: torch.Tensor,
+                                     sparse: AttentionSparseArgs,
+                                     sample_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if sparse.sparse_kv_indices is None:
+            return k_states, v_states
+        if sparse.sparse_kv_offsets is None:
+            raise NotImplementedError(
+                "KVarN GQA sparse_kv_indices requires sparse_kv_offsets; "
+                "refusing to infer dense/fp16 fallback semantics")
+        if sparse.sparse_kv_indices.size(0) != self.num_kv_heads:
+            raise RuntimeError(
+                f"KVarN GQA sparse_kv_indices head count mismatch: "
+                f"indices={sparse.sparse_kv_indices.size(0)}, kv_heads={self.num_kv_heads}")
+        start = int(sparse.sparse_kv_offsets[sample_idx].item())
+        end = int(sparse.sparse_kv_offsets[sample_idx + 1].item())
+        if end < start:
+            raise RuntimeError(
+                f"KVarN GQA sparse_kv_offsets are not monotonic for sample={sample_idx}: "
+                f"start={start}, end={end}")
+        indices = sparse.sparse_kv_indices[:, start:end].to(device=k_states.device,
+                                                            dtype=torch.long)
+        if indices.numel() == 0:
+            empty = k_states.new_empty((0, self.num_kv_heads, self.head_dim))
+            return empty, empty
+        if bool(((indices < 0) | (indices >= k_states.shape[0])).any().item()):
+            raise RuntimeError(
+                f"KVarN GQA sparse_kv_indices out of range for sample={sample_idx}: "
+                f"seq_len={k_states.shape[0]}")
+        token_indices = indices.transpose(0, 1).contiguous()
+        kv_head_indices = torch.arange(self.num_kv_heads, device=k_states.device).view(1, -1)
+        kv_head_indices = kv_head_indices.expand(token_indices.shape[0], -1)
+        return k_states[token_indices, kv_head_indices], v_states[token_indices, kv_head_indices]
+
+    def _sparse_mask_or_raise(self, attention_mask: AttentionMask, q_len: int) -> tuple[bool, Optional[torch.Tensor]]:
+        if attention_mask == PredefinedAttentionMask.FULL:
+            return False, None
+        if attention_mask == PredefinedAttentionMask.CAUSAL and q_len == 1:
+            return False, None
+        raise NotImplementedError(
+            "KVarN GQA sparse KV read currently supports FULL masks and "
+            "single-token causal decode only; multi-token sparse causal masks need "
+            "position-aware packed sparse scoring")
+
     def _decode_with_packed_records(self, state: _KVarNGQASidePool,
                                     kv_pages: torch.Tensor, slot: int,
                                     block_ids: list[int], total_kv_len: int,
@@ -700,11 +744,18 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         sparse = forward_args.sparse
-        if sparse is not None and any(x is not None for x in (
-                sparse.sparse_kv_indices, sparse.sparse_kv_offsets,
-                sparse.sparse_attn_indices, sparse.sparse_attn_offsets)):
+        has_sparse_kv = bool(sparse is not None and sparse.sparse_kv_indices is not None)
+        if sparse is not None and (sparse.sparse_attn_indices is not None
+                                   or sparse.sparse_attn_offsets is not None):
             raise NotImplementedError(
-                "KVarN GQA sparse index selection needs a dedicated packed-record read path")
+                "KVarN GQA sparse attention top-k indices need a dedicated "
+                "packed-record scoring path")
+        if has_sparse_kv and sparse.sparse_kv_offsets is None:
+            raise NotImplementedError(
+                "KVarN GQA sparse_kv_indices requires sparse_kv_offsets")
+        if sparse is not None and sparse.sparse_kv_offsets is not None and not has_sparse_kv:
+            raise NotImplementedError(
+                "KVarN GQA sparse_kv_offsets without sparse_kv_indices is unsupported")
         if metadata.kv_cache_manager is None:
             raise RuntimeError("KVarN GQA requires a KV cache manager")
         if metadata.is_cross:
@@ -745,19 +796,28 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self._store_new_tokens(state, kv_pages, request_id, slot, block_ids, past,
                                    k_view, v_view, allow_commit=allow_commit)
             total_kv_len = past + new_kv_len
-            packed_out = self._decode_with_packed_records(
-                state, kv_pages, slot, block_ids, total_kv_len, single_q, q_view,
-                forward_args.attention_mask, forward_args.attention_window_size)
+            packed_out = None
+            if not has_sparse_kv:
+                packed_out = self._decode_with_packed_records(
+                    state, kv_pages, slot, block_ids, total_kv_len, single_q, q_view,
+                    forward_args.attention_mask, forward_args.attention_window_size)
             if packed_out is not None:
                 outputs.append(packed_out)
             else:
                 k_states, v_states = self._load_sequence(state, kv_pages, request_id,
                                                          slot, block_ids, total_kv_len,
                                                          single_q.dtype, single_q.device)
-                attn_mask, is_causal = self._make_mask(forward_args.attention_mask,
-                                                       past, new_kv_len, single_q.device,
-                                                       q_view.size(2),
-                                                       forward_args.attention_window_size)
+                if has_sparse_kv:
+                    assert sparse is not None
+                    k_states, v_states = self._gather_sparse_kv_for_sample(
+                        k_states, v_states, sparse, sample_idx)
+                    is_causal, attn_mask = self._sparse_mask_or_raise(
+                        forward_args.attention_mask, q_view.size(2))
+                else:
+                    attn_mask, is_causal = self._make_mask(forward_args.attention_mask,
+                                                           past, new_kv_len, single_q.device,
+                                                           q_view.size(2),
+                                                           forward_args.attention_window_size)
                 outputs.append(self._attend(q_view, k_states, v_states,
                                             is_causal, attn_mask).squeeze(0))
             offset_q += q_len

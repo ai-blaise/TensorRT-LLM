@@ -299,6 +299,69 @@ def test_kvarn_gqa_bdr_restore_scales_with_churn_not_working_set(monkeypatch):
     assert int(state.restored_gen[0, torch.tensor([2, 4, 6])].sum().item()) == 0
 
 
+def test_kvarn_gqa_sparse_kv_gather_is_per_kv_head():
+    torch = _TORCH
+    from tensorrt_llm._torch.attention_backend.interface import (
+        AttentionSparseArgs,
+        PredefinedAttentionMask,
+    )
+
+    attn = KVarNGQAAttention(layer_idx=0, num_heads=4, num_kv_heads=2,
+                             head_dim=128)
+    k_states = torch.arange(6 * 2 * 128, dtype=torch.float16).reshape(6, 2, 128)
+    v_states = -k_states
+    sparse = AttentionSparseArgs(
+        sparse_kv_indices=torch.tensor([[0, 3, 5], [1, 2, 4]], dtype=torch.int64),
+        sparse_kv_offsets=torch.tensor([0, 3], dtype=torch.int64),
+    )
+
+    k_sel, v_sel = attn._gather_sparse_kv_for_sample(k_states, v_states, sparse, 0)
+
+    assert k_sel.shape == (3, 2, 128)
+    assert torch.equal(k_sel[:, 0], k_states[[0, 3, 5], 0])
+    assert torch.equal(k_sel[:, 1], k_states[[1, 2, 4], 1])
+    assert torch.equal(v_sel[:, 0], v_states[[0, 3, 5], 0])
+    assert torch.equal(v_sel[:, 1], v_states[[1, 2, 4], 1])
+
+    assert attn._sparse_mask_or_raise(PredefinedAttentionMask.FULL, q_len=25) == (False, None)
+    assert attn._sparse_mask_or_raise(PredefinedAttentionMask.CAUSAL, q_len=1) == (False, None)
+    with pytest.raises(NotImplementedError, match="multi-token sparse causal"):
+        attn._sparse_mask_or_raise(PredefinedAttentionMask.CAUSAL, q_len=5)
+
+    bad_heads = AttentionSparseArgs(
+        sparse_kv_indices=torch.zeros((1, 3), dtype=torch.int64),
+        sparse_kv_offsets=torch.tensor([0, 3], dtype=torch.int64),
+    )
+    with pytest.raises(RuntimeError, match="head count mismatch"):
+        attn._gather_sparse_kv_for_sample(k_states, v_states, bad_heads, 0)
+
+    bad_range = AttentionSparseArgs(
+        sparse_kv_indices=torch.tensor([[0, 7], [1, 2]], dtype=torch.int64),
+        sparse_kv_offsets=torch.tensor([0, 2], dtype=torch.int64),
+    )
+    with pytest.raises(RuntimeError, match="out of range"):
+        attn._gather_sparse_kv_for_sample(k_states, v_states, bad_range, 0)
+
+
+def test_kvarn_gqa_sparse_attn_indices_still_fail_closed():
+    torch = _TORCH
+    from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionSparseArgs
+
+    attn = KVarNGQAAttention(layer_idx=0, num_heads=2, num_kv_heads=1,
+                             head_dim=128)
+    sparse = AttentionSparseArgs(
+        sparse_attn_indices=torch.zeros((1, 1, 1), dtype=torch.int64),
+        sparse_attn_offsets=torch.zeros((2,), dtype=torch.int64),
+    )
+    args = AttentionForwardArgs(sparse=sparse)
+    with pytest.raises(NotImplementedError, match="sparse attention top-k"):
+        attn.forward(torch.empty((1, 256)), torch.empty((1, 128)),
+                     torch.empty((1, 128)), metadata=type("M", (), {
+                         "kv_cache_manager": None,
+                         "is_cross": False,
+                     })(), forward_args=args)
+
+
 def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
     torch = _TORCH
     from types import SimpleNamespace

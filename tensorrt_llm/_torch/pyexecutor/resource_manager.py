@@ -1240,6 +1240,9 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        side_pool = getattr(self, "_kvarn_gqa_side_pool", None)
+        if side_pool is not None and request.py_request_id is not None:
+            side_pool.release_request(int(request.py_request_id))
         return self.impl.remove_sequence(request.py_request_id, request,
                                          pin_on_release)
 
@@ -3336,6 +3339,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        side_pool = getattr(self, "_kvarn_gqa_side_pool", None)
+        if side_pool is not None and request.py_request_id is not None:
+            side_pool.release_request(int(request.py_request_id))
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
