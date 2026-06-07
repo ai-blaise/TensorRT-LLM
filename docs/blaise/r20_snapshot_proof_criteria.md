@@ -105,6 +105,12 @@ deploy/disagg_pd_r20/snapshot_hook_canary.sh \
   --canary-dgd topo-c1-dp2tp4-hook-canary \
   --target-node a4-us-001-rl9
 
+# Dry-run the canary-only hook signal probe. Add --execute only after the
+# canary DGD is Ready and isolated from production traffic.
+deploy/disagg_pd_r20/snapshot_hook_signal_probe.sh \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary
+
 # Canary readiness proof after the hook-enabled DGD has generated proof files.
 deploy/disagg_pd_r20/snapshot_readiness.sh \
   --vm local \

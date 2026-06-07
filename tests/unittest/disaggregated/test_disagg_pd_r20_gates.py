@@ -244,6 +244,34 @@ def test_r20_snapshot_hook_canary_runner_is_fail_closed():
         assert token not in script
 
 
+def test_r20_snapshot_hook_signal_probe_is_canary_only():
+    script = (DEPLOY_DIR / "snapshot_hook_signal_probe.sh").read_text()
+
+    assert "DRY_RUN=1" in script
+    assert "refusing production r20 DGD" in script
+    assert "refusing non-canary DGD name" in script
+    assert "OPTRT_SNAPSHOT_HOOKS=1" in script
+    assert "OPTRT_SNAPSHOT_HOOK_DIR" in script
+    assert "DYN_COMPONENT" in script
+    assert "SIGRTMIN+5" in script
+    assert "SIGRTMIN+6" in script
+    assert "dynamo.trtllm" in script
+    assert "optrt_snapshot_*_pre_snapshot.ready.json" in script
+    assert "optrt_snapshot_*_post_restore.ready.json" in script
+    assert "deploy/disagg_pd_r20/snapshot_readiness.sh" in script
+
+    forbidden = [
+        " delete ",
+        " scale ",
+        " rollout restart",
+        " patch dgd",
+        " patch dynamographdeployment",
+        " apply -f",
+    ]
+    for token in forbidden:
+        assert token not in script
+
+
 def test_r20_transceiver_backend_selection_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
 

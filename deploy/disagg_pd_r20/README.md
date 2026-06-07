@@ -423,6 +423,24 @@ deploy/disagg_pd_r20/snapshot_hook_canary.sh \
   --wait-ready
 ```
 
+After the hook canary is Ready, generate the local pre/post proof files on that
+canary. The probe is also dry-run by default and refuses production DGD names:
+
+```bash
+deploy/disagg_pd_r20/snapshot_hook_signal_probe.sh \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary
+```
+
+Execute only against the hook canary:
+
+```bash
+deploy/disagg_pd_r20/snapshot_hook_signal_probe.sh \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --execute
+```
+
 ## Knob provenance
 
 - WarpDecode: `tensorrt_llm/llmapi/llm_args.py` `WarpDecodeConfig`
