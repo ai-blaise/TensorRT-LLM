@@ -400,6 +400,29 @@ and a writable hostPath proof directory only to the prefill/decode workers. Run
 --hook-proof-dir /tmp/optrt-snapshot-hooks-canary --strict` after the canary
 has generated both pre-snapshot and post-restore proof files.
 
+Use the guarded helper for the real canary step. It is dry-run by default and
+refuses `--apply` when the canary already exists or any target-node GPU has more
+than the configured memory threshold in use:
+
+```bash
+deploy/disagg_pd_r20/snapshot_hook_canary.sh \
+  --source-dgd topo-c1-dp2tp4-disagg-r20 \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --target-node a4-us-001-rl9
+```
+
+Only when the target B200 node is idle enough for an isolated canary:
+
+```bash
+deploy/disagg_pd_r20/snapshot_hook_canary.sh \
+  --source-dgd topo-c1-dp2tp4-disagg-r20 \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --target-node a4-us-001-rl9 \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --apply \
+  --wait-ready
+```
+
 ## Knob provenance
 
 - WarpDecode: `tensorrt_llm/llmapi/llm_args.py` `WarpDecodeConfig`

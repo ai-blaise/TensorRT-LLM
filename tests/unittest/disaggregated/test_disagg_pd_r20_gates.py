@@ -219,6 +219,31 @@ def test_r20_render_snapshot_hooks_are_canary_only(tmp_path):
     assert "OPTRT_SNAPSHOT_HOOKS" not in frontend_text
 
 
+def test_r20_snapshot_hook_canary_runner_is_fail_closed():
+    script = (DEPLOY_DIR / "snapshot_hook_canary.sh").read_text()
+
+    assert "APPLY=0" in script
+    assert "SERVER_DRY_RUN=1" in script
+    assert "--enable-snapshot-hooks" in script
+    assert "--server-dry-run" in script
+    assert "canary_dgd_already_exists" in script
+    assert "canary_pods_already_exist" in script
+    assert "gpu_memory_not_idle" in script
+    assert "nvidia-smi --query-gpu=index,memory.used" in script
+    assert "deploy/disagg_pd_r20/snapshot_readiness.sh" in script
+    assert "snapshot_resource_created" not in script
+
+    forbidden = [
+        " delete ",
+        " scale ",
+        " rollout restart",
+        " patch dgd",
+        " patch dynamographdeployment",
+    ]
+    for token in forbidden:
+        assert token not in script
+
+
 def test_r20_transceiver_backend_selection_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
 

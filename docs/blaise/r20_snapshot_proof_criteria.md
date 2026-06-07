@@ -97,6 +97,14 @@ deploy/disagg_pd_r20/render_dgd.sh \
   --snapshot-hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
   --server-dry-run
 
+# Guarded helper for the same default-safe render path. Add --apply only after
+# it reports the canary is absent and the target node's GPUs are idle enough for
+# an isolated canary.
+deploy/disagg_pd_r20/snapshot_hook_canary.sh \
+  --source-dgd topo-c1-dp2tp4-disagg-r20 \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --target-node a4-us-001-rl9
+
 # Canary readiness proof after the hook-enabled DGD has generated proof files.
 deploy/disagg_pd_r20/snapshot_readiness.sh \
   --vm local \
