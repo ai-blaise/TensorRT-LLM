@@ -389,6 +389,23 @@ def test_r20_cpp_cache_sender_completes_cancelled_promises():
     assert "mReadyResponses.erase(it)" in cancel_branch
 
 
+def test_r20_cache_transceiver_timeout_config_roundtrips_sender_future_timeout():
+    config_source = (REPO_ROOT / "cpp/tensorrt_llm/executor/cacheTransceiverConfig.cpp").read_text()
+    nanobind_source = (REPO_ROOT / "cpp/tensorrt_llm/nanobind/executor/executorConfig.cpp").read_text()
+    llm_args = (REPO_ROOT / "tensorrt_llm/llmapi/llm_args.py").read_text()
+
+    operator_eq = config_source[
+        config_source.index("bool CacheTransceiverConfig::operator=="):
+        config_source.index("void CacheTransceiverConfig::setBackendType")
+    ]
+    assert "mKvTransferSenderFutureTimeoutMs == other.mKvTransferSenderFutureTimeoutMs" in operator_eq
+    assert "getKvTransferSenderFutureTimeoutMs" in nanobind_source
+    assert "state.size() != 3 && state.size() != 4" in nanobind_source
+    assert "senderFutureTimeoutMs" in nanobind_source
+    assert "kv_transfer_sender_future_timeout_ms" in llm_args
+    assert "Requests exceeding this timeout will be cancelled" in llm_args
+
+
 def test_r20_live_smoke_strips_ansi_router_logs():
     smoke = (REPO_ROOT / "deploy/disagg_pd_r20/smoke_request_pinning.sh").read_text()
     assert "ansi_re = re.compile" in smoke
