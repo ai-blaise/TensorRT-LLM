@@ -137,7 +137,7 @@ def test_r20_nixl_gate_requires_generation_first_write_mode():
 
     assert "tensorrt_llm._torch.disaggregation.native.transfer" in smoke
     assert "importlib.util.find_spec(\\\"msgpack\\\")" in smoke
-    assert "handoff_mode=\\\"?generation_first\\\"?" in audit
+    assert "handoff_mode=\"?generation_first\"?" in audit
     assert "completed-prefill handoff in NIXL write-mode gate" in audit
     assert "NIXL write-mode gate forbids completed-prefill handoff markers" in smoke
 
