@@ -367,15 +367,25 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
+    std::optional<std::string> disaggInfoEndpoint{std::nullopt};
+    if (mCommState != nullptr)
+    {
+        auto commEndpoint = mCommState->toString();
+        if (!commEndpoint.empty())
+        {
+            disaggInfoEndpoint = std::move(commEndpoint);
+        }
+    }
     if (!llmRequest->hasDraftTokens())
     {
-        llmRequest->setContextPhaseParams(
-            executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release(), std::nullopt});
+        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
+            {}, llmRequest->mRequestId, contextState.release(), std::nullopt, std::nullopt, disaggInfoEndpoint});
     }
     else
     {
         llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
-            {}, llmRequest->mRequestId, contextState.release(), *llmRequest->getDraftTokens()});
+            {}, llmRequest->mRequestId, contextState.release(), *llmRequest->getDraftTokens(), std::nullopt,
+            disaggInfoEndpoint});
     }
 }
 

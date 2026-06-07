@@ -28,6 +28,11 @@ not a Python-only overlay over an older base. The C++ MLA cache formatter must
 include the CP-domain reassembly path (`mDomainCPSize > 1`) or decode KV receive
 will reject the LayerSplit handoff.
 
+Completed-prefill request pinning also depends on the C++ NIXL transceiver
+stamping `ContextPhaseParams.disagg_info_endpoint` from its concrete
+`CommState`. Without that source-built fix, Dynamo correctly rejects the handoff
+as unpinned because the prefill response has no `ctx_info_endpoint`.
+
 ## Deploy (orchestrator only -- gated)
 
 ```bash

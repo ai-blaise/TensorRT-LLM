@@ -17,9 +17,10 @@ back to an unknown-DP broadcast path before A/B testing.
 - `ctx_dp_rank` is present before decode asks for KV. Missing `ctx_dp_rank` is
   a hard error because it would otherwise broadcast `REQUEST_DATA` across
   context DP groups.
-- `ctx_info_endpoint`, when provided by the transceiver runtime, is treated as
-  request-local transfer metadata. Context response metadata wins over static
-  server metadata; static server metadata only backfills missing fields.
+- `ctx_info_endpoint` must be present for completed-prefill handoff. It is
+  treated as request-local transfer metadata. Context response metadata wins
+  over static server metadata; static server metadata only backfills missing
+  fields.
 - Request pins are cleared on normal completion, error, generation-first
   validation failure, generation-first context errors, and when a streaming
   response is consumed or closed.
@@ -40,6 +41,11 @@ back to an unknown-DP broadcast path before A/B testing.
   layout; request pinning still supplies the stable producer request id and
   transfer metadata to the executor before `requestAndReceive*` starts. UCX is
   retained only as an A/B comparison candidate.
+- The C++ transceiver stamps `ContextPhaseParams.disagg_info_endpoint` from the
+  concrete `CommState` identity before prefill responds. Python result handling
+  propagates that as `ctx_info_endpoint`, allowing Dynamo to fail closed when a
+  completed-prefill response lacks endpoint metadata instead of routing decode
+  through an unpinned fallback.
 - The r20 canary emits request-pinning trace logs at both boundaries:
   `disagg request pin outbound` from the frontend's OpenAI client before it
   sends context/generation requests, and `disagg request pin received` from the
@@ -82,7 +88,7 @@ back to an unknown-DP broadcast path before A/B testing.
 Collect these from the live rollout before A/B:
 
 - Frontend/request logs include `disagg request pin established` with
-  `ctx_server`, `ctx_dp_rank`, and `gen_server`.
+  `ctx_server`, `ctx_dp_rank`, `ctx_info_endpoint`, and `gen_server`.
 - Frontend logs include `disagg request pin outbound` for a
   `request_type=generation_only` request with matching `disagg_request_id` and
   non-null `ctx_dp_rank`.
@@ -101,6 +107,9 @@ Collect these from the live rollout before A/B:
   `policy='force'`, and no backend fallback. The temporary NIXL/LayerSplit smoke may run with `SMC_GATE_MODE=deferred`; that mode does not clear the SMC-SD A/B item.
 - KVarN dense MLA shows `mla_latent_kv_dtype='kvarn_k2v2'` and amortized restore.
 - Worker pods have zero restarts through smoke and 16-concurrency warmup.
+- `deploy/disagg_pd_r20/audit_cpp_context_endpoint_static.py` passes before a
+  full source build, and the strict live smoke observes a non-empty
+  `ctx_info_endpoint` in the completed-prefill pin markers.
 
 ## Reproducible live smoke
 

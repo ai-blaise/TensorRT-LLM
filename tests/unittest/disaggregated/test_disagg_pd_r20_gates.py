@@ -157,6 +157,22 @@ def test_r20_smc_moondream_decode_pinning_is_fail_closed():
     assert "audit_smc_decode_pinning_static" not in audit
 
 
+def test_r20_cpp_context_prefill_stamps_pin_endpoint():
+    source = (
+        REPO_ROOT / "cpp" / "tensorrt_llm" / "batch_manager" / "cacheTransceiver.cpp"
+    ).read_text()
+    audit = (DEPLOY_DIR / "audit_cpp_context_endpoint_static.py").read_text()
+    result = (REPO_ROOT / "tensorrt_llm" / "executor" / "result.py").read_text()
+
+    assert "std::optional<std::string> disaggInfoEndpoint" in source
+    assert "mCommState->toString()" in source
+    assert "if (!commEndpoint.empty())" in source
+    assert "disaggInfoEndpoint = std::move(commEndpoint)" in source
+    assert source.count("disaggInfoEndpoint") >= 4
+    assert "ctx_info_endpoint=context_phase_params.disagg_info_endpoint" in result
+    assert "C++ completed-prefill endpoint audit" in audit
+
+
 def test_r20_request_pinning_smoke_is_fail_closed():
     script = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
 
