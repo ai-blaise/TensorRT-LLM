@@ -57,15 +57,15 @@ Indexer/HISA sparse K path.
 | Requirement | Status | Notes |
 |---|---|---|
 | Packed 2-bit record format | **Implemented as primitives** | `kvarn_k2v2_g128` maps one 128-token block/head to a 9,728-byte record, hosted as 76 byte slots per token. Layout, bit pack/unpack, Hadamard/variance-normalized store, dequant restore, and transfer-view shapes are tested. |
-| Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
+| Dense/GQA separation from Indexer | **Implemented in config/docs; backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Unsupported GQA sparse offsets/shapes fail closed instead of routing through the Indexer or dense MLA path. |
 | HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype`, `quantization_config.kvarn.gqa`, or explicit SMC `draft_kv_cache_dtype="kvarn_k2v2_g128"`; startup rejects GQA KVarN unless the fused store/decode/sparse-decode/dequant ops are registered and the readiness gate passes. |
-| Disaggregated transfer compatibility | **Implemented as metadata/fragments; E2E proof pending** | Packed pages move through the existing byte-backed KV pool as opaque `UINT8` self-only blocks. KVarN GQA side-state now has explicit NIXL metadata (`kvarn_gqa_side_meta`) and final-slice transfer fragments for sink/tail/commit tensors keyed by request-pinned side-pool slots. Unit coverage checks nonzero sender/receiver slot pointer offsets and `RecvReqInfo` serialization. Full multi-rank NIXL proof is still pending, so backend readiness remains false. |
+| Disaggregated transfer compatibility | **Implemented as metadata/fragments; E2E proof pending** | Packed pages move through the existing byte-backed KV pool as opaque `UINT8` self-only blocks. KVarN GQA side-state now has explicit NIXL metadata (`kvarn_gqa_side_meta`) and final-slice transfer fragments for sink/tail/commit tensors keyed by request-pinned side-pool slots. The receiver mirrors its local block table into a device int64 tensor and reconstructs physical commit generation from transferred logical `committed`/`commit_gen`, so BDR restore can discover changed destination physical blocks after NIXL remapping without a host block-table loop. Unit coverage checks nonzero sender/receiver slot pointer offsets, `RecvReqInfo` serialization, and receiver-side BDR generation reconstruction. Full multi-rank NIXL proof is still pending, so backend readiness remains false. |
 | CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. V1/V2 KV cache manager `free_resources()` calls release side-pool state before block removal. The BDR readable pool and `restored_gen`/`physical_commit_gen` tensors are preallocated/lazy-grown outside the hot restore. The sparse/store bench now has `--graph-replay` to capture/replay store, dense decode, and sparse decode, but B200 graph proof is still pending. |
 | Sparse packed reads | **Fused candidate implemented, proof pending** | `sparse_kv_indices`/offsets compose by restoring through KVarN BDR/readable state and gathering selected tokens per KV head. `sparse_attn_indices` top-k scoring now has `torch.ops.trtllm.kvarn_gqa_decode_sparse`, a packed 2-bit in-kernel dequant/scoring path for top-k<=256 with -1 padding. Static SM100 compile and a runnable B200 harness exist, but GPU parity/perf, sparse offsets semantics, graph replay, and E2E HISA composition proof are still pending, so backend readiness remains false. |
-| BDR fold / amortized dequant | **Prototype implemented; production fusion still gated** | GQA has a physical-block keyed readable pool plus device int64 commit/restored generation metadata. The BDR restore path gathers logical full blocks from the request block table, maps them to physical block ids, masks by valid and changed generation state, applies torch.unique, and batched-dequants only churn blocks into the persistent readable pool. The CUDA decode hook now bypasses the readable-pool restore for safe generation/FULL-mask reads and calls the GQA packed decode op, which reads packed 2-bit records and folds Hadamard dequant into scoring/value accumulation. The decode kernel is now block-parallel, but production readiness remains false until runtime parity, transfer, graph lifecycle, sparse-read, and B200 perf gates pass. |
+| BDR fold / amortized dequant | **Prototype implemented; production fusion still gated** | GQA has a physical-block keyed readable pool plus device int64 commit/restored generation metadata. The request block table is mirrored into device int64 storage per layer/slot; restore maps logical full blocks to physical ids, filters valid committed records, reconstructs receiver physical generation after transfer when needed, applies torch.unique to stale physical ids, and batched-dequants only churn blocks into the persistent readable pool. The CUDA decode hook now bypasses the readable-pool restore for safe generation/FULL-mask reads and calls the GQA packed decode op, which reads packed 2-bit records and folds Hadamard dequant into scoring/value accumulation. The decode kernel is now block-parallel, but production readiness remains false until runtime parity, transfer, graph lifecycle, sparse-read, and B200 perf gates pass. |
 | Fused B200 store/decode kernels | **Store/decode/sparse-decode candidates wired for safe cases; not production-ready** | The GQA store, dense packed decode, and sparse top-k packed decode ops now have block-parallel SM100/B200 kernels. CUDA full-block commits call the store op; CUDA generation q_len=1 and FULL-mask reads call the packed decode op directly over byte pages, fp16 sink, and fp16 tail. The dense decode op launches one CTA per (query, head), 256 threads per CTA, shared-memory Q rotation, block reductions for softmax max/denom, and in-kernel packed 2-bit K/V dequant folded into scoring/value accumulation. For total sink+packed+tail length <=256 it dispatches a no-atomic small decoder. The sparse top-k op uses the same packed/sink/tail loaders and softmaxes only the selected logical token ids, avoiding readable-pool staging for `sparse_attn_indices`. Store packing now writes four 2-bit values per byte directly instead of zeroing and read/OR/writing each byte. Causal multi-token prefill, sliding-window, q_scaling, uncommitted full speculative blocks, and top-k>256 fail closed. Multi-rank NIXL E2E proof, CUDA graph replay, broader runtime parity, post-optimization store timing, and c16 B200 performance proof are still missing, so backend readiness remains false. |
 | Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
-| Performance proof | **Missing** | Microbench has a correctness floor and `--require-fused` promotion guard, but no fused B200 numbers or c16 tok/s/user proof exist. |
+| Performance proof | **Partial isolated decode only** | Earlier B200 microbench runs showed the packed decode candidate faster than the reference restore path for q_len/M in {1,5,25}, and the harness has a correctness floor plus `--require-fused` promotion guard. Store+read, sparse, graph replay, multi-rank transfer, and c16 tok/s/user proof are still missing, so this is not production-ready. |
 | Production enablement | **Blocked** | Requires fused kernels, disagg side-state transfer, sparse packed reads, graph-safe lifecycle, fp16/fp8 correctness proof, and c16 E2E performance proof. |
 
 ## Current op-trt status
@@ -82,13 +82,18 @@ Implemented:
   speculative tail in fp16, calls the CUDA packed store/decode ops when tensors
   are CUDA and the mask is a supported generation/FULL case, otherwise restores
   committed records through the BDR physical-block keyed readable pool for GQA
-  SDPA on the CPU reference path, and rejects
-  sparse-indexed reads until a packed sparse read path exists. The side buffers
+  SDPA on the CPU reference path, routes supported sparse attention top-k
+  reads through the packed sparse decode hook, and fails closed for unsupported
+  sparse offsets/shapes. The side buffers
   are preallocated by layer/request slot with commit metadata sized to
   `max_blocks_per_seq`, so ordinary decode does not allocate new sink/tail
-  tensors inside the step. BDR restore uses device int64 `physical_commit_gen` and
-  `restored_gen` tensors plus `torch.unique` on the stale physical block ids, so
-  reference dequant cost follows churn rather than the full working set.
+  tensors inside the step. The current request block table is mirrored into
+  device int64 storage before store/read; BDR restore uses that device table,
+  `physical_commit_gen`, and `restored_gen` plus `torch.unique` on stale
+  physical block ids, so reference dequant cost follows churn rather than the
+  full working set. Receiver-side restore also rebuilds physical generation from
+  transferred logical commit metadata after NIXL remaps packed pages to local
+  physical block ids.
 - `_util.py` allocates non-MLA KVarN GQA KV as an opaque UINT8 self-only page
   pool. For k2v2/g128 it uses `tokens_per_block=128`, `head_dim=76`, and
   `CacheType.SELFKONLY`, so each page is exactly one 9,728-byte KVarN record per
@@ -197,10 +202,13 @@ deployment can be called complete:
    the native/NIXL worker registers request-slot side-state VRAM regions for
    `sink_k`, `sink_v`, `sink_len`, `tail_k`, `tail_v`, `tail_filled`,
    `tail_block_start`, `committed`, and `commit_gen`. The sender appends
-   side-state fragments only on the final KV slice using the receiver's
-   request-pinned side slot. Unit coverage now validates nonzero sender and
-   receiver side-slot pointer offsets plus `RecvReqInfo` serialization. Remaining
-   work is an actual multi-rank NIXL run
+   side-state fragments only on the final KV slice using the receiver-side
+   request-pinned side slot. The receiver mirrors destination physical block ids
+   into device storage and rebuilds physical commit generation from transferred
+   logical side-state before BDR restore. Unit coverage now validates nonzero
+   sender and receiver side-slot pointer offsets, `RecvReqInfo` serialization,
+   and receiver-side BDR rerestore behavior. Remaining work is an actual
+   multi-rank NIXL run
    that proves payload arrival, request abort/reuse behavior, and Moondream
    pinning interaction.
 3. Sparse-indexed GQA reads: HISA/Indexer state remains separate and is not

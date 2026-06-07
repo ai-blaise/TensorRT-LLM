@@ -65,6 +65,9 @@ class _KVarNGQASidePool:
                                       max(1, max_blocks_per_seq)),
                                      device=device, dtype=torch.bool)
         self.commit_gen = torch.zeros_like(self.committed, dtype=torch.int64)
+        self.block_ids = torch.full((num_layers, max_batch_size,
+                                     max(1, max_blocks_per_seq)), -1,
+                                    device=device, dtype=torch.int64)
         self.request_to_slot: dict[int, int] = {}
         self.slot_to_request: dict[int, int] = {}
         self.request_block_to_slot_block: dict[tuple[int, int, int], int] = {}
@@ -131,6 +134,7 @@ class _KVarNGQASidePool:
         self.tail_block_start[:, slot].fill_(-1)
         self.committed[:, slot].zero_()
         self.commit_gen[:, slot].zero_()
+        self.block_ids[:, slot].fill_(-1)
 
     def ensure_bdr_pool(self, num_physical_blocks: int) -> None:
         """Lazily allocate the BDR readable pool keyed by physical block id.
@@ -169,6 +173,17 @@ class _KVarNGQASidePool:
                 self.physical_valid[layer, physical] = False
                 self.restored_gen[layer, physical] = 0
                 self.physical_commit_gen[layer, physical] = 0
+
+    def update_block_ids(self, layer: int, slot: int, block_ids: list[int]) -> None:
+        """Mirror the request block table into graph-stable device storage."""
+        if len(block_ids) > self.max_committed_blocks:
+            raise RuntimeError(
+                f"KVarN GQA block table length {len(block_ids)} exceeds side-pool "
+                f"capacity {self.max_committed_blocks}; increase max_seq_len/tokens_per_block")
+        self.block_ids[layer, slot].fill_(-1)
+        if block_ids:
+            block_ids_t = torch.as_tensor(block_ids, dtype=torch.long, device=self.device)
+            self.block_ids[layer, slot, :block_ids_t.numel()].copy_(block_ids_t)
 
     def mark_committed(self, layer: int, slot: int, request_id: int,
                        block_start: int, physical_block_id: Optional[int] = None) -> None:
@@ -237,7 +252,7 @@ class _KVarNGQASidePool:
             empty = torch.empty((0,), dtype=torch.long, device=self.device)
             return empty, empty
 
-        block_ids_t = torch.as_tensor(block_ids, dtype=torch.long, device=self.device)
+        block_ids_t = self.block_ids[layer, slot]
         logical = torch.arange(sink_blocks, n_full, dtype=torch.long, device=self.device)
         logical = logical[logical < block_ids_t.numel()]
         if logical.numel() == 0:
@@ -252,6 +267,12 @@ class _KVarNGQASidePool:
             return logical, physical
 
         logical_committed = self.committed[layer, slot].index_select(0, logical)
+        logical_commit_gen = self.commit_gen[layer, slot].index_select(0, logical)
+        committed_physical = physical[logical_committed]
+        if committed_physical.numel() > 0:
+            committed_gen = logical_commit_gen[logical_committed]
+            self.physical_valid[layer, committed_physical] = True
+            self.physical_commit_gen[layer].index_copy_(0, committed_physical, committed_gen)
         valid = self.physical_valid[layer].index_select(0, physical) & logical_committed
         commit = self.physical_commit_gen[layer].index_select(0, physical)
         if amortize:
@@ -863,6 +884,7 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             use_spec_decoding = bool(getattr(metadata, "use_spec_decoding", False))
             allow_commit = sample_idx < metadata.num_contexts or not use_spec_decoding
             slot = state.slot_for_request(request_id)
+            state.update_block_ids(self.layer_idx, slot, block_ids)
             self._store_new_tokens(state, kv_pages, request_id, slot, block_ids, past,
                                    k_view, v_view, allow_commit=allow_commit)
             total_kv_len = past + new_kv_len

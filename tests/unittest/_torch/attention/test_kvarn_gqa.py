@@ -174,7 +174,8 @@ def test_kvarn_gqa_side_pool_release_request_clears_abort_reuse_state():
     tok = torch.ones((1, cfg.head_dim), dtype=torch.float16)
     pool.put_sink(0, slot, tok, tok, 0)
     pool.put_tail(1, slot, cfg.group, 0, tok, tok)
-    pool.mark_committed(0, slot, 41, 0)
+    pool.update_block_ids(0, slot, [3, 5])
+    pool.mark_committed(0, slot, 41, 0, physical_block_id=3)
 
     assert int(pool.sink_len[0, slot].item()) == 1
     assert bool(pool.tail_filled[1, slot, 0].item())
@@ -190,6 +191,7 @@ def test_kvarn_gqa_side_pool_release_request_clears_abort_reuse_state():
     assert torch.equal(pool.tail_block_start[:, slot], torch.full((2,), -1, dtype=torch.int64))
     assert not bool(pool.committed[:, slot].any().item())
     assert int(pool.commit_gen[:, slot].sum().item()) == 0
+    assert torch.equal(pool.block_ids[:, slot], torch.full((2, 2), -1, dtype=torch.int64))
     assert not pool.request_block_to_slot_block
 
     reused = pool.slot_for_request(42)
@@ -240,6 +242,7 @@ def test_kvarn_gqa_bdr_restore_scales_with_churn_not_working_set(monkeypatch):
 
     slot = state.slot_for_request(7)
     block_ids = [0, 2, 4, 6, 7]
+    state.update_block_ids(0, slot, block_ids)
     for logical_block, physical_block in ((1, 2), (2, 4), (3, 6)):
         k = torch.randn(cfg.group, 1, cfg.head_dim, dtype=torch.float16) * 0.2
         v = torch.randn_like(k) * 0.2
@@ -293,11 +296,65 @@ def test_kvarn_gqa_bdr_restore_scales_with_churn_not_working_set(monkeypatch):
     assert calls == [3]
 
     state.release_request(7)
+    assert torch.equal(state.block_ids[0, slot], torch.full((5,), -1, dtype=torch.int64))
     assert not bool(state.physical_valid[0, 2].item())
     assert not bool(state.physical_valid[0, 4].item())
     assert not bool(state.physical_valid[0, 6].item())
     assert int(state.restored_gen[0, torch.tensor([2, 4, 6])].sum().item()) == 0
 
+
+
+def test_kvarn_gqa_bdr_reconstructs_receiver_physical_generation(monkeypatch):
+    torch = _TORCH
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    state = _KVarNGQASidePool(
+        cfg,
+        num_layers=1,
+        max_batch_size=1,
+        max_blocks_per_seq=4,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    kv_pages = torch.zeros((8, 1, cfg.group, 1, cfg.bytes_per_token_slot),
+                           dtype=torch.uint8)
+    state.ensure_bdr_pool(kv_pages.shape[0])
+    slot = state.slot_for_request(17)
+    # Simulate receiver-side state after NIXL: logical committed/commit_gen
+    # arrived, and the receiver has its own physical destination block ids, but
+    # physical_valid/physical_commit_gen were not pre-populated locally.
+    state.update_block_ids(0, slot, [0, 5, 6, 7])
+    state.committed[0, slot, 1:3] = True
+    state.commit_gen[0, slot, 1] = 4
+    state.commit_gen[0, slot, 2] = 9
+    for physical in (5, 6):
+        k = torch.randn(cfg.group, 1, cfg.head_dim, dtype=torch.float16) * 0.1
+        v = torch.randn_like(k) * 0.1
+        _write_record_to_page(kv_pages[physical, 0], quantize_gqa_tile(k, v, cfg), cfg)
+
+    calls = []
+    real_dequant = _gqa_attention.dequantize_gqa_tiles
+
+    def counted_dequant(records, cfg):
+        calls.append(int(records.shape[0]))
+        return real_dequant(records, cfg)
+
+    monkeypatch.setattr(_gqa_attention, "dequantize_gqa_tiles", counted_dequant)
+
+    _, physical = state.restore_committed_blocks_amortized(
+        0, slot, [], seq_len=3 * cfg.group, kv_pages=kv_pages, amortize=True)
+
+    assert physical.tolist() == [5, 6]
+    assert calls == [2]
+    assert bool(state.physical_valid[0, 5].item())
+    assert bool(state.physical_valid[0, 6].item())
+    assert int(state.physical_commit_gen[0, 5].item()) == 4
+    assert int(state.physical_commit_gen[0, 6].item()) == 9
+
+    calls.clear()
+    state.restore_committed_blocks_amortized(
+        0, slot, [], seq_len=3 * cfg.group, kv_pages=kv_pages, amortize=True)
+    assert calls == []
 
 def test_kvarn_gqa_sparse_kv_gather_is_per_kv_head():
     torch = _TORCH

@@ -300,12 +300,14 @@ cleanup. It is not production-default yet.
 Required completion:
 
 - Prove multi-rank NIXL transfer for packed GQA KVarN pages plus side-state
-  fragments. The integration branch has side-state metadata/fragments and unit
-  coverage for nonzero request-pinned slot offsets; it still needs the real
-  multi-rank NIXL run.
+  fragments. The integration branch has side-state metadata/fragments,
+  receiver-side device block-table mirroring, physical generation reconstruction
+  after destination block remap, and unit coverage for nonzero request-pinned
+  slot offsets; it still needs the real multi-rank NIXL run.
 - Finish and prove BDR fold with in-kernel dequant-on-read for the GQA 2-bit
   path, matching the dense MLA optimization level described in
-  `docs/blaise/kvarn.md`. The branch has physical-block generation tracking,
+  `docs/blaise/kvarn.md`. The branch has device-side block-table mirroring,
+  physical-block generation tracking, receiver-side generation reconstruction,
   amortized dequant, and packed decode/sparse-decode kernels that read/dequant
   in-kernel; live parity/perf proof is still pending.
 - Keep the default production KV contract explicit: dense MLA defaults to
