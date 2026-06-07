@@ -119,6 +119,22 @@ deploy/disagg_pd_r20/render_dgd.sh \
   --server-dry-run
 ```
 
+Check exact image handoff before prewarm/deploy. This is read-only and catches
+missing resident tags or local-registry tags before an operator spends time on a
+prewarm job or DGD rollout:
+
+```bash
+deploy/disagg_pd_r20/check_image_handoff.sh \
+  --vm local \
+  --image-from-dgd topo-c1-dp2tp4-disagg-r20 \
+  --mode auto \
+  --require
+```
+
+Use `--mode resident` when the pod spec will use `imagePullPolicy: Never`, and
+`--mode registry` when the tag must be available from the VM-local registry with
+`imagePullPolicy: IfNotPresent`.
+
 Build and apply the main DGD:
 
 ```bash
@@ -218,6 +234,8 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
   iterations and alternate-name canary deployments.
 - `render_dgd.sh` -- render and optionally server-dry-run the DGD with an
   existing image, so router/deploy-YAML checks do not require a new image loop.
+- `check_image_handoff.sh` -- read-only exact-image preflight for containerd
+  residency, VM-local registry availability, and recommended pull policy.
 - `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
   prewarm/validation job.
 - `smoke_request_pinning.sh` -- ready-only live gate for non-MORI request
