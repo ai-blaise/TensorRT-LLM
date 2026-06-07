@@ -3,7 +3,10 @@ from typing import List, Optional
 
 import msgpack
 
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBufferMeta,
+    KVarNGQASidePoolMeta,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
@@ -33,6 +36,7 @@ class RankInfo:
 
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
+    kvarn_gqa_side_meta: Optional[KVarNGQASidePoolMeta] = None
     page_table: Optional[KVCachePageTable] = None
 
     @property
@@ -45,6 +49,11 @@ class RankInfo:
         data = asdict(self)
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
+        data["kvarn_gqa_side_meta"] = (
+            self.kvarn_gqa_side_meta.to_dict()
+            if self.kvarn_gqa_side_meta is not None
+            else None
+        )
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
         return msgpack.packb(data)
 
@@ -55,6 +64,7 @@ class RankInfo:
         kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        kvarn_gqa_side_meta: Optional[KVarNGQASidePoolMeta] = None,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
@@ -85,6 +95,7 @@ class RankInfo:
                 is_mla=kvm.kv_factor == 1,
             ),
             aux_meta=aux_buffer_meta,
+            kvarn_gqa_side_meta=kvarn_gqa_side_meta,
             page_table=build_page_table_from_manager(kvm),
         )
 
@@ -97,4 +108,8 @@ class RankInfo:
             unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
+        if unpacked.get("kvarn_gqa_side_meta") is not None:
+            unpacked["kvarn_gqa_side_meta"] = KVarNGQASidePoolMeta.from_dict(
+                unpacked["kvarn_gqa_side_meta"]
+            )
         return cls(**unpacked)

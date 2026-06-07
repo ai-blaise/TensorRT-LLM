@@ -34,6 +34,45 @@ class AuxBufferMeta:
         )
 
 
+@dataclass
+class KVarNGQASidePoolMeta:
+    """Transfer metadata for request-slot keyed KVarN GQA side state.
+
+    Packed 2-bit K/V records live in the normal byte-backed KV page pool and
+    are transferred by block id.  Attention sink, active tail, and generation
+    state are request-slot keyed tensors, so NIXL needs per-slot pointer/size
+    metadata for them instead of treating them as ordinary K/V pages.
+    """
+
+    ptrs: np.ndarray  # dtype=np.int64, base pointer for slot 0 of each entry
+    size: np.ndarray  # dtype=np.int64, total bytes registered for each entry
+    item_sizes: np.ndarray  # dtype=np.int64, bytes for one request slot
+    names: list[str] = field(default_factory=list)
+    max_slots: int = 0
+    device_id: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ptrs": self.ptrs.tolist(),
+            "size": self.size.tolist(),
+            "item_sizes": self.item_sizes.tolist(),
+            "names": list(self.names),
+            "max_slots": int(self.max_slots),
+            "device_id": int(self.device_id),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "KVarNGQASidePoolMeta":
+        return cls(
+            ptrs=np.array(data["ptrs"], dtype=np.int64),
+            size=np.array(data["size"], dtype=np.int64),
+            item_sizes=np.array(data["item_sizes"], dtype=np.int64),
+            names=[str(x) for x in data.get("names", [])],
+            max_slots=int(data.get("max_slots", 0)),
+            device_id=int(data.get("device_id", 0)),
+        )
+
+
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
 

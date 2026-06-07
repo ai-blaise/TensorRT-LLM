@@ -76,6 +76,7 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
+    kvarn_gqa_side_slot: Optional[int] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -91,6 +92,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
+                "kvarn_gqa_side_slot": self.kvarn_gqa_side_slot,
             }
         )
 
@@ -100,6 +102,7 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
+        d.setdefault("kvarn_gqa_side_slot", None)
         return cls(**d)
 
 
@@ -227,8 +230,10 @@ class Sender(SenderBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
+        kvarn_gqa_side_pool=None,
     ):
         self._registrar = peer_registrar
+        self._kvarn_gqa_side_pool = kvarn_gqa_side_pool
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._peer_requests: dict = {}
@@ -645,6 +650,55 @@ class Sender(SenderBase):
             dst_block_ids[dst_skip : dst_skip + n_transfer],
         )
 
+    def _collect_kvarn_gqa_side_frags(
+        self, peer_ri: RankInfo, req_info: RecvReqInfo, task: KVSendTask
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        side_pool = self._kvarn_gqa_side_pool
+        if side_pool is None:
+            return None
+        if not task._slice.is_last_slice:
+            return None
+        src_meta = self._registrar.self_rank_info.kvarn_gqa_side_meta
+        dst_meta = peer_ri.kvarn_gqa_side_meta
+        if src_meta is None or dst_meta is None:
+            raise RuntimeError(
+                "KVarN GQA disaggregated transfer requires side-state metadata "
+                "on both sender and receiver; refusing to transfer packed pages "
+                "without sink/tail/commit state"
+            )
+        if task._unique_rid is None:
+            raise RuntimeError("KVarN GQA side-state transfer requires a request id")
+        src_slot = side_pool.request_to_slot.get(int(task._unique_rid))
+        if src_slot is None:
+            raise RuntimeError(
+                f"KVarN GQA side-state transfer missing sender slot for "
+                f"request={task._unique_rid}; packed pages alone are incomplete"
+            )
+        dst_slot = req_info.kvarn_gqa_side_slot
+        if dst_slot is None:
+            raise RuntimeError(
+                f"KVarN GQA side-state transfer missing receiver slot for "
+                f"request={task._unique_rid}"
+            )
+        if src_meta.item_sizes.shape != dst_meta.item_sizes.shape or not np.array_equal(
+            src_meta.item_sizes, dst_meta.item_sizes
+        ):
+            raise RuntimeError(
+                "KVarN GQA side-state layout mismatch between sender and receiver"
+            )
+        if int(src_slot) >= int(src_meta.max_slots) or int(dst_slot) >= int(dst_meta.max_slots):
+            raise RuntimeError(
+                f"KVarN GQA side-state slot out of range: src={src_slot}/"
+                f"{src_meta.max_slots}, dst={dst_slot}/{dst_meta.max_slots}"
+            )
+        src_ptrs = src_meta.ptrs + src_meta.item_sizes * int(src_slot)
+        dst_ptrs = dst_meta.ptrs + dst_meta.item_sizes * int(dst_slot)
+        return (
+            src_ptrs.astype(np.int64, copy=False),
+            dst_ptrs.astype(np.int64, copy=False),
+            src_meta.item_sizes.astype(np.int64, copy=False),
+        )
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -774,6 +828,13 @@ class Sender(SenderBase):
             src_frags = np.concatenate([src_frags, np.array(m_src, dtype=np.int64)])
             dst_frags = np.concatenate([dst_frags, np.array(m_dst, dtype=np.int64)])
             kv_sizes = np.concatenate([kv_sizes, np.array(m_sizes, dtype=np.int64)])
+
+        side_frags = self._collect_kvarn_gqa_side_frags(peer_ri, req_info, task)
+        if side_frags is not None:
+            s_src, s_dst, s_sizes = side_frags
+            src_frags = np.concatenate([src_frags, s_src])
+            dst_frags = np.concatenate([dst_frags, s_dst])
+            kv_sizes = np.concatenate([kv_sizes, s_sizes])
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1287,8 +1348,10 @@ class Receiver(ReceiverBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
+        kvarn_gqa_side_pool=None,
     ):
         self._registrar = peer_registrar
+        self._kvarn_gqa_side_pool = kvarn_gqa_side_pool
         self._agent = agent
         self._dealers = {}
         self._sender_ep_instance_map = {}
@@ -1350,6 +1413,9 @@ class Receiver(ReceiverBase):
         )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
         # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
+        kvarn_side_slot = None
+        if self._kvarn_gqa_side_pool is not None:
+            kvarn_side_slot = self._kvarn_gqa_side_pool.slot_for_request(task._unique_rid)
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
@@ -1360,6 +1426,7 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
+            kvarn_gqa_side_slot=kvarn_side_slot,
         )
 
     def dispatch_task(self, task: KVRecvTask):
@@ -1939,14 +2006,35 @@ class TransferWorker:
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len
         )
+        self._kvarn_gqa_side_pool = self._make_kvarn_gqa_side_pool(kvm, config.device_id)
+        kvarn_gqa_side_meta = (
+            self._kvarn_gqa_side_pool.transfer_meta(device_id=config.device_id)
+            if self._kvarn_gqa_side_pool is not None
+            else None
+        )
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+            kvarn_gqa_side_meta=kvarn_gqa_side_meta,
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
+
+    @staticmethod
+    def _make_kvarn_gqa_side_pool(kvm: KVCacheManager, device_id: int):
+        if getattr(kvm, "kvarn_gqa_config", None) is None:
+            return None
+        from tensorrt_llm._torch.attention_backend.kvarn_gqa_attention import (
+            get_or_create_kvarn_gqa_side_pool_for_manager,
+        )
+
+        torch.cuda.set_device(device_id)
+        dtype = getattr(kvm, "kvarn_gqa_state_dtype", torch.float16)
+        return get_or_create_kvarn_gqa_side_pool_for_manager(
+            kvm, dtype=dtype, device=torch.device("cuda", device_id)
+        )
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -2003,8 +2091,8 @@ class TransferWorker:
             self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
-            self._sender = Sender(self._peer_registrar, self._agent)
-            self._receiver = Receiver(self._peer_registrar, self._agent)
+            self._sender = Sender(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
+            self._receiver = Receiver(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
@@ -2021,6 +2109,16 @@ class TransferWorker:
             self._agent.register_memory(reg_memory_desc)
             logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
             self._registered_mem.append(reg_memory_desc)
+        side_meta = self._rank_info.kvarn_gqa_side_meta
+        if side_meta is not None and side_meta.ptrs.size > 0:
+            side_descs = [
+                (int(ptr), int(size), self._rank_info.device_id, f"kvarn_gqa_side_pool{i}")
+                for i, (ptr, size) in enumerate(zip(side_meta.ptrs, side_meta.size))
+            ]
+            reg_side_desc = RegMemoryDescs("VRAM", side_descs)
+            self._agent.register_memory(reg_side_desc)
+            logger.debug(f"Registered KVarN GQA side-state memory: {side_descs}")
+            self._registered_mem.append(reg_side_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None

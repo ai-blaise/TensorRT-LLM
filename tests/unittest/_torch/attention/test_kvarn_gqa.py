@@ -299,6 +299,82 @@ def test_kvarn_gqa_bdr_restore_scales_with_churn_not_working_set(monkeypatch):
     assert int(state.restored_gen[0, torch.tensor([2, 4, 6])].sum().item()) == 0
 
 
+def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
+    torch = _TORCH
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
+
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    src_pool = _KVarNGQASidePool(
+        cfg,
+        num_layers=2,
+        max_batch_size=3,
+        max_blocks_per_seq=4,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    dst_pool = _KVarNGQASidePool(
+        cfg,
+        num_layers=2,
+        max_batch_size=3,
+        max_blocks_per_seq=4,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    src_slot = src_pool.slot_for_request(123)
+    dst_slot = dst_pool.slot_for_request(123)
+    assert src_slot == 0
+    assert dst_slot == 0
+
+    src_meta = src_pool.transfer_meta(device_id=0)
+    dst_meta = dst_pool.transfer_meta(device_id=0)
+
+    assert src_meta.ptrs.shape == src_meta.item_sizes.shape
+    assert src_meta.max_slots == 3
+    assert any(name.endswith("sink_k") for name in src_meta.names)
+    assert any(name.endswith("tail_block_start") for name in src_meta.names)
+    assert any(name.endswith("commit_gen") for name in src_meta.names)
+
+    sender_self = SimpleNamespace(
+        _kvarn_gqa_side_pool=src_pool,
+        _registrar=SimpleNamespace(
+            self_rank_info=SimpleNamespace(kvarn_gqa_side_meta=src_meta)
+        ),
+    )
+    peer_ri = SimpleNamespace(kvarn_gqa_side_meta=dst_meta)
+    req_info = RecvReqInfo(
+        sender_req_id=11,
+        instance_name="dst",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=123,
+        kvarn_gqa_side_slot=dst_slot,
+    )
+    task = SimpleNamespace(_unique_rid=123, _slice=SimpleNamespace(is_last_slice=True))
+
+    src_ptrs, dst_ptrs, sizes = Sender._collect_kvarn_gqa_side_frags(
+        sender_self, peer_ri, req_info, task
+    )
+
+    assert torch.equal(torch.from_numpy(sizes), torch.from_numpy(src_meta.item_sizes))
+    assert torch.equal(torch.from_numpy(src_ptrs), torch.from_numpy(src_meta.ptrs))
+    assert torch.equal(torch.from_numpy(dst_ptrs), torch.from_numpy(dst_meta.ptrs))
+
+    # Non-final slices carry packed pages only; final slice carries side state.
+    task._slice.is_last_slice = False
+    assert Sender._collect_kvarn_gqa_side_frags(sender_self, peer_ri, req_info, task) is None
+
+    # Missing side metadata must fail closed rather than transferring incomplete KVarN state.
+    task._slice.is_last_slice = True
+    with pytest.raises(RuntimeError, match="side-state metadata"):
+        Sender._collect_kvarn_gqa_side_frags(
+            sender_self, SimpleNamespace(kvarn_gqa_side_meta=None), req_info, task
+        )
+
+
 def test_kvarn_gqa_packed_decode_guards_causal_multitoken_and_scaling():
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 

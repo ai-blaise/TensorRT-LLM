@@ -6,10 +6,9 @@ Huawei-compatible packed records from ``kvarn_gqa`` as the authoritative cache
 for full 128-token prefill blocks and keeps attention sink / speculative tail
 state in fp16 side buffers. The read path restores packed blocks into GQA SDPA.
 
-The implementation is intentionally conservative and Python-level. It is correct
-and composable enough to remove the config-only fail-close, but the c16
-throughput target still requires replacing the restore+SDPA section with a
-fused CUDA/Triton decode kernel.
+The CUDA path uses packed-record store/decode ops for full blocks and keeps
+attention sink / speculative tail state in a graph-stable side pool. Unsupported
+GQA features fail closed instead of falling back to fp16/fp8/NVFP4 KV.
 """
 
 from __future__ import annotations
@@ -298,18 +297,96 @@ class _KVarNGQASidePool:
             "commit_gen": self.commit_gen[layer, slot],
         }
 
+    def transfer_meta(self, *, device_id: int):
+        """Describe per-request-slot side tensors for NIXL registration.
 
-def _get_or_create_side_pool(kv_cache_manager, cfg: KVarNGQAConfig,
-                             *, layer_idx: int, kv_pages: torch.Tensor,
-                             dtype: torch.dtype) -> _KVarNGQASidePool:
+        Entries are per-layer views with slot 0 as the base pointer and a fixed
+        per-slot byte size.  The transfer worker offsets these pointers by the
+        source/destination request slots selected by request pinning.
+        """
+        from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+            KVarNGQASidePoolMeta,
+        )
+        import numpy as np
+
+        tensors = {
+            "sink_k": self.sink_k,
+            "sink_v": self.sink_v,
+            "sink_len": self.sink_len,
+            "tail_k": self.tail_k,
+            "tail_v": self.tail_v,
+            "tail_filled": self.tail_filled,
+            "tail_block_start": self.tail_block_start,
+            "committed": self.committed,
+            "commit_gen": self.commit_gen,
+        }
+        ptrs = []
+        sizes = []
+        item_sizes = []
+        names = []
+        for layer in range(self.num_layers):
+            for name, tensor in tensors.items():
+                view = tensor[layer, 0].contiguous()
+                item_size = int(view.numel() * view.element_size())
+                ptrs.append(int(tensor[layer, 0].data_ptr()))
+                item_sizes.append(item_size)
+                sizes.append(item_size * int(self.max_batch_size))
+                names.append(f"layer{layer}.{name}")
+        return KVarNGQASidePoolMeta(
+            ptrs=np.array(ptrs, dtype=np.int64),
+            size=np.array(sizes, dtype=np.int64),
+            item_sizes=np.array(item_sizes, dtype=np.int64),
+            names=names,
+            max_slots=int(self.max_batch_size),
+            device_id=int(device_id),
+        )
+
+
+def get_or_create_kvarn_gqa_side_pool_for_manager(kv_cache_manager, *,
+                                                  dtype: Optional[torch.dtype] = None,
+                                                  device: Optional[torch.device] = None
+                                                  ) -> Optional[_KVarNGQASidePool]:
+    cfg = getattr(kv_cache_manager, "kvarn_gqa_config", None)
+    if cfg is None:
+        return None
     pool = getattr(kv_cache_manager, "_kvarn_gqa_side_pool", None)
-    num_layers = max(getattr(kv_cache_manager, "layer_offsets", {layer_idx: 0}).values()) + 1
+    if pool is not None:
+        return pool
+    if dtype is None:
+        dtype = getattr(kv_cache_manager, "kvarn_gqa_state_dtype", torch.float16)
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    layer_offsets = getattr(kv_cache_manager, "layer_offsets", {0: 0})
+    num_layers = max(layer_offsets.values()) + 1 if layer_offsets else 1
     max_batch_size = int(getattr(kv_cache_manager, "max_batch_size", 1))
     max_blocks_per_seq = int(getattr(kv_cache_manager, "max_blocks_per_seq",
                                      max(1, math.ceil(getattr(kv_cache_manager, "max_seq_len",
                                                               cfg.group) / cfg.group))))
-    num_kv_heads = int(kv_pages.shape[3])
+    kv_heads = getattr(kv_cache_manager, "num_kv_heads_per_layer", [1])
+    num_kv_heads = int(kv_heads[0] if isinstance(kv_heads, (list, tuple)) else kv_heads)
+    pool = _KVarNGQASidePool(cfg,
+                             num_layers=num_layers,
+                             max_batch_size=max_batch_size,
+                             max_blocks_per_seq=max_blocks_per_seq,
+                             num_kv_heads=num_kv_heads,
+                             dtype=dtype,
+                             device=device)
+    setattr(kv_cache_manager, "_kvarn_gqa_side_pool", pool)
+    return pool
+
+
+def _get_or_create_side_pool(kv_cache_manager, cfg: KVarNGQAConfig,
+                             *, layer_idx: int, kv_pages: torch.Tensor,
+                             dtype: torch.dtype) -> _KVarNGQASidePool:
+    pool = get_or_create_kvarn_gqa_side_pool_for_manager(
+        kv_cache_manager, dtype=dtype, device=kv_pages.device)
     if pool is None:
+        num_layers = max(getattr(kv_cache_manager, "layer_offsets", {layer_idx: 0}).values()) + 1
+        max_batch_size = int(getattr(kv_cache_manager, "max_batch_size", 1))
+        max_blocks_per_seq = int(getattr(kv_cache_manager, "max_blocks_per_seq",
+                                         max(1, math.ceil(getattr(kv_cache_manager, "max_seq_len",
+                                                                  cfg.group) / cfg.group))))
+        num_kv_heads = int(kv_pages.shape[3])
         pool = _KVarNGQASidePool(cfg,
                                  num_layers=num_layers,
                                  max_batch_size=max_batch_size,

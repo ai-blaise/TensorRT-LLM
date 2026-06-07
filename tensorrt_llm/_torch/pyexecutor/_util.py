@@ -1448,10 +1448,6 @@ def _create_kv_cache_manager(
             model_type="qwen3_next",
         )
     elif is_kvarn_gqa:
-        if not estimating_kv_cache and kv_connector_manager is not None:
-            raise NotImplementedError(
-                "KVarN GQA disaggregated KV transfer needs packed-record plus "
-                "fp16 sink/tail metadata support before connector mode can run.")
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -1468,7 +1464,8 @@ def _create_kv_cache_manager(
             max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
-            kv_connector_manager=None,
+            kv_connector_manager=kv_connector_manager
+            if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
@@ -1476,6 +1473,7 @@ def _create_kv_cache_manager(
             is_disagg=is_disagg,
         )
         kv_cache_manager.kvarn_gqa_config = kvarn_gqa_cfg
+        kv_cache_manager.kvarn_gqa_state_dtype = dtype
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         # Only needed for V1; V2 handles per-layer windows natively via life cycles.

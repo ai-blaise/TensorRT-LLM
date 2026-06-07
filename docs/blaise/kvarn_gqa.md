@@ -37,17 +37,15 @@ This handoff is intentionally split into two merge lanes:
 
 - **A: safe scaffolding** can merge now. It adds the Huawei-compatible k2v2/g128
   byte layout, 2/3/4-bit pack/unpack tests, HF/config parsing, fail-closed
-  validation, docs, and the microbench harness. It does not allocate generic GQA
-  KVarN pages or route model execution through the reference backend.
-- **B: reference backend** is not production-promoted. It adds byte-backed page
-  allocation, Python-level store/restore, fp16 sink/tail side state, and SDPA
-  scoring for isolated code review only. Startup still fails closed unless both
-  `torch.ops.trtllm.kvarn_gqa_store` and
-  `torch.ops.trtllm.kvarn_gqa_decode` are registered and
-  `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. Do not enable this in the
-  op-trt deployment until the fused B200 store/decode kernel, packed-record
-  disaggregated transfer with fp16 sink/tail side-state, sparse-indexed packed
-  reads, CUDA graph request lifecycle, and E2E perf proof are complete.
+  validation, docs, and the microbench harness.
+- **B: production-kernel candidate** is still not production-promoted. It adds
+  byte-backed page allocation, block-parallel SM100/B200 packed store/decode
+  ops, fp16/bf16 sink/tail side state, BDR/in-kernel packed read hooks, and
+  NIXL metadata/fragments for request-slot side-state. Startup still fails
+  closed unless `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. Do
+  not enable this in the op-trt deployment until sparse-indexed packed reads,
+  CUDA graph request lifecycle, full E2E transfer proof, and c16 B200 perf proof
+  are complete.
 
 Dense MLA KVarN remains separate and production-owned by
 `sparse_attention_config.mla_latent_kv_dtype`; GQA KVarN never replaces the
@@ -60,7 +58,7 @@ Indexer/HISA sparse K path.
 | Packed 2-bit record format | **Implemented as primitives** | `kvarn_k2v2_g128` maps one 128-token block/head to a 9,728-byte record, hosted as 76 byte slots per token. Layout, bit pack/unpack, Hadamard/variance-normalized store, dequant restore, and transfer-view shapes are tested. |
 | Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
 | HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the fused store/decode ops are registered and the production backend removes the gate. |
-| Disaggregated transfer compatibility | **Not production-ready** | Packed pages plus fp16 sink/tail side state need a connector payload contract. Current connector mode rejects rather than reinterpreting packed records as dense K/V. |
+| Disaggregated transfer compatibility | **Implemented as metadata/fragments; E2E proof pending** | Packed pages move through the existing byte-backed KV pool as opaque `UINT8` self-only blocks. KVarN GQA side-state now has explicit NIXL metadata (`kvarn_gqa_side_meta`) and final-slice transfer fragments for sink/tail/commit tensors keyed by request-pinned side-pool slots. Full multi-rank NIXL proof is still pending, so backend readiness remains false. |
 | CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. The BDR readable pool and `restored_gen`/`physical_commit_gen` tensors are preallocated/lazy-grown outside the hot restore. End-to-end request lifecycle hooks and CUDA graph capture proof are still missing. |
 | Sparse packed reads | **Missing** | HISA/Indexer sparse selection over packed KVarN records needs a dedicated read/dequant path. |
 | BDR fold / amortized dequant | **Prototype implemented; production fusion still gated** | GQA has a physical-block keyed readable pool plus device int64 commit/restored generation metadata. The BDR restore path gathers logical full blocks from the request block table, maps them to physical block ids, masks by valid and changed generation state, applies torch.unique, and batched-dequants only churn blocks into the persistent readable pool. The CUDA decode hook now bypasses the readable-pool restore for safe generation/FULL-mask reads and calls the GQA packed decode op, which reads packed 2-bit records and folds Hadamard dequant into scoring/value accumulation. The decode kernel is now block-parallel, but production readiness remains false until runtime parity, transfer, graph lifecycle, sparse-read, and B200 perf gates pass. |
@@ -100,10 +98,10 @@ Implemented:
   `tokens_per_block=128`; validation remains fail-closed unless both
   `torch.ops.trtllm.kvarn_gqa_store` and
   `torch.ops.trtllm.kvarn_gqa_decode` are registered and
-  `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. The current
-  store/decode ops are serial prototypes. Decode now covers fp16 sink + packed full
-  blocks + fp16 tail, but the path is not runtime-parity or perf proven, so it
-  must not be promoted by config defaults.
+  `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. Store/decode now
+  launch block-parallel SM100/B200 kernels for supported full-block commit and
+  q_len=1/FULL-mask reads, but the path is not sparse/graph/E2E or c16 perf
+  proven, so it must not be promoted by config defaults.
 - Hugging Face artifacts can request GQA KVarN explicitly through top-level
   `kv_cache_dtype`, or through `quantization_config.kvarn.gqa`.
 - HF artifacts can declare production default support without a YAML override by
@@ -184,29 +182,30 @@ The production fail-close remains in place for GQA KVarN. The reference
 backend is not a deployment path; these pieces must be finished before the
 deployment can be called complete:
 
-1. CUDA/Triton kernels: replace the remaining serial full-block store with
-   a parallel fused store kernel and optimize the first block-parallel packed
-   decode kernel for
-   generation and SMC draft/verify query shapes, including odd M values such as
-   25. Python per-token/tile loops are functional but not acceptable for the
-   c16 throughput target. The packed decode kernel folds BDR dequant into the
-   read/scoring path so packed records are not round-tripped through HBM beyond
-   the persistent readable state required by the production design.
-2. Disaggregated transfer: `kv_extractor.py` and the cache transceiver must
-   transfer packed records plus fp16 sink/tail side-state as KVarN records. The
-   side pool now exposes a tensor snapshot contract (`sink_k`, `sink_v`,
-   `tail_k`, `tail_v`, `tail_filled`, `tail_block_start`, `committed`,
-   `commit_gen`), but connector mode still rejects at startup until those
-   tensors are registered/restored with the transfer backend.
+1. CUDA/Triton kernels: optimize the first block-parallel packed store and
+   decode kernels for generation and SMC draft/verify query shapes, including
+   odd M values such as 25. Python per-token/tile loops are no longer on the
+   launched full-block CUDA store/decode path, but store latency is still too
+   high for production default and needs B200 tuning. The packed decode kernel
+   folds BDR dequant into the read/scoring path so packed records are not
+   round-tripped through HBM beyond the persistent readable state required by
+   the production design.
+2. Disaggregated transfer: packed records now transfer as opaque byte pages and
+   the native/NIXL worker registers request-slot side-state VRAM regions for
+   `sink_k`, `sink_v`, `sink_len`, `tail_k`, `tail_v`, `tail_filled`,
+   `tail_block_start`, `committed`, and `commit_gen`. The sender appends
+   side-state fragments only on the final KV slice using the receiver's
+   request-pinned side slot. Remaining work is an actual multi-rank NIXL run
+   that proves payload arrival, request abort/reuse behavior, and Moondream
+   pinning interaction.
 3. Sparse-indexed GQA reads: HISA/Indexer state remains separate and is not
    quantized by KVarN, but sparse read selection over packed KVarN records needs
    its own read/dequant path before `sparse_attn_config` can compose with this
    backend.
 4. CUDA graph state: sink/tail tensors and commit generations are preallocated,
-   but request-slot assignment and reference restore/scoring are still
-   Python-managed. Full graph capture needs native store/restore/decode kernels
-   plus a request lifecycle hook to recycle side-pool slots without host-side
-   mutation inside a captured region.
+   and transfer uses fixed request-slot tensor regions. Full graph capture still
+   needs replay proof plus lifecycle hooks that recycle side-pool slots without
+   host mutation inside a captured region.
 5. LayerSplit/CP proof: packed pages are byte pages and can be owner-split, but
    the current code still needs a full LayerSplit run to verify non-owner scratch
    routing for generic GQA KVarN, separate from dense MLA LayerSplit.
