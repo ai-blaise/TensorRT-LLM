@@ -112,6 +112,8 @@ def main() -> None:
                         help="committed full blocks to include in the BDR restore timing")
     parser.add_argument("--bdr-churn-blocks", type=int, default=1,
                         help="committed physical blocks to mark stale each BDR churn timing iteration")
+    parser.add_argument("--decode-op-iters", type=int, default=20,
+                        help="iterations for CUDA packed decode op timing when --try-decode-op/--try-side-op is set")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -231,8 +233,9 @@ def main() -> None:
             packed_container = _records_to_container(records, cfg, layout)
             for m, q in q_by_m.items():
                 seq_lens = torch.full((m,), cfg.group, device=device, dtype=torch.int32)
+                q_contig = q.contiguous()
                 op_out = trtllm_ops.kvarn_gqa_decode(
-                    q.contiguous(), packed_container, block_ids, empty_side, empty_side,
+                    q_contig, packed_container, block_ids, empty_side, empty_side,
                     empty_side, empty_side, seq_lens, args.kv_heads, args.kv_heads,
                     cfg.head_dim, cfg.group)
                 ref_out = _ref_attention(q, k_restore, v_restore, cfg)
@@ -241,7 +244,15 @@ def main() -> None:
                     raise SystemExit(
                         f"decode op mismatch layout={layout} dtype={args.runtime_dtype} odd_m={m}: "
                         f"max_abs={max_abs:.6f} atol={args.decode_op_atol:.6f}")
-                print(f"decode_op_layout={layout} dtype={args.runtime_dtype} odd_m={m} max_abs={max_abs:.6f}")
+                decode_us = _bench(lambda: trtllm_ops.kvarn_gqa_decode(
+                    q_contig, packed_container, block_ids, empty_side, empty_side,
+                    empty_side, empty_side, seq_lens, args.kv_heads, args.kv_heads,
+                    cfg.head_dim, cfg.group), max(args.decode_op_iters, 1), device)
+                ref_us = _bench(lambda: _ref_attention(q, k_restore, v_restore, cfg),
+                                max(args.decode_op_iters, 1), device)
+                print(f"decode_op_layout={layout} dtype={args.runtime_dtype} odd_m={m} "
+                      f"max_abs={max_abs:.6f} decode_op_us={decode_us:.2f} "
+                      f"restore_score_ref_us={ref_us:.2f}")
 
     if args.try_side_op:
         sink_tokens = max(0, min(args.sink_side_tokens, cfg.sink_tokens))
@@ -257,12 +268,14 @@ def main() -> None:
             packed_container = _records_to_container(records, cfg, layout)
             for m, q in q_by_m.items():
                 seq_lens = torch.full((m,), side_seq_len, device=device, dtype=torch.int32)
+                q_contig = q.contiguous()
+                sink_k_m = sink_k.expand(m, -1, -1, -1).contiguous()
+                sink_v_m = sink_v.expand(m, -1, -1, -1).contiguous()
+                tail_k_m = tail_k.expand(m, -1, -1, -1).contiguous()
+                tail_v_m = tail_v.expand(m, -1, -1, -1).contiguous()
                 op_out = trtllm_ops.kvarn_gqa_decode(
-                    q.contiguous(), packed_container, block_ids,
-                    sink_k.expand(m, -1, -1, -1).contiguous(),
-                    sink_v.expand(m, -1, -1, -1).contiguous(),
-                    tail_k.expand(m, -1, -1, -1).contiguous(),
-                    tail_v.expand(m, -1, -1, -1).contiguous(),
+                    q_contig, packed_container, block_ids,
+                    sink_k_m, sink_v_m, tail_k_m, tail_v_m,
                     seq_lens, args.kv_heads, args.kv_heads, cfg.head_dim, cfg.group)
                 ref_out = _ref_attention(q, all_k, all_v, cfg)
                 max_abs = _max_abs(op_out, ref_out)
@@ -270,8 +283,16 @@ def main() -> None:
                     raise SystemExit(
                         f"side decode op mismatch layout={layout} dtype={args.runtime_dtype} odd_m={m}: "
                         f"max_abs={max_abs:.6f} atol={args.decode_op_atol:.6f}")
+                decode_us = _bench(lambda: trtllm_ops.kvarn_gqa_decode(
+                    q_contig, packed_container, block_ids,
+                    sink_k_m, sink_v_m, tail_k_m, tail_v_m,
+                    seq_lens, args.kv_heads, args.kv_heads, cfg.head_dim, cfg.group),
+                    max(args.decode_op_iters, 1), device)
+                ref_us = _bench(lambda: _ref_attention(q, all_k, all_v, cfg),
+                                max(args.decode_op_iters, 1), device)
                 print(f"side_decode_op_layout={layout} dtype={args.runtime_dtype} odd_m={m} "
-                      f"seq_len={side_seq_len} max_abs={max_abs:.6f}")
+                      f"seq_len={side_seq_len} max_abs={max_abs:.6f} "
+                      f"decode_op_us={decode_us:.2f} restore_score_ref_us={ref_us:.2f}")
 
     print(f"dtype={cfg.dtype} runtime_dtype={args.runtime_dtype} tile_bytes={cfg.tile_bytes_aligned} bytes_per_token_slot={cfg.bytes_per_token_slot}")
     print(f"restore_cosine_k={k_cos:.4f} restore_cosine_v={v_cos:.4f}")
