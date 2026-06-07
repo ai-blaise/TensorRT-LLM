@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import yaml
@@ -193,6 +194,21 @@ def test_r20_transport_bench_is_nixl_first_and_fail_closed():
     assert 'MLACacheFormatter::inquireSupport' in script
     assert 'CacheTransferLayer::validateSupport' in script
     assert 'Using UCX kv-cache transceiver' in script
+    assert '--min-tok-per-user' in script
+    assert 'MIN_TOK_PER_USER="${MIN_TOK_PER_USER:-150}"' in script
+    assert 'summary.json' in script
+    assert 'positive_transfer_proof_count' in script
+    assert 'KV cache transfer timeout' in script
+    assert 'logs = \"\\\\n\".join' in script
+    assert r'request_id=(\\S+)' in script
+
+def test_r20_transport_bench_embedded_verifier_compiles():
+    script = (DEPLOY_DIR / "run_c16_transport_bench.sh").read_text()
+
+    match = re.search(r"<<'PY_VERIFY'\n(.*?)\nPY_VERIFY", script, re.DOTALL)
+    assert match is not None
+    compile(match.group(1), "run_c16_transport_bench.py_verify", "exec")
+
 
 def test_r20_cpp_cache_sender_completes_cancelled_promises():
     source = (REPO_ROOT / "cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp").read_text()

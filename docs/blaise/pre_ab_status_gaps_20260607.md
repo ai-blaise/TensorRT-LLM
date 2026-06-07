@@ -35,9 +35,11 @@ smoke-response, readiness result, or partial marker as production completion.
   - Moondream-style overlap is enabled while SMC-SD remains deferred in the
     live manifest.
 
-## Latest strict smoke result
+## Latest strict smoke result and current gate state
 
-Command:
+NIXL is the pre-A/B KV-transfer gate. UCX, Mooncake, and MORI-IO are A/B-only
+until NIXL proves end-to-end correctness under the custom r20 stack. The strict
+smoke command remains:
 
 ```bash
 REQUIRE_DYNAMO_PIN_MARKERS=1 \
@@ -47,16 +49,19 @@ SMC_GATE_MODE=deferred \
 ./deploy/disagg_pd_r20/smoke_request_pinning.sh
 ```
 
-Result: failed. The service returned completions and worker metadata, and the
-router emitted `dynamo request pin route selected`, `dynamo request pin cleanup
-scheduled`, and `dynamo request pin cleared` markers. The smoke correctly failed
-because there was still no `dynamo disagg request pin established` marker tying
-the selected prefill producer, `ctx_dp_rank`, and outbound decode metadata into a
-single request-lifecycle proof.
+The prior gen88/gen89 failure is understood more narrowly now: requests reached
+the service, emitted worker metadata, and selected NIXL, but prefill ranks logged
+`Terminating context request ... due to KV cache transfer timeout`. The root
+cause was in `cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp`: a canceled or
+not-ready cache sender response erased the ready-response entry without
+fulfilling its promise, so the sender future could remain pending until the
+Python-side transfer timeout expired. Commit `342222145` (`fix(nixl): complete
+cancelled cache sender futures`) completes the promise before erase and is now a
+hard dependency for the NIXL gate.
 
-This is not a model crash: gen89 remained ready with zero restarts. It is a
-request-pinning proof gap. The r20 gate must not be marked green until the
-frontend emits and preserves the full pin lifecycle:
+This fix is not a green gate by itself. A rebuilt/full-source or ABI-compatible
+image containing `342222145` must pass the strict smoke above. The smoke must
+prove all of the following in one request lifecycle:
 
 - route-selected prefill marker;
 - pin-established marker with prefill worker, prefill DP rank, bootstrap or
@@ -64,16 +69,16 @@ frontend emits and preserves the full pin lifecycle:
 - outbound-to-decode marker with the same request id and non-null `ctx_dp_rank`;
 - route-selected decode marker for the same request id;
 - cleanup/clear markers for normal finish and early stream close;
-- positive nonzero KV transfer proof from response timing, worker metrics, or
-  explicit `OPTRT_NIXL_TRANSFER_PROOF` logs.
+- positive nonzero NIXL transfer proof from explicit
+  `OPTRT_NIXL_TRANSFER_PROOF` logs or an equivalent worker-side metric source;
+- no `KV cache transfer timeout`, MLA formatter rejection, illegal memory access,
+  UCX fallback marker, HELIX fallback marker, or worker restart.
 
-The smoke has also been hardened so `KV cache transfer timeout` is a fail-closed
-bad pattern. A prior gen88/gen89 run completed responses but logged
-`Terminating context request ... due to KV cache transfer timeout` on prefill
-ranks; that must remain a hard NIXL gate failure until root-caused. The
-current-head proof image adds explicit `OPTRT_NIXL_TRANSFER_PROOF` and
-`OPTRT_LAYERSPLIT_XFER_DEBUG` markers so the next strict smoke can distinguish a
-missing proof marker from a real transfer timeout.
+The `/perf_metrics` endpoint on the frontend returned 404 in earlier smokes, so
+positive transfer proof must not depend on that frontend URL. Current proof
+should come from worker logs and/or worker-side metrics surfaces. The smoke and
+benchmark harness treat a missing positive NIXL transfer proof as failure rather
+than silently accepting a decode response.
 
 ## Completed or partially integrated pieces
 
@@ -103,8 +108,9 @@ legacy backend selector conflicts.
 
 Remaining NIXL gaps:
 
+- Rebuild or select an image that contains commit `342222145` and the current
+  r20 LayerSplit/KVarN/request-pinning sources.
 - Prove positive nonzero NIXL KV transfer under strict smoke.
-- Root-cause the prior prefill `KV cache transfer timeout` warning.
 - Ensure request-pinning metadata is actually propagated into the NIXL handoff,
   not only logged by the scheduler route-selection path.
 - Keep UCX, Mooncake, and MORI-IO only for later A/B comparisons until NIXL is
@@ -159,6 +165,49 @@ Remaining infrastructure gaps:
   when an overlay-on-overlay rebuild reaches containerd rootfs mount-option
   limits; it should not replace full source builds for ABI-affecting C++/CUDA
   changes.
+
+## NIXL c16 benchmark harness
+
+After strict smoke is green and the GPU window is assigned, run the NIXL
+throughput gate before any UCX/Mooncake/MORI A/B. The harness is intentionally
+NIXL-first and fail-closed:
+
+```bash
+./deploy/disagg_pd_r20/run_c16_transport_bench.sh \
+  --backend nixl \
+  --lengths 1024,4096,8192,16384,32768,65536,131072 \
+  --concurrency 16 \
+  --max-tokens 128 \
+  --min-tok-per-user 150
+```
+
+Artifacts are written under `/tmp/r20_transport_bench_<backend>_<timestamp>`
+unless `BENCH_OUT` is set. Each run captures `results.jsonl`, `summary.json`,
+frontend/prefill/decode logs, pod descriptions, `nvidia-smi dmon`, and
+`ip -s link` before/after snapshots. The post-run verifier fails closed on:
+
+- any request failure or worker restart;
+- `KV cache transfer timeout`;
+- `MLACacheFormatter::inquireSupport`, `CacheTransferLayer::validateSupport`,
+  same-layer-count rejection, or CUDA illegal memory access;
+- NIXL error/failure logs;
+- UCX backend or `layersplit_transfer_backend: ucx` markers during a NIXL run;
+- missing nonzero `OPTRT_NIXL_TRANSFER_PROOF` start+complete pair;
+- missing `nvext.worker_id` on successful responses;
+- any prompt length below the configured tokens/sec/user-after-first-token floor.
+
+UCX, Mooncake, and MORI runs require explicit A/B opt-in and are not allowed to
+replace the pre-A/B NIXL gate:
+
+```bash
+ALLOW_TRANSPORT_AB=1 ./deploy/disagg_pd_r20/run_c16_transport_bench.sh --backend ucx
+ALLOW_TRANSPORT_AB=1 ./deploy/disagg_pd_r20/run_c16_transport_bench.sh --backend mooncake
+ALLOW_TRANSPORT_AB=1 ./deploy/disagg_pd_r20/run_c16_transport_bench.sh --backend mori
+```
+
+Mooncake and native MORI remain blocked unless their TRT-LLM-compatible wrapper
+libraries and runtime APIs are present in the selected image. Do not claim a
+Mooncake or MORI win from config importability alone.
 
 ## Major remaining gaps requested by the user
 

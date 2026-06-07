@@ -8,11 +8,12 @@ BACKEND="nixl"
 LENGTHS="1024,4096,8192,16384,32768,65536,131072"
 CONCURRENCY=16
 MAX_TOKENS=128
+MIN_TOK_PER_USER="${MIN_TOK_PER_USER:-150}"
 OUTPUT_DIR="${BENCH_OUT:-}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--backend nixl|ucx|mooncake|mori] [--lengths csv] [--concurrency n] [--max-tokens n] [--output-dir dir]
+Usage: $0 [--backend nixl|ucx|mooncake|mori] [--lengths csv] [--concurrency n] [--max-tokens n] [--min-tok-per-user n] [--output-dir dir]
 
 Runs a request-pinned disaggregated transport profile through the live frontend.
 NIXL is the pre-A/B gate. Non-NIXL backends require ALLOW_TRANSPORT_AB=1 and
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --lengths) LENGTHS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
+    --min-tok-per-user) MIN_TOK_PER_USER="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -252,6 +254,7 @@ DEC_RESTART_AFTER="$(restart_count "$DEC")"
   echo "lengths=$LENGTHS"
   echo "concurrency=$CONCURRENCY"
   echo "max_tokens=$MAX_TOKENS"
+  echo "min_tok_per_user=$MIN_TOK_PER_USER"
   echo "output_dir=$OUTPUT_DIR"
 } >"$OUTPUT_DIR/metadata.txt"
 
@@ -260,9 +263,92 @@ if [[ "$PRE_RESTART_BEFORE" != "$PRE_RESTART_AFTER" || "$DEC_RESTART_BEFORE" != 
   exit 1
 fi
 
-if grep -E 'MLACacheFormatter::inquireSupport|CacheTransferLayer::validateSupport|illegal memory access|Using UCX kv-cache transceiver|backend.: .UCX.|NIXL.*(failed|failure|error)|(failed|failure|error).*NIXL' "$OUTPUT_DIR"/*.log >/dev/null; then
-  echo "transport failure/fallback marker found; see $OUTPUT_DIR" >&2
-  exit 1
-fi
+python3 - "$OUTPUT_DIR" "$BACKEND" "$CONCURRENCY" "$MIN_TOK_PER_USER" <<'PY_VERIFY'
+import json
+import re
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+backend = sys.argv[2].lower()
+concurrency = int(sys.argv[3])
+min_tok = float(sys.argv[4])
+logs = "\n".join((out / name).read_text(errors="ignore") for name in ("frontend.log", "prefill.log", "decode.log") if (out / name).exists())
+ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+logs_clean = ansi.sub("", logs)
+
+bad_patterns = [
+    r"KV cache transfer timeout",
+    r"Terminating .* due to KV cache transfer timeout",
+    r"MLACacheFormatter::inquireSupport",
+    r"CacheTransferLayer::validateSupport",
+    r"only support same number of layers",
+    r"illegal memory access",
+    r"Traceback",
+    r"NIXL.*(?:failed|failure|error)",
+    r"(?:failed|failure|error).*NIXL",
+]
+if backend == "nixl":
+    bad_patterns.extend([
+        r"Using UCX kv-cache transceiver",
+        r"cache_transceiver_config.*backend.*UCX",
+        r"layersplit_transfer_backend: ucx",
+    ])
+for pattern in bad_patterns:
+    if re.search(pattern, logs_clean, re.IGNORECASE):
+        raise SystemExit(f"bad log pattern present during {backend} benchmark: {pattern}")
+
+rows = []
+for line in (out / "results.jsonl").read_text().splitlines():
+    if line.strip():
+        rows.append(json.loads(line))
+summaries = [row for row in rows if row.get("type") == "summary"]
+requests = [row for row in rows if row.get("type") == "request"]
+if not summaries:
+    raise SystemExit("benchmark emitted no summary rows")
+failed = [row for row in summaries if row.get("failed") != 0 or row.get("ok") != concurrency]
+if failed:
+    raise SystemExit(f"benchmark request failures: {failed}")
+slow = [row for row in summaries if float(row.get("tok_per_user_after_first_min") or 0.0) < min_tok]
+
+proof_starts = {
+    rid: int(blocks)
+    for rid, blocks in re.findall(
+        r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_start.*request_id=(\S+).*cache_blocks=([0-9]+)",
+        logs_clean,
+    )
+}
+proof_ctx_complete = set(re.findall(
+    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_complete.*request_id=(\S+)", logs_clean
+))
+proof_gen_complete = set(re.findall(
+    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=gen_recv_complete.*request_id=(\S+)", logs_clean
+))
+positive = sorted(rid for rid, blocks in proof_starts.items() if blocks > 0 and (rid in proof_ctx_complete or rid in proof_gen_complete))
+if backend == "nixl" and not positive:
+    raise SystemExit(
+        "missing positive NIXL transfer proof: no nonzero OPTRT_NIXL_TRANSFER_PROOF "
+        f"start+complete pair found; starts={proof_starts} ctx_complete={proof_ctx_complete} gen_complete={proof_gen_complete}"
+    )
+
+worker_missing = [row for row in requests if row.get("status") == "ok" and not row.get("worker_id")]
+if worker_missing:
+    raise SystemExit(f"request-pinning worker metadata missing from {len(worker_missing)} completed requests")
+
+report = {
+    "backend": backend,
+    "concurrency": concurrency,
+    "min_tok_per_user": min_tok,
+    "summaries": summaries,
+    "positive_transfer_proof_ids": positive[:20],
+    "positive_transfer_proof_count": len(positive),
+    "request_count": len(requests),
+    "slow_lengths": slow,
+}
+(out / "summary.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+if slow:
+    raise SystemExit(f"tok/s/user floor not met; see {out / 'summary.json'}")
+PY_VERIFY
 
 echo "transport benchmark complete: $OUTPUT_DIR"
+echo "summary: $OUTPUT_DIR/summary.json"
