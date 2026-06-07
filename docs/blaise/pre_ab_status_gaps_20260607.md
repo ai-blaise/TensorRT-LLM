@@ -151,7 +151,10 @@ carry request pin metadata (`disagg_request_id` or `ctx_request_id`,
 commit consumes `draft_token_log_probs`. The handoff also waits on
 `sample_state.sampler_event` before reading pinned host draft-token buffers and
 emits `SMC Moondream decode handoff preserved ... pinned_host_tokens=True ...
-ctx_dp_rank=... ctx_info_endpoint=...` for live proof.
+ctx_dp_rank=... ctx_info_endpoint=...` for live proof. If that evented pinned
+`sample_state` is absent, SMC-SD now fails closed by default instead of falling
+back to a blocking `.cpu()` draft-token copy; the unpinned path requires the
+explicit diagnostic override `TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT=1`.
 
 Remaining Moondream gap: live SMC-SD E2E is still required. Run the strict smoke
 with `SMC_GATE_MODE=required` only after the NIXL/LayerSplit gate is green and

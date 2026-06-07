@@ -241,6 +241,10 @@ def main() -> None:
     expect_failure("missing_smc_ctx_info_endpoint", bad, "ctx_info_endpoint")
 
     bad = copy.deepcopy(good)
+    bad.decode = bad.decode.replace("pinned_host_tokens=True", "pinned_host_tokens=False")
+    expect_failure("missing_smc_pinned_host_tokens", bad, "pinned_host_tokens=True")
+
+    bad = copy.deepcopy(good)
     bad.prefill += "\nhost_pinned_blocks=0"
     expect_failure("zero_host_pinned_blocks", bad, "host_pinned_blocks")
 

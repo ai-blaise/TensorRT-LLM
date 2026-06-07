@@ -44,6 +44,8 @@ def main() -> None:
         "sample_state.sampler_event.synchronize()",
         "sample_state.host.new_tokens",
         "used_pinned_host_tokens = True",
+        "TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT",
+        "SMC-SD Moondream decode requires evented pinned host",
         "draft_token_log_probs",
         "py_smc_draft_token_log_probs",
         "SMC Moondream decode handoff preserved",

@@ -306,6 +306,11 @@ class SMCModelDrafter(ModelDrafter):
             draft_tokens_host = sample_state.host.new_tokens
             used_pinned_host_tokens = True
         else:
+            if os.environ.get("TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT", "0") != "1":
+                raise RuntimeError(
+                    "SMC-SD Moondream decode requires evented pinned host "
+                    "draft tokens; set TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT=1 "
+                    "only for explicit diagnostic fallback")
             draft_tokens_host = outputs["new_draft_tokens"].cpu()
             used_pinned_host_tokens = False
         draft_token_log_probs = outputs["draft_token_log_probs"]

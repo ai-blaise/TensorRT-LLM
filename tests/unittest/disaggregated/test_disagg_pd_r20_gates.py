@@ -168,6 +168,8 @@ def test_r20_smc_moondream_decode_pinning_is_fail_closed():
     assert "sample_state.sampler_event.synchronize()" in source
     assert "sample_state.host.new_tokens" in source
     assert "used_pinned_host_tokens = True" in source
+    assert "TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT" in source
+    assert "SMC-SD Moondream decode requires evented pinned host" in source
     assert "SMC Moondream decode handoff preserved" in source
     assert source.index("validate_smc_decode_request_pin(target_model_req)") < source.index("target_model_req.py_draft_tokens = []")
     assert source.index("sample_state.sampler_event.synchronize()") < source.index("draft_tokens_host = sample_state.host.new_tokens")
