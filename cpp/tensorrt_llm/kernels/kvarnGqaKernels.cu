@@ -159,18 +159,6 @@ __device__ __forceinline__ void storeScalar<__nv_bfloat16>(__nv_bfloat16* ptr, f
 }
 
 
-__device__ __forceinline__ std::uint8_t recordByte(PackedRecordWriteView view, std::int64_t blockId, int kvHead, int byteIdx)
-{
-    if (view.pageLayout)
-    {
-        int tokenSlot = byteIdx / Layout::kBytesPerTokenSlot;
-        int byteInSlot = byteIdx - tokenSlot * Layout::kBytesPerTokenSlot;
-        return view.ptr[blockId * view.strideBlock + tokenSlot * view.strideToken + kvHead * view.strideHead
-            + byteInSlot * view.strideByte];
-    }
-    return view.ptr[blockId * view.strideBlock + kvHead * view.strideHead + byteIdx * view.strideByte];
-}
-
 __device__ __forceinline__ void writeRecordByte(
     PackedRecordWriteView view, std::int64_t blockId, int kvHead, int byteIdx, std::uint8_t value)
 {
@@ -339,12 +327,6 @@ __device__ void quantizeAndWriteTileParallel(T const* src, PackedRecordWriteView
     int sRowOffset = IsKey ? kKSRowAbsOffset : kVSRowAbsOffset;
     int zpOffset = IsKey ? kKZpAbsOffset : kVZpAbsOffset;
     int sColOffset = IsKey ? kKSColOffset : kVSColOffset;
-    for (int i = tid; i < 4096; i += blockDim.x)
-    {
-        writeRecordByte(view, blockId, kvHead, packedOffset + i, 0);
-    }
-    __syncthreads();
-
     for (int r = tid; r < Layout::kGroupSize; r += blockDim.x)
     {
         float lo = FLT_MAX;
@@ -358,17 +340,19 @@ __device__ void quantizeAndWriteTileParallel(T const* src, PackedRecordWriteView
         float scale = fmaxf((hi - lo) / 3.0f, 1e-10f);
         writePackedFp16(view, blockId, kvHead, sRowOffset + r * 2, bestRow[r] * scale);
         writePackedFp16(view, blockId, kvHead, zpOffset + r * 2, bestRow[r] * lo);
-        for (int c = 0; c < Layout::kHeadDim; ++c)
+        for (int byteCol = 0; byteCol < Layout::kHeadDim / 4; ++byteCol)
         {
-            float balanced = tile[r * Layout::kHeadDim + c] / bestRow[r] / bestCol[c];
-            int q = static_cast<int>(floorf((balanced - lo) / scale + 0.5f));
-            q = q < 0 ? 0 : (q > 3 ? 3 : q);
-            int valueIdx = r * Layout::kHeadDim + c;
-            int bit = valueIdx * 2;
-            int byteIdx = packedOffset + (bit >> 3);
-            int shift = bit & 7;
-            std::uint8_t old = recordByte(view, blockId, kvHead, byteIdx);
-            writeRecordByte(view, blockId, kvHead, byteIdx, old | static_cast<std::uint8_t>(q << shift));
+            std::uint8_t packed = 0;
+            for (int lane = 0; lane < 4; ++lane)
+            {
+                int c = byteCol * 4 + lane;
+                float balanced = tile[r * Layout::kHeadDim + c] / bestRow[r] / bestCol[c];
+                int q = static_cast<int>(floorf((balanced - lo) / scale + 0.5f));
+                q = q < 0 ? 0 : (q > 3 ? 3 : q);
+                packed |= static_cast<std::uint8_t>(q << (lane * 2));
+            }
+            int byteIdx = packedOffset + r * (Layout::kHeadDim / 4) + byteCol;
+            writeRecordByte(view, blockId, kvHead, byteIdx, packed);
         }
     }
     for (int c = tid; c < Layout::kHeadDim; c += blockDim.x)
