@@ -452,6 +452,37 @@ __device__ float loadVRotatedForLogicalToken(T const* sinkV, T const* tailV, Pac
     return loadSideRotated(tailV, query, tailBatch, tailToken, kvHead, dim, tailTokens, numKvHeads);
 }
 
+template <bool IsKey, typename T>
+__device__ void dequantReadableTileFromShared(PackedRecordView records, std::int64_t blockId, int kvHead,
+    T* readable, int numKvHeads, float* rotTile)
+{
+    int total = Layout::kGroupSize * Layout::kHeadDim;
+    int tid = threadIdx.x;
+    for (int linear = tid; linear < total; linear += blockDim.x)
+    {
+        int token = linear / Layout::kHeadDim;
+        int dim = linear - token * Layout::kHeadDim;
+        rotTile[linear] = IsKey ? dequantKRot(records, blockId, kvHead, token, dim)
+                                : dequantVRot(records, blockId, kvHead, token, dim);
+    }
+    __syncthreads();
+
+    for (int linear = tid; linear < total; linear += blockDim.x)
+    {
+        int token = linear / Layout::kHeadDim;
+        int dim = linear - token * Layout::kHeadDim;
+        float out = 0.0f;
+        float const* row = rotTile + token * Layout::kHeadDim;
+        for (int rotDim = 0; rotDim < Layout::kHeadDim; ++rotDim)
+        {
+            out += row[rotDim] * static_cast<float>(hadamardSign(dim, rotDim));
+        }
+        std::int64_t outIdx = ((blockId * Layout::kGroupSize + token) * numKvHeads + kvHead) * Layout::kHeadDim + dim;
+        storeScalar(readable + outIdx, out * kHadamardScale);
+    }
+    __syncthreads();
+}
+
 template <typename T>
 __global__ void kvarnGqaDequantAmortizedKernel(PackedRecordView records, std::int64_t const* blockIds,
     T* readableK, T* readableV, int numChurnBlocks, int numPhysicalBlocks, int numKvHeads)
@@ -468,23 +499,9 @@ __global__ void kvarnGqaDequantAmortizedKernel(PackedRecordView records, std::in
         return;
     }
 
-    int total = Layout::kGroupSize * Layout::kHeadDim;
-    for (int linear = threadIdx.x; linear < total; linear += blockDim.x)
-    {
-        int token = linear / Layout::kHeadDim;
-        int dim = linear - token * Layout::kHeadDim;
-        float kOut = 0.0f;
-        float vOut = 0.0f;
-        for (int rotDim = 0; rotDim < Layout::kHeadDim; ++rotDim)
-        {
-            float sign = static_cast<float>(hadamardSign(dim, rotDim));
-            kOut += dequantKRot(records, blockId, kvHead, token, rotDim) * sign;
-            vOut += dequantVRot(records, blockId, kvHead, token, rotDim) * sign;
-        }
-        std::int64_t outIdx = ((blockId * Layout::kGroupSize + token) * numKvHeads + kvHead) * Layout::kHeadDim + dim;
-        storeScalar(readableK + outIdx, kOut * kHadamardScale);
-        storeScalar(readableV + outIdx, vOut * kHadamardScale);
-    }
+    extern __shared__ float rotTile[];
+    dequantReadableTileFromShared<true>(records, blockId, kvHead, readableK, numKvHeads, rotTile);
+    dequantReadableTileFromShared<false>(records, blockId, kvHead, readableV, numKvHeads, rotTile);
 }
 
 template <typename T>
@@ -1071,15 +1088,22 @@ void invokeKvarnGqaDequantAmortizedK2V2G128(std::uint8_t const* packedRecords, s
     PackedRecordView view{packedRecords, pageLayout, strideBlock, strideToken, strideHead, strideByte};
     dim3 grid(numChurnBlocks, numKvHeads);
     constexpr int kThreads = 256;
+    constexpr std::size_t kSharedBytes = Layout::kGroupSize * Layout::kHeadDim * sizeof(float);
     if (useBf16)
     {
-        kvarnGqaDequantAmortizedKernel<<<grid, kThreads, 0, stream>>>(view, blockIds,
+        checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaDequantAmortizedKernel<__nv_bfloat16>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes)),
+            "kvarn_gqa_dequant_amortized bf16 dynamic smem attribute");
+        kvarnGqaDequantAmortizedKernel<<<grid, kThreads, kSharedBytes, stream>>>(view, blockIds,
             static_cast<__nv_bfloat16*>(readableK), static_cast<__nv_bfloat16*>(readableV),
             numChurnBlocks, numPhysicalBlocks, numKvHeads);
     }
     else
     {
-        kvarnGqaDequantAmortizedKernel<<<grid, kThreads, 0, stream>>>(view, blockIds,
+        checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaDequantAmortizedKernel<__half>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes)),
+            "kvarn_gqa_dequant_amortized fp16 dynamic smem attribute");
+        kvarnGqaDequantAmortizedKernel<<<grid, kThreads, kSharedBytes, stream>>>(view, blockIds,
             static_cast<__half*>(readableK), static_cast<__half*>(readableV), numChurnBlocks, numPhysicalBlocks,
             numKvHeads);
     }
