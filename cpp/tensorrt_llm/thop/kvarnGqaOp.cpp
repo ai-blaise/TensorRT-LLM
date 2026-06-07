@@ -223,6 +223,64 @@ th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords
     return output;
 }
 
+
+th::Tensor kvarn_gqa_decode_sparse(th::Tensor const& q, th::Tensor const& packedRecords, th::Tensor const& blockIds,
+    th::Tensor const& sinkK, th::Tensor const& sinkV, th::Tensor const& tailK, th::Tensor const& tailV,
+    th::Tensor const& seqLens, th::Tensor const& sparseIndices, int64_t numHeads, int64_t numKvHeads,
+    int64_t headDim, int64_t groupSize)
+{
+    check_cuda_contiguous(q, "q");
+    check_cuda_contiguous(packedRecords, "packed_records");
+    check_cuda_contiguous(blockIds, "block_ids");
+    check_cuda_contiguous(sinkK, "sink_k");
+    check_cuda_contiguous(sinkV, "sink_v");
+    check_cuda_contiguous(tailK, "tail_k");
+    check_cuda_contiguous(tailV, "tail_v");
+    check_cuda_contiguous(seqLens, "seq_lens");
+    check_cuda_contiguous(sparseIndices, "sparse_indices");
+    TORCH_CHECK(q.scalar_type() == at::ScalarType::Half || q.scalar_type() == at::ScalarType::BFloat16,
+        "kvarn_gqa_decode_sparse supports fp16/bf16 Q input only");
+    TORCH_CHECK(packedRecords.scalar_type() == at::ScalarType::Byte, "packed_records must be uint8");
+    TORCH_CHECK(blockIds.scalar_type() == at::ScalarType::Long, "block_ids must be int64");
+    TORCH_CHECK(seqLens.scalar_type() == at::ScalarType::Int, "seq_lens must be int32");
+    TORCH_CHECK(sparseIndices.scalar_type() == at::ScalarType::Long, "sparse_indices must be int64 with -1 padding");
+    TORCH_CHECK(q.dim() == 3, "q must be [num_queries, num_heads, head_dim]");
+    TORCH_CHECK(sparseIndices.dim() == 3,
+        "sparse_indices must be [num_kv_heads, num_queries, topk] int64 logical token ids");
+    check_group_shape(headDim, groupSize);
+    TORCH_CHECK(q.size(1) == numHeads && q.size(2) == headDim,
+        "q shape must match num_heads/head_dim");
+    TORCH_CHECK(numHeads % numKvHeads == 0, "num_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(sparseIndices.size(0) == numKvHeads && sparseIndices.size(1) == q.size(0),
+        "sparse_indices shape must match num_kv_heads and num_queries");
+    TORCH_CHECK(sparseIndices.size(2) <= 256, "kvarn_gqa_decode_sparse supports top-k <= 256");
+    TORCH_CHECK(seqLens.dim() == 1 && (seqLens.size(0) == 1 || seqLens.size(0) == q.size(0)),
+        "seq_lens must be [1] or [num_queries]");
+    TORCH_CHECK(sinkK.scalar_type() == sinkV.scalar_type(), "sink_k/sink_v dtypes must match");
+    TORCH_CHECK(tailK.scalar_type() == tailV.scalar_type(), "tail_k/tail_v dtypes must match");
+    auto sinkTokens = side_tokens(sinkK, q.size(0), numKvHeads, headDim, "sink_k");
+    auto sinkVTokens = side_tokens(sinkV, q.size(0), numKvHeads, headDim, "sink_v");
+    auto tailTokens = side_tokens(tailK, q.size(0), numKvHeads, headDim, "tail_k");
+    auto tailVTokens = side_tokens(tailV, q.size(0), numKvHeads, headDim, "tail_v");
+    TORCH_CHECK(sinkTokens == sinkVTokens, "sink_k/sink_v token counts must match");
+    TORCH_CHECK(tailTokens == tailVTokens, "tail_k/tail_v token counts must match");
+    auto strides = get_packed_record_strides(packedRecords, numKvHeads, "kvarn_gqa_decode_sparse");
+
+    auto output = th::empty_like(q);
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    tk::invokeKvarnGqaDecodeSparseK2V2G128(q.data_ptr(), packedRecords.data_ptr<std::uint8_t>(),
+        blockIds.data_ptr<std::int64_t>(), sinkK.data_ptr(), sinkV.data_ptr(), tailK.data_ptr(), tailV.data_ptr(),
+        seqLens.data_ptr<std::int32_t>(), sparseIndices.data_ptr<std::int64_t>(), output.data_ptr(),
+        static_cast<int>(q.size(0)), static_cast<int>(blockIds.size(0)), static_cast<int>(numHeads),
+        static_cast<int>(numKvHeads), static_cast<int>(headDim), static_cast<int>(groupSize),
+        q.scalar_type() == at::ScalarType::BFloat16, static_cast<int>(seqLens.size(0)), static_cast<int>(sinkTokens),
+        static_cast<int>(side_batch(sinkK)), static_cast<int>(tailTokens), static_cast<int>(side_batch(tailK)),
+        static_cast<int>(sparseIndices.size(2)), sparseIndices.stride(0), sparseIndices.stride(1),
+        sparseIndices.stride(2), strides.pageLayout, strides.strideBlock, strides.strideToken, strides.strideHead,
+        strides.strideByte, stream);
+    return output;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -238,6 +296,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor tail_k, Tensor tail_v, Tensor seq_lens, int num_heads, int num_kv_heads, int head_dim, "
         "int group_size) -> Tensor");
     m.def(
+        "kvarn_gqa_decode_sparse(Tensor q, Tensor packed_records, Tensor block_ids, Tensor sink_k, Tensor sink_v, "
+        "Tensor tail_k, Tensor tail_v, Tensor seq_lens, Tensor sparse_indices, int num_heads, int num_kv_heads, "
+        "int head_dim, int group_size) -> Tensor");
+    m.def(
         "kvarn_gqa_dequant_amortized(Tensor packed_records, Tensor block_ids, Tensor readable_k, "
         "Tensor readable_v, int num_kv_heads, int head_dim, int group_size) -> ()");
 }
@@ -251,5 +313,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("kvarn_gqa_store", &tensorrt_llm::torch_ext::kvarn_gqa_store);
     m.impl("kvarn_gqa_decode", &tensorrt_llm::torch_ext::kvarn_gqa_decode);
+    m.impl("kvarn_gqa_decode_sparse", &tensorrt_llm::torch_ext::kvarn_gqa_decode_sparse);
     m.impl("kvarn_gqa_dequant_amortized", &tensorrt_llm::torch_ext::kvarn_gqa_dequant_amortized);
 }

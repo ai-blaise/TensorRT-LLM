@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Low-memory GQA KVarN packed store/decode/sparse-decode probe.
+
+This script intentionally avoids importing the full tensorrt_llm Python package.
+It builds the local THOP extension, packs a single 128-token K/V block, compares
+fused sparse top-k decode against dense packed decode when top-k enumerates the
+whole block, then reports latency for store, dense decode, sparse-full, and a
+smaller sparse top-k path.  It is meant for the next isolated B200 GPU window.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+import torch
+from torch.utils.cpp_extension import load
+
+
+def build_ops(repo: Path) -> None:
+    libs = "/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs"
+    load(
+        name="kvarn_gqa_sparse_bench_ext",
+        sources=[
+            str(repo / "cpp/tensorrt_llm/thop/kvarnGqaOp.cpp"),
+            str(repo / "cpp/tensorrt_llm/kernels/kvarnGqaKernels.cu"),
+        ],
+        extra_include_paths=[
+            str(repo / "cpp/include"),
+            str(repo / "cpp"),
+            str(repo / "cpp/tensorrt_llm"),
+            "/usr/local/tensorrt/include",
+        ],
+        extra_cflags=["-std=c++17"],
+        extra_cuda_cflags=["-std=c++17", "-arch=sm_100"],
+        extra_ldflags=[
+            f"-L{libs}",
+            f"-Wl,-rpath,{libs}",
+            "-ltensorrt_llm",
+            "-lth_common",
+        ],
+        is_python_module=False,
+        verbose=False,
+    )
+
+
+def timed_us(fn, iters: int, warmup: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iters
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", default="/workspace")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--kv-heads", type=int, default=2)
+    parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 25])
+    parser.add_argument("--sparse-topk", type=int, default=64)
+    parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--warmup", type=int, default=20)
+    args = parser.parse_args()
+
+    torch.cuda.set_device(args.device)
+    repo = Path(args.repo)
+    build_ops(repo)
+    assert hasattr(torch.ops.trtllm, "kvarn_gqa_store")
+    assert hasattr(torch.ops.trtllm, "kvarn_gqa_decode")
+    assert hasattr(torch.ops.trtllm, "kvarn_gqa_decode_sparse")
+
+    dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    device = torch.device("cuda", args.device)
+    group = 128
+    head_dim = 128
+    num_blocks = 1
+    torch.manual_seed(1234)
+
+    k = torch.randn((num_blocks, group, args.kv_heads, head_dim), device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    packed = torch.empty((num_blocks, 1, group, args.kv_heads, 76), device=device, dtype=torch.uint8)
+    block_ids = torch.arange(num_blocks, device=device, dtype=torch.long)
+    empty = torch.empty((0,), device=device, dtype=dtype)
+
+    store = lambda: torch.ops.trtllm.kvarn_gqa_store(k, v, packed, block_ids, 0, head_dim, group)
+    store()
+    store_us = timed_us(store, args.iters, args.warmup)
+    store()
+
+    print(f"STORE dtype={args.dtype} blocks={num_blocks} kv_heads={args.kv_heads} store_us={store_us:.2f}")
+    for m in args.m:
+        q = torch.randn((m, args.heads, head_dim), device=device, dtype=dtype)
+        seq_lens = torch.full((m,), group, device=device, dtype=torch.int32)
+        dense = lambda: torch.ops.trtllm.kvarn_gqa_decode(
+            q, packed, block_ids, empty, empty, empty, empty, seq_lens,
+            args.heads, args.kv_heads, head_dim, group)
+        sparse_full_idx = torch.arange(group, device=device, dtype=torch.long).view(1, 1, group)
+        sparse_full_idx = sparse_full_idx.expand(args.kv_heads, m, group).contiguous()
+        sparse_full = lambda: torch.ops.trtllm.kvarn_gqa_decode_sparse(
+            q, packed, block_ids, empty, empty, empty, empty, seq_lens, sparse_full_idx,
+            args.heads, args.kv_heads, head_dim, group)
+        topk = min(args.sparse_topk, group)
+        sparse_idx = torch.arange(topk, device=device, dtype=torch.long).view(1, 1, topk)
+        sparse_idx = sparse_idx.expand(args.kv_heads, m, topk).contiguous()
+        sparse = lambda: torch.ops.trtllm.kvarn_gqa_decode_sparse(
+            q, packed, block_ids, empty, empty, empty, empty, seq_lens, sparse_idx,
+            args.heads, args.kv_heads, head_dim, group)
+
+        ref = dense()
+        got = sparse_full()
+        torch.cuda.synchronize()
+        max_abs = (got - ref).abs().max().item()
+        dense_us = timed_us(dense, args.iters, args.warmup)
+        sparse_full_us = timed_us(sparse_full, args.iters, args.warmup)
+        sparse_us = timed_us(sparse, args.iters, args.warmup)
+        print(
+            f"DECODE dtype={args.dtype} M={m} topk={topk} max_abs_full={max_abs:.6f} "
+            f"dense_us={dense_us:.2f} sparse_full_us={sparse_full_us:.2f} sparse_topk_us={sparse_us:.2f}"
+        )
+
+
+if __name__ == "__main__":
+    main()

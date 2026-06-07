@@ -700,6 +700,73 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                  self.cfg.group)
         return out.transpose(0, 1).contiguous()
 
+    def _decode_with_sparse_attn_indices(self, state: _KVarNGQASidePool,
+                                        kv_pages: torch.Tensor, slot: int,
+                                        block_ids: list[int], total_kv_len: int,
+                                        single_q: torch.Tensor, q_view: torch.Tensor,
+                                        sparse_indices: torch.Tensor,
+                                        attention_mask: AttentionMask,
+                                        attention_window_size: Optional[int]) -> torch.Tensor:
+        if not single_q.is_cuda:
+            raise NotImplementedError(
+                "KVarN GQA sparse top-k packed decode requires CUDA fused op; "
+                "refusing to stage through fp16/fp8 KV")
+        if attention_window_size is not None:
+            raise NotImplementedError(
+                "KVarN GQA sparse top-k packed decode does not support sliding-window attention")
+        self._sparse_mask_or_raise(attention_mask, q_view.size(2))
+        if self.q_scaling is not None and float(self.q_scaling) != 1.0:
+            raise NotImplementedError(
+                "KVarN GQA sparse top-k packed decode does not yet accept q_scaling")
+        if sparse_indices.dim() != 3:
+            raise RuntimeError(
+                "KVarN GQA sparse_attn_indices must be [num_kv_heads, q_len, topk]")
+        q_len = int(q_view.size(2))
+        if sparse_indices.shape[0] != self.num_kv_heads or sparse_indices.shape[1] != q_len:
+            raise RuntimeError(
+                f"KVarN GQA sparse_attn_indices shape mismatch: "
+                f"got={tuple(sparse_indices.shape)}, expected=({self.num_kv_heads}, {q_len}, topk)")
+        if sparse_indices.shape[2] > 256:
+            raise NotImplementedError(
+                "KVarN GQA sparse top-k packed decode currently supports topk<=256")
+        sparse_indices = sparse_indices.to(device=single_q.device,
+                                           dtype=torch.long).contiguous()
+        valid = sparse_indices >= 0
+        if bool((sparse_indices < -1).any().item()):
+            raise RuntimeError("KVarN GQA sparse_attn_indices use -1 as the only padding sentinel")
+        if bool((sparse_indices[valid] >= int(total_kv_len)).any().item()):
+            raise RuntimeError(
+                f"KVarN GQA sparse_attn_indices out of range for total_kv_len={int(total_kv_len)}")
+        op = _required_trtllm_op("kvarn_gqa_decode_sparse")
+
+        sink_n = min(int(total_kv_len), self.cfg.sink_tokens)
+        if sink_n > 0:
+            sink_k, sink_v = state.sink_tensors(self.layer_idx, slot, sink_n)
+        else:
+            sink_k = single_q.new_empty((0,))
+            sink_v = single_q.new_empty((0,))
+
+        block_ids_t = self._packed_decode_full_blocks(state, slot, block_ids,
+                                                      total_kv_len)
+        tail_len = int(total_kv_len) - (int(total_kv_len) // self.cfg.group) * self.cfg.group
+        if total_kv_len > self.cfg.sink_tokens and tail_len > 0:
+            tail_start = (int(total_kv_len) // self.cfg.group) * self.cfg.group
+            tail_k, tail_v = state.active_tail_tensors(self.layer_idx, slot,
+                                                       tail_start, tail_len)
+        else:
+            tail_k = single_q.new_empty((0,))
+            tail_v = single_q.new_empty((0,))
+
+        seq_lens = torch.full((q_len,), int(total_kv_len),
+                              device=single_q.device, dtype=torch.int32)
+        q_decode = single_q.view(q_len, self.num_heads, self.head_dim).contiguous()
+        out = op(q_decode, kv_pages, block_ids_t.contiguous(),
+                 sink_k.contiguous(), sink_v.contiguous(),
+                 tail_k.contiguous(), tail_v.contiguous(), seq_lens,
+                 sparse_indices, self.num_heads, self.num_kv_heads,
+                 self.cfg.head_dim, self.cfg.group)
+        return out.transpose(0, 1).contiguous()
+
     def _make_mask(self, attention_mask: AttentionMask, past_seen_token: int,
                    kv_len: int, q_device: torch.device, q_len: int,
                    attention_window_size: Optional[int]):
@@ -745,11 +812,14 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         sparse = forward_args.sparse
         has_sparse_kv = bool(sparse is not None and sparse.sparse_kv_indices is not None)
-        if sparse is not None and (sparse.sparse_attn_indices is not None
-                                   or sparse.sparse_attn_offsets is not None):
+        has_sparse_attn = bool(sparse is not None and sparse.sparse_attn_indices is not None)
+        if has_sparse_kv and has_sparse_attn:
             raise NotImplementedError(
-                "KVarN GQA sparse attention top-k indices need a dedicated "
-                "packed-record scoring path")
+                "KVarN GQA cannot combine sparse_kv_indices with sparse_attn_indices; "
+                "packed top-k scoring expects the authoritative packed KV page set")
+        if sparse is not None and sparse.sparse_attn_offsets is not None and not has_sparse_attn:
+            raise NotImplementedError(
+                "KVarN GQA sparse_attn_offsets without sparse_attn_indices is unsupported")
         if has_sparse_kv and sparse.sparse_kv_offsets is None:
             raise NotImplementedError(
                 "KVarN GQA sparse_kv_indices requires sparse_kv_offsets")
@@ -797,7 +867,14 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    k_view, v_view, allow_commit=allow_commit)
             total_kv_len = past + new_kv_len
             packed_out = None
-            if not has_sparse_kv:
+            if has_sparse_attn:
+                assert sparse is not None
+                sample_sparse_attn = sparse.sparse_attn_indices[:, offset_q:offset_q + q_len, :]
+                packed_out = self._decode_with_sparse_attn_indices(
+                    state, kv_pages, slot, block_ids, total_kv_len, single_q, q_view,
+                    sample_sparse_attn, forward_args.attention_mask,
+                    forward_args.attention_window_size)
+            elif not has_sparse_kv:
                 packed_out = self._decode_with_packed_records(
                     state, kv_pages, slot, block_ids, total_kv_len, single_q, q_view,
                     forward_args.attention_mask, forward_args.attention_window_size)

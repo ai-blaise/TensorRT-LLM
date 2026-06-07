@@ -40,10 +40,11 @@ This handoff is intentionally split into two merge lanes:
   validation, docs, and the microbench harness.
 - **B: production-kernel candidate** is still not production-promoted. It adds
   byte-backed page allocation, block-parallel SM100/B200 packed store/decode
-  ops, fp16/bf16 sink/tail side state, BDR/in-kernel packed read hooks, and
-  NIXL metadata/fragments for request-slot side-state. Startup still fails
-  closed unless `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. Do
-  not enable this in the op-trt deployment until sparse-indexed packed reads,
+  ops, fused sparse top-k packed decode, fp16/bf16 sink/tail side state,
+  BDR/in-kernel packed read hooks, and NIXL metadata/fragments for request-slot
+  side-state. Startup still fails closed unless
+  `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. Do not enable this
+  in the op-trt deployment until sparse-indexed packed reads have GPU parity,
   CUDA graph request lifecycle, full E2E transfer proof, and c16 B200 perf proof
   are complete.
 
@@ -60,9 +61,9 @@ Indexer/HISA sparse K path.
 | HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the fused store/decode ops are registered and the production backend removes the gate. |
 | Disaggregated transfer compatibility | **Implemented as metadata/fragments; E2E proof pending** | Packed pages move through the existing byte-backed KV pool as opaque `UINT8` self-only blocks. KVarN GQA side-state now has explicit NIXL metadata (`kvarn_gqa_side_meta`) and final-slice transfer fragments for sink/tail/commit tensors keyed by request-pinned side-pool slots. Full multi-rank NIXL proof is still pending, so backend readiness remains false. |
 | CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. V1/V2 KV cache manager `free_resources()` calls release side-pool state before block removal. The BDR readable pool and `restored_gen`/`physical_commit_gen` tensors are preallocated/lazy-grown outside the hot restore. CUDA graph capture/replay proof is still missing. |
-| Sparse packed reads | **Partial, not fused** | `sparse_kv_indices`/offsets now compose by restoring through KVarN BDR/readable state and gathering selected tokens per KV head. `sparse_attn_indices` top-k scoring still fails closed until a fused packed sparse scorer exists. |
+| Sparse packed reads | **Fused candidate implemented, proof pending** | `sparse_kv_indices`/offsets compose by restoring through KVarN BDR/readable state and gathering selected tokens per KV head. `sparse_attn_indices` top-k scoring now has `torch.ops.trtllm.kvarn_gqa_decode_sparse`, a packed 2-bit in-kernel dequant/scoring path for top-k<=256 with -1 padding. Static SM100 compile and a runnable B200 harness exist, but GPU parity/perf, sparse offsets semantics, graph replay, and E2E HISA composition proof are still pending, so backend readiness remains false. |
 | BDR fold / amortized dequant | **Prototype implemented; production fusion still gated** | GQA has a physical-block keyed readable pool plus device int64 commit/restored generation metadata. The BDR restore path gathers logical full blocks from the request block table, maps them to physical block ids, masks by valid and changed generation state, applies torch.unique, and batched-dequants only churn blocks into the persistent readable pool. The CUDA decode hook now bypasses the readable-pool restore for safe generation/FULL-mask reads and calls the GQA packed decode op, which reads packed 2-bit records and folds Hadamard dequant into scoring/value accumulation. The decode kernel is now block-parallel, but production readiness remains false until runtime parity, transfer, graph lifecycle, sparse-read, and B200 perf gates pass. |
-| Fused B200 store/decode kernels | **Store/decode prototypes wired for safe cases; not production-ready** | The GQA store and decode ops now have block-parallel SM100/B200 kernels. CUDA full-block commits call the store op; CUDA generation q_len=1 and FULL-mask reads call the packed decode op directly over byte pages, fp16 sink, and fp16 tail. The decode op now launches a block-parallel SM100/B200 kernel with one CTA per (query, head), 256 threads per CTA, shared-memory Q rotation, block reductions for softmax max/denom, and in-kernel packed 2-bit K/V dequant folded into scoring/value accumulation. For total sink+packed+tail length <=256 it dispatches a no-atomic small decoder that stores logits/weights in shared memory and assigns one thread per rotated-V channel. Causal multi-token prefill, sliding-window, q_scaling, sparse attention top-k indices, and uncommitted full speculative blocks fail closed. Disaggregated side-state E2E proof, fused sparse packed top-k reads, graph lifecycle, broader runtime parity, and full E2E B200 performance proof are still missing, so backend readiness remains false. |
+| Fused B200 store/decode kernels | **Store/decode/sparse-decode candidates wired for safe cases; not production-ready** | The GQA store, dense packed decode, and sparse top-k packed decode ops now have block-parallel SM100/B200 kernels. CUDA full-block commits call the store op; CUDA generation q_len=1 and FULL-mask reads call the packed decode op directly over byte pages, fp16 sink, and fp16 tail. The dense decode op launches one CTA per (query, head), 256 threads per CTA, shared-memory Q rotation, block reductions for softmax max/denom, and in-kernel packed 2-bit K/V dequant folded into scoring/value accumulation. For total sink+packed+tail length <=256 it dispatches a no-atomic small decoder. The sparse top-k op uses the same packed/sink/tail loaders and softmaxes only the selected logical token ids, avoiding readable-pool staging for `sparse_attn_indices`. Causal multi-token prefill, sliding-window, q_scaling, uncommitted full speculative blocks, and top-k>256 fail closed. Multi-rank NIXL E2E proof, CUDA graph replay, broader runtime parity, store optimization, and c16 B200 performance proof are still missing, so backend readiness remains false. |
 | Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
 | Performance proof | **Missing** | Microbench has a correctness floor and `--require-fused` promotion guard, but no fused B200 numbers or c16 tok/s/user proof exist. |
 | Production enablement | **Blocked** | Requires fused kernels, disagg side-state transfer, sparse packed reads, graph-safe lifecycle, fp16/fp8 correctness proof, and c16 E2E performance proof. |
@@ -95,13 +96,15 @@ Implemented:
 - Resource/capacity accounting uses the packed slope
   `layers * local_kv_heads * 76 bytes/token` rather than dense K+V bytes.
 - `kv_cache_config.dtype="kvarn_k2v2_g128"` is accepted only with
-  `tokens_per_block=128`; validation remains fail-closed unless both
-  `torch.ops.trtllm.kvarn_gqa_store` and
-  `torch.ops.trtllm.kvarn_gqa_decode` are registered and
-  `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. Store/decode now
-  launch block-parallel SM100/B200 kernels for supported full-block commit and
-  q_len=1/FULL-mask reads, but the path is not sparse/graph/E2E or c16 perf
-  proven, so it must not be promoted by config defaults.
+  `tokens_per_block=128`; validation remains fail-closed unless
+  `torch.ops.trtllm.kvarn_gqa_store`, `torch.ops.trtllm.kvarn_gqa_decode`,
+  `torch.ops.trtllm.kvarn_gqa_decode_sparse`,
+  `torch.ops.trtllm.kvarn_gqa_dequant_amortized`, and
+  `torch.ops.trtllm.kvarn_gqa_backend_ready()` are registered and the readiness
+  op returns true. Store/decode/sparse-decode now launch block-parallel
+  SM100/B200 kernels for supported full-block commit, q_len=1/FULL-mask reads,
+  and top-k<=256 sparse packed reads, but the path is not graph/E2E/NIXL or c16
+  perf proven, so it must not be promoted by config defaults.
 - Hugging Face artifacts can request GQA KVarN explicitly through top-level
   `kv_cache_dtype`, or through `quantization_config.kvarn.gqa`.
 - HF artifacts can declare production default support without a YAML override by
@@ -199,10 +202,11 @@ deployment can be called complete:
    that proves payload arrival, request abort/reuse behavior, and Moondream
    pinning interaction.
 3. Sparse-indexed GQA reads: HISA/Indexer state remains separate and is not
-   quantized by KVarN. Sparse KV token selection now composes through the BDR
-   readable pool and per-head gather, but sparse attention top-k scoring over
-   packed records still needs a fused read/dequant/scoring path before this can
-   be production default under HISA sparse decode.
+   quantized by KVarN. Sparse KV token selection composes through the BDR
+   readable pool and per-head gather. Sparse attention top-k scoring now has a
+   fused packed read/dequant/scoring candidate op, but it still needs B200
+   correctness/perf, sparse-offset/E2E HISA composition, and graph replay proof
+   before this can be production default under HISA sparse decode.
 4. CUDA graph state: sink/tail tensors and commit generations are preallocated,
    transfer uses fixed request-slot tensor regions, and request finish/abort
    releases side-pool slots through KV cache manager free hooks. Full graph
@@ -284,17 +288,19 @@ wrapper. File/function boundaries:
      compact record layout `[blocks, kv_heads, 9728]` and KV-cache page layout
      `[blocks, planes, 128, kv_heads, 76]` so the production kernel can avoid
      Python record copies.
-   - `kvarnGqaStoreK2V2G128` currently contains only a serial store prototype
-     for full 128-token blocks. It applies normalized Hadamard rotation, 16
-     KVarN/SINQ variance-normalization iterations, asymmetric 2-bit RTN, and
-     fp16 scale/zero-point writes into the packed record/page layout.
-   - `kvarnGqaDecodeK2V2G128` currently contains only a serial decode prototype.
-     It rotates Q, reads fp16 sink tokens, packed 2-bit K/V records, and fp16
-     tail tokens, dequantizes packed blocks with stored fp16 scales/zero points,
-     computes one softmax across the combined sequence, and inverse-rotates V.
-     These are correctness stepping stones, not the B200 throughput kernels. The
-     readiness op must remain false until CUDA graph lifecycle, transfer,
-     sparse-read, runtime correctness, and performance gates all pass.
+   - `kvarnGqaStoreK2V2G128` is now a block-parallel full-block pack path.
+     It applies normalized Hadamard rotation, 16 KVarN/SINQ variance-normalization
+     iterations, asymmetric 2-bit RTN, and fp16 scale/zero-point writes into the
+     packed record/page layout. The latest measured B200 store latency is still
+     too high, so this remains an optimization target before production default.
+   - `kvarnGqaDecodeK2V2G128` and `kvarnGqaDecodeSparseK2V2G128` are
+     block-parallel SM100/B200 candidate kernels. They rotate Q, read fp16/bf16
+     sink tokens, packed 2-bit K/V records, and fp16/bf16 tail tokens, dequantize
+     packed blocks with stored fp16 scales/zero points inside the attention read,
+     score/softmax/accumulate, and rotate the output back. The sparse variant
+     accepts `[num_kv_heads, q_len, topk]` logical token ids with -1 padding and
+     top-k<=256. The readiness op must remain false until CUDA graph lifecycle,
+     transfer, sparse-read runtime correctness, and performance gates all pass.
    - Build integration belongs in the existing CMake/Bazel custom-op lists next
      to the other TRT-LLM torch custom ops.
 
@@ -348,14 +354,18 @@ Current focused coverage:
   fail-close, and side-state snapshot shape.
 - `benchmarks/python/bench_kvarn_gqa_micro.py`: light pack/restore/reference
   scoring timing for `M in {1,5,25}`. It enforces a restore-cosine floor and
-  supports `--require-fused`, which fails until a real
-  `torch.ops.trtllm.kvarn_gqa_store` and
-  `torch.ops.trtllm.kvarn_gqa_decode` are registered and
-  `torch.ops.trtllm.kvarn_gqa_backend_ready()` returns true. `--try-store-op`,
-  `--try-decode-op`, and `--try-side-op` are development-only parity checks for
-  the experimental ops against the Python KVarN oracle. They cover FP16/BF16
-  runtime tensors, compact records, paged KV-cache layout, odd SMC query counts,
-  and fp16/bf16 sink + packed block + tail decode. They must be run only after a
+  supports `--require-fused`, which fails until real
+  `torch.ops.trtllm.kvarn_gqa_store`, `torch.ops.trtllm.kvarn_gqa_decode`,
+  `torch.ops.trtllm.kvarn_gqa_decode_sparse`, and
+  `torch.ops.trtllm.kvarn_gqa_backend_ready()` are registered and ready.
+  `blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py` is the focused low-memory
+  B200 harness for the new packed sparse top-k op: it builds the THOP extension
+  from the checkout, times store/dense decode/sparse-full/sparse-topk, and checks
+  sparse-full equality against dense packed decode for odd M values. The earlier
+  `--try-store-op`, `--try-decode-op`, and `--try-side-op` development parity
+  checks cover FP16/BF16 runtime tensors, compact records, paged KV-cache layout,
+  odd SMC query counts, and fp16/bf16 sink + packed block + tail decode. They
+  must be run only after a
   C++ build on an idle GPU and do not imply production readiness while
   `backend_ready()` is false. Use the default mode on CPU; it is a reference
   baseline, not the fused production-kernel benchmark.

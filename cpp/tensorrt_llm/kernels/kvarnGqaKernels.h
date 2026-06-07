@@ -49,6 +49,14 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
     int tailBatch, bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken, std::int64_t strideHead,
     std::int64_t strideByte, cudaStream_t stream = 0);
 
+void invokeKvarnGqaDecodeSparseK2V2G128(void const* q, std::uint8_t const* packedRecords,
+    std::int64_t const* blockIds, void const* sinkK, void const* sinkV, void const* tailK, void const* tailV,
+    std::int32_t const* seqLens, std::int64_t const* sparseIndices, void* output, int numQueries, int numBlocks,
+    int numHeads, int numKvHeads, int headDim, int groupSize, bool useBf16, int seqLensCount, int sinkTokens,
+    int sinkBatch, int tailTokens, int tailBatch, int sparseTopk, std::int64_t sparseStrideKv,
+    std::int64_t sparseStrideQuery, std::int64_t sparseStrideTopk, bool pageLayout, std::int64_t strideBlock,
+    std::int64_t strideToken, std::int64_t strideHead, std::int64_t strideByte, cudaStream_t stream = 0);
+
 void invokeKvarnGqaDequantAmortizedK2V2G128(std::uint8_t const* packedRecords, std::int64_t const* blockIds,
     void* readableK, void* readableV, int numChurnBlocks, int numPhysicalBlocks, int numKvHeads, int headDim,
     int groupSize, bool useBf16, bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken,

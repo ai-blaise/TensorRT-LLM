@@ -343,18 +343,40 @@ def test_kvarn_gqa_sparse_kv_gather_is_per_kv_head():
         attn._gather_sparse_kv_for_sample(k_states, v_states, bad_range, 0)
 
 
-def test_kvarn_gqa_sparse_attn_indices_still_fail_closed():
+def test_kvarn_gqa_sparse_attn_indices_require_fused_cuda_path():
+    torch = _TORCH
+    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+
+    attn = KVarNGQAAttention(layer_idx=0, num_heads=2, num_kv_heads=1,
+                             head_dim=128)
+    with pytest.raises(NotImplementedError, match="requires CUDA fused op"):
+        attn._decode_with_sparse_attn_indices(
+            state=None,
+            kv_pages=torch.empty((0,), dtype=torch.uint8),
+            slot=0,
+            block_ids=[],
+            total_kv_len=1,
+            single_q=torch.empty((1, 256), dtype=torch.float16),
+            q_view=torch.empty((1, 2, 1, 128), dtype=torch.float16),
+            sparse_indices=torch.zeros((1, 1, 1), dtype=torch.int64),
+            attention_mask=PredefinedAttentionMask.FULL,
+            attention_window_size=None,
+        )
+
+
+def test_kvarn_gqa_sparse_kv_and_sparse_attn_cannot_mix():
     torch = _TORCH
     from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionSparseArgs
 
     attn = KVarNGQAAttention(layer_idx=0, num_heads=2, num_kv_heads=1,
                              head_dim=128)
     sparse = AttentionSparseArgs(
+        sparse_kv_indices=torch.zeros((1, 1), dtype=torch.int64),
+        sparse_kv_offsets=torch.zeros((2,), dtype=torch.int64),
         sparse_attn_indices=torch.zeros((1, 1, 1), dtype=torch.int64),
-        sparse_attn_offsets=torch.zeros((2,), dtype=torch.int64),
     )
     args = AttentionForwardArgs(sparse=sparse)
-    with pytest.raises(NotImplementedError, match="sparse attention top-k"):
+    with pytest.raises(NotImplementedError, match="cannot combine"):
         attn.forward(torch.empty((1, 256)), torch.empty((1, 128)),
                      torch.empty((1, 128)), metadata=type("M", (), {
                          "kv_cache_manager": None,
