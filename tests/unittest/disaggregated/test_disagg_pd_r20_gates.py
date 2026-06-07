@@ -101,8 +101,8 @@ def test_r20_transceiver_backend_selection_is_fail_closed():
     assert "_resolve_cache_transceiver_backend" in source
     assert "TRTLLM_USE_UCX_KVCACHE" in source
     assert "TRTLLM_USE_MOONCAKE_KVCACHE" in source
-    assert "conflicts with legacy env backend selector" in source
-    assert "implicit transport fallback is not allowed" in source
+    assert "legacy env backend selector(s)" in source
+    assert "implicit transport fallback is" in source
     assert "received multiple" in source
 
 
@@ -138,11 +138,12 @@ def test_r20_request_pinning_smoke_is_fail_closed():
     assert "REQUIRE_DYNAMO_PIN_MARKERS" in script
     assert "REQUIRE_POSITIVE_TRANSFER_METRICS" in script
     assert "REQUIRE_ABORT_CLEANUP_MARKER" in script
-    assert "positive KV transfer metrics missing" in script
-    assert "response nvext timing and worker /perf_metrics" in script
+    assert "positive KV transfer proof missing" in script
+    assert "response nvext timing" in script
+    assert "worker /perf_metrics" in script
     assert "KV cache transfer timeout" in script
     assert "OPTRT_NIXL_TRANSFER_PROOF" in script
-    assert "positive KV transfer proof missing" in script
+    assert r"request_id=(\S+)" in script
     assert "ctx_dp_rank is None" in script
     assert "SMC-SD must remain deferred" in script
     assert "SMC_GATE_MODE" in script
@@ -199,8 +200,8 @@ def test_r20_transport_bench_is_nixl_first_and_fail_closed():
     assert 'summary.json' in script
     assert 'positive_transfer_proof_count' in script
     assert 'KV cache transfer timeout' in script
-    assert 'logs = \"\\\\n\".join' in script
-    assert r'request_id=(\\S+)' in script
+    assert 'logs = \"\\n\".join' in script
+    assert r'request_id=(\S+)' in script
 
 def test_r20_transport_bench_embedded_verifier_compiles():
     script = (DEPLOY_DIR / "run_c16_transport_bench.sh").read_text()

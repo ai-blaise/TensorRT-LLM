@@ -394,16 +394,16 @@ for item in _walk(perf_metrics):
 proof_starts = {
     rid: int(blocks)
     for rid, blocks in re.findall(
-        r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_start.*request_id=([^ ]+).*cache_blocks=([0-9]+)",
+        r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_start.*request_id=(\S+).*cache_blocks=([0-9]+)",
         all_logs,
     )
 }
 proof_ctx_complete = set(re.findall(
-    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_complete.*request_id=([^ ]+)",
+    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_complete.*request_id=(\S+)",
     all_logs,
 ))
 proof_gen_complete = set(re.findall(
-    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=gen_recv_complete.*request_id=([^ ]+)",
+    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=gen_recv_complete.*request_id=(\S+)",
     all_logs,
 ))
 positive_transfer_proof_ids = {
