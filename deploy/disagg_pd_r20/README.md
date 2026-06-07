@@ -551,13 +551,16 @@ The matrix probe writes per-plugin artifacts under
 `/tmp/nixl_plugin_matrix_<timestamp>` and fails closed only for required plugins.
 The current gate requires UCX and LIBFABRIC to import, create a backend, and expose
 `VRAM_SEG`; non-required GDS/GDS_MT failures are recorded but do not block the
-peer-KV gate. UCX is the immediate NIXL gate plugin when it creates a VRAM-capable
-backend without cleanup stderr. LIBFABRIC remains an A/B-only candidate until a
-strict request-pinning smoke proves endpoint lifecycle and abort cleanup, because
-this runtime can emit `fi_close fabric failed ... Device or resource busy` cleanup
-warnings. `GDS` and `GDS_MT` can appear in `getAvailPlugins()`, but they are
-storage-oriented plugins rather than the live peer-to-peer KV transfer candidate;
-keep them out of the R20 pre-A/B gate unless the design explicitly moves to a
+peer-KV gate. LIBFABRIC is the immediate NIXL gate plugin because it creates a
+VRAM-capable backend while avoiding the direct UCX transceiver path. UCX remains
+available only as an A/B comparison candidate; do not switch the gate back to UCX
+without strict request-pinning smoke plus C16 throughput evidence. If LIBFABRIC
+emits `fi_close fabric failed ... Device or resource busy` cleanup warnings, keep
+the warning in the probe artifacts and require the strict smoke/abort-cleanup gate
+to pass before promotion. `GDS` and `GDS_MT` can appear in `getAvailPlugins()`,
+but they are storage-oriented plugins rather than the live peer-to-peer KV
+transfer candidate; keep them out of the R20 pre-A/B gate unless the design
+explicitly moves to a
 supported GDS transfer path.
 
 The older combined-process probe is still useful for a compact dependency check:
