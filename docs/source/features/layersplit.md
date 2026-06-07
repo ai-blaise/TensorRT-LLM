@@ -463,10 +463,14 @@ CZS proof:
   allocated lazily once and cached. M5d's transient broadcast buffer
   must be sized to the worst-case at metadata setup time so its address
   is graph-stable.
-- **Cache transceiver (UCX / NIXL)**: M5b binds `cp_group_pg` for the
-  same-node NCCL fast path. M8g will add UCX / NIXL fast-paths for
-  disaggregated-PD deployments where prefill and decode live in
-  different pods and the broadcast must cross the fabric.
+- **Cache transceiver (NIXL / UCX A/B)**: the r20 disaggregated-PD gate
+  uses NIXL with owner-local LayerSplit allocation. Prefill TP2xCP2
+  advertises the global model layer vector for compatibility, but each CP
+  sender writes only its owned contiguous layer slice into the TP4xCP1 decode
+  cache. The NIXL write path uses per-domain-rank LayerSplit
+  `layer_start/layer_count` metadata, so odd layer counts such as 61 reassemble
+  as `0..30` plus `31..60` instead of treating both CP ranks as a full PP
+  layer domain. UCX remains an A/B candidate rather than a production fallback.
 - **WarpDecode (MoE decode overlay)**: orthogonal; WarpDecode operates
   on the MoE expert dispatch / routing path, LayerSplit on the DSA KV
   cache. Both compose with CP independently.

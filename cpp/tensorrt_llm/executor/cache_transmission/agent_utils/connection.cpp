@@ -51,19 +51,30 @@ std::string genUniqueAgentName()
 // context when it sending requestInfo, but don't send buffer offset, since
 // unformmatter has not called yet, it didn't know the cacheSize and offset. We
 // assume the recv_size is the same as the send_size. and compute the buffer
-// offset according to  the layer num of the selfPPrank ,and previous PP rank's
-// layer num, since the buffer size is ratio is equal to the layer num ratio
-// except the VSWA case.
+// offset according to the layer range owned by the peer rank being written.
+// LayerSplit can shard a single PP domain across CP ranks, so KV/KV_INDEXER
+// offsets must use per-domain-rank layer starts/counts when that metadata is
+// available. RNN cache still uses the PP-domain path below.
 
-auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectionIdx)
+std::pair<size_t, size_t> computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectionIdx)
 {
+    if (peerTargetInfo.mPeerLayerShardedByCP)
+    {
+        TLLM_CHECK_WITH_INFO(static_cast<size_t>(connectionIdx) < peerTargetInfo.mPeerLayerStartInDomainRanks.size(),
+            "LayerSplit peer rank layer-start metadata missing for connection index %d", connectionIdx);
+        TLLM_CHECK_WITH_INFO(static_cast<size_t>(connectionIdx) < peerTargetInfo.mPeerLayerNumInDomainRanks.size(),
+            "LayerSplit peer rank layer-count metadata missing for connection index %d", connectionIdx);
+        return std::make_pair(peerTargetInfo.mPeerLayerStartInDomainRanks.at(connectionIdx),
+            peerTargetInfo.mPeerLayerNumInDomainRanks.at(connectionIdx));
+    }
+
     size_t offsetLayer = 0;
     for (int i = 0; i < connectionIdx; i++)
     {
-        offsetLayer += peerTargetInfo.getPeerPPDomainLayerNum(i);
+        offsetLayer += peerTargetInfo.getPeerDomainRankLayerNum(i);
     }
 
-    size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(connectionIdx);
+    size_t selfSendLayer = peerTargetInfo.getPeerDomainRankLayerNum(connectionIdx);
     return std::make_pair(offsetLayer, selfSendLayer);
 }
 

@@ -64,6 +64,11 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::batch_manager;
 namespace texec = tensorrt_llm::executor;
 
+namespace tensorrt_llm::executor::kv_cache
+{
+std::pair<size_t, size_t> computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectionIdx);
+}
+
 using testing::Return;
 using testing::ReturnRef;
 
@@ -2505,6 +2510,10 @@ TEST(targetTest, CacheStateNODP)
         EXPECT_EQ((std::vector<int>{31, 30}), genRank0TargetInfo.mPeerLayerNumInDomainRanks);
         EXPECT_EQ(31, genRank0TargetInfo.getPeerDomainRankLayerNum(0));
         EXPECT_EQ(30, genRank0TargetInfo.getPeerDomainRankLayerNum(1));
+        EXPECT_EQ((std::pair<size_t, size_t>{0, 31}),
+            tensorrt_llm::executor::kv_cache::computeSendOffsetRatio(genRank0TargetInfo, 0));
+        EXPECT_EQ((std::pair<size_t, size_t>{31, 30}),
+            tensorrt_llm::executor::kv_cache::computeSendOffsetRatio(genRank0TargetInfo, 1));
 
         auto const genRank3TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, 3);
         EXPECT_EQ((std::vector<int>{2, 3}), genRank3TargetInfo.mIRanks);
@@ -2514,6 +2523,10 @@ TEST(targetTest, CacheStateNODP)
         EXPECT_TRUE(genRank3TargetInfo.mPeerLayerShardedByCP);
         EXPECT_EQ((std::vector<int>{0, 31}), genRank3TargetInfo.mPeerLayerStartInDomainRanks);
         EXPECT_EQ((std::vector<int>{31, 30}), genRank3TargetInfo.mPeerLayerNumInDomainRanks);
+        EXPECT_EQ((std::pair<size_t, size_t>{0, 31}),
+            tensorrt_llm::executor::kv_cache::computeSendOffsetRatio(genRank3TargetInfo, 0));
+        EXPECT_EQ((std::pair<size_t, size_t>{31, 30}),
+            tensorrt_llm::executor::kv_cache::computeSendOffsetRatio(genRank3TargetInfo, 1));
 
         auto const ctxRank1TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, 1);
         EXPECT_EQ((std::vector<int>{0, 1}), ctxRank1TargetInfo.mIRanks);
