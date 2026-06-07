@@ -294,8 +294,8 @@ References:
 ### Complete and optimize 2-bit GQA KVarN
 
 The GQA KVarN subagent has advanced the implementation with packed decode,
-NIXL/native side-state metadata, sparse KV token selection, and lifecycle
-cleanup. It is not production-default yet.
+batched aligned full-block store, NIXL/native side-state metadata, sparse KV
+token selection, and lifecycle cleanup. It is not production-default yet.
 
 Required completion:
 

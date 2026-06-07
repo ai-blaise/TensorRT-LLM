@@ -357,6 +357,56 @@ def test_kvarn_gqa_bdr_reconstructs_receiver_physical_generation(monkeypatch):
     assert calls == []
 
 
+
+def test_kvarn_gqa_store_commits_aligned_full_blocks_without_tail_loop(monkeypatch):
+    torch = _TORCH
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    state = _KVarNGQASidePool(
+        cfg,
+        num_layers=1,
+        max_batch_size=1,
+        max_blocks_per_seq=3,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    kv_pages = torch.zeros((8, 1, cfg.group, 1, cfg.bytes_per_token_slot),
+                           dtype=torch.uint8)
+    slot = state.slot_for_request(23)
+    block_ids = [0, 2, 3]
+    state.update_block_ids(0, slot, block_ids)
+    attn = KVarNGQAAttention(0, num_heads=1, head_dim=cfg.head_dim, num_kv_heads=1)
+    attn.cfg = cfg
+
+    tail_calls = []
+    real_put_tail = state.put_tail
+
+    def counted_put_tail(*args, **kwargs):
+        tail_calls.append(args)
+        return real_put_tail(*args, **kwargs)
+
+    monkeypatch.setattr(state, "put_tail", counted_put_tail)
+
+    k = torch.randn(2 * cfg.group, 1, cfg.head_dim, dtype=torch.float16) * 0.2
+    v = torch.randn_like(k) * 0.2
+    attn._store_new_tokens(state, kv_pages, request_id=23, slot=slot,
+                           block_ids=block_ids, past_seen_token=cfg.sink_tokens,
+                           k=k, v=v, allow_commit=True)
+
+    assert tail_calls == []
+    assert state.committed[0, slot, 1:3].tolist() == [True, True]
+    assert state.request_block_to_physical[(0, 23, cfg.group)] == 2
+    assert state.request_block_to_physical[(0, 23, 2 * cfg.group)] == 3
+    pages = torch.stack([kv_pages[2, 0], kv_pages[3, 0]], dim=0)
+    records = _gqa_attention._record_views_from_pages(pages, cfg)
+    k_restored, v_restored = dequantize_gqa_tiles(records, cfg)
+    assert torch.isfinite(k_restored).all()
+    assert torch.isfinite(v_restored).all()
+    assert torch.nn.functional.cosine_similarity(
+        k.float().flatten(), k_restored.flatten(), dim=0).item() > 0.45
+    assert torch.nn.functional.cosine_similarity(
+        v.float().flatten(), v_restored.flatten(), dim=0).item() > 0.45
+
 def test_kvarn_gqa_packed_decode_uses_device_block_table():
     torch = _TORCH
     cfg = KVarNGQAConfig(sinkhorn_iters=1)

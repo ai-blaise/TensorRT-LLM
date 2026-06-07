@@ -526,6 +526,41 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
         state.mark_committed(layer, slot, request_id, block_start,
                              physical_block_id=block_id)
 
+    def _commit_full_block_range(self, state: _KVarNGQASidePool,
+                                 kv_pages: torch.Tensor, layer: int,
+                                 request_id: int, slot: int, block_ids: list[int],
+                                 token_offset: int, start_block_num: int,
+                                 num_blocks: int, k: torch.Tensor,
+                                 v: torch.Tensor) -> None:
+        if num_blocks <= 0:
+            return
+        end_block_num = start_block_num + num_blocks
+        if end_block_num > len(block_ids):
+            raise RuntimeError(
+                f"KVarN GQA missing block ids for request={request_id} "
+                f"block range=[{start_block_num}, {end_block_num}); ids={block_ids}")
+        token_end = token_offset + num_blocks * self.cfg.group
+        k_blocks = k[token_offset:token_end].view(
+            num_blocks, self.cfg.group, self.num_kv_heads, self.cfg.head_dim)
+        v_blocks = v[token_offset:token_end].view_as(k_blocks)
+        physical_ids = [int(x) for x in block_ids[start_block_num:end_block_num]]
+        if k_blocks.is_cuda:
+            op = _required_trtllm_op("kvarn_gqa_store")
+            block_ids_t = state.block_ids[layer, slot,
+                                          start_block_num:end_block_num]
+            op(k_blocks.contiguous(), v_blocks.contiguous(), kv_pages,
+               block_ids_t.contiguous(), layer, self.cfg.head_dim,
+               self.cfg.group)
+        else:
+            for block_idx, physical in enumerate(physical_ids):
+                record = quantize_gqa_tile(k_blocks[block_idx],
+                                           v_blocks[block_idx], self.cfg)
+                _write_record_to_page(kv_pages[physical, 0], record, self.cfg)
+        for block_idx, physical in enumerate(physical_ids):
+            block_start = (start_block_num + block_idx) * self.cfg.group
+            state.mark_committed(layer, slot, request_id, block_start,
+                                 physical_block_id=physical)
+
     def _store_new_tokens(self, state: _KVarNGQASidePool,
                           kv_pages: torch.Tensor, request_id: int,
                           slot: int, block_ids: list[int], past_seen_token: int,
@@ -533,10 +568,13 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                           *, allow_commit: bool) -> None:
         if k is None or v is None:
             return
-        for i in range(k.shape[0]):
+        i = 0
+        total = int(k.shape[0])
+        while i < total:
             pos = past_seen_token + i
             if pos < self.cfg.sink_tokens:
                 state.put_sink(self.layer_idx, slot, k[i], v[i], pos)
+                i += 1
                 continue
             block_num = pos // self.cfg.group
             block_start = block_num * self.cfg.group
@@ -545,10 +583,20 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 raise RuntimeError(
                     f"KVarN GQA missing block id for request={request_id} "
                     f"position={pos} block_num={block_num} ids={block_ids}")
+            if allow_commit and block_offset == 0 and total - i >= self.cfg.group:
+                max_blocks_from_tokens = (total - i) // self.cfg.group
+                max_blocks_from_ids = len(block_ids) - block_num
+                num_blocks = min(max_blocks_from_tokens, max_blocks_from_ids)
+                self._commit_full_block_range(
+                    state, kv_pages, self.layer_idx, request_id, slot,
+                    block_ids, i, block_num, num_blocks, k, v)
+                i += num_blocks * self.cfg.group
+                continue
             state.put_tail(self.layer_idx, slot, block_start, block_offset, k[i], v[i])
             self._commit_tail_if_full(state, kv_pages, self.layer_idx,
                                       request_id, slot, block_start,
                                       block_ids[block_num], allow_commit)
+            i += 1
 
     def _load_sequence(self, state: _KVarNGQASidePool,
                        kv_pages: torch.Tensor, request_id: int,
