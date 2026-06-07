@@ -117,13 +117,22 @@ require_config_shape() {
     require_fixed "TRTLLM_NIXL_KVCACHE_BACKEND=${EXPECTED_NIXL_PLUGIN_BACKEND}" "$OUTPUT_DIR/decode.env" "decode NIXL plugin backend env"
     require_fixed 'TRTLLM_NIXL_ENABLE_COALESCE=1' "$OUTPUT_DIR/prefill.env" "prefill NIXL descriptor coalescing env"
     require_fixed 'TRTLLM_NIXL_ENABLE_COALESCE=1' "$OUTPUT_DIR/decode.env" "decode NIXL descriptor coalescing env"
+    require_fixed 'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0' "$OUTPUT_DIR/prefill.env" "prefill NIXL transfer overlap env"
+    require_fixed 'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0' "$OUTPUT_DIR/decode.env" "decode NIXL transfer overlap env"
+    require_fixed 'TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL=1' "$OUTPUT_DIR/prefill.env" "prefill NIXL parallel receive env"
+    require_fixed 'TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL=1' "$OUTPUT_DIR/decode.env" "decode NIXL parallel receive env"
   else
     [[ "$(count_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND' "$cfg")" -ge 2 ]] \
       || fail "TRTLLM_NIXL_KVCACHE_BACKEND must be explicit on prefill and decode"
     [[ "$(count_fixed 'TRTLLM_NIXL_ENABLE_COALESCE' "$cfg")" -ge 2 ]] \
       || fail "TRTLLM_NIXL_ENABLE_COALESCE must be explicit on prefill and decode"
+    [[ "$(count_fixed 'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP' "$cfg")" -ge 2 ]] \
+      || fail "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP must be explicit on prefill and decode"
+    [[ "$(count_fixed 'TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL' "$cfg")" -ge 2 ]] \
+      || fail "TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL must be explicit on prefill and decode"
     require_fixed "value: ${EXPECTED_NIXL_PLUGIN_BACKEND}" "$cfg" "NIXL plugin backend value"
     require_fixed "value: '1'" "$cfg" "enabled boolean env values"
+    require_fixed "value: '0'" "$cfg" "disabled boolean env values"
   fi
   require_fixed 'UCX_CUDA_IPC_ENABLE_MNNVL' "$cfg" "UCX CUDA IPC MNNVL guard"
   require_fixed 'NVIDIA_GDRCOPY' "$cfg" "GDRCopy env"

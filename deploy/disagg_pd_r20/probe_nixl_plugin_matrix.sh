@@ -112,10 +112,12 @@ for plugin in plugins:
         and entry["has_vram_seg"]
         and not entry["cleanup_warning"]
     )
-    if plugin == "UCX" and entry["gate_candidate"]:
+    if plugin == "LIBFABRIC" and entry["gate_candidate"]:
         entry["recommended_role"] = "current_nixl_gate_plugin"
     elif plugin == "LIBFABRIC" and entry.get("create_backend") == "ok" and entry["has_vram_seg"]:
-        entry["recommended_role"] = "ab_candidate_cleanup_risk" if entry["cleanup_warning"] else "ab_candidate"
+        entry["recommended_role"] = "current_nixl_gate_plugin_cleanup_risk"
+    elif plugin == "UCX" and entry["gate_candidate"]:
+        entry["recommended_role"] = "ab_candidate"
     elif plugin.startswith("GDS"):
         entry["recommended_role"] = "not_peer_kv_gate"
     else:
@@ -128,14 +130,16 @@ if failures:
     summary["status"] = "fail"
     summary["failures"] = failures
 
-if summary["plugins"].get("UCX", {}).get("gate_candidate"):
-    summary["recommendations"].append("Use NIXL with UCX plugin as the immediate gate candidate; it creates a VRAM-capable backend without cleanup warnings in this isolated probe.")
+if summary["plugins"].get("LIBFABRIC", {}).get("gate_candidate"):
+    summary["recommendations"].append("Use NIXL with LIBFABRIC plugin as the immediate gate candidate; it creates a VRAM-capable backend and avoids direct UCX.")
 libfabric = summary["plugins"].get("LIBFABRIC", {})
 if libfabric.get("create_backend") == "ok" and libfabric.get("has_vram_seg"):
     if libfabric.get("cleanup_warning"):
-        summary["recommendations"].append("Keep LIBFABRIC as A/B-only until strict smoke proves lifecycle cleanup; isolated backend creation emitted cleanup stderr.")
+        summary["recommendations"].append("LIBFABRIC is the current gate plugin, but strict smoke must watch cleanup/abort paths because isolated backend creation emitted cleanup stderr.")
     else:
-        summary["recommendations"].append("LIBFABRIC is a valid A/B candidate after the NIXL UCX-plugin gate passes strict smoke.")
+        summary["recommendations"].append("LIBFABRIC is ready for strict NIXL write-mode smoke.")
+if summary["plugins"].get("UCX", {}).get("gate_candidate"):
+    summary["recommendations"].append("Keep the NIXL UCX plugin as an A/B candidate; it creates a VRAM-capable backend, but is not the r20 gate default.")
 if any(name.startswith("GDS") for name in summary["plugins"]):
     summary["recommendations"].append("GDS/GDS_MT are recorded for dependency coverage only; do not promote them for peer KV transfer without an explicit supported storage/GDS design.")
 print(json.dumps(summary, indent=2, sort_keys=True))

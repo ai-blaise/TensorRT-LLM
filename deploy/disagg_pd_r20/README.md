@@ -524,6 +524,11 @@ The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
 - `TRTLLM_NIXL_ENABLE_COALESCE=1` on both workers. NIXL coalesces contiguous
   VMM-split descriptors during registration, deregistration, and transfer request
   creation, reducing descriptor count and hot-path overhead.
+- `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0` and
+  `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL=1` on both workers. The first keeps
+  KV transfer/inference overlap explicitly enabled; the second allows generation
+  ranks to receive KV from the prefill CP ranks in parallel instead of
+  sequentially.
 - `UCX_CUDA_IPC_ENABLE_MNNVL=0`, `NVIDIA_GDRCOPY=1`, `NCCL_NET_PLUGIN=none`, and
   `TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED` keep the single-node B200/NVLink
   path explicit and avoid the direct UCX MNNVL warning path seen in earlier

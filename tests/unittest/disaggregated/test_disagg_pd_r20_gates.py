@@ -67,6 +67,8 @@ def test_r20_manifest_has_no_helix_or_smc_fallback():
     assert manifest.count("value: LIBFABRIC") >= 2
     assert "value: UCX" not in manifest
     assert manifest.count("TRTLLM_NIXL_ENABLE_COALESCE") >= 2
+    assert manifest.count("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") >= 2
+    assert manifest.count("TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL") >= 2
     assert "UCX_CUDA_IPC_ENABLE_MNNVL" in manifest
     assert "NVIDIA_GDRCOPY" in manifest
     assert "TRTLLM_FORCE_COMM_METHOD" in manifest
@@ -478,6 +480,8 @@ def test_r20_nixl_gate_readiness_audit_is_read_only_and_fail_closed():
     assert 'EXPECTED_NIXL_PLUGIN_BACKEND="${EXPECTED_NIXL_PLUGIN_BACKEND:-LIBFABRIC}"' in script
     assert "UCX|LIBFABRIC" in script
     assert "TRTLLM_NIXL_ENABLE_COALESCE" in script
+    assert "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP" in script
+    assert "TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL" in script
     assert "max_tokens_in_buffer must be at least" in script
     assert "Initializing NIXL Connect" in script
     assert "OPTRT_LAYERSPLIT_XFER_DEBUG" in script
@@ -524,7 +528,7 @@ def test_r20_nixl_plugin_matrix_probe_is_no_traffic_and_checks_cleanup():
     assert "fi_close" in script
     assert "Device or resource busy" in script
     assert "current_nixl_gate_plugin" in script
-    assert "ab_candidate_cleanup_risk" in script
+    assert "current_nixl_gate_plugin_cleanup_risk" in script
     assert "not_peer_kv_gate" in script
     assert "summary.json" in script
     assert "result.json" in script
