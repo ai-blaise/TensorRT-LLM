@@ -117,6 +117,14 @@ deploy/disagg_pd_r20/snapshot_readiness.sh \
   --dgd-name topo-c1-dp2tp4-hook-canary \
   --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
   --strict
+
+# Snapshot CR render after recent hook proof exists. This is dry-run by default
+# and creates separate prefill/decode DynamoGraphDeploymentSnapshot resources
+# only under --apply.
+deploy/disagg_pd_r20/snapshot_take_canary.sh \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --oci-repo localhost:5000/optrt-snapshots/topo-c1-dp2tp4-hook-canary
 ```
 
 Pass criteria:

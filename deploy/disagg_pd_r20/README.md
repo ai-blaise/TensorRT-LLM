@@ -441,6 +441,28 @@ deploy/disagg_pd_r20/snapshot_hook_signal_probe.sh \
   --execute
 ```
 
+After fresh pre/post hook proof files exist, render the component snapshot
+resources. This is also dry-run by default and requires recent hook proof files
+before it will even server-dry-run the snapshot CRs:
+
+```bash
+deploy/disagg_pd_r20/snapshot_take_canary.sh \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --oci-repo localhost:5000/optrt-snapshots/topo-c1-dp2tp4-hook-canary
+```
+
+Only after the canary is isolated, hook-proven, and the rendered resources pass
+API-server validation:
+
+```bash
+deploy/disagg_pd_r20/snapshot_take_canary.sh \
+  --canary-dgd topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --oci-repo localhost:5000/optrt-snapshots/topo-c1-dp2tp4-hook-canary \
+  --apply
+```
+
 ## Knob provenance
 
 - WarpDecode: `tensorrt_llm/llmapi/llm_args.py` `WarpDecodeConfig`

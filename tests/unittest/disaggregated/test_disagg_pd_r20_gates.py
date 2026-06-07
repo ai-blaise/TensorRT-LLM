@@ -276,6 +276,39 @@ def test_r20_snapshot_hook_signal_probe_is_canary_only():
         assert token not in script
 
 
+def test_r20_snapshot_take_canary_is_proof_gated_and_fail_closed():
+    script = (DEPLOY_DIR / "snapshot_take_canary.sh").read_text()
+
+    assert "APPLY=0" in script
+    assert "SERVER_DRY_RUN=1" in script
+    assert "refusing production r20 DGD" in script
+    assert "refusing non-canary DGD name" in script
+    assert "canary_dgd_not_ready" in script
+    assert "hook_pre_ready_recent_count" in script
+    assert "hook_post_ready_recent_count" in script
+    assert "missing_recent_hook_pre_post_proof" in script
+    assert "recent_hook_error_files_present" in script
+    assert "snapshot_resource_already_exists" in script
+    assert "DynamoGraphDeploymentSnapshot" in script
+    assert "apiVersion: snapshots.ai-blaise.io/v1alpha1" in script
+    assert "component: ${component}" in script
+    assert "render_snapshot prefill" in script
+    assert "render_snapshot decode" in script
+    assert "maxInFlight: ${MAX_IN_FLIGHT}" in script
+    assert "type: openai-completion" in script
+    assert "apply --dry-run=server" in script
+
+    forbidden = [
+        " delete ",
+        " scale ",
+        " rollout restart",
+        " patch dgd",
+        " patch dynamographdeployment",
+    ]
+    for token in forbidden:
+        assert token not in script
+
+
 def test_r20_transceiver_backend_selection_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
 
