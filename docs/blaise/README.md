@@ -71,6 +71,7 @@ a correctness signal — see "Validation philosophy" below).
 9. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
 10. [foundry_iteration_speed.md](foundry_iteration_speed.md) — Foundry vs CRIU snapshot decision for iteration/runtime reuse.
 11. [r20_snapshot_composition.md](r20_snapshot_composition.md) — R20 CRIU snapshot readiness and next hook patch.
+12. [r20_snapshot_proof_criteria.md](r20_snapshot_proof_criteria.md) — proof gates for TRT-LLM hooks, NIXL, LayerSplit, KVarN/CUDA graph scratch, and checkpointctl.
 
 ## Validation philosophy
 

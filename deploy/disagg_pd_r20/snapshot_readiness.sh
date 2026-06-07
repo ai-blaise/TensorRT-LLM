@@ -79,6 +79,8 @@ warns=()
 
 kv report snapshot_readiness
 kv mode read_only
+kv composition_path criu_snapshots_sidecar
+kv proof_criteria_doc docs/blaise/r20_snapshot_proof_criteria.md
 kv dgd_namespace "$DGD_NAMESPACE"
 kv dgd_name "$DGD_NAME"
 kv snapshot_namespace "$SNAPSHOT_NAMESPACE"
@@ -136,6 +138,11 @@ for tool in checkpointctl buildah oras; do
     warns+=("${tool}_missing")
   fi
 done
+if have checkpointctl; then
+  kv checkpointctl_restore_image_tooling ready
+else
+  kv checkpointctl_restore_image_tooling missing_for_restore_image_materialization
+fi
 
 if [[ -d /opt/criu-snapshots ]]; then
   kv host_install_dir present
@@ -243,6 +250,24 @@ ${config_yaml}"
     kv optrt_cache_mount missing
     blockers+=(optrt_cache_mount)
   fi
+  if grep -Eq 'backend:[[:space:]]*NIXL|cache_transceiver_config.*NIXL|layersplit_transfer_backend:[[:space:]]*nixl' <<<"$target_yaml"; then
+    kv nixl_backend_configured 1
+  else
+    kv nixl_backend_configured 0
+    warns+=(nixl_backend_not_detected)
+  fi
+  if grep -q 'layersplit_enabled: true' <<<"$target_yaml"       && grep -q 'tensor_parallel_size: 2' <<<"$target_yaml"       && grep -q 'context_parallel_size: 2' <<<"$target_yaml"; then
+    kv layersplit_tp2cp2_configured 1
+  else
+    kv layersplit_tp2cp2_configured 0
+    warns+=(layersplit_tp2cp2_not_detected)
+  fi
+  if grep -Eq 'mla_latent_kv_dtype:[[:space:]]*kvarn_k2v2|mla_latent_kv_dtype.*kvarn' <<<"$target_yaml"; then
+    kv dense_kvarn_configured 1
+  else
+    kv dense_kvarn_configured 0
+    warns+=(dense_kvarn_not_detected)
+  fi
 
   pod_lines="$($KUBECTL -n "$DGD_NAMESPACE" get pods --ignore-not-found -o wide --no-headers 2>/dev/null | grep -F "$DGD_NAME" || true)"
   kv target_pod_count "$(printf '%s\n' "$pod_lines" | count_lines)"
@@ -265,7 +290,16 @@ else
 fi
 
 kv trtllm_snapshot_hook_status missing
-blockers+=(trtllm_snapshot_hooks)
+kv trtllm_snapshot_hook_proof missing
+kv nixl_inflight_restore_proof missing
+kv layersplit_tp2cp2_restore_proof missing
+kv kvarn_cuda_graph_scratch_restore_proof missing
+kv checkpointctl_restore_proof missing
+blockers+=(trtllm_snapshot_hook_proof)
+blockers+=(nixl_inflight_restore_proof)
+blockers+=(layersplit_tp2cp2_restore_proof)
+blockers+=(kvarn_cuda_graph_scratch_restore_proof)
+blockers+=(checkpointctl_restore_proof)
 kv safe_to_take_snapshot 0
 kv recommended_next_action add_gated_trtllm_pre_snapshot_post_restore_hooks_then_run_dgds_canary
 

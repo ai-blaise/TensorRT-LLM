@@ -240,9 +240,10 @@ deploy/disagg_pd_r20/snapshot_readiness.sh \
 ```
 
 This is a preflight only. `safe_to_take_snapshot=0` is expected until R20 has a
-gated TensorRT-LLM pre-snapshot/post-restore hook that drains requests, quiesces
-NIXL, destroys/rebuilds process groups, and proves TP4 decode plus TP2xCP2
-LayerSplit prefill restore parity.
+gated TensorRT-LLM pre-snapshot/post-restore hook and the proof gates in
+`docs/blaise/r20_snapshot_proof_criteria.md` pass: NIXL in-flight restore,
+LayerSplit TP2xCP2 restore, dense KVarN/CUDA graph scratch restore, and
+`checkpointctl` restore-image tooling.
 
 ## Knob provenance
 

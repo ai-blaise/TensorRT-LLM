@@ -53,6 +53,9 @@ TP4 decode or TP2xCP2 LayerSplit prefill.
 
 ## New Safe Probe
 
+The detailed pass/fail criteria live in
+[`r20_snapshot_proof_criteria.md`](r20_snapshot_proof_criteria.md).
+
 `deploy/disagg_pd_r20/snapshot_readiness.sh` is a read-only preflight for this
 composition path. It reports:
 
@@ -63,8 +66,11 @@ composition path. It reports:
 - R20 live config shape: TensorRT-LLM runtime marker, persistent cache mount,
   absence/presence of snapshot hook env vars, and absence/presence of Foundry or
   `LD_PRELOAD` markers;
-- the hard blocker: `trtllm_snapshot_hook_status=missing` and
-  `safe_to_take_snapshot=0` until a TensorRT-LLM hook is implemented and tested.
+- the hard blockers: `trtllm_snapshot_hook_proof=missing`,
+  `nixl_inflight_restore_proof=missing`,
+  `layersplit_tp2cp2_restore_proof=missing`, and
+  `kvarn_cuda_graph_scratch_restore_proof=missing` until canary restore tests
+  prove those paths; `safe_to_take_snapshot=0` remains expected for production.
 
 It does not create a `DynamoGraphDeploymentSnapshot`, patch a ConfigMap, drain
 traffic, restart pods, or run a restore probe.
@@ -110,5 +116,7 @@ infra wrapper safely run a real `DynamoGraphDeploymentSnapshot` against R20.
 - LayerSplit owner-local CP-sharded prefill state has no restore parity test.
 - Dense KVarN and CUDA graph capture buffers have no persistent-scratch restore
   proof.
+- `checkpointctl` is still required before restore-image materialization / Tier 3
+  restored-Pod launch can be considered complete.
 - No R20 first-token restore benchmark exists to compare CRIU fast-start against
   cold start plus current image/cache/prewarm work.
