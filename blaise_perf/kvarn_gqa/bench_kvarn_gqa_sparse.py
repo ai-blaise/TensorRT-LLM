@@ -106,6 +106,43 @@ def capture_dequant_op(fn, readable_k: torch.Tensor, readable_v: torch.Tensor):
     return max_abs, graph
 
 
+def reference_attention(q: torch.Tensor, readable_k: torch.Tensor, readable_v: torch.Tensor,
+                        seq_lens: torch.Tensor, num_heads: int, num_kv_heads: int,
+                        sparse_indices: torch.Tensor | None = None) -> torch.Tensor:
+    """Independent PyTorch attention over restored KVarN blocks.
+
+    The fused dense and sparse GQA ops intentionally read packed 2-bit records
+    directly. This reference reads the dequantized readable pool produced by the
+    same pack/store path so the benchmark catches scoring, GQA head mapping,
+    sparse-index semantics, and odd-M behavior independently from the CUDA
+    decode kernels.
+    """
+    tokens = readable_k.reshape(-1, num_kv_heads, q.shape[-1])
+    values = readable_v.reshape_as(tokens)
+    groups = num_heads // num_kv_heads
+    out = torch.empty_like(q)
+    scale = q.shape[-1] ** -0.5
+    for query in range(q.shape[0]):
+        seq_idx = query if seq_lens.numel() > 1 else 0
+        seq_len = int(seq_lens[seq_idx].item())
+        for head in range(num_heads):
+            kv_head = head // groups
+            if sparse_indices is None:
+                idx = torch.arange(seq_len, device=q.device, dtype=torch.long)
+            else:
+                idx = sparse_indices[kv_head, query]
+                idx = idx[(idx >= 0) & (idx < seq_len)]
+            if idx.numel() == 0:
+                out[query, head].zero_()
+                continue
+            k_sel = tokens.index_select(0, idx)[:, kv_head]
+            v_sel = values.index_select(0, idx)[:, kv_head]
+            logits = torch.matmul(k_sel.float(), q[query, head].float()) * scale
+            probs = torch.softmax(logits, dim=0)
+            out[query, head] = torch.matmul(probs, v_sel.float()).to(dtype=q.dtype)
+    return out
+
+
 def dry_run(args: argparse.Namespace) -> None:
     group = 128
     head_dim = 128
@@ -252,6 +289,8 @@ def main() -> None:
             args.heads, args.kv_heads, head_dim, group)
 
         ref = dense()
+        ref_dense = reference_attention(q, full_k, full_v, seq_lens, args.heads, args.kv_heads)
+        ref_max_abs = (ref - ref_dense).abs().max().item()
         if sparse_full is not None:
             got = sparse_full()
             torch.cuda.synchronize()
@@ -259,6 +298,9 @@ def main() -> None:
         else:
             torch.cuda.synchronize()
             max_abs = float("nan")
+        sparse_got = sparse()
+        ref_sparse = reference_attention(q, full_k, full_v, seq_lens, args.heads, args.kv_heads, sparse_idx)
+        sparse_topk_ref_max_abs = (sparse_got - ref_sparse).abs().max().item()
         dense_us = timed_us(dense, args.iters, args.warmup)
         sparse_full_us = timed_us(sparse_full, args.iters, args.warmup) if sparse_full is not None else float("nan")
         sparse_us = timed_us(sparse, args.iters, args.warmup)
@@ -280,6 +322,7 @@ def main() -> None:
             )
         print(
             f"DECODE dtype={args.dtype} blocks={num_blocks} M={m} topk={topk} max_abs_full={max_abs:.6f} "
+            f"ref_max_abs={ref_max_abs:.6f} sparse_topk_ref_max_abs={sparse_topk_ref_max_abs:.6f} "
             f"dense_us={dense_us:.2f} sparse_full_us={sparse_full_us:.2f} sparse_topk_us={sparse_us:.2f}"
         )
 

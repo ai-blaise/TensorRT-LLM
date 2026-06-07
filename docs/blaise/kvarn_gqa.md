@@ -387,7 +387,9 @@ Current focused coverage:
   `--graph-replay`, accepts `--blocks` and `--bdr-churn-blocks` to prove dequant
   cost scales with churn rather than resident working set, and checks sparse-full
   equality against dense packed decode
-  for odd M values when the resident set is <=256 tokens. The earlier
+  for odd M values when the resident set is <=256 tokens, and compares both
+  dense and sparse packed decode outputs against an independent PyTorch
+  attention reference over the dequantized KVarN readable pool. The earlier
   `--try-store-op`, `--try-decode-op`, and `--try-side-op` development parity
   checks cover FP16/BF16 runtime tensors, compact records, paged KV-cache layout,
   odd SMC query counts, and fp16/bf16 sink + packed block + tail decode. They

@@ -93,6 +93,8 @@ REQUIRED_BENCH_SNIPPETS = (
     "GRAPH_BDR_DEQUANT",
     "churn_max_abs",
     "max_abs_full",
+    "ref_max_abs",
+    "sparse_topk_ref_max_abs",
     "STORE dtype=",
     "DECODE dtype=",
 )
