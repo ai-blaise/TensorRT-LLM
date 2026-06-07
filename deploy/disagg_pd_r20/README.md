@@ -203,13 +203,17 @@ Inspect cache/image residency without touching pods. From the B200 VM itself,
 ```bash
 deploy/disagg_pd_r20/cache_report.sh \
   --vm local \
+  --dgd-name topo-c1-dp2tp4-disagg-r20 \
   --image-filter dynamo-trtllm-optrt-custom
 ```
 
 Run this after the first cold rollout and again after the next overlay rollout.
-The useful signal is whether `triton`, `cuda`, `deep_gemm`, and
-`tensorrt_llm/*` grow and then stabilize; if they remain empty, the workers are
-not writing to the intended persistent cache paths.
+The useful signal is whether active prefill/decode images are already resident
+in k3s/containerd with the intended pull policy, and whether `triton`, `cuda`,
+`deep_gemm`, and `tensorrt_llm/*` grow and then stabilize. If the persistent
+cache directories remain empty, the workers are not writing to the intended
+cache paths. If an active image is not resident, a resident-mode deploy will not
+be reproducible without a registry push or explicit image import.
 
 Inspect CRIU snapshot composition readiness without touching pods:
 

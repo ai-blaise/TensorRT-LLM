@@ -5,6 +5,7 @@ VM_HOST="${VM_HOST:-34.106.33.128}"
 VM_USER="${VM_USER:-spencergarnets}"
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 IMAGE_FILTER="${IMAGE_FILTER:-dynamo-trtllm-optrt-custom}"
+DGD_NAME="${DGD_NAME:-topo-c1-dp2tp4-disagg-r20}"
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -25,6 +26,7 @@ Options:
   --user USER            SSH user (default: $VM_USER)
   --local-registry HOST  Registry host:port to probe (default: $LOCAL_REGISTRY)
   --image-filter TEXT    Image substring for k3s/containerd listing
+  --dgd-name NAME        DGD/pod-name prefix to report active image residency
   -h, --help             Show this help
 EOF
 }
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --user) VM_USER="$2"; shift 2 ;;
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --image-filter) IMAGE_FILTER="$2"; shift 2 ;;
+    --dgd-name) DGD_NAME="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -80,6 +83,61 @@ if command -v curl >/dev/null 2>&1; then
   echo
 fi
 
+
+echo
+echo "== active DGD pod images =="
+if [[ -x /usr/local/bin/k3s ]]; then
+  KUBECTL=(sudo -E /usr/local/bin/k3s kubectl)
+elif command -v kubectl >/dev/null 2>&1; then
+  KUBECTL=(kubectl)
+else
+  KUBECTL=()
+fi
+
+active_images=""
+if [[ "${#KUBECTL[@]}" -eq 0 ]]; then
+  echo "kubectl_unavailable"
+else
+  pod_lines="$(
+    "${KUBECTL[@]}" -n dynamo-system get pods \
+      -o custom-columns='POD:.metadata.name,PHASE:.status.phase,RESTARTS:.status.containerStatuses[*].restartCount,NODE:.spec.nodeName,IMAGE:.spec.containers[*].image,PULL_POLICY:.spec.containers[*].imagePullPolicy' \
+      --no-headers 2>/dev/null | grep -F "$DGD_NAME" || true
+  )"
+  if [[ -z "$pod_lines" ]]; then
+    echo "no_pods_matching_dgd=$DGD_NAME"
+  else
+    printf '%s\n' "$pod_lines"
+    active_images="$(printf '%s\n' "$pod_lines" | awk '{print $(NF-1)}' | sort -u)"
+  fi
+fi
+
+if [[ -n "$active_images" ]]; then
+  echo
+  echo "== active DGD image residency =="
+  while IFS= read -r image; do
+    [[ -z "$image" ]] && continue
+    detail=""
+    if command -v nerdctl >/dev/null 2>&1; then
+      detail="$(
+        sudo nerdctl -n k8s.io images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' 2>/dev/null \
+          | awk -F '\t' -v img="$image" '$1 == img {print; found=1} END {exit found ? 0 : 1}' \
+          || true
+      )"
+    else
+      detail="$(
+        sudo /usr/local/bin/k3s ctr -n k8s.io images ls 2>/dev/null \
+          | awk -v img="$image" '$1 == img {print; found=1} END {exit found ? 0 : 1}' \
+          || true
+      )"
+    fi
+    if [[ -n "$detail" ]]; then
+      printf 'resident=yes image=%s detail=%s\n' "$image" "$detail"
+    else
+      printf 'resident=no  image=%s\n' "$image"
+    fi
+  done <<<"$active_images"
+fi
+
 echo
 echo "== k3s/containerd image residency =="
 if command -v nerdctl >/dev/null 2>&1; then
@@ -90,9 +148,9 @@ fi
 EOS
 
 if [[ "$VM_HOST" == "local" ]]; then
-  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" bash -s <<<"$REMOTE_SCRIPT"
+  LOCAL_REGISTRY="$LOCAL_REGISTRY" IMAGE_FILTER="$IMAGE_FILTER" DGD_NAME="$DGD_NAME" bash -s <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' bash -s" \
+    "LOCAL_REGISTRY='$LOCAL_REGISTRY' IMAGE_FILTER='$IMAGE_FILTER' DGD_NAME='$DGD_NAME' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi
