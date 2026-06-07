@@ -9,6 +9,8 @@ KC="${KC:-sudo -E /usr/local/bin/k3s kubectl -n dynamo-system}"
 # image that has not yet rebuilt Dynamo with the fail-closed marker patch. The
 # pre-A/B gate must leave this at 1.
 REQUIRE_DYNAMO_PIN_MARKERS="${REQUIRE_DYNAMO_PIN_MARKERS:-1}"
+REQUIRE_POSITIVE_TRANSFER_METRICS="${REQUIRE_POSITIVE_TRANSFER_METRICS:-1}"
+REQUIRE_ABORT_CLEANUP_MARKER="${REQUIRE_ABORT_CLEANUP_MARKER:-1}"
 SMC_GATE_MODE="${SMC_GATE_MODE:-deferred}"
 
 die() {
@@ -39,6 +41,29 @@ restart_count() {
     | awk '{sum += $1} END {print sum + 0}'
 }
 
+require_runtime_nixl_gate() {
+  local pre="$1" dec="$2"
+  local pod env_dump log_dump
+
+  for pod in "$pre" "$dec"; do
+    env_dump="$($KC get "$pod" -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"="}{.value}{"\n"}{end}' 2>/dev/null || true)"
+    ! grep -Eq '^TRTLLM_USE_(UCX|MOONCAKE|MPI)_KVCACHE=1$' <<<"$env_dump" \
+      || die "$pod has a legacy env backend override that conflicts with the NIXL gate"
+
+    log_dump="$($KC logs "$pod" 2>/dev/null || true)"
+    grep -q 'Initializing NIXL Connect' <<<"$log_dump" || die "$pod did not initialize NIXL Connect"
+    grep -Eq "cache_transceiver_config.*backend.*NIXL|cache_transceiver_config: \{'backend': 'NIXL'" <<<"$log_dump" \
+      || die "$pod logs do not prove cache_transceiver_config.backend=NIXL"
+    ! grep -Eq "cache_transceiver_config.*backend.*UCX|cache_transceiver_config: \{'backend': 'UCX'|Using UCX kv-cache transceiver" <<<"$log_dump" \
+      || die "$pod selected UCX cache transceiver in logs"
+    grep -q 'OPTRT_LAYERSPLIT_XFER_DEBUG' <<<"$log_dump" || die "$pod missing LayerSplit transfer debug proof"
+    grep -q 'global_layers=61' <<<"$log_dump" || die "$pod did not advertise global_layers=61 to CacheTransceiver"
+  done
+
+  grep -q 'transfer_attr=True' <<<"$($KC logs "$pre" 2>/dev/null || true)" \
+    || die "prefill did not expose DSACacheManager transfer_attr=True global metadata"
+}
+
 require_config_gate() {
   local cfg
   cfg="$($KC get cm "${DGD}-config" -o yaml)"
@@ -51,7 +76,11 @@ require_config_gate() {
   [[ "$(grep -c 'backend: NIXL' <<<"$cfg")" -ge 2 ]] || die "prefill/decode NIXL cache transceivers are not both configured"
   ! grep -q 'backend: UCX' <<<"$cfg" || die "UCX cache transceiver backend is present; NIXL is the pre-A/B baseline"
   grep -q 'mla_latent_kv_dtype: kvarn_k2v2' <<<"$cfg" || die "dense MLA KVarN kvarn_k2v2 is not configured"
+  ! grep -q 'mla_latent_kv_dtype: auto' <<<"$cfg" || die "dense MLA KVarN fell back to auto dtype"
   grep -q 'mla_latent_kv_amortize: true' <<<"$cfg" || die "dense MLA KVarN amortization is not configured"
+  grep -q 'indexer_k_dtype: fp4' <<<"$cfg" || die "Indexer K is not FP4/HISA"
+  ! grep -q 'indexer_k_dtype: kvarn' <<<"$cfg" || die "Indexer K was incorrectly routed to KVarN"
+  ! grep -q 'layersplit_transfer_backend: ucx' <<<"$cfg" || die "LayerSplit transfer backend fell back to UCX"
   grep -q 'backend: WARPDECODE' <<<"$cfg" || die "WarpDecode is not configured"
   grep -q 'allow_parallelism_fallback: false' <<<"$cfg" || die "WarpDecode kernel backend fallback is not fail-closed"
   ! grep -q 'cp_type: HELIX' <<<"$cfg" || die "HELIX is present in production config"
@@ -60,6 +89,7 @@ require_config_gate() {
     deferred)
       ! grep -q 'decoding_type: SMC' <<<"$cfg" || die "SMC-SD must remain deferred for the current NIXL/LayerSplit gate"
       ! grep -q 'speculative_model:' <<<"$cfg" || die "speculative draft model must remain absent while SMC is deferred"
+      ! grep -q 'draft_attention_backend:' <<<"$cfg" || die "draft attention backend must remain absent while SMC is deferred"
       ;;
     required)
       grep -q 'decoding_type: SMC' <<<"$cfg" || die "SMC-SD is required for this smoke but not configured"
@@ -78,7 +108,7 @@ import urllib.request
 model = sys.argv[1]
 payload = {
     "model": model,
-    "prompt": "Non-MORI request pinning smoke. Count to five.",
+    "prompt": "NIXL request pinning smoke. Count to five.",
     "max_tokens": 32,
     "temperature": 0,
     "stream": False,
@@ -104,7 +134,7 @@ import urllib.request
 model = sys.argv[1]
 payload = {
     "model": model,
-    "prompt": "Non-MORI request pinning early-close smoke. Continue briefly.",
+    "prompt": "NIXL request pinning early-close smoke. Continue briefly.",
     "max_tokens": 128,
     "temperature": 0,
     "stream": True,
@@ -121,12 +151,28 @@ response.close()
 PY_REQ
 }
 
+fetch_perf_metrics() {
+  local fe="$1" metrics_file="$2"
+  $KC exec -i "$fe" -- python3 - <<'PY_METRICS' >"$metrics_file"
+import json
+import urllib.request
+
+try:
+    body = urllib.request.urlopen("http://127.0.0.1:8000/perf_metrics", timeout=120).read().decode()
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+else:
+    print(body)
+PY_METRICS
+}
+
 parse_logs() {
   local frontend_log="$1"
   local prefill_log="$2"
   local decode_log="$3"
   local response_json="$4"
-  python3 - "$frontend_log" "$prefill_log" "$decode_log" "$response_json" "$REQUIRE_DYNAMO_PIN_MARKERS" "$SMC_GATE_MODE" <<'PY_PARSE'
+  local metrics_json="$5"
+  python3 - "$frontend_log" "$prefill_log" "$decode_log" "$response_json" "$metrics_json" "$REQUIRE_DYNAMO_PIN_MARKERS" "$REQUIRE_POSITIVE_TRANSFER_METRICS" "$REQUIRE_ABORT_CLEANUP_MARKER" "$SMC_GATE_MODE" <<'PY_PARSE'
 import json
 import re
 import sys
@@ -136,8 +182,11 @@ frontend = Path(sys.argv[1]).read_text(errors="ignore")
 prefill = Path(sys.argv[2]).read_text(errors="ignore")
 decode = Path(sys.argv[3]).read_text(errors="ignore")
 response_text = Path(sys.argv[4]).read_text(errors="ignore")
-require_dynamo = sys.argv[5] == "1"
-smc_gate_mode = sys.argv[6]
+metrics_text = Path(sys.argv[5]).read_text(errors="ignore")
+require_dynamo = sys.argv[6] == "1"
+require_positive_transfer_metrics = sys.argv[7] == "1"
+require_abort_cleanup_marker = sys.argv[8] == "1"
+smc_gate_mode = sys.argv[9]
 all_logs = "\n".join([frontend, prefill, decode])
 
 bad = [
@@ -156,7 +205,17 @@ bad = [
     r"no scratch routing",
     r"SMC-SD requires target token probabilities",
     r"SMC-SD requires selected draft token log probabilities",
+    r"host[_ -]?pinned(?:[_ -]?blocks?)?[=: ]+0\b",
+    r"host_pinned_blocks[=: ]+0\b",
+    r"host_pinned blocks 0\b",
+    r"cache_state_layers[=: ]+0\b",
+    r"pinned KV handoff.*0 blocks",
     r"illegal memory access",
+    r"MLACacheFormatter::inquireSupport",
+    r"only support same number of layers",
+    r"CacheTransferLayer::validateSupport",
+    r"NIXL.*(?:failed|failure|error)",
+    r"(?:failed|failure|error).*NIXL",
     r"Traceback",
 ]
 for pattern in bad:
@@ -184,24 +243,29 @@ selected_decode = re.findall(
     frontend,
 )
 route_selected = re.findall(
-    r"dynamo request pin route selected.*worker_id[= ](\d+).*dp_rank[= ](\d+).*phase[= ](Prefill|Decode|Aggregated)",
+    r"dynamo request pin route selected.*request_id[= ]([^, ]+).*worker_id[= ](\d+).*dp_rank[= ](\d+).*phase[= ](Prefill|Decode|Aggregated)",
     frontend,
 )
 established = re.findall(
-    r"dynamo disagg request pin established.*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+)",
+    r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
     frontend,
 )
-outbound = re.findall(r"dynamo disagg request pin outbound to decode", frontend)
+outbound = re.findall(
+    r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
+    frontend,
+)
+cleared = re.findall(r"dynamo request pin cleared|disagg request pin cleared", all_logs)
+cleanup_scheduled = re.findall(r"dynamo request pin cleanup scheduled", all_logs)
 
 prefill_pair = (str(worker["prefill_worker_id"]), str(worker["prefill_dp_rank"]))
 decode_pair = (str(worker["decode_worker_id"]), str(worker["decode_dp_rank"]))
-route_prefill = [(w, r) for w, r, phase in route_selected if phase == "Prefill"]
-route_decode = [(w, r) for w, r, phase in route_selected if phase == "Decode"]
-if prefill_pair not in selected_prefill and prefill_pair not in route_prefill:
+route_prefill = [(rid, w, r) for rid, w, r, phase in route_selected if phase == "Prefill"]
+route_decode = [(rid, w, r) for rid, w, r, phase in route_selected if phase == "Decode"]
+if prefill_pair not in selected_prefill and prefill_pair not in [(w, r) for _rid, w, r in route_prefill]:
     raise SystemExit(f"response prefill worker/rank {prefill_pair} not found in frontend Rust route logs")
 if selected_decode and decode_pair not in selected_decode:
     raise SystemExit(f"response decode worker/rank {decode_pair} not found in frontend decode selection logs")
-if route_decode and decode_pair not in route_decode:
+if route_decode and decode_pair not in [(w, r) for _rid, w, r in route_decode]:
     raise SystemExit(f"response decode worker/rank {decode_pair} not found in Dynamo decode route-selected logs")
 
 if require_dynamo:
@@ -209,10 +273,70 @@ if require_dynamo:
         raise SystemExit("no Dynamo pin-established marker found; rebuild Dynamo router image/base with the request-pinning patch")
     if not outbound:
         raise SystemExit("no Dynamo pin outbound-to-decode marker found; request-level KV handoff was not proven")
-    if prefill_pair not in [(w, r) for w, r in established]:
+    established_pairs = [(w, r) for _rid, w, r, _host, _port in established]
+    if prefill_pair not in established_pairs:
         raise SystemExit(f"response prefill worker/rank {prefill_pair} not present in Dynamo pin-established markers: {established}")
+    established_rids = {rid for rid, _w, _r, _host, _port in established}
+    outbound_rids = {rid for rid, _host, _port in outbound}
+    shared_pin_rids = established_rids & outbound_rids
+    if not shared_pin_rids:
+        raise SystemExit(f"no request id appears in both pin-established and outbound-to-decode markers: established={established_rids} outbound={outbound_rids}")
+    route_prefill_rids = {rid for rid, _w, _r in route_prefill}
+    route_decode_rids = {rid for rid, _w, _r in route_decode}
+    if not (shared_pin_rids & route_prefill_rids):
+        raise SystemExit(f"no request id appears in both route-selected prefill and pin lifecycle markers: route_prefill={route_prefill_rids} pin={shared_pin_rids}")
+    if not (shared_pin_rids & route_decode_rids):
+        raise SystemExit(f"no request id appears in both route-selected decode and pin lifecycle markers: route_decode={route_decode_rids} pin={shared_pin_rids}")
+    if len(cleared) < len(established):
+        raise SystemExit(
+            f"request pin cleanup proof incomplete: established={len(established)} cleared={len(cleared)} cleanup_scheduled={len(cleanup_scheduled)}"
+        )
+    if require_abort_cleanup_marker and not cleanup_scheduled:
+        raise SystemExit("early-close abort cleanup proof missing: no dynamo request pin cleanup scheduled marker")
 else:
     print("WARNING: REQUIRE_DYNAMO_PIN_MARKERS=0; selector-only dry run is not a pre-A/B proof")
+
+
+
+
+def _walk(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from _walk(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _walk(value)
+
+positive_transfer_metrics = []
+try:
+    perf_metrics = json.loads(metrics_text) if metrics_text.strip() else []
+except Exception as exc:
+    if require_positive_transfer_metrics:
+        raise SystemExit(f"perf_metrics response was not valid JSON: {exc}: {metrics_text[:400]}")
+    perf_metrics = []
+
+for item in _walk(perf_metrics):
+    timing = item.get("timing_metrics")
+    if not isinstance(timing, dict):
+        continue
+    size = timing.get("kv_cache_size", 0) or 0
+    start = timing.get("kv_cache_transfer_start", 0) or 0
+    end = timing.get("kv_cache_transfer_end", 0) or 0
+    try:
+        size = float(size)
+        start = float(start)
+        end = float(end)
+    except (TypeError, ValueError):
+        continue
+    if size > 0 and start > 0 and end >= start:
+        positive_transfer_metrics.append((size, start, end))
+
+if require_positive_transfer_metrics and not positive_transfer_metrics:
+    raise SystemExit(
+        "positive KV transfer metrics missing: /perf_metrics did not expose kv_cache_size>0 "
+        "with kv_cache_transfer_start/end; enable return_perf_metrics/perf_metrics_max_requests or fix transfer"
+    )
 
 if smc_gate_mode == "required":
     if re.search(r"Disable overlap scheduler.*SMC", all_logs):
@@ -223,7 +347,9 @@ if smc_gate_mode == "required":
 print(
     "request pinning live proof ok: "
     f"prefill={prefill_pair} decode={decode_pair} "
-    f"dynamo_required={require_dynamo} established={len(established)} outbound={len(outbound)}"
+    f"dynamo_required={require_dynamo} established={len(established)} outbound={len(outbound)} "
+    f"cleared={len(cleared)} cleanup_scheduled={len(cleanup_scheduled)} "
+    f"positive_transfer_metrics={len(positive_transfer_metrics)}"
 )
 PY_PARSE
 }
@@ -237,6 +363,7 @@ main() {
   pre="$(pod_for prefill)"
   dec="$(pod_for decode)"
   [[ -n "$fe" && -n "$pre" && -n "$dec" ]] || die "could not resolve frontend/prefill/decode pods"
+  require_runtime_nixl_gate "$pre" "$dec"
 
   local pre_restart dec_restart
   pre_restart="$(restart_count "$pre")"
@@ -249,15 +376,16 @@ main() {
 
   run_non_streaming_smoke "$fe" "$tmpdir/response.json"
   run_stream_abort_smoke "$fe"
+  fetch_perf_metrics "$fe" "$tmpdir/perf_metrics.json"
 
   $KC logs "$fe" --since-time="$start" >"$tmpdir/frontend.log"
   $KC logs "$pre" --since-time="$start" >"$tmpdir/prefill.log"
   $KC logs "$dec" --since-time="$start" >"$tmpdir/decode.log"
-  parse_logs "$tmpdir/frontend.log" "$tmpdir/prefill.log" "$tmpdir/decode.log" "$tmpdir/response.json"
+  parse_logs "$tmpdir/frontend.log" "$tmpdir/prefill.log" "$tmpdir/decode.log" "$tmpdir/response.json" "$tmpdir/perf_metrics.json"
 
   [[ "$(restart_count "$pre")" == "$pre_restart" ]] || die "prefill restarted during smoke"
   [[ "$(restart_count "$dec")" == "$dec_restart" ]] || die "decode restarted during smoke"
-  echo "non-MORI NIXL request pinning smoke passed for $DGD"
+  echo "NIXL request pinning smoke passed for $DGD"
 }
 
 main "$@"

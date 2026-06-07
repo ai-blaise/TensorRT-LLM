@@ -65,11 +65,23 @@ def test_r20_overlay_carries_layersplit_and_request_pinning_sources():
     dockerfile = (DEPLOY_DIR / "Dockerfile.r20-overlay").read_text()
 
     assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
+    assert "tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py" in dockerfile
     assert "tensorrt_llm/serve/openai_disagg_service.py" in dockerfile
     assert "tensorrt_llm/serve/openai_client.py" in dockerfile
     assert "tensorrt_llm/serve/openai_protocol.py" in dockerfile
     assert "tensorrt_llm/serve/openai_server.py" in dockerfile
     assert "tensorrt_llm/disaggregated_params.py" in dockerfile
+
+
+def test_r20_transceiver_backend_selection_is_fail_closed():
+    source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
+
+    assert "_resolve_cache_transceiver_backend" in source
+    assert "TRTLLM_USE_UCX_KVCACHE" in source
+    assert "TRTLLM_USE_MOONCAKE_KVCACHE" in source
+    assert "conflicts with legacy env backend selector" in source
+    assert "implicit transport fallback is not allowed" in source
+    assert "received multiple" in source
 
 
 def test_r20_request_pinning_smoke_is_fail_closed():
@@ -78,19 +90,68 @@ def test_r20_request_pinning_smoke_is_fail_closed():
     assert "dynamo disagg request pin established" in script
     assert "dynamo disagg request pin outbound to decode" in script
     assert "dynamo request pin route selected" in script
+    assert "dynamo request pin cleared" in script
+    assert "request pin cleanup proof incomplete" in script
+    assert "early-close abort cleanup proof missing" in script
+    assert "host_pinned_blocks" in script
+    assert "cache_state_layers" in script
+    assert "no request id appears in both pin-established and outbound-to-decode" in script
+    assert "route-selected prefill" in script
+    assert "route-selected decode" in script
     assert "Selected worker: worker_type=prefill" in script
     assert "nvext.worker_id" in script
     assert "REQUIRE_DYNAMO_PIN_MARKERS" in script
+    assert "REQUIRE_POSITIVE_TRANSFER_METRICS" in script
+    assert "REQUIRE_ABORT_CLEANUP_MARKER" in script
+    assert "positive KV transfer metrics missing" in script
     assert "ctx_dp_rank is None" in script
     assert "SMC-SD must remain deferred" in script
+    assert "SMC_GATE_MODE" in script
+    assert "SMC-SD is required" in script
     assert "mla_latent_kv_dtype: kvarn_k2v2" in script
+    assert "mla_latent_kv_dtype: auto" in script
+    assert "mla_latent_kv_amortize: true" in script
+    assert "indexer_k_dtype: fp4" in script
+    assert "indexer_k_dtype: kvarn" in script
     assert "layersplit_transfer_backend: nixl" in script
+    assert "layersplit_transfer_backend: ucx" in script
+    assert "Initializing NIXL Connect" in script
+    assert "global_layers=61" in script
+    assert "TRTLLM_USE_(UCX|MOONCAKE|MPI)_KVCACHE=1" in script
+    assert "selected UCX cache transceiver" in script
     assert "layersplit_owner_local_alloc: true" in script
     assert "backend: NIXL" in script
     assert "backend: UCX" in script
     assert "layersplit_all_cp_ranks_transfer: true" in script
     assert "no scratch routing" in script
     assert "LayerSplit: layer .* no local KV pool slot" in script
-    assert "SMC_GATE_MODE" in script
+    assert "MLACacheFormatter::inquireSupport" in script
+    assert "CacheTransferLayer::validateSupport" in script
     assert "speculative_model" in script
+    assert "draft_attention_backend" in script
     assert "cp_type: HELIX" in script
+
+def test_r20_transport_bench_is_nixl_first_and_fail_closed():
+    script = (DEPLOY_DIR / "run_c16_transport_bench.sh").read_text()
+
+    assert 'BACKEND="nixl"' in script
+    assert 'CONCURRENCY=16' in script
+    assert '1024,4096,8192,16384,32768,65536,131072' in script
+    assert 'ALLOW_TRANSPORT_AB=1' in script
+    assert 'NIXL is the pre-A/B gate' in script
+    assert 'backend: NIXL' in script
+    assert 'layersplit_transfer_backend: nixl' in script
+    assert 'backend: UCX' in script
+    assert 'layersplit_transfer_backend: ucx' in script
+    assert 'mla_latent_kv_dtype: kvarn_k2v2' in script
+    assert 'indexer_k_dtype: fp4' in script
+    assert 'cp_type: HELIX' in script
+    assert 'tok_per_user_after_first' in script
+    assert 'ttft_p95_s' in script
+    assert 'itl_p99_s' in script
+    assert 'perf_metrics' in script
+    assert 'nvidia-smi dmon' in script
+    assert 'ip -s link' in script
+    assert 'MLACacheFormatter::inquireSupport' in script
+    assert 'CacheTransferLayer::validateSupport' in script
+    assert 'Using UCX kv-cache transceiver' in script

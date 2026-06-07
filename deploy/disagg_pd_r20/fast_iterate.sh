@@ -5,7 +5,7 @@ VM_HOST="${VM_HOST:-34.106.33.128}"
 VM_USER="${VM_USER:-spencergarnets}"
 REMOTE_REPO="${REMOTE_REPO:-/tmp/tensorrt-llm-op-trt-fast}"
 IMAGE_REPO="${IMAGE_REPO:-docker.io/local/dynamo-trtllm-optrt-custom}"
-BASE_IMAGE="${BASE_IMAGE:-local/dynamo-trtllm-optrt-custom:canonical-smc-r20-fullsrc-ls-kvarn2-nvlsfix-smcfi-multidecode-swapabodd-tritonquant-scalecontig-oddmpad-tma128-kvarndef-20260606}"
+BASE_IMAGE="${BASE_IMAGE:-local/dynamo-trtllm-optrt-custom:r20-nixl-layersplit-base}"
 TARGET_NODE="${TARGET_NODE:-a4-us-001-rl9}"
 DGD_NAME="${DGD_NAME:-topo-c1-dp2tp4-disagg-r20}"
 REQUIRED_TRANSPORT_WRAPPERS="${REQUIRED_TRANSPORT_WRAPPERS:-ucx,nixl}"
@@ -16,6 +16,7 @@ BUILD=1
 PREWARM=0
 USE_LOCAL_REGISTRY=0
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
+LOCAL_REGISTRY_MODE="${LOCAL_REGISTRY_MODE:-push}"
 ALLOW_CHAINED_OVERLAY="${ALLOW_CHAINED_OVERLAY:-0}"
 TAG_SUFFIX="${TAG_SUFFIX:-fast}"
 SSH_OPTS=(
@@ -33,7 +34,8 @@ Build a thin op-trt overlay image on the target B200 VM, import it directly into
 k3s containerd when needed, and optionally apply the disagg r20 DGD.
 
 Options:
-  --vm HOST             Target VM IP or hostname (default: $VM_HOST)
+  --vm HOST             Target VM IP or hostname (default: $VM_HOST);
+                        use local to run directly from the current VM checkout
   --user USER           SSH user (default: $VM_USER)
   --remote-repo PATH    Remote rsync/build directory (default: $REMOTE_REPO)
   --image-repo NAME     Image repository (default: $IMAGE_REPO)
@@ -47,8 +49,13 @@ Options:
   --deploy              Apply the DGD after build/import
   --prewarm             Run the lightweight cache/model visibility prewarm job
                         after build and before deploy
-  --use-local-registry  Push the thin image to a VM-local registry and pull it
+  --use-local-registry  Tag the thin image with a VM-local registry name and
+                        render pods with imagePullPolicy=IfNotPresent
   --local-registry HOST Registry host:port (default: $LOCAL_REGISTRY)
+  --local-registry-mode MODE
+                        push: push to registry (default, multi-node safe);
+                        resident: keep exact deploy tag in k3s containerd and
+                        skip registry push (single-node iteration only)
   --allow-chained-overlay
                         Allow using a previous r20 overlay image as the base
   --full-sync           Sync the whole repo instead of the overlay build subset
@@ -75,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --prewarm) PREWARM=1; shift ;;
     --use-local-registry) USE_LOCAL_REGISTRY=1; shift ;;
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
+    --local-registry-mode) LOCAL_REGISTRY_MODE="$2"; shift 2 ;;
     --allow-chained-overlay) ALLOW_CHAINED_OVERLAY=1; shift ;;
     --full-sync) FULL_SYNC=1; shift ;;
     --no-sync) SYNC=0; shift ;;
@@ -86,6 +94,10 @@ done
 
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
+if [[ "$VM_HOST" == "local" ]]; then
+  REMOTE_REPO="$ROOT_DIR"
+  SYNC=0
+fi
 SHA="$(git rev-parse --short=12 HEAD)"
 STAMP="$(date -u +%Y%m%d%H%M%S)"
 IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:optrt-${SHA}-${TAG_SUFFIX}-${STAMP}}"
@@ -94,6 +106,14 @@ if [[ "$USE_LOCAL_REGISTRY" == 1 && "$DEPLOY_IMAGE_TAG" != "$LOCAL_REGISTRY/"* ]
   image_path="${IMAGE_TAG#docker.io/}"
   image_path="${image_path#${LOCAL_REGISTRY}/}"
   DEPLOY_IMAGE_TAG="${LOCAL_REGISTRY}/${image_path}"
+fi
+case "$LOCAL_REGISTRY_MODE" in
+  push|resident) ;;
+  *) echo "unknown --local-registry-mode: $LOCAL_REGISTRY_MODE" >&2; exit 2 ;;
+esac
+if [[ "$LOCAL_REGISTRY_MODE" == "resident" && "$USE_LOCAL_REGISTRY" != 1 ]]; then
+  echo "--local-registry-mode=resident requires --use-local-registry" >&2
+  exit 2
 fi
 SSH_TARGET="${VM_USER}@${VM_HOST}"
 
@@ -156,6 +176,15 @@ read -r -d '' REMOTE_SCRIPT <<'EOS' || true
 set -euo pipefail
 cd "$REMOTE_REPO"
 BUILD_IMAGE_TAG="$IMAGE_TAG"
+OVERLAY_DOCKERIGNORE="deploy/disagg_pd_r20/Dockerfile.r20-overlay.dockerignore"
+if [[ -f "$OVERLAY_DOCKERIGNORE" ]]; then
+  if [[ -d .git ]]; then
+    echo "overlay_dockerignore=using_dockerfile_specific_ignore"
+  else
+    cp "$OVERLAY_DOCKERIGNORE" .dockerignore
+    echo "overlay_dockerignore=installed_build_root_ignore"
+  fi
+fi
 
 sudo mkdir -p \
   /var/lib/optrt-cache/hf_modules \
@@ -194,14 +223,19 @@ if [[ "$BUILD" == 1 ]]; then
       -f deploy/disagg_pd_r20/Dockerfile.r20-overlay \
       -t "$BUILD_IMAGE_TAG" .
     if [[ "$USE_LOCAL_REGISTRY" == 1 && "$DEPLOY_IMAGE_TAG" != "$BUILD_IMAGE_TAG" ]]; then
-      if command -v docker >/dev/null 2>&1; then
-        if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
-          docker rm -f optrt-registry >/dev/null 2>&1 || true
-          docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
-        fi
-      fi
       sudo nerdctl -n k8s.io tag "$BUILD_IMAGE_TAG" "$DEPLOY_IMAGE_TAG"
-      sudo nerdctl -n k8s.io push "$DEPLOY_IMAGE_TAG"
+      if [[ "$LOCAL_REGISTRY_MODE" == "push" ]]; then
+        if command -v docker >/dev/null 2>&1; then
+          if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
+            docker rm -f optrt-registry >/dev/null 2>&1 || true
+            docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
+          fi
+        fi
+        sudo nerdctl -n k8s.io push "$DEPLOY_IMAGE_TAG"
+      else
+        echo "resident_local_image=$DEPLOY_IMAGE_TAG"
+        echo "registry_push_skipped=1"
+      fi
     fi
   else
     if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
@@ -215,12 +249,18 @@ if [[ "$BUILD" == 1 ]]; then
       -f deploy/disagg_pd_r20/Dockerfile.r20-overlay \
       -t "$BUILD_IMAGE_TAG" .
     if [[ "$USE_LOCAL_REGISTRY" == 1 ]]; then
-      if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
-        docker rm -f optrt-registry >/dev/null 2>&1 || true
-        docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
-      fi
       docker tag "$BUILD_IMAGE_TAG" "$DEPLOY_IMAGE_TAG"
-      docker push "$DEPLOY_IMAGE_TAG"
+      if [[ "$LOCAL_REGISTRY_MODE" == "push" ]]; then
+        if ! docker ps --format '{{.Names}}' | grep -qx optrt-registry; then
+          docker rm -f optrt-registry >/dev/null 2>&1 || true
+          docker run -d --restart=always -p "${LOCAL_REGISTRY##*:}:5000" --name optrt-registry registry:2 >/dev/null
+        fi
+        docker push "$DEPLOY_IMAGE_TAG"
+      else
+        docker save "$DEPLOY_IMAGE_TAG" | sudo /usr/local/bin/k3s ctr -n k8s.io images import -
+        echo "resident_local_image=$DEPLOY_IMAGE_TAG"
+        echo "registry_push_skipped=1"
+      fi
     elif ! sudo /usr/local/bin/k3s ctr -n k8s.io images ls name=="$BUILD_IMAGE_TAG" | grep -F "$BUILD_IMAGE_TAG" >/dev/null 2>&1; then
       docker save "$BUILD_IMAGE_TAG" | sudo /usr/local/bin/k3s ctr -n k8s.io images import -
     fi
@@ -328,7 +368,6 @@ spec:
           from transformers import AutoConfig, AutoTokenizer
           for model in [
               "/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft",
-              "/models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP",
           ]:
               print(f"prewarm_model={model}")
               AutoConfig.from_pretrained(model, trust_remote_code=True, local_files_only=True)
@@ -385,9 +424,19 @@ else
 fi
 EOS
 
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' REQUIRED_TRANSPORT_WRAPPERS='$REQUIRED_TRANSPORT_WRAPPERS' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' ALLOW_CHAINED_OVERLAY='$ALLOW_CHAINED_OVERLAY' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
-  <<<"$REMOTE_SCRIPT"
+if [[ "$VM_HOST" == "local" ]]; then
+  REMOTE_REPO="$REMOTE_REPO" IMAGE_TAG="$IMAGE_TAG" DEPLOY_IMAGE_TAG="$DEPLOY_IMAGE_TAG" \
+    BASE_IMAGE="$BASE_IMAGE" TARGET_NODE="$TARGET_NODE" DGD_NAME="$DGD_NAME" \
+    REQUIRED_TRANSPORT_WRAPPERS="$REQUIRED_TRANSPORT_WRAPPERS" DEPLOY="$DEPLOY" \
+    BUILD="$BUILD" PREWARM="$PREWARM" USE_LOCAL_REGISTRY="$USE_LOCAL_REGISTRY" \
+    LOCAL_REGISTRY="$LOCAL_REGISTRY" LOCAL_REGISTRY_MODE="$LOCAL_REGISTRY_MODE" \
+    ALLOW_CHAINED_OVERLAY="$ALLOW_CHAINED_OVERLAY" \
+    OUT="/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml" bash -s <<<"$REMOTE_SCRIPT"
+else
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+    "REMOTE_REPO='$REMOTE_REPO' IMAGE_TAG='$IMAGE_TAG' DEPLOY_IMAGE_TAG='$DEPLOY_IMAGE_TAG' BASE_IMAGE='$BASE_IMAGE' TARGET_NODE='$TARGET_NODE' DGD_NAME='$DGD_NAME' REQUIRED_TRANSPORT_WRAPPERS='$REQUIRED_TRANSPORT_WRAPPERS' DEPLOY='$DEPLOY' BUILD='$BUILD' PREWARM='$PREWARM' USE_LOCAL_REGISTRY='$USE_LOCAL_REGISTRY' LOCAL_REGISTRY='$LOCAL_REGISTRY' LOCAL_REGISTRY_MODE='$LOCAL_REGISTRY_MODE' ALLOW_CHAINED_OVERLAY='$ALLOW_CHAINED_OVERLAY' OUT='/tmp/${DGD_NAME}-${DEPLOY_IMAGE_TAG##*:}.yaml' bash -s" \
+    <<<"$REMOTE_SCRIPT"
+fi
 
 echo "built_image=$IMAGE_TAG"
 echo "deploy_image=$DEPLOY_IMAGE_TAG"
