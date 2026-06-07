@@ -13,6 +13,62 @@ from .model_drafter import ModelDrafter
 from .spec_tree_manager import SpecTreeManager
 
 
+def _nonempty_ctx_endpoint(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (list, tuple)):
+        return any(_nonempty_ctx_endpoint(item) for item in value)
+    return True
+
+
+def _smc_request_pin_required(request: LlmRequest) -> bool:
+    params = getattr(request, "py_disaggregated_params", None)
+    request_type = getattr(params, "request_type", None)
+    return bool(getattr(request, "is_generation_only_request", lambda: False)()
+                or request_type == "generation_only")
+
+
+def validate_smc_decode_request_pin(request: LlmRequest) -> tuple[object, object, object]:
+    """Fail closed when SMC-SD decode lacks disagg request pin metadata.
+
+    The Moondream overlap path commits draft tokens one iteration after the
+    draft forward. In disaggregated generation-only decode, that delayed commit
+    must stay attached to the same prefill KV handoff, so require the request id,
+    ctx DP rank, and ctx endpoint before consuming SMC draft payloads.
+    """
+    if os.environ.get("TRTLLM_SMC_REQUIRE_REQUEST_PIN", "1") == "0":
+        return None, None, None
+    if not _smc_request_pin_required(request):
+        return None, None, None
+
+    params = getattr(request, "py_disaggregated_params", None)
+    if params is None:
+        raise RuntimeError(
+            "SMC-SD decode requires disaggregated request pin metadata "
+            "for generation-only requests")
+
+    disagg_request_id = getattr(params, "disagg_request_id", None)
+    if disagg_request_id is None:
+        disagg_request_id = getattr(params, "ctx_request_id", None)
+    ctx_dp_rank = getattr(params, "ctx_dp_rank", None)
+    ctx_info_endpoint = getattr(params, "ctx_info_endpoint", None)
+
+    missing = []
+    if disagg_request_id is None:
+        missing.append("disagg_request_id")
+    if ctx_dp_rank is None:
+        missing.append("ctx_dp_rank")
+    if not _nonempty_ctx_endpoint(ctx_info_endpoint):
+        missing.append("ctx_info_endpoint")
+    if missing:
+        raise RuntimeError(
+            "SMC-SD decode requires request pin metadata; missing "
+            + ", ".join(missing))
+    return disagg_request_id, ctx_dp_rank, ctx_info_endpoint
+
+
 def build_smc_particle_choices(gamma: int, n_particles: int) -> list[list[int]]:
     choices: list[list[int]] = []
     for depth in range(1, gamma + 1):
@@ -248,14 +304,26 @@ class SMCModelDrafter(ModelDrafter):
         if sample_state is not None:
             sample_state.sampler_event.synchronize()
             draft_tokens_host = sample_state.host.new_tokens
+            used_pinned_host_tokens = True
         else:
             draft_tokens_host = outputs["new_draft_tokens"].cpu()
+            used_pinned_host_tokens = False
         draft_token_log_probs = outputs["draft_token_log_probs"]
 
         for req_idx, req in enumerate(draft_batch.all_requests()):
             target_model_req = self.req_id_to_old_request[req.py_request_id]
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 continue
+            disagg_request_id, ctx_dp_rank, ctx_info_endpoint = (
+                validate_smc_decode_request_pin(target_model_req))
+            logger.info(
+                "SMC Moondream decode handoff preserved "
+                "draft_token_log_probs sample_state.sampler_event "
+                f"pinned_host_tokens={used_pinned_host_tokens} "
+                f"request_id={target_model_req.py_request_id} "
+                f"disagg_request_id={disagg_request_id} "
+                f"ctx_dp_rank={ctx_dp_rank} "
+                f"ctx_info_endpoint={ctx_info_endpoint}")
             target_model_req.py_draft_tokens = []
             token_log_probs = []
             for token_idx in range(self.max_total_draft_tokens):

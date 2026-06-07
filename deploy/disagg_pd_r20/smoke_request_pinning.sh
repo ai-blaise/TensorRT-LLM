@@ -445,8 +445,23 @@ if require_positive_transfer_metrics and not positive_transfer_metrics:
 if smc_gate_mode == "required":
     if re.search(r"Disable overlap scheduler.*SMC", all_logs):
         raise SystemExit("SMC overlap scheduler was disabled")
-    if "draft_token_log_probs" not in all_logs and "SMC" in all_logs:
-        print("WARNING: SMC logprob payload marker not found in logs; rely on focused tests plus deeper E2E parser")
+    required_smc_markers = [
+        "SMC Moondream decode handoff preserved",
+        "draft_token_log_probs",
+        "sample_state.sampler_event",
+        "pinned_host_tokens=True",
+        "ctx_dp_rank=",
+        "ctx_info_endpoint=",
+    ]
+    missing = [marker for marker in required_smc_markers if marker not in all_logs]
+    if missing:
+        raise SystemExit(
+            f"SMC-SD is required but decode handoff markers are missing: {missing}"
+        )
+    if re.search(r"SMC Moondream decode handoff preserved.*ctx_dp_rank=None", all_logs):
+        raise SystemExit("SMC-SD decode handoff marker has ctx_dp_rank=None")
+    if re.search(r"SMC Moondream decode handoff preserved.*ctx_info_endpoint=(?:None|null|$)", all_logs):
+        raise SystemExit("SMC-SD decode handoff marker has empty ctx_info_endpoint")
 
 print(
     "request pinning live proof ok: "

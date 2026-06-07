@@ -51,7 +51,7 @@ def _base_fixture() -> Fixture:
         [
             f"disagg request pin received request_type=generation_only disagg_request_id={rid} ctx_request_id={rid} ctx_dp_rank=0 ctx_info_endpoint=nixl://ctx/0",
             "disable_overlap_scheduler: False backend: WARPDECODE allow_parallelism_backend_guard=false mla_latent_kv_dtype=kvarn_k2v2",
-            "SMC overlap static draft payload preserved draft_token_log_probs sample_state.sampler_event pinned_host_tokens",
+            f"SMC Moondream decode handoff preserved draft_token_log_probs sample_state.sampler_event pinned_host_tokens=True request_id={rid} disagg_request_id={rid} ctx_dp_rank=0 ctx_info_endpoint=nixl://ctx/0",
         ]
     )
     response = {
@@ -93,6 +93,8 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
     bad = [
         r"Request pinning requires",
         r"ctx_dp_rank is None",
+        r"SMC Moondream decode handoff preserved.*ctx_dp_rank=None",
+        r"SMC Moondream decode handoff preserved.*ctx_info_endpoint=(?:None|null|$)",
         r"could not resolve dp_rank",
         r"NoBootstrapEndpoint",
         r"Disable overlap scheduler.*SMC",
@@ -193,7 +195,7 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
         raise AssertionError("missing positive KV transfer metrics")
 
     if smc_required:
-        for token in ("SMC", "draft_token_log_probs", "sampler_event", "pinned_host_tokens"):
+        for token in ("SMC Moondream decode handoff preserved", "draft_token_log_probs", "sample_state.sampler_event", "pinned_host_tokens=True", "ctx_dp_rank=", "ctx_info_endpoint="):
             if token not in all_logs:
                 raise AssertionError(f"missing SMC/Moondream decode handoff marker: {token}")
 
@@ -229,6 +231,14 @@ def main() -> None:
     bad = copy.deepcopy(good)
     bad.decode = bad.decode.replace("draft_token_log_probs sample_state.sampler_event pinned_host_tokens", "generic draft_logits greedy_fallback")
     expect_failure("missing_smc_payload", bad, "draft_token_log_probs")
+
+    bad = copy.deepcopy(good)
+    bad.decode = bad.decode.replace("ctx_dp_rank=0", "ctx_dp_rank=None")
+    expect_failure("missing_smc_ctx_dp_rank", bad, "ctx_dp_rank")
+
+    bad = copy.deepcopy(good)
+    bad.decode = bad.decode.replace("ctx_info_endpoint=nixl://ctx/0", "ctx_info_endpoint=None")
+    expect_failure("missing_smc_ctx_info_endpoint", bad, "ctx_info_endpoint")
 
     bad = copy.deepcopy(good)
     bad.prefill += "\nhost_pinned_blocks=0"

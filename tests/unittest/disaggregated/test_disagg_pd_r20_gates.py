@@ -123,6 +123,40 @@ def test_r20_executor_emits_nixl_transfer_proof_markers():
     assert "cache_blocks=" in source
 
 
+def test_r20_smc_moondream_decode_pinning_is_fail_closed():
+    source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "speculative" / "smc.py").read_text()
+    smoke = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
+    offline = (DEPLOY_DIR / "offline_request_pinning_smoke.py").read_text()
+    audit = (DEPLOY_DIR / "audit_smc_decode_pinning_static.py").read_text()
+
+    assert "validate_smc_decode_request_pin" in source
+    assert "TRTLLM_SMC_REQUIRE_REQUEST_PIN" in source
+    assert "generation_only" in source
+    assert "SMC-SD decode requires request pin metadata" in source
+    assert "disagg_request_id" in source
+    assert "ctx_dp_rank" in source
+    assert "ctx_info_endpoint" in source
+    assert "sample_state.sampler_event.synchronize()" in source
+    assert "sample_state.host.new_tokens" in source
+    assert "used_pinned_host_tokens = True" in source
+    assert "SMC Moondream decode handoff preserved" in source
+    assert source.index("validate_smc_decode_request_pin(target_model_req)") < source.index("target_model_req.py_draft_tokens = []")
+    assert source.index("sample_state.sampler_event.synchronize()") < source.index("draft_tokens_host = sample_state.host.new_tokens")
+
+    assert "SMC-SD is required but decode handoff markers are missing" in smoke
+    assert "SMC Moondream decode handoff preserved" in smoke
+    assert "pinned_host_tokens=True" in smoke
+    assert "ctx_dp_rank=None" in smoke
+    assert "ctx_info_endpoint=(?:None|null|$)" in smoke
+    assert "WARNING: SMC logprob payload marker" not in smoke
+
+    assert "missing_smc_ctx_dp_rank" in offline
+    assert "missing_smc_ctx_info_endpoint" in offline
+    assert "pinned_host_tokens=True" in offline
+    assert "positive KV transfer" in offline
+    assert "audit_smc_decode_pinning_static" not in audit
+
+
 def test_r20_request_pinning_smoke_is_fail_closed():
     script = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
 

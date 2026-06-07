@@ -137,10 +137,19 @@ Moondream-style overlap is enabled in r20 prefill and decode via
 `disable_overlap_scheduler: false`. The current non-SMC gate keeps the
 pipelining path active while SMC-SD is deferred.
 
-Remaining Moondream gap: when SMC-SD is re-enabled, decode must preserve SMC
-payloads (`draft_token_log_probs`, sampler events, pinned host draft-token
-buffers) through the same overlap scheduler. The source/test audit says this is
-wired in op-trt, but live SMC-SD E2E is not complete.
+SMC-SD decode now has a fail-closed Moondream handoff guard in
+`tensorrt_llm/_torch/speculative/smc.py`: generation-only decode requests must
+carry request pin metadata (`disagg_request_id` or `ctx_request_id`,
+`ctx_dp_rank`, and `ctx_info_endpoint`) before the delayed SMC draft-token
+commit consumes `draft_token_log_probs`. The handoff also waits on
+`sample_state.sampler_event` before reading pinned host draft-token buffers and
+emits `SMC Moondream decode handoff preserved ... pinned_host_tokens=True ...
+ctx_dp_rank=... ctx_info_endpoint=...` for live proof.
+
+Remaining Moondream gap: live SMC-SD E2E is still required. Run the strict smoke
+with `SMC_GATE_MODE=required` only after the NIXL/LayerSplit gate is green and
+SMC-SD is explicitly enabled; that mode now fails if the decode handoff marker,
+pinned host-token proof, ctx DP rank, or ctx endpoint is missing.
 
 Reference: https://moondream.ai/blog/popping-the-gpu-bubble
 Reference doc: `docs/blaise/moondream_pipelining.md`
