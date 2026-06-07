@@ -5,22 +5,31 @@ r20 disaggregated prefill/decode rollout on the B200 canary. It is intentionally
 explicit about incomplete work so later commits do not accidentally treat a
 smoke-response, readiness result, or partial marker as production completion.
 
-## Current update - 2026-06-07 17:50 UTC
+## Current update - 2026-06-07 17:55 UTC
 
-- Pushed head after this integration pass includes `33eaba65f`
-  (`deploy(r20): gate NIXL on VRAM-proven UCX plugin`) plus the KVarN GQA
-  side-state probe registration update.
+- Pushed head after this integration pass is `cd1712c75`
+  (`bench(kvarn): align GQA side-state NIXL probe registration`). It includes
+  `33eaba65f` (`deploy(r20): gate NIXL on VRAM-proven UCX plugin`) plus the
+  KVarN GQA side-state probe registration update and matching gate docs/tests.
 - The live r20 DGD is generation `104` in `dynamo-system`, observed generation
-  `104`, state `pending`, Ready `False`.
-- Current live pods: frontend and prefill are running; decode is running but not
-  ready yet. The checked decode tail shows warmup/autotune cache misses,
-  attention-workspace sizing warnings, and readiness 503s, not the previous
-  NIXL VRAM registration crash.
+  `104`, state `successful`, Ready `True`.
+- Current live pods are all `1/1 Running` with zero restarts:
+  `topo-c1-dp2tp4-disagg-r20-0-frontend-6gdtn`,
+  `topo-c1-dp2tp4-disagg-r20-0-prefill-zxxfh`, and
+  `topo-c1-dp2tp4-disagg-r20-0-decode-lx249`.
 - The live image is still the 3457 LayerSplit/NIXL CP overlay. It contains the
   LayerSplit Python transceiver fix required for owner-local CP, but not the
   later documentation/test-only commits or the SMC/Moondream request-pinning
-  source slice. Do not rebuild/redeploy only for docs while the current rollout
-  is warming.
+  source slice.
+- A read-only live audit against generation 104 wrote artifacts to
+  `/tmp/nixl_ucx_live_audit_20260607T1755Z`. It confirms both workers are using
+  `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` and both log `Initializing NIXL Connect`,
+  but it fails the final write-mode gate because the generation-first request
+  pin marker is missing:
+  `dynamo disagg request pin established.*handoff_mode="?generation_first"?`.
+  This is expected for the live 3457 overlay and must be fixed by building and
+  deploying an image that contains the later request-pinning source slice before
+  strict smoke or A/B acceptance.
 - The current pre-A/B transport gate is the NIXL runtime with
   `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` on both prefill and decode. This is not the
   old direct UCX cache transceiver. LIBFABRIC was demoted because backend
@@ -88,8 +97,10 @@ SMC_GATE_MODE=deferred \
 
 Latest historical green result: green for the NIXL/request-pinning pre-A/B
 correctness gate on generation 100 using the full-source `45a05fe19` image. The
-current generation 104 rollout must repeat the live audit and strict smoke after
-decode readiness turns green.
+current generation 104 rollout is healthy but has not cleared the live audit
+because its image is missing the generation-first request-pinning marker; rebuild
+and redeploy the current pushed head before repeating live audit and strict
+smoke.
 
 - Live NIXL audit passed:
   `/tmp/nixl_gate_audit_live_20260607T121624Z_2312782`.
@@ -459,7 +470,9 @@ Required A/B axes include at minimum:
 - [x] Offline request-pinning smoke, including negative endpoint and SMC
   handoff cases, passes.
 - [x] Cached DGD render/server-dry-run validation passes with the active image.
-- [x] Live NIXL gate readiness audit passes on the current generation.
+- [ ] Live NIXL gate readiness audit passes on the current generation. The
+  generation-104 audit fails only on the missing generation-first request-pin
+  marker in the live 3457 overlay.
 - [x] Endpoint-fixed full-source base plus latest Python/shell overlay is built,
   pushed to the local registry, imported/resident, and deployed.
 - [x] Routerpin emits full pin-established/outbound decode lifecycle markers
