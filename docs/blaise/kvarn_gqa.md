@@ -61,9 +61,10 @@ Indexer/HISA sparse K path.
 | Dense/GQA separation from Indexer | **Implemented in config/docs; reference backend enforces separation** | Dense MLA KVarN uses `mla_latent_kv_dtype`; GQA uses `kv_cache_dtype`. Indexer/HISA sparse K remains separate and is not quantized. Sparse GQA KVarN read attempts fail closed. |
 | HF deployability/default | **Implemented, fail-closed by default** | HF can request/default `kvarn_k2v2_g128` via top-level `kv_cache_dtype` or `quantization_config.kvarn.gqa`; startup rejects GQA KVarN unless the fused store/decode ops are registered and the production backend removes the gate. |
 | Disaggregated transfer compatibility | **Not production-ready** | Packed pages plus fp16 sink/tail side state need a connector payload contract. Current connector mode rejects rather than reinterpreting packed records as dense K/V. |
-| CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. End-to-end request lifecycle hooks and CUDA graph capture proof are still missing. |
+| CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. The BDR readable pool and `restored_gen`/`physical_commit_gen` tensors are preallocated/lazy-grown outside the hot restore. End-to-end request lifecycle hooks and CUDA graph capture proof are still missing. |
 | Sparse packed reads | **Missing** | HISA/Indexer sparse selection over packed KVarN records needs a dedicated read/dequant path. |
-| Fused B200 store/decode kernels | **Store/decode prototypes only; not production-ready** | `torch.ops.trtllm.kvarn_gqa_store` and `torch.ops.trtllm.kvarn_gqa_decode` now have experimental serial correctness kernels. Store performs Hadamard rotation, KVarN variance normalization, 2-bit packing, and fp16 scale/zp writes; decode reads fp16 sink tokens, compact records or byte-page KV-cache layout, and fp16 tail tokens directly, then performs Hadamard-rotated K/V dequant plus softmax attention across the combined sequence. Disaggregated side-state transfer, sparse packed reads, graph lifecycle, runtime parity, and performance proof are still missing, so `kvarn_gqa_backend_ready()` remains false. |
+| BDR fold / amortized dequant | **Reference implemented; fused kernel missing** | GQA now has a physical-block keyed readable pool plus device-tensor `physical_commit_gen`/`restored_gen` metadata. The reference restore gathers logical full blocks from the request block table, maps them to physical block ids, masks by `valid & restored_gen != physical_commit_gen`, applies `torch.unique`, and batched-dequants only churn blocks into the persistent readable pool. This removes the reference working-set dequant loop, but the production B200 in-kernel dequant/scoring path is still required. |
+| Fused B200 store/decode kernels | **Store/decode prototypes only; not production-ready** | `torch.ops.trtllm.kvarn_gqa_store` and `torch.ops.trtllm.kvarn_gqa_decode` now have experimental serial correctness kernels. Store performs Hadamard rotation, KVarN variance normalization, 2-bit packing, and fp16 scale/zp writes; decode reads fp16 sink tokens, compact records or byte-page KV-cache layout, and fp16 tail tokens directly, then performs Hadamard-rotated K/V dequant plus softmax attention across the combined sequence. Disaggregated side-state transfer, sparse packed reads, graph lifecycle, runtime parity, fused BDR in-kernel dequant, and performance proof are still missing, so `kvarn_gqa_backend_ready()` remains false. |
 | Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
 | Performance proof | **Missing** | Microbench has a correctness floor and `--require-fused` promotion guard, but no fused B200 numbers or c16 tok/s/user proof exist. |
 | Production enablement | **Blocked** | Requires fused kernels, disagg side-state transfer, sparse packed reads, graph-safe lifecycle, fp16/fp8 correctness proof, and c16 E2E performance proof. |
@@ -79,11 +80,14 @@ Implemented:
 - `tensorrt_llm/_torch/attention_backend/kvarn_gqa_attention.py` is the first
   runnable GQA KVarN backend. It forces split Q/K/V, commits full context blocks
   into packed KVarN records, keeps the first 128 sink tokens and in-progress
-  speculative tail in fp16, restores packed records for GQA SDPA, and rejects
+  speculative tail in fp16, restores committed records through the BDR
+  physical-block keyed readable pool for GQA SDPA, and rejects
   sparse-indexed reads until a packed sparse read path exists. The side buffers
   are preallocated by layer/request slot with commit metadata sized to
   `max_blocks_per_seq`, so ordinary decode does not allocate new sink/tail
-  tensors inside the step.
+  tensors inside the step. BDR restore uses device int64 `physical_commit_gen` and
+  `restored_gen` tensors plus `torch.unique` on the stale physical block ids, so
+  reference dequant cost follows churn rather than the full working set.
 - `_util.py` allocates non-MLA KVarN GQA KV as an opaque UINT8 self-only page
   pool. For k2v2/g128 it uses `tokens_per_block=128`, `head_dim=76`, and
   `CacheType.SELFKONLY`, so each page is exactly one 9,728-byte KVarN record per
@@ -140,11 +144,13 @@ The production fail-close remains in place for GQA KVarN. The reference
 backend is not a deployment path; these pieces must be finished before the
 deployment can be called complete:
 
-1. CUDA/Triton kernels: replace Python restore + SDPA with fused full-block
+1. CUDA/Triton kernels: replace Python BDR restore + SDPA with fused full-block
    store, packed 2-bit load, dequant/scaled dot-product/value accumulation for
    generation and SMC draft/verify query shapes, including odd M values such as
    25. Python per-token/tile loops are functional but not acceptable for the
-   c16 throughput target.
+   c16 throughput target. The fused decode kernel must fold BDR dequant into the
+   read/scoring path so packed records are not round-tripped through HBM beyond
+   the persistent readable state required by the production design.
 2. Disaggregated transfer: `kv_extractor.py` and the cache transceiver must
    transfer packed records plus fp16 sink/tail side-state as KVarN records. The
    side pool now exposes a tensor snapshot contract (`sink_k`, `sink_v`,
@@ -181,7 +187,8 @@ false and keep SMC-SD/GQA KVarN out of production defaults.
 
 2. **Single-node fused-kernel correctness**
    - Build with `torch.ops.trtllm.kvarn_gqa_store`,
-     `torch.ops.trtllm.kvarn_gqa_decode`, and `kvarn_gqa_backend_ready()` still
+     `torch.ops.trtllm.kvarn_gqa_decode`,
+     `torch.ops.trtllm.kvarn_gqa_dequant_amortized`, and `kvarn_gqa_backend_ready()` still
      false. Run op-level shape/error tests for unsupported head/group sizes.
    - Enable readiness only in a test image and compare fused GQA logits/output
      with fp16/fp8 KV for `M in {1, 5, 25}`, batch 1 and 16, and sequence
@@ -212,6 +219,7 @@ false and keep SMC-SD/GQA KVarN out of production defaults.
      require a faster-than-UCX proof before promotion.
 
 6. **Performance gates**
+   - `benchmarks/python/bench_kvarn_gqa_micro.py --bdr-working-set-blocks 32 --bdr-churn-blocks 1` must show steady/churn restore cost tracking churn, not the full working set.
    - `benchmarks/python/bench_kvarn_gqa_micro.py --require-fused` must report the
      fused path present, ready, correct, and faster than the reference path.
    - `benchmarks/python/bench_kvarn_gqa_production_gate.py --dry-run` emits the

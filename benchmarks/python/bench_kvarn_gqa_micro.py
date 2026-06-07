@@ -20,7 +20,12 @@ import torch
 from tensorrt_llm._torch.attention_backend.kvarn_gqa import (
     KVarNGQAConfig,
     dequantize_gqa_tile,
+    dequantize_gqa_tiles,
     quantize_gqa_tile,
+)
+from tensorrt_llm._torch.attention_backend.kvarn_gqa_attention import (
+    _KVarNGQASidePool,
+    _write_record_to_page,
 )
 
 _RUNTIME_DTYPES = {
@@ -103,6 +108,10 @@ def main() -> None:
                         help="exercise decode over fp16/bf16 sink + packed full block + fp16/bf16 tail")
     parser.add_argument("--decode-op-atol", type=float, default=7.5e-2)
     parser.add_argument("--store-op-atol", type=float, default=1.25e-1)
+    parser.add_argument("--bdr-working-set-blocks", type=int, default=16,
+                        help="committed full blocks to include in the BDR restore timing")
+    parser.add_argument("--bdr-churn-blocks", type=int, default=1,
+                        help="committed physical blocks to mark stale each BDR churn timing iteration")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -129,9 +138,54 @@ def main() -> None:
 
     pack_us = _bench(lambda: quantize_gqa_tile(k, v, cfg), args.iters, device)
     restore_us = _bench(lambda: dequantize_gqa_tile(records, cfg), args.iters, device)
+
+    # BDR fold reference timing: packed pages remain authoritative, while the
+    # persistent readable pool is restored only for physical blocks whose commit
+    # generation changed. This mirrors the production CUDA kernel gate: full
+    # restore scales with the working set, steady restore is metadata-only, and
+    # churn restore scales with changed blocks.
+    bdr_blocks = max(1, args.bdr_working_set_blocks)
+    bdr_churn = max(0, min(args.bdr_churn_blocks, bdr_blocks))
+    bdr_pages = torch.zeros((bdr_blocks + 1, 1, cfg.group, args.kv_heads,
+                             cfg.bytes_per_token_slot),
+                            device=device, dtype=torch.uint8)
+    bdr_state = _KVarNGQASidePool(cfg, num_layers=1, max_batch_size=1,
+                                  max_blocks_per_seq=bdr_blocks + 1,
+                                  num_kv_heads=args.kv_heads,
+                                  dtype=runtime_dtype, device=device)
+    bdr_state.ensure_bdr_pool(bdr_pages.shape[0])
+    bdr_slot = bdr_state.slot_for_request(11)
+    bdr_block_ids = list(range(bdr_blocks + 1))
+    for logical_block in range(1, bdr_blocks + 1):
+        _write_record_to_page(bdr_pages[logical_block, 0], records, cfg)
+        bdr_state.mark_committed(0, bdr_slot, 11, logical_block * cfg.group,
+                                 physical_block_id=logical_block)
+    bdr_seq_len = (bdr_blocks + 1) * cfg.group
+    bdr_state.restore_committed_blocks_amortized(
+        0, bdr_slot, bdr_block_ids, bdr_seq_len, bdr_pages, amortize=True)
+
+    bdr_full_restore_us = _bench(
+        lambda: bdr_state.restore_committed_blocks_amortized(
+            0, bdr_slot, bdr_block_ids, bdr_seq_len, bdr_pages, amortize=False),
+        max(args.iters // 10, 1), device)
+    bdr_steady_restore_us = _bench(
+        lambda: bdr_state.restore_committed_blocks_amortized(
+            0, bdr_slot, bdr_block_ids, bdr_seq_len, bdr_pages, amortize=True),
+        args.iters, device)
+
+    def bump_and_restore_churn():
+        if bdr_churn:
+            churn_ids = torch.arange(1, bdr_churn + 1, device=device, dtype=torch.long)
+            bdr_state.physical_commit_gen[0, churn_ids] += 1
+        return bdr_state.restore_committed_blocks_amortized(
+            0, bdr_slot, bdr_block_ids, bdr_seq_len, bdr_pages, amortize=True)
+
+    bdr_churn_restore_us = _bench(bump_and_restore_churn,
+                                  max(args.iters // 10, 1), device)
     trtllm_ops = getattr(torch.ops, "trtllm", object())
     fused_registered = (hasattr(trtllm_ops, "kvarn_gqa_store")
                         and hasattr(trtllm_ops, "kvarn_gqa_decode")
+                        and hasattr(trtllm_ops, "kvarn_gqa_dequant_amortized")
                         and hasattr(trtllm_ops, "kvarn_gqa_backend_ready"))
     fused_ready = False
     if fused_registered:
@@ -142,7 +196,7 @@ def main() -> None:
     if args.require_fused and not fused_ready:
         raise SystemExit(
             "--require-fused was set, but torch.ops.trtllm.kvarn_gqa_store, "
-            "kvarn_gqa_decode, and kvarn_gqa_backend_ready() are not all "
+            "kvarn_gqa_decode, kvarn_gqa_dequant_amortized, and kvarn_gqa_backend_ready() are not all "
             "present and production-ready; do not promote the reference path as fused")
 
     if args.try_store_op or args.try_decode_op or args.try_side_op:
@@ -222,6 +276,7 @@ def main() -> None:
     print(f"dtype={cfg.dtype} runtime_dtype={args.runtime_dtype} tile_bytes={cfg.tile_bytes_aligned} bytes_per_token_slot={cfg.bytes_per_token_slot}")
     print(f"restore_cosine_k={k_cos:.4f} restore_cosine_v={v_cos:.4f}")
     print(f"pack_us={pack_us:.2f} restore_us={restore_us:.2f} kv_heads={args.kv_heads} fused_registered={fused_registered} fused_ready={fused_ready}")
+    print(f"bdr_working_set_blocks={bdr_blocks} bdr_churn_blocks={bdr_churn} full_restore_us={bdr_full_restore_us:.2f} steady_restore_us={bdr_steady_restore_us:.2f} churn_restore_us={bdr_churn_restore_us:.2f}")
     for m, q in q_by_m.items():
         def score_once():
             return _ref_attention(q, k_restore, v_restore, cfg)

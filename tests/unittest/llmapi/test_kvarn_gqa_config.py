@@ -81,7 +81,7 @@ def test_gqa_kvarn_fused_ops_gate_sets_kvarn_quant_mode(monkeypatch):
 
     validate_and_set_kv_cache_quant(model_config, "kvarn_k2v2_g128")
 
-    assert _KVARN_GQA_FUSED_OPS == ("kvarn_gqa_store", "kvarn_gqa_decode")
+    assert _KVARN_GQA_FUSED_OPS == ("kvarn_gqa_store", "kvarn_gqa_decode", "kvarn_gqa_dequant_amortized")
     assert _KVARN_GQA_READY_OP == "kvarn_gqa_backend_ready"
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.KVARN.value
     assert model_config.quant_config.kv_cache_dtype == "kvarn_k2v2_g128"
@@ -98,10 +98,12 @@ def test_gqa_kvarn_fused_backend_probe_requires_ready_op(monkeypatch):
     trtllm = SimpleNamespace(
         kvarn_gqa_store=object(),
         kvarn_gqa_decode=object(),
+        kvarn_gqa_dequant_amortized=object(),
     )
     monkeypatch.setattr(model_loader.torch, "ops", SimpleNamespace(trtllm=trtllm))
     assert model_loader._has_kvarn_gqa_fused_backend() is False
 
+    trtllm.kvarn_gqa_dequant_amortized = object()
     trtllm.kvarn_gqa_backend_ready = Ready(False)
     assert model_loader._has_kvarn_gqa_fused_backend() is False
 
@@ -116,6 +118,7 @@ def test_gqa_kvarn_fused_backend_probe_fails_closed_on_ready_error(monkeypatch):
     trtllm = SimpleNamespace(
         kvarn_gqa_store=object(),
         kvarn_gqa_decode=object(),
+        kvarn_gqa_dequant_amortized=object(),
         kvarn_gqa_backend_ready=raises,
     )
     monkeypatch.setattr(model_loader.torch, "ops", SimpleNamespace(trtllm=trtllm))

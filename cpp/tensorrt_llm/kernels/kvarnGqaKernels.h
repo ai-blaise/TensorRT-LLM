@@ -49,6 +49,11 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
     int tailBatch, bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken, std::int64_t strideHead,
     std::int64_t strideByte, cudaStream_t stream = 0);
 
+void invokeKvarnGqaDequantAmortizedK2V2G128(std::uint8_t const* packedRecords, std::int64_t const* blockIds,
+    void* readableK, void* readableV, int numChurnBlocks, int numPhysicalBlocks, int numKvHeads, int headDim,
+    int groupSize, bool useBf16, bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken,
+    std::int64_t strideHead, std::int64_t strideByte, cudaStream_t stream = 0);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

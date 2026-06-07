@@ -38,7 +38,7 @@ _KV_CACHE_MAP = {
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 _BLAISE_DEFAULT_GQA_KVARN_DTYPE = "kvarn_k2v2_g128"
-_KVARN_GQA_FUSED_OPS = ("kvarn_gqa_store", "kvarn_gqa_decode")
+_KVARN_GQA_FUSED_OPS = ("kvarn_gqa_store", "kvarn_gqa_decode", "kvarn_gqa_dequant_amortized")
 _KVARN_GQA_READY_OP = "kvarn_gqa_backend_ready"
 
 

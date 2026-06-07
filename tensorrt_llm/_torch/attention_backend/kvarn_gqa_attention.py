@@ -24,7 +24,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs, AttentionMask,
                         merge_attention_forward_args)
 from .trtllm import TrtllmAttentionMetadata
 from .vanilla import generate_causal_mask, generate_sliding_window_mask, repeat_kv
-from .kvarn_gqa import (KVarNGQAConfig, dequantize_gqa_tile,
+from .kvarn_gqa import (KVarNGQAConfig, dequantize_gqa_tiles,
                         parse_kvarn_gqa_dtype, quantize_gqa_tile)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -69,6 +69,12 @@ class _KVarNGQASidePool:
         self.request_to_slot: dict[int, int] = {}
         self.slot_to_request: dict[int, int] = {}
         self.request_block_to_slot_block: dict[tuple[int, int, int], int] = {}
+        self.request_block_to_physical: dict[tuple[int, int, int], int] = {}
+        self.readable_k: Optional[torch.Tensor] = None
+        self.readable_v: Optional[torch.Tensor] = None
+        self.restored_gen: Optional[torch.Tensor] = None
+        self.physical_commit_gen: Optional[torch.Tensor] = None
+        self.physical_valid: Optional[torch.Tensor] = None
 
     @property
     def max_committed_blocks(self) -> int:
@@ -127,6 +133,25 @@ class _KVarNGQASidePool:
         self.committed[:, slot].zero_()
         self.commit_gen[:, slot].zero_()
 
+    def ensure_bdr_pool(self, num_physical_blocks: int) -> None:
+        """Lazily allocate the BDR readable pool keyed by physical block id.
+
+        The packed KVarN page remains authoritative. This FP16/BF16 pool is the
+        persistent read target for committed full blocks; amortized restore only
+        dequants physical blocks whose packed commit epoch changed.
+        """
+        if (self.readable_k is not None
+                and self.readable_k.shape[1] >= num_physical_blocks):
+            return
+        shape = (self.num_layers, num_physical_blocks, self.cfg.group,
+                 self.num_kv_heads, self.cfg.head_dim)
+        self.readable_k = torch.empty(shape, device=self.device, dtype=self.dtype)
+        self.readable_v = torch.empty_like(self.readable_k)
+        meta_shape = (self.num_layers, num_physical_blocks)
+        self.restored_gen = torch.zeros(meta_shape, device=self.device, dtype=torch.int64)
+        self.physical_commit_gen = torch.zeros(meta_shape, device=self.device, dtype=torch.int64)
+        self.physical_valid = torch.zeros(meta_shape, device=self.device, dtype=torch.bool)
+
     def release_request(self, request_id: int) -> None:
         """Release slot ownership after abort/finish so reuse cannot see stale KV."""
         slot = self.request_to_slot.pop(request_id, None)
@@ -138,9 +163,16 @@ class _KVarNGQASidePool:
                  if key[1] == request_id]
         for key in stale:
             self.request_block_to_slot_block.pop(key, None)
+            physical = self.request_block_to_physical.pop(key, None)
+            if (physical is not None and self.physical_valid is not None
+                    and 0 <= physical < self.physical_valid.shape[1]):
+                layer = key[0]
+                self.physical_valid[layer, physical] = False
+                self.restored_gen[layer, physical] = 0
+                self.physical_commit_gen[layer, physical] = 0
 
     def mark_committed(self, layer: int, slot: int, request_id: int,
-                       block_start: int) -> None:
+                       block_start: int, physical_block_id: Optional[int] = None) -> None:
         block_num = block_start // self.cfg.group
         if block_num >= self.max_committed_blocks:
             raise RuntimeError(
@@ -148,7 +180,14 @@ class _KVarNGQASidePool:
                 f"capacity {self.max_committed_blocks}; increase max_seq_len/tokens_per_block")
         self.committed[layer, slot, block_num] = True
         self.commit_gen[layer, slot, block_num] += 1
-        self.request_block_to_slot_block[(layer, request_id, block_start)] = block_num
+        key = (layer, request_id, block_start)
+        self.request_block_to_slot_block[key] = block_num
+        if physical_block_id is not None:
+            physical = int(physical_block_id)
+            self.request_block_to_physical[key] = physical
+            if self.physical_commit_gen is not None:
+                self.physical_valid[layer, physical] = True
+                self.physical_commit_gen[layer, physical] += 1
         self.clear_tail(layer, slot)
 
     def is_committed(self, layer: int, slot: int, block_start: int) -> bool:
@@ -172,6 +211,78 @@ class _KVarNGQASidePool:
                 f"KVarN GQA tail block missing for layer={layer} slot={slot} "
                 f"block_start={block_start}, active={cur_start}")
         return self.tail_k[layer, slot, :take], self.tail_v[layer, slot, :take]
+
+    def restore_committed_blocks_amortized(self, layer: int, slot: int,
+                                           block_ids: list[int], seq_len: int,
+                                           kv_pages: torch.Tensor, *,
+                                           amortize: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        """BDR restore: dequant only changed committed physical blocks.
+
+        The set-diff is tensor/device based: logical full-block numbers are
+        gathered from the request block table, mapped to physical block ids,
+        masked by ``physical_valid`` and ``restored_gen != physical_commit_gen``,
+        then uniqued before a single batched dequant/scatter into the persistent
+        readable pool. This mirrors the dense-MLA BDR contract while keeping GQA
+        storage separate from ``mla_latent_kv_dtype`` and the Indexer path.
+        """
+        self.ensure_bdr_pool(int(kv_pages.shape[0]))
+        assert self.readable_k is not None
+        assert self.readable_v is not None
+        assert self.restored_gen is not None
+        assert self.physical_commit_gen is not None
+        assert self.physical_valid is not None
+
+        sink_blocks = self.cfg.sink_tokens // self.cfg.group
+        n_full = int(seq_len) // self.cfg.group
+        if n_full <= sink_blocks:
+            empty = torch.empty((0,), dtype=torch.long, device=self.device)
+            return empty, empty
+
+        block_ids_t = torch.as_tensor(block_ids, dtype=torch.long, device=self.device)
+        logical = torch.arange(sink_blocks, n_full, dtype=torch.long, device=self.device)
+        logical = logical[logical < block_ids_t.numel()]
+        if logical.numel() == 0:
+            empty = torch.empty((0,), dtype=torch.long, device=self.device)
+            return empty, empty
+
+        physical = block_ids_t.index_select(0, logical)
+        in_range = (physical >= 0) & (physical < self.physical_valid.shape[1])
+        logical = logical[in_range]
+        physical = physical[in_range]
+        if physical.numel() == 0:
+            return logical, physical
+
+        logical_committed = self.committed[layer, slot].index_select(0, logical)
+        valid = self.physical_valid[layer].index_select(0, physical) & logical_committed
+        commit = self.physical_commit_gen[layer].index_select(0, physical)
+        if amortize:
+            restored = self.restored_gen[layer].index_select(0, physical)
+            stale = valid & (restored != commit)
+        else:
+            stale = valid
+        churn_phys = torch.unique(physical[stale])
+        if churn_phys.numel() > 0:
+            if kv_pages.is_cuda:
+                trtllm_ops = getattr(torch.ops, "trtllm", None)
+                op = getattr(trtllm_ops, "kvarn_gqa_dequant_amortized", None)
+                if op is None:
+                    raise NotImplementedError(
+                        "KVarN GQA BDR restore requires "
+                        "torch.ops.trtllm.kvarn_gqa_dequant_amortized on CUDA; "
+                        "refusing to fall back to working-set fp16/fp8 KV")
+                op(kv_pages, churn_phys.contiguous(), self.readable_k[layer],
+                   self.readable_v[layer], self.num_kv_heads,
+                   self.cfg.head_dim, self.cfg.group)
+            else:
+                pages = kv_pages.index_select(0, churn_phys)[:, 0]
+                records = _record_views_from_pages(pages, self.cfg)
+                k_tiles, v_tiles = dequantize_gqa_tiles(records, self.cfg)
+                self.readable_k[layer].index_copy_(0, churn_phys,
+                                                   k_tiles.to(dtype=self.dtype))
+                self.readable_v[layer].index_copy_(0, churn_phys,
+                                                   v_tiles.to(dtype=self.dtype))
+            self.restored_gen[layer, churn_phys] = self.physical_commit_gen[layer, churn_phys]
+        return logical, physical
 
     def transfer_snapshot(self, layer: int, request_id: int) -> dict[str, torch.Tensor]:
         slot = self.slot_for_request(request_id)
@@ -207,6 +318,7 @@ def _get_or_create_side_pool(kv_cache_manager, cfg: KVarNGQAConfig,
                                  dtype=dtype,
                                  device=kv_pages.device)
         setattr(kv_cache_manager, "_kvarn_gqa_side_pool", pool)
+    pool.ensure_bdr_pool(int(kv_pages.shape[0]))
     return pool
 
 
@@ -220,6 +332,12 @@ def _write_record_to_page(page: torch.Tensor, record: torch.Tensor,
     # record: [kv_heads, tile_bytes_aligned]
     page.copy_(record.reshape(record.shape[0], cfg.group,
                               cfg.bytes_per_token_slot).permute(1, 0, 2))
+
+
+def _record_views_from_pages(pages: torch.Tensor, cfg: KVarNGQAConfig) -> torch.Tensor:
+    # pages: [num_blocks, group, kv_heads, bytes_per_token_slot]
+    return pages.permute(0, 2, 1, 3).contiguous().reshape(
+        pages.shape[0], pages.shape[2], cfg.tile_bytes_aligned)
 
 
 class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
@@ -289,7 +407,8 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
         tail_k, tail_v = state.tail_tensors(layer, slot)
         record = quantize_gqa_tile(tail_k, tail_v, self.cfg)
         _write_record_to_page(kv_pages[block_id, 0], record, self.cfg)
-        state.mark_committed(layer, slot, request_id, block_start)
+        state.mark_committed(layer, slot, request_id, block_start,
+                             physical_block_id=block_id)
 
     def _store_new_tokens(self, state: _KVarNGQASidePool,
                           kv_pages: torch.Tensor, request_id: int,
@@ -327,6 +446,8 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             pieces_k.append(sink_k.to(device=device, dtype=dtype))
             pieces_v.append(sink_v.to(device=device, dtype=dtype))
 
+        state.restore_committed_blocks_amortized(self.layer_idx, slot, block_ids,
+                                                seq_len, kv_pages, amortize=True)
         pos = self.cfg.sink_tokens
         while pos < seq_len:
             block_num = pos // self.cfg.group
@@ -338,10 +459,11 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     f"position={pos} block_num={block_num} ids={block_ids}")
             if take == self.cfg.group and state.is_committed(
                     self.layer_idx, slot, block_start):
-                record = _record_view_from_page(kv_pages[block_ids[block_num], 0], self.cfg)
-                k_tile, v_tile = dequantize_gqa_tile(record, self.cfg)
-                pieces_k.append(k_tile.to(dtype=dtype))
-                pieces_v.append(v_tile.to(dtype=dtype))
+                physical = int(block_ids[block_num])
+                if state.readable_k is None or state.readable_v is None:
+                    raise RuntimeError("KVarN GQA BDR readable pool is not initialized")
+                pieces_k.append(state.readable_k[self.layer_idx, physical].to(dtype=dtype))
+                pieces_v.append(state.readable_v[self.layer_idx, physical].to(dtype=dtype))
             else:
                 tail_k, tail_v = state.active_tail_tensors(self.layer_idx, slot,
                                                             block_start, take)

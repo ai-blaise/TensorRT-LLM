@@ -269,6 +269,63 @@ def quantize_gqa_tile(k_tile: torch.Tensor, v_tile: torch.Tensor,
     return records
 
 
+def dequantize_gqa_tiles(records: torch.Tensor,
+                         cfg: Optional[KVarNGQAConfig] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restore one or more full GQA tiles from packed records.
+
+    Args:
+        records: ``[num_tiles, num_kv_heads, cfg.tile_bytes_aligned]`` uint8.
+
+    Returns:
+        ``(k, v)`` as ``[num_tiles, group, num_kv_heads, head_dim]`` fp32
+        tensors in the original, unrotated frame. This batched primitive is the
+        reference stand-in for the BDR in-kernel dequant: callers pass only the
+        physical blocks whose packed commit generation has changed, so dequant
+        work scales with churn rather than the full decode working set.
+    """
+    cfg = cfg or KVarNGQAConfig()
+    if records.ndim != 3 or records.shape[2] < cfg.tile_bytes:
+        raise ValueError(
+            f"expected records [num_tiles, num_kv_heads, >= {cfg.tile_bytes}], got {records.shape}")
+    num_tiles, num_kv_heads, _ = records.shape
+    flat = records.reshape(num_tiles * num_kv_heads, records.shape[2])
+
+    def get(offset: int, nbytes: int) -> torch.Tensor:
+        return flat[:, offset:offset + nbytes].contiguous()
+
+    flat_heads = num_tiles * num_kv_heads
+    k_rec = {
+        "q_packed": get(cfg.k_packed_offset, cfg.k_packed_bytes),
+        "s_row_abs": _fp16_from_bytes(get(cfg.k_s_col_offset, cfg.head_dim * 2),
+                                      (flat_heads, cfg.head_dim)),
+        "zp_abs": _fp16_from_bytes(get(cfg.k_zp_offset, cfg.head_dim * 2),
+                                   (flat_heads, cfg.head_dim)),
+        "s_col": _fp16_from_bytes(get(cfg.k_s_row_offset, cfg.group * 2),
+                                  (flat_heads, cfg.group)),
+    }
+    v_rec = {
+        "q_packed": get(cfg.v_packed_offset, cfg.v_packed_bytes),
+        "s_col": _fp16_from_bytes(get(cfg.v_s_col_offset, cfg.head_dim * 2),
+                                  (flat_heads, cfg.head_dim)),
+        "s_row_abs": _fp16_from_bytes(get(cfg.v_s_row_offset, cfg.group * 2),
+                                      (flat_heads, cfg.group)),
+        "zp_abs": _fp16_from_bytes(get(cfg.v_zp_offset, cfg.group * 2),
+                                   (flat_heads, cfg.group)),
+    }
+    k_rot = _dequant_rows(k_rec, cfg.key_bits,
+                          (flat_heads, cfg.head_dim, cfg.group))
+    v_rot = _dequant_rows(v_rec, cfg.value_bits,
+                          (flat_heads, cfg.group, cfg.head_dim))
+    H = hadamard_matrix(cfg.head_dim, records.device, torch.float32)
+    k_pre = k_rot.reshape(num_tiles, num_kv_heads, cfg.head_dim, cfg.group)
+    k_pre = k_pre.permute(0, 3, 1, 2).contiguous()
+    v_pre = v_rot.reshape(num_tiles, num_kv_heads, cfg.group, cfg.head_dim)
+    v_pre = v_pre.permute(0, 2, 1, 3).contiguous()
+    k = torch.matmul(k_pre, H)
+    v = torch.matmul(v_pre, H)
+    return k, v
+
+
 def dequantize_gqa_tile(records: torch.Tensor,
                         cfg: Optional[KVarNGQAConfig] = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Restore a full GQA tile from KVarN packed records.
@@ -284,37 +341,8 @@ def dequantize_gqa_tile(records: torch.Tensor,
     if records.ndim != 2 or records.shape[1] < cfg.tile_bytes:
         raise ValueError(
             f"expected records [num_kv_heads, >= {cfg.tile_bytes}], got {records.shape}")
-    num_kv_heads = records.shape[0]
-
-    def get(offset: int, nbytes: int) -> torch.Tensor:
-        return records[:, offset:offset + nbytes].contiguous()
-
-    k_rec = {
-        "q_packed": get(cfg.k_packed_offset, cfg.k_packed_bytes),
-        "s_row_abs": _fp16_from_bytes(get(cfg.k_s_col_offset, cfg.head_dim * 2),
-                                      (num_kv_heads, cfg.head_dim)),
-        "zp_abs": _fp16_from_bytes(get(cfg.k_zp_offset, cfg.head_dim * 2),
-                                   (num_kv_heads, cfg.head_dim)),
-        "s_col": _fp16_from_bytes(get(cfg.k_s_row_offset, cfg.group * 2),
-                                  (num_kv_heads, cfg.group)),
-    }
-    v_rec = {
-        "q_packed": get(cfg.v_packed_offset, cfg.v_packed_bytes),
-        "s_col": _fp16_from_bytes(get(cfg.v_s_col_offset, cfg.head_dim * 2),
-                                  (num_kv_heads, cfg.head_dim)),
-        "s_row_abs": _fp16_from_bytes(get(cfg.v_s_row_offset, cfg.group * 2),
-                                      (num_kv_heads, cfg.group)),
-        "zp_abs": _fp16_from_bytes(get(cfg.v_zp_offset, cfg.group * 2),
-                                   (num_kv_heads, cfg.group)),
-    }
-    k_rot = _dequant_rows(k_rec, cfg.key_bits,
-                          (num_kv_heads, cfg.head_dim, cfg.group))
-    v_rot = _dequant_rows(v_rec, cfg.value_bits,
-                          (num_kv_heads, cfg.group, cfg.head_dim))
-    H = hadamard_matrix(cfg.head_dim, records.device, torch.float32)
-    k = torch.matmul(k_rot.permute(2, 0, 1).contiguous(), H)
-    v = torch.matmul(v_rot.permute(1, 0, 2).contiguous(), H)
-    return k, v
+    k, v = dequantize_gqa_tiles(records.unsqueeze(0), cfg)
+    return k[0], v[0]
 
 
 class KVarNGQAPackedPool:

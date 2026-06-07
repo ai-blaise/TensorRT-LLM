@@ -87,6 +87,7 @@ def test_gate_requires_fused_ops_and_backend_readiness(monkeypatch):
 
     fake_torch.ops.trtllm.kvarn_gqa_store = object()
     fake_torch.ops.trtllm.kvarn_gqa_decode = object()
+    fake_torch.ops.trtllm.kvarn_gqa_dequant_amortized = object()
     fake_torch.ops.trtllm.kvarn_gqa_backend_ready = _Ready(False)
     with pytest.raises(SystemExit, match="not production-ready"):
         _gate._require_fused_ready()
@@ -102,6 +103,7 @@ def test_gate_fails_closed_when_backend_probe_raises(monkeypatch):
     fake_torch = SimpleNamespace(ops=SimpleNamespace(trtllm=SimpleNamespace(
         kvarn_gqa_store=object(),
         kvarn_gqa_decode=object(),
+        kvarn_gqa_dequant_amortized=object(),
         kvarn_gqa_backend_ready=raises,
     )))
     monkeypatch.setitem(sys.modules, "torch", fake_torch)

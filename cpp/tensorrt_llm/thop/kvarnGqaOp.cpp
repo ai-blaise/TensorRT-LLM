@@ -146,6 +146,35 @@ void kvarn_gqa_store(th::Tensor const& k, th::Tensor const& v, th::Tensor const&
         strides.strideHead, strides.strideByte, stream);
 }
 
+void kvarn_gqa_dequant_amortized(th::Tensor const& packedRecords, th::Tensor const& blockIds,
+    th::Tensor const& readableK, th::Tensor const& readableV, int64_t numKvHeads, int64_t headDim, int64_t groupSize)
+{
+    check_cuda_contiguous(packedRecords, "packed_records");
+    check_cuda_contiguous(blockIds, "block_ids");
+    check_cuda_contiguous(readableK, "readable_k");
+    check_cuda_contiguous(readableV, "readable_v");
+    TORCH_CHECK(packedRecords.scalar_type() == at::ScalarType::Byte, "packed_records must be uint8");
+    TORCH_CHECK(blockIds.scalar_type() == at::ScalarType::Long, "block_ids must be int64 physical block ids");
+    TORCH_CHECK(readableK.scalar_type() == at::ScalarType::Half || readableK.scalar_type() == at::ScalarType::BFloat16,
+        "readable_k must be fp16/bf16");
+    TORCH_CHECK(readableV.scalar_type() == readableK.scalar_type(), "readable_k/readable_v dtypes must match");
+    TORCH_CHECK(readableK.dim() == 4 && readableV.dim() == 4,
+        "readable_k/readable_v must be [num_physical_blocks, group, num_kv_heads, head_dim]");
+    TORCH_CHECK(readableK.sizes() == readableV.sizes(), "readable_k/readable_v shapes must match");
+    check_group_shape(headDim, groupSize);
+    TORCH_CHECK(readableK.size(1) == groupSize && readableK.size(2) >= numKvHeads && readableK.size(3) == headDim,
+        "readable_k/readable_v shape must match group_size/num_kv_heads/head_dim");
+    TORCH_CHECK(blockIds.dim() == 1, "block_ids must be [num_churn_blocks]");
+    auto strides = get_packed_record_strides(packedRecords, numKvHeads, "kvarn_gqa_dequant_amortized");
+
+    auto stream = at::cuda::getCurrentCUDAStream(readableK.get_device());
+    tk::invokeKvarnGqaDequantAmortizedK2V2G128(packedRecords.data_ptr<std::uint8_t>(),
+        blockIds.data_ptr<std::int64_t>(), readableK.data_ptr(), readableV.data_ptr(),
+        static_cast<int>(blockIds.size(0)), static_cast<int>(readableK.size(0)), static_cast<int>(numKvHeads),
+        static_cast<int>(headDim), static_cast<int>(groupSize), readableK.scalar_type() == at::ScalarType::BFloat16,
+        strides.pageLayout, strides.strideBlock, strides.strideToken, strides.strideHead, strides.strideByte, stream);
+}
+
 th::Tensor kvarn_gqa_decode(th::Tensor const& q, th::Tensor const& packedRecords, th::Tensor const& blockIds,
     th::Tensor const& sinkK, th::Tensor const& sinkV, th::Tensor const& tailK, th::Tensor const& tailV,
     th::Tensor const& seqLens, int64_t numHeads, int64_t numKvHeads, int64_t headDim, int64_t groupSize)
@@ -208,6 +237,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "kvarn_gqa_decode(Tensor q, Tensor packed_records, Tensor block_ids, Tensor sink_k, Tensor sink_v, "
         "Tensor tail_k, Tensor tail_v, Tensor seq_lens, int num_heads, int num_kv_heads, int head_dim, "
         "int group_size) -> Tensor");
+    m.def(
+        "kvarn_gqa_dequant_amortized(Tensor packed_records, Tensor block_ids, Tensor readable_k, "
+        "Tensor readable_v, int num_kv_heads, int head_dim, int group_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
@@ -219,4 +251,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("kvarn_gqa_store", &tensorrt_llm::torch_ext::kvarn_gqa_store);
     m.impl("kvarn_gqa_decode", &tensorrt_llm::torch_ext::kvarn_gqa_decode);
+    m.impl("kvarn_gqa_dequant_amortized", &tensorrt_llm::torch_ext::kvarn_gqa_dequant_amortized);
 }

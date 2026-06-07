@@ -425,6 +425,41 @@ __device__ float loadVRotatedForLogicalToken(T const* sinkV, T const* tailV, Pac
 }
 
 template <typename T>
+__global__ void kvarnGqaDequantAmortizedKernel(PackedRecordView records, std::int64_t const* blockIds,
+    T* readableK, T* readableV, int numChurnBlocks, int numPhysicalBlocks, int numKvHeads)
+{
+    int churnIdx = blockIdx.x;
+    int kvHead = blockIdx.y;
+    if (churnIdx >= numChurnBlocks || kvHead >= numKvHeads)
+    {
+        return;
+    }
+    std::int64_t blockId = blockIds[churnIdx];
+    if (blockId < 0 || blockId >= numPhysicalBlocks)
+    {
+        return;
+    }
+
+    int total = Layout::kGroupSize * Layout::kHeadDim;
+    for (int linear = threadIdx.x; linear < total; linear += blockDim.x)
+    {
+        int token = linear / Layout::kHeadDim;
+        int dim = linear - token * Layout::kHeadDim;
+        float kOut = 0.0f;
+        float vOut = 0.0f;
+        for (int rotDim = 0; rotDim < Layout::kHeadDim; ++rotDim)
+        {
+            float sign = static_cast<float>(hadamardSign(dim, rotDim));
+            kOut += dequantKRot(records, blockId, kvHead, token, rotDim) * sign;
+            vOut += dequantVRot(records, blockId, kvHead, token, rotDim) * sign;
+        }
+        std::int64_t outIdx = ((blockId * Layout::kGroupSize + token) * numKvHeads + kvHead) * Layout::kHeadDim + dim;
+        storeScalar(readableK + outIdx, kOut * kHadamardScale);
+        storeScalar(readableV + outIdx, vOut * kHadamardScale);
+    }
+}
+
+template <typename T>
 __global__ void kvarnGqaDecodeReferenceKernel(T const* q, PackedRecordView records, std::int64_t const* blockIds,
     T const* sinkK, T const* sinkV, T const* tailK, T const* tailV, std::int32_t const* seqLens, T* output,
     int numQueries, int numBlocks, int numHeads, int numKvHeads, int seqLensCount, int sinkTokens, int sinkBatch,
@@ -550,6 +585,36 @@ void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* pac
     {
         kvarnGqaStoreReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__half const*>(k),
             static_cast<__half const*>(v), view, blockIds, numBlocks, numKvHeads);
+    }
+}
+
+void invokeKvarnGqaDequantAmortizedK2V2G128(std::uint8_t const* packedRecords, std::int64_t const* blockIds,
+    void* readableK, void* readableV, int numChurnBlocks, int numPhysicalBlocks, int numKvHeads, int headDim,
+    int groupSize, bool useBf16, bool pageLayout, std::int64_t strideBlock, std::int64_t strideToken,
+    std::int64_t strideHead, std::int64_t strideByte, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(headDim == Layout::kHeadDim && groupSize == Layout::kGroupSize,
+        "kvarn_gqa_dequant_amortized currently supports only k2v2_g128");
+    TLLM_CHECK_WITH_INFO(numChurnBlocks >= 0 && numPhysicalBlocks >= 0 && numKvHeads > 0,
+        "kvarn_gqa_dequant_amortized got invalid sizes");
+    if (numChurnBlocks == 0)
+    {
+        return;
+    }
+    PackedRecordView view{packedRecords, pageLayout, strideBlock, strideToken, strideHead, strideByte};
+    dim3 grid(numChurnBlocks, numKvHeads);
+    constexpr int kThreads = 256;
+    if (useBf16)
+    {
+        kvarnGqaDequantAmortizedKernel<<<grid, kThreads, 0, stream>>>(view, blockIds,
+            static_cast<__nv_bfloat16*>(readableK), static_cast<__nv_bfloat16*>(readableV),
+            numChurnBlocks, numPhysicalBlocks, numKvHeads);
+    }
+    else
+    {
+        kvarnGqaDequantAmortizedKernel<<<grid, kThreads, 0, stream>>>(view, blockIds,
+            static_cast<__half*>(readableK), static_cast<__half*>(readableV), numChurnBlocks, numPhysicalBlocks,
+            numKvHeads);
     }
 }
 

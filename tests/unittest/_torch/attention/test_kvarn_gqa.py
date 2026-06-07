@@ -6,8 +6,10 @@ import pytest
 
 _TORCH = pytest.importorskip("torch")
 
+from tensorrt_llm._torch.attention_backend import kvarn_gqa_attention as _gqa_attention  # noqa: E402
 from tensorrt_llm._torch.attention_backend.kvarn_gqa_attention import (  # noqa: E402
     _KVarNGQASidePool,
+    _write_record_to_page,
 )
 from tensorrt_llm._torch.attention_backend.kvarn_gqa import (  # noqa: E402
     KVarNGQAConfig,
@@ -15,6 +17,7 @@ from tensorrt_llm._torch.attention_backend.kvarn_gqa import (  # noqa: E402
     _pack_bits_flat,
     _unpack_bits_flat,
     dequantize_gqa_tile,
+    dequantize_gqa_tiles,
     parse_kvarn_gqa_dtype,
     quantize_gqa_tile,
 )
@@ -192,3 +195,104 @@ def test_kvarn_gqa_side_pool_release_request_clears_abort_reuse_state():
     assert reused == slot
     with pytest.raises(RuntimeError, match="sink state incomplete"):
         pool.sink_tensors(0, reused, 1)
+
+
+def test_kvarn_gqa_batched_dequant_matches_single_tile_reference():
+    torch = _TORCH
+    torch.manual_seed(20260607)
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    records = []
+    for i in range(2):
+        k = (torch.randn(cfg.group, 1, cfg.head_dim, dtype=torch.float16) * 0.25 + i)
+        v = (torch.randn_like(k) * 0.25 - i)
+        records.append(quantize_gqa_tile(k, v, cfg))
+    records = torch.stack(records, dim=0)
+
+    k_batch, v_batch = dequantize_gqa_tiles(records, cfg)
+
+    assert k_batch.shape == (2, cfg.group, 1, cfg.head_dim)
+    assert v_batch.shape == (2, cfg.group, 1, cfg.head_dim)
+    for i in range(2):
+        k_single, v_single = dequantize_gqa_tile(records[i], cfg)
+        assert torch.equal(k_batch[i], k_single)
+        assert torch.equal(v_batch[i], v_single)
+
+
+def test_kvarn_gqa_bdr_restore_scales_with_churn_not_working_set(monkeypatch):
+    torch = _TORCH
+    torch.manual_seed(20260607)
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    state = _KVarNGQASidePool(
+        cfg,
+        num_layers=1,
+        max_batch_size=1,
+        max_blocks_per_seq=5,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    kv_pages = torch.zeros((8, 1, cfg.group, 1, cfg.bytes_per_token_slot),
+                           dtype=torch.uint8)
+    state.ensure_bdr_pool(kv_pages.shape[0])
+    assert state.restored_gen.dtype == torch.int64
+    assert state.physical_commit_gen.dtype == torch.int64
+
+    slot = state.slot_for_request(7)
+    block_ids = [0, 2, 4, 6, 7]
+    for logical_block, physical_block in ((1, 2), (2, 4), (3, 6)):
+        k = torch.randn(cfg.group, 1, cfg.head_dim, dtype=torch.float16) * 0.2
+        v = torch.randn_like(k) * 0.2
+        record = quantize_gqa_tile(k + logical_block, v - logical_block, cfg)
+        _write_record_to_page(kv_pages[physical_block, 0], record, cfg)
+        state.mark_committed(0, slot, 7, logical_block * cfg.group,
+                             physical_block_id=physical_block)
+
+    real_dequant = _gqa_attention.dequantize_gqa_tiles
+    calls = []
+
+    def counted_dequant(records, cfg):
+        calls.append(int(records.shape[0]))
+        return real_dequant(records, cfg)
+
+    monkeypatch.setattr(_gqa_attention, "dequantize_gqa_tiles", counted_dequant)
+
+    logical, physical = state.restore_committed_blocks_amortized(
+        0, slot, block_ids, seq_len=4 * cfg.group, kv_pages=kv_pages,
+        amortize=True)
+
+    assert logical.tolist() == [1, 2, 3]
+    assert physical.tolist() == [2, 4, 6]
+    assert calls == [3]
+    assert torch.equal(state.restored_gen[0, physical],
+                       state.physical_commit_gen[0, physical])
+
+    calls.clear()
+    state.restore_committed_blocks_amortized(
+        0, slot, block_ids, seq_len=4 * cfg.group, kv_pages=kv_pages,
+        amortize=True)
+    assert calls == []
+
+    k = torch.randn(cfg.group, 1, cfg.head_dim, dtype=torch.float16) * 0.2
+    v = torch.randn_like(k) * 0.2
+    record = quantize_gqa_tile(k, v, cfg)
+    _write_record_to_page(kv_pages[4, 0], record, cfg)
+    state.mark_committed(0, slot, 7, 2 * cfg.group, physical_block_id=4)
+
+    calls.clear()
+    state.restore_committed_blocks_amortized(
+        0, slot, block_ids, seq_len=4 * cfg.group, kv_pages=kv_pages,
+        amortize=True)
+    assert calls == [1]
+    assert int(state.restored_gen[0, 4].item()) == int(state.physical_commit_gen[0, 4].item())
+
+    calls.clear()
+    state.restore_committed_blocks_amortized(
+        0, slot, block_ids, seq_len=4 * cfg.group, kv_pages=kv_pages,
+        amortize=False)
+    assert calls == [3]
+
+    state.release_request(7)
+    assert not bool(state.physical_valid[0, 2].item())
+    assert not bool(state.physical_valid[0, 4].item())
+    assert not bool(state.physical_valid[0, 6].item())
+    assert int(state.restored_gen[0, torch.tensor([2, 4, 6])].sum().item()) == 0
