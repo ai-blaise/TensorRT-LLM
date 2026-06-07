@@ -59,6 +59,12 @@ def test_r20_manifest_has_no_helix_or_smc_fallback():
     assert "layersplit_transfer_backend: nixl" in manifest
     assert "layersplit_owner_local_alloc: true" in manifest
     assert "backend: NIXL" in manifest
+    assert manifest.count("TRTLLM_NIXL_KVCACHE_BACKEND") >= 2
+    assert manifest.count("TRTLLM_NIXL_ENABLE_COALESCE") >= 2
+    assert "UCX_CUDA_IPC_ENABLE_MNNVL" in manifest
+    assert "NVIDIA_GDRCOPY" in manifest
+    assert "TRTLLM_FORCE_COMM_METHOD" in manifest
+    assert "NVLINK_TWO_SIDED" in manifest
     assert "allow_parallelism_fallback: false" in manifest
 
 
@@ -170,6 +176,30 @@ def test_r20_request_pinning_smoke_is_fail_closed():
     assert "speculative_model" in script
     assert "draft_attention_backend" in script
     assert "cp_type: HELIX" in script
+
+def test_r20_nixl_gate_readiness_audit_is_read_only_and_fail_closed():
+    script = (DEPLOY_DIR / "audit_nixl_gate_readiness.sh").read_text()
+
+    assert "NIXL_AUDIT_MODE" in script
+    assert "CHECK_RUNTIME_LIBS" in script
+    assert "MIN_MAX_TOKENS_IN_BUFFER" in script
+    assert "TRTLLM_NIXL_KVCACHE_BACKEND" in script
+    assert "TRTLLM_NIXL_ENABLE_COALESCE" in script
+    assert "max_tokens_in_buffer must be at least" in script
+    assert "Initializing NIXL Connect" in script
+    assert "OPTRT_LAYERSPLIT_XFER_DEBUG" in script
+    assert "global_layers=61" in script
+    assert "transfer_attr=True" in script
+    assert "KV cache transfer timeout" in script
+    assert "MLACacheFormatter::inquireSupport" in script
+    assert "CacheTransferLayer::validateSupport" in script
+    assert "libtensorrt_llm_nixl_wrapper.so" in script
+    assert "find_spec" in script
+    assert "nixl" in script
+    assert "/v1/completions" not in script
+    assert "kubectl apply" not in script
+    assert "kubectl delete" not in script
+
 
 def test_r20_transport_bench_is_nixl_first_and_fail_closed():
     script = (DEPLOY_DIR / "run_c16_transport_bench.sh").read_text()

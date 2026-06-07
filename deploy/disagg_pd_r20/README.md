@@ -235,6 +235,61 @@ LAYERSPLIT`) so LayerSplit is a real CP split and MoE EP remains supported. Ther
 engine YAML `context_parallel_size` field. Decode remains TP4/CP1 and consumes
 the reassembled KV through the LayerSplit KV handoff path.
 
+## NIXL gate audit and tuning knobs
+
+Run the read-only audit before sending request traffic to a new NIXL gate image:
+
+```bash
+NIXL_AUDIT_MODE=live CHECK_RUNTIME_LIBS=1 \
+  deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
+```
+
+For local manifest validation before deploy, use:
+
+```bash
+NIXL_AUDIT_MODE=local deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
+```
+
+The audit does not send completions, apply manifests, delete pods, or restart
+workers. It validates the R20 composition and writes artifacts under
+`/tmp/nixl_gate_audit_<timestamp>`. A passing audit proves only readiness for the
+request smoke; it does not replace the request-pinning smoke or the c16
+throughput gate.
+
+The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
+
+- `cache_transceiver_config.max_tokens_in_buffer: 131072` on both prefill and
+  decode. TRT-LLM C++ warns that dynamic transfer buffers can fail with NIXL;
+  the pre-registered buffer must cover the 128k ISL target.
+- `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` on both workers. This selects the UCX plugin
+  inside NIXL explicitly; it is not the old direct UCX cache transceiver.
+- `TRTLLM_NIXL_ENABLE_COALESCE=1` on both workers. NIXL coalesces contiguous
+  VMM-split descriptors during registration, deregistration, and transfer request
+  creation, reducing descriptor count and hot-path overhead.
+- `UCX_CUDA_IPC_ENABLE_MNNVL=0`, `NVIDIA_GDRCOPY=1`, `NCCL_NET_PLUGIN=none`, and
+  `TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED` keep the single-node B200/NVLink
+  path explicit and avoid the direct UCX MNNVL warning path seen in earlier
+  rollouts.
+- Prefill keeps `NCCL_NVLS_ENABLE=0` because TP/CP subgroup allreduces hit NVLS
+  binding failures on this stack; decode keeps `NCCL_NVLS_ENABLE=1` for the
+  non-CP TP4 decode side.
+
+After the audit passes, run the strict smoke. After strict smoke passes, run the
+NIXL c16 gate before any UCX/Mooncake/MORI A/B:
+
+```bash
+SMC_GATE_MODE=deferred REQUIRE_DYNAMO_PIN_MARKERS=1 \
+REQUIRE_POSITIVE_TRANSFER_METRICS=1 REQUIRE_ABORT_CLEANUP_MARKER=1 \
+  deploy/disagg_pd_r20/smoke_request_pinning.sh
+
+deploy/disagg_pd_r20/run_c16_transport_bench.sh \
+  --backend nixl \
+  --lengths 1024,4096,8192,16384,32768,65536,131072 \
+  --concurrency 16 \
+  --max-tokens 128 \
+  --min-tok-per-user 150
+```
+
 ## KV handoff shape
 
 The deployment uses the TRT-LLM disaggregated KV transceiver, not vLLM MORI-IO.
