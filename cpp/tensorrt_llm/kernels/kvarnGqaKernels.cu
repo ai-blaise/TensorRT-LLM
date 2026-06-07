@@ -218,6 +218,23 @@ __device__ float tileStd(float const* tile, float const* logCol, float const* lo
     return sqrtf(fmaxf(var, 0.0f));
 }
 
+__device__ float tileStdScaled(float const* tile, float const* invCol, float const* invRow, bool byColumn, int idx)
+{
+    float sum = 0.0f;
+    float sumSq = 0.0f;
+    for (int i = 0; i < Layout::kGroupSize; ++i)
+    {
+        int r = byColumn ? i : idx;
+        int c = byColumn ? idx : i;
+        float x = tile[r * Layout::kHeadDim + c] * invRow[r] * invCol[c];
+        sum += x;
+        sumSq += x * x;
+    }
+    float n = static_cast<float>(Layout::kGroupSize);
+    float var = (sumSq - (sum * sum / n)) / (n - 1.0f);
+    return sqrtf(fmaxf(var, 0.0f));
+}
+
 template <bool IsKey, typename T>
 __device__ void quantizeAndWriteTileParallel(T const* src, PackedRecordWriteView view, std::int64_t blockId,
     int inputBlock, int kvHead, int numKvHeads, float* smem)
@@ -229,7 +246,9 @@ __device__ void quantizeAndWriteTileParallel(T const* src, PackedRecordWriteView
     float* bestRow = bestCol + Layout::kHeadDim;
     float* tmpCol = bestRow + Layout::kGroupSize;
     float* tmpRow = tmpCol + Layout::kHeadDim;
-    float* scalar = tmpRow + Layout::kGroupSize;
+    float* invCol = tmpRow + Layout::kGroupSize;
+    float* invRow = invCol + Layout::kHeadDim;
+    float* scalar = invRow + Layout::kGroupSize;
     int tid = threadIdx.x;
 
     for (int i = tid; i < Layout::kHeadDim; i += blockDim.x)
@@ -290,20 +309,37 @@ __device__ void quantizeAndWriteTileParallel(T const* src, PackedRecordWriteView
     {
         if (tid < Layout::kHeadDim)
         {
-            float std = clampf(tileStd(tile, logCol, logRow, true, tid), 1e-3f, 1e3f);
+            invCol[tid] = expf(-logCol[tid]);
+            invRow[tid] = expf(-logRow[tid]);
+        }
+        __syncthreads();
+        if (tid < Layout::kHeadDim)
+        {
+            float std = clampf(tileStdScaled(tile, invCol, invRow, true, tid), 1e-3f, 1e3f);
             logCol[tid] = clampf(logCol[tid] + logf(std), -0.3f, 10.0f);
+        }
+        __syncthreads();
+        if (tid < Layout::kHeadDim)
+        {
+            invCol[tid] = expf(-logCol[tid]);
         }
         __syncthreads();
         if (tid < Layout::kGroupSize)
         {
-            float std = clampf(tileStd(tile, logCol, logRow, false, tid), 1e-3f, 1e3f);
+            float std = clampf(tileStdScaled(tile, invCol, invRow, false, tid), 1e-3f, 1e3f);
             logRow[tid] = clampf(logRow[tid] + logf(std), -0.3f, 10.0f);
         }
         __syncthreads();
         if (tid < Layout::kHeadDim)
         {
-            tmpCol[tid] = tileStd(tile, logCol, logRow, true, tid);
-            tmpRow[tid] = tileStd(tile, logCol, logRow, false, tid);
+            invCol[tid] = expf(-logCol[tid]);
+            invRow[tid] = expf(-logRow[tid]);
+        }
+        __syncthreads();
+        if (tid < Layout::kHeadDim)
+        {
+            tmpCol[tid] = tileStdScaled(tile, invCol, invRow, true, tid);
+            tmpRow[tid] = tileStdScaled(tile, invCol, invRow, false, tid);
         }
         __syncthreads();
         if (tid == 0)
@@ -1012,7 +1048,7 @@ void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* pac
     PackedRecordWriteView view{packedRecords, pageLayout, strideBlock, strideToken, strideHead, strideByte};
     dim3 grid(numBlocks, numKvHeads);
     constexpr int kThreads = 256;
-    constexpr std::size_t kSharedFloats = Layout::kGroupSize * Layout::kHeadDim + 6 * Layout::kHeadDim + 1;
+    constexpr std::size_t kSharedFloats = Layout::kGroupSize * Layout::kHeadDim + 8 * Layout::kHeadDim + 1;
     constexpr std::size_t kSharedBytes = kSharedFloats * sizeof(float);
     if (useBf16)
     {
