@@ -588,6 +588,16 @@ private:
                 TLLM_CHECK(it != mReadyResponses.end());
                 {
                     std::scoped_lock lkResp(mSenderMutex);
+                    try
+                    {
+                        it->second.mPromise.set_value();
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Cancelled request %zu sender promise was already completed: %s", mCurrentRequest.value(),
+                            e.what());
+                    }
                     mReadyResponses.erase(it);
                     mCancelledRequests.erase(mCurrentRequest.value());
                     mRemainSendCount.erase(mCurrentRequest.value());

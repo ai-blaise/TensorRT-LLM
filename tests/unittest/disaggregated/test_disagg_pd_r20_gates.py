@@ -186,3 +186,15 @@ def test_r20_transport_bench_is_nixl_first_and_fail_closed():
     assert 'MLACacheFormatter::inquireSupport' in script
     assert 'CacheTransferLayer::validateSupport' in script
     assert 'Using UCX kv-cache transceiver' in script
+
+def test_r20_cpp_cache_sender_completes_cancelled_promises():
+    source = (REPO_ROOT / "cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp").read_text()
+    cancel_branch = source[source.index("if (mCancelledRequests.find(reqId)"):source.index("void response() noexcept")]
+    assert "it->second.mPromise.set_value()" in cancel_branch
+    assert "mReadyResponses.erase(it)" in cancel_branch
+
+
+def test_r20_live_smoke_strips_ansi_router_logs():
+    smoke = (REPO_ROOT / "deploy/disagg_pd_r20/smoke_request_pinning.sh").read_text()
+    assert "ansi_re = re.compile" in smoke
+    assert "ansi_re.sub" in smoke

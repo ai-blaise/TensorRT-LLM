@@ -197,9 +197,10 @@ import re
 import sys
 from pathlib import Path
 
-frontend = Path(sys.argv[1]).read_text(errors="ignore")
-prefill = Path(sys.argv[2]).read_text(errors="ignore")
-decode = Path(sys.argv[3]).read_text(errors="ignore")
+ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+frontend = ansi_re.sub("", Path(sys.argv[1]).read_text(errors="ignore"))
+prefill = ansi_re.sub("", Path(sys.argv[2]).read_text(errors="ignore"))
+decode = ansi_re.sub("", Path(sys.argv[3]).read_text(errors="ignore"))
 response_text = Path(sys.argv[4]).read_text(errors="ignore")
 metrics_text = Path(sys.argv[5]).read_text(errors="ignore")
 require_dynamo = sys.argv[6] == "1"
