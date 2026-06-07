@@ -82,6 +82,7 @@ def test_r20_overlay_carries_layersplit_and_request_pinning_sources():
     assert "msgpack==1.1.1" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py" in dockerfile
+    assert "tensorrt_llm/_torch/disaggregation/transceiver.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py" in dockerfile
     assert "tensorrt_llm/serve/openai_disagg_service.py" in dockerfile
     assert "tensorrt_llm/serve/openai_client.py" in dockerfile
@@ -338,6 +339,17 @@ def test_r20_transceiver_backend_selection_is_fail_closed():
     assert "legacy env backend selector(s)" in source
     assert "implicit transport fallback is" in source
     assert "received multiple" in source
+
+
+def test_r20_python_transceiver_allows_only_layersplit_owner_local_cp():
+    source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "disaggregation" / "transceiver.py").read_text()
+
+    assert "CpType.LAYERSPLIT" in source
+    assert "layersplit_state" in source
+    assert "owner_local_alloc" in source
+    assert "allowing LayerSplit owner-local CP transfer" in source
+    assert "context parallelism requires LayerSplit owner-local KV ownership" in source
+    assert "CpType.HELIX" not in source
 
 
 def test_r20_executor_emits_nixl_transfer_proof_markers():

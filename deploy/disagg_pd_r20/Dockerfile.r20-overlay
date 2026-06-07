@@ -22,6 +22,7 @@ COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/model_engine.py ${SITE_PACK
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/disaggregation/transceiver.py ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/transceiver.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/_util.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/sampler.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py
@@ -71,6 +72,7 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/transceiver.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py \
 		    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py \

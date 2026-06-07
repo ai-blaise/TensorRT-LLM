@@ -35,7 +35,7 @@ from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -631,11 +631,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._wait_reqs[rid]
 
     def _check_compatible(self):
-        if self._mapping.cp_size != 1:
-            raise ValueError(
-                f"KvCacheTransceiverV2: _check_compatible: only support context parallelism is 1: "
-                f"cp_size: {self._mapping.cp_size}"
+        if self._mapping.cp_size == 1:
+            return
+
+        cp_type = self._mapping.cp_config.get("cp_type")
+        layersplit_state = getattr(self._kv_cache_manager, "layersplit_state", None)
+        if (
+            cp_type == CpType.LAYERSPLIT
+            and layersplit_state is not None
+            and getattr(layersplit_state, "enabled", False)
+            and getattr(layersplit_state, "owner_local_alloc", False)
+        ):
+            logger.info(
+                "KvCacheTransceiverV2 allowing LayerSplit owner-local CP "
+                "transfer: cp_size=%s cp_rank=%s",
+                self._mapping.cp_size,
+                self._mapping.cp_rank,
             )
+            return
+
+        raise ValueError(
+            "KvCacheTransceiverV2: _check_compatible: context parallelism "
+            "requires LayerSplit owner-local KV ownership; "
+            f"cp_size: {self._mapping.cp_size}, cp_type: {cp_type}"
+        )
 
     def commit_blocks_for_reuse(self, req) -> None:
         self._reuse_adapter.commit_blocks_for_reuse(req)
