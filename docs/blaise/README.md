@@ -69,6 +69,7 @@ a correctness signal — see "Validation philosophy" below).
    Moondream overlap gates, and rollout proof points.
 8. [warpdecode.md](warpdecode.md) — the MoE decode fast path.
 9. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
+10. [foundry_iteration_speed.md](foundry_iteration_speed.md) — Foundry vs CRIU snapshot decision for iteration/runtime reuse.
 
 ## Validation philosophy
 

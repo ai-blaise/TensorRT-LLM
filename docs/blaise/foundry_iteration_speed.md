@@ -36,6 +36,10 @@ ai-blaise comparison inputs:
 - VM worktrees:
   `/tmp/tensorrt-llm-op-trt-clean`, `/home/spencer/work/TensorRT-LLM-op-trt-ls`,
   `/home/spencer/optimization-playground`, and `/tmp/foundry-org-foundry-audit`.
+- `ai-blaise/sglang` `main` was checked for `SGLANG_SNAPSHOT_HOOKS` / CRIU
+  hook files; those hook files were not present there as of this audit. The
+  hook source available on the VM is the `optimization-playground` runtime tree
+  referenced by the `criu-snapshots` Tier-4 notes.
 
 ## What Foundry Accelerates
 
@@ -190,6 +194,89 @@ Foundry should stay disabled while any of these remain true:
   r20 request-pinning protocol;
 - live workload snapshots in `criu-snapshots` are still pending for the relevant
   serving path.
+
+## Integration-Ready Patch Status
+
+This branch intentionally does not ship a runtime Foundry integration. It ships
+an integration-ready decision artifact from the exact `op-trt` base below and
+validates the already-present safe readiness probe:
+
+- Repository: `https://github.com/ai-blaise/TensorRT-LLM.git`
+- Base branch/commit: `op-trt` at `b5d317c4fdc259d20afbba749d51c74761a767db`
+- Audit branch: `anscombe/foundry-snapshot-audit`
+- Changed paths in this audit commit:
+  - `docs/blaise/foundry_iteration_speed.md`
+  - `docs/blaise/README.md`
+- Existing gated probe validated by this audit:
+  - `deploy/disagg_pd_r20/foundry_prepare.sh`
+
+The readiness probe is acceptable to keep because it is gated, reports
+`ld_preload_modified=0` and `live_workload_modified=0`, and never applies a DGD
+or restarts pods. Treat it like `cache_report.sh`: an operator visibility tool,
+not a deployment mechanism.
+
+## Proof Commands
+
+Safe commands used for this audit:
+
+```bash
+# op-trt branch/base proof
+cd /tmp/tensorrt-llm-op-trt-clean
+git rev-parse HEAD
+git branch --show-current
+git status --short
+
+# Foundry direct-source proof
+cd /var/lib/optrt-cache/foundry/src
+git rev-parse HEAD
+sed -n '1,120p' docs/trtllm/overview.md
+sed -n '1,80p' recipe/trtllm/README.md
+sed -n '1,40p' python/foundry/integration/trtllm/__init__.py
+
+# Foundry paper direct-read proof
+ls -lh /var/lib/optrt-cache/foundry-paper/2604.06664.pdf
+
+# Readiness probe proof, no pod mutation
+cd /tmp/tensorrt-llm-op-trt-clean
+bash -n deploy/disagg_pd_r20/foundry_prepare.sh
+deploy/disagg_pd_r20/foundry_prepare.sh --help
+deploy/disagg_pd_r20/foundry_prepare.sh --vm local --mode check
+
+# Live config guardrail, read-only
+kubectl get cm topo-c1-dp2tp4-disagg-r20-config -n dynamo-system -o yaml \
+  | grep -Ei 'foundry|LD_PRELOAD|graph_extension' -C 2
+```
+
+Expected readiness-probe signal on the current VM:
+
+```text
+trtllm_integration=placeholder
+cmake_version=3.26.5
+boost_status=not_found_in_ldconfig
+ld_preload_modified=0
+live_workload_modified=0
+```
+
+No output from the live config grep means the active r20 DGD config does not
+contain Foundry or `LD_PRELOAD` markers.
+
+## Residual Gaps
+
+This audit is complete enough to block wholesale Foundry integration now. The
+remaining work before any runtime integration is external to this patch:
+
+- upstream Foundry TensorRT-LLM hooks or an equivalent local TRT-LLM hook design;
+- CMake 4.0+ / Boost 1.83+ / clean Python+Torch Foundry build environment on the
+  B200 VM or in a dedicated build image;
+- a TensorRT-LLM SAVE/LOAD parity test for TP4 decode and TP2xCP2 LayerSplit
+  prefill;
+- proof that Foundry graph replay composes with NIXL KV transfer, request
+  pinning, dense KVarN, and abort/cleanup paths;
+- `criu-snapshots` live first-token restore proof for the target serving stack,
+  so Foundry can be compared as a residual graph-capture accelerator rather than
+  as a competing fast-start substrate;
+- startup breakdowns showing CUDA graph capture remains a material residual
+  after image-cache, persistent-cache, prewarm, and snapshot fast-start work.
 
 ## Safe Artifact Delivered Here
 
