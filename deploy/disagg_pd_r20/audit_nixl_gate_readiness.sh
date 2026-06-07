@@ -6,8 +6,15 @@ KC="${KC:-sudo -E /usr/local/bin/k3s kubectl -n dynamo-system}"
 MODE="${NIXL_AUDIT_MODE:-live}"
 MIN_MAX_TOKENS_IN_BUFFER="${MIN_MAX_TOKENS_IN_BUFFER:-131072}"
 CHECK_RUNTIME_LIBS="${CHECK_RUNTIME_LIBS:-1}"
+EXPECTED_NIXL_PLUGIN_BACKEND="${EXPECTED_NIXL_PLUGIN_BACKEND:-UCX}"
 SMC_GATE_MODE="${SMC_GATE_MODE:-deferred}"
 OUTPUT_DIR="${NIXL_AUDIT_OUT:-/tmp/nixl_gate_audit_${MODE}_$(date -u +%Y%m%dT%H%M%SZ)_$$}"
+LOCAL_DGD_MANIFEST="${LOCAL_DGD_MANIFEST:-deploy/disagg_pd_r20/topo-c1-dp2tp4-disagg-r20.yaml}"
+
+case "$EXPECTED_NIXL_PLUGIN_BACKEND" in
+  UCX|LIBFABRIC) ;;
+  *) echo "nixl gate audit failed: EXPECTED_NIXL_PLUGIN_BACKEND must be UCX or LIBFABRIC, got $EXPECTED_NIXL_PLUGIN_BACKEND" >&2; exit 2 ;;
+esac
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -52,10 +59,11 @@ reject_regex() {
 }
 
 collect_local() {
-  cat deploy/disagg_pd_r20/topo-c1-dp2tp4-disagg-r20.yaml \
+  [[ -f "$LOCAL_DGD_MANIFEST" ]] || fail "local DGD manifest not found: $LOCAL_DGD_MANIFEST"
+  cat "$LOCAL_DGD_MANIFEST" \
       deploy/disagg_pd_r20/prefill.yaml \
       deploy/disagg_pd_r20/decode.yaml >"$OUTPUT_DIR/config_combined.yaml"
-  cp deploy/disagg_pd_r20/topo-c1-dp2tp4-disagg-r20.yaml "$OUTPUT_DIR/dgd.yaml"
+  cp "$LOCAL_DGD_MANIFEST" "$OUTPUT_DIR/dgd.yaml"
 }
 
 collect_live() {
@@ -103,8 +111,8 @@ require_config_shape() {
   [[ "$(count_fixed 'max_tokens_in_buffer: 131072' "$cfg")" -ge 2 ]] \
     || fail "max_tokens_in_buffer must be at least ${MIN_MAX_TOKENS_IN_BUFFER} for 128k NIXL transfer buffer coverage"
   if [[ "$MODE" == "live" ]]; then
-    require_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND=UCX' "$OUTPUT_DIR/prefill.env" "prefill NIXL UCX plugin backend env"
-    require_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND=UCX' "$OUTPUT_DIR/decode.env" "decode NIXL UCX plugin backend env"
+    require_fixed "TRTLLM_NIXL_KVCACHE_BACKEND=${EXPECTED_NIXL_PLUGIN_BACKEND}" "$OUTPUT_DIR/prefill.env" "prefill NIXL plugin backend env"
+    require_fixed "TRTLLM_NIXL_KVCACHE_BACKEND=${EXPECTED_NIXL_PLUGIN_BACKEND}" "$OUTPUT_DIR/decode.env" "decode NIXL plugin backend env"
     require_fixed 'TRTLLM_NIXL_ENABLE_COALESCE=1' "$OUTPUT_DIR/prefill.env" "prefill NIXL descriptor coalescing env"
     require_fixed 'TRTLLM_NIXL_ENABLE_COALESCE=1' "$OUTPUT_DIR/decode.env" "decode NIXL descriptor coalescing env"
   else
@@ -112,7 +120,7 @@ require_config_shape() {
       || fail "TRTLLM_NIXL_KVCACHE_BACKEND must be explicit on prefill and decode"
     [[ "$(count_fixed 'TRTLLM_NIXL_ENABLE_COALESCE' "$cfg")" -ge 2 ]] \
       || fail "TRTLLM_NIXL_ENABLE_COALESCE must be explicit on prefill and decode"
-    require_fixed 'value: UCX' "$cfg" "NIXL UCX plugin backend value"
+    require_fixed "value: ${EXPECTED_NIXL_PLUGIN_BACKEND}" "$cfg" "NIXL plugin backend value"
     require_fixed "value: '1'" "$cfg" "enabled boolean env values"
   fi
   require_fixed 'UCX_CUDA_IPC_ENABLE_MNNVL' "$cfg" "UCX CUDA IPC MNNVL guard"
@@ -179,6 +187,8 @@ mode=$MODE
 dgd=$DGD
 min_max_tokens_in_buffer=$MIN_MAX_TOKENS_IN_BUFFER
 check_runtime_libs=$CHECK_RUNTIME_LIBS
+expected_nixl_plugin_backend=$EXPECTED_NIXL_PLUGIN_BACKEND
+local_dgd_manifest=$LOCAL_DGD_MANIFEST
 smc_gate_mode=$SMC_GATE_MODE
 status=pass
 EOF_SUMMARY

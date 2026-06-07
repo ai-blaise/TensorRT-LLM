@@ -183,8 +183,11 @@ def test_r20_nixl_gate_readiness_audit_is_read_only_and_fail_closed():
     assert "NIXL_AUDIT_MODE" in script
     assert "CHECK_RUNTIME_LIBS" in script
     assert "MIN_MAX_TOKENS_IN_BUFFER" in script
+    assert "EXPECTED_NIXL_PLUGIN_BACKEND" in script
+    assert "LOCAL_DGD_MANIFEST" in script
     assert "nixl_gate_audit_${MODE}" in script
     assert "TRTLLM_NIXL_KVCACHE_BACKEND" in script
+    assert "UCX|LIBFABRIC" in script
     assert "TRTLLM_NIXL_ENABLE_COALESCE" in script
     assert "max_tokens_in_buffer must be at least" in script
     assert "Initializing NIXL Connect" in script
@@ -198,6 +201,34 @@ def test_r20_nixl_gate_readiness_audit_is_read_only_and_fail_closed():
     assert "find_spec" in script
     assert "nixl" in script
     assert "/v1/completions" not in script
+    assert "kubectl apply" not in script
+    assert "kubectl delete" not in script
+
+
+def test_r20_nixl_plugin_probe_is_no_traffic_and_checks_vram_plugins():
+    script = (DEPLOY_DIR / "probe_nixl_plugins.sh").read_text()
+
+    assert 'PLUGINS="${PLUGINS:-UCX,LIBFABRIC}"' in script
+    assert "getAvailPlugins" in script
+    assert "getPluginParams" in script
+    assert "createBackend" in script
+    assert "VRAM_SEG" in script
+    assert "plugin_probe.json" in script
+    assert "plugin_probe.stderr" in script
+    assert "/v1/completions" not in script
+    assert "kubectl apply" not in script
+    assert "kubectl delete" not in script
+
+
+def test_r20_nixl_plugin_variant_renderer_is_fail_closed():
+    script = (DEPLOY_DIR / "render_nixl_plugin_variant.sh").read_text()
+
+    assert "--plugin UCX|LIBFABRIC" in script
+    assert "TRTLLM_NIXL_KVCACHE_BACKEND" in script
+    assert "backend: UCX" in script
+    assert "backend: MOONCAKE" in script
+    assert "cp_type: HELIX" in script
+    assert "layersplit_transfer_backend: ucx" in script
     assert "kubectl apply" not in script
     assert "kubectl delete" not in script
 

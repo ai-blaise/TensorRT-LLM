@@ -311,6 +311,33 @@ The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
   binding failures on this stack; decode keeps `NCCL_NVLS_ENABLE=1` for the
   non-CP TP4 decode side.
 
+Probe NIXL plugins before considering an alternative plugin backend:
+
+```bash
+PLUGINS=UCX,LIBFABRIC COMPONENT=prefill \
+  deploy/disagg_pd_r20/probe_nixl_plugins.sh
+```
+
+The probe creates NIXL plugin backends in-process and verifies `VRAM_SEG` support
+without sending model traffic. On the current B200 image, both UCX and LIBFABRIC
+can be created, so LIBFABRIC is a valid one-at-a-time NIXL plugin A/B candidate.
+The current probe may emit LIBFABRIC `fi_close fabric failed ... Device or
+resource busy` cleanup warnings; they are captured in `plugin_probe.stderr` and
+are not throughput proof. This is not a promotion claim: run the strict smoke and
+c16 throughput gate before selecting it. Render an unapplied LIBFABRIC variant
+with:
+
+```bash
+deploy/disagg_pd_r20/render_nixl_plugin_variant.sh \
+  --plugin LIBFABRIC \
+  --output /tmp/topo-c1-dp2tp4-disagg-r20-nixl-libfabric.yaml
+
+EXPECTED_NIXL_PLUGIN_BACKEND=LIBFABRIC \
+LOCAL_DGD_MANIFEST=/tmp/topo-c1-dp2tp4-disagg-r20-nixl-libfabric.yaml \
+NIXL_AUDIT_MODE=local \
+  deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
+```
+
 After the audit passes, run the strict smoke. After strict smoke passes, run the
 NIXL c16 gate before any UCX/Mooncake/MORI A/B:
 
