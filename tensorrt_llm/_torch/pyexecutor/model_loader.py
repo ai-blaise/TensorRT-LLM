@@ -90,13 +90,22 @@ def _hf_declares_gqa_kvarn_default(pretrained_config, quant_config: dict) -> boo
     return False
 
 
+def _strict_kvarn_gqa_dtype(value, field: str) -> str:
+    if is_kvarn_gqa_dtype(value):
+        return str(value).lower()
+    raise ValueError(
+        f"HF config field {field}={value!r} is not a supported GQA KVarN "
+        f"dtype. Use {_BLAISE_DEFAULT_GQA_KVARN_DTYPE!r}, disable the GQA "
+        "KVarN block explicitly, or omit dtype to request the production default.")
+
+
 def _hf_kvarn_gqa_kv_dtype(pretrained_config) -> Optional[str]:
     """Return a generic GQA/MHA KVarN KV dtype requested/defaulted by HF config."""
     top_dtype = getattr(pretrained_config, "kv_cache_dtype", None)
     if _is_disabled(top_dtype):
         return None
-    if is_kvarn_gqa_dtype(top_dtype):
-        return str(top_dtype).lower()
+    if top_dtype is not None:
+        return _strict_kvarn_gqa_dtype(top_dtype, "kv_cache_dtype")
 
     quant_config = _as_dict(getattr(pretrained_config, "quantization_config", None)) or {}
     roots = [
@@ -115,16 +124,16 @@ def _hf_kvarn_gqa_kv_dtype(pretrained_config) -> Optional[str]:
             dtype = gqa.get("dtype") or gqa.get("kv_dtype") or gqa.get("kv_cache_dtype")
             if _is_disabled(dtype):
                 return None
-            if is_kvarn_gqa_dtype(dtype):
-                return str(dtype).lower()
-            return _BLAISE_DEFAULT_GQA_KVARN_DTYPE
+            if dtype is None:
+                return _BLAISE_DEFAULT_GQA_KVARN_DTYPE
+            return _strict_kvarn_gqa_dtype(dtype, "quantization_config.kvarn.gqa.dtype")
 
         path = str(root.get("path", "")).lower()
         dtype = root.get("kv_cache_dtype") or root.get("dtype")
         if _is_disabled(dtype):
             return None
-        if is_kvarn_gqa_dtype(dtype) and path not in ("dense_mla", "mla"):
-            return str(dtype).lower()
+        if dtype is not None and path not in ("dense_mla", "mla"):
+            return _strict_kvarn_gqa_dtype(dtype, "quantization_config.kvarn.dtype")
 
     if _hf_declares_gqa_kvarn_default(pretrained_config, quant_config):
         return _BLAISE_DEFAULT_GQA_KVARN_DTYPE

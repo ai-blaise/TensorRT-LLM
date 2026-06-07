@@ -50,6 +50,28 @@ def test_hf_config_can_request_gqa_kvarn():
     assert _hf_kvarn_gqa_kv_dtype(cfg) == "kvarn_k2v2_g128"
 
 
+def test_hf_config_rejects_invalid_explicit_gqa_kvarn_dtype():
+    with pytest.raises(ValueError, match="kv_cache_dtype"):
+        _hf_kvarn_gqa_kv_dtype(SimpleNamespace(kv_cache_dtype="fp8"))
+
+    cfg = SimpleNamespace(
+        quantization_config={
+            "kvarn": {"gqa": {"enabled": True, "dtype": "fp8"}}
+        }
+    )
+    with pytest.raises(ValueError, match="quantization_config.kvarn.gqa.dtype"):
+        _hf_kvarn_gqa_kv_dtype(cfg)
+
+    cfg = SimpleNamespace(quantization_config={"kvarn": {"dtype": "kvarn_k2v2"}})
+    with pytest.raises(ValueError, match="quantization_config.kvarn.dtype"):
+        _hf_kvarn_gqa_kv_dtype(cfg)
+
+
+def test_hf_config_can_disable_top_level_gqa_kvarn():
+    for value in ("false", "disabled", "none", False):
+        assert _hf_kvarn_gqa_kv_dtype(SimpleNamespace(kv_cache_dtype=value)) is None
+
+
 def test_hf_config_defaults_gqa_kvarn_when_model_declares_support():
     cfg = SimpleNamespace(supports_kvarn_gqa=True)
     assert _hf_kvarn_gqa_kv_dtype(cfg) == "kvarn_k2v2_g128"
