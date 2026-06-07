@@ -390,10 +390,17 @@ The probe creates NIXL plugin backends in-process and verifies `VRAM_SEG` suppor
 without sending model traffic. On the current B200 image, both UCX and LIBFABRIC
 can be created, so LIBFABRIC is a valid one-at-a-time NIXL plugin A/B candidate.
 The current probe may emit LIBFABRIC `fi_close fabric failed ... Device or
-resource busy` cleanup warnings; they are captured in `plugin_probe.stderr` and
-are not throughput proof. This is not a promotion claim: run the strict smoke and
-c16 throughput gate before selecting it. Render an unapplied LIBFABRIC variant
-with:
+resource busy` cleanup warnings; they are captured in `plugin_probe.stderr` and are
+not throughput proof. `GDS` and `GDS_MT` can appear in `getAvailPlugins()`, but
+they are storage-oriented plugins rather than the live peer-to-peer KV transfer
+candidate. On this runtime `GDS_MT` returns `NIXL_ERR_NOT_ALLOWED` when probed in
+the same process as the KV candidates, so keep it out of the R20 pre-A/B gate.
+
+This is not a promotion claim: run the strict smoke and c16 throughput gate
+before selecting a plugin. The C++ NIXL transfer agent must also fail closed for
+unsupported plugin names; it may not silently fall back to UCX if an experiment
+misspells or selects an unavailable backend. Render an unapplied LIBFABRIC
+variant with:
 
 ```bash
 deploy/disagg_pd_r20/render_nixl_plugin_variant.sh \

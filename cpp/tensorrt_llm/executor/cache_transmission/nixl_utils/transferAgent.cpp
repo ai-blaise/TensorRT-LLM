@@ -561,8 +561,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
     {
-        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
-        nixlBackend = "UCX";
+        TLLM_THROW("Unsupported NIXL backend: %s. Supported backends: UCX, LIBFABRIC. Refusing implicit UCX fallback.",
+            nixlBackend.c_str());
     }
 
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());

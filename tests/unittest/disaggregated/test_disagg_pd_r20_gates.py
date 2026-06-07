@@ -142,6 +142,16 @@ def test_r20_executor_emits_nixl_transfer_proof_markers():
     assert "cache_blocks=" in source
 
 
+def test_r20_cpp_nixl_backend_selection_rejects_implicit_ucx_fallback():
+    source = (
+        REPO_ROOT / "cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.cpp"
+    ).read_text()
+
+    assert "kSUPPORTED_BACKENDS = {\"UCX\", \"LIBFABRIC\"}" in source
+    assert "Unsupported NIXL backend: %s. Supported backends: UCX, LIBFABRIC" in source
+    assert "fallback to UCX" not in source
+
+
 def test_r20_smc_moondream_decode_pinning_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "speculative" / "smc.py").read_text()
     smoke = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
