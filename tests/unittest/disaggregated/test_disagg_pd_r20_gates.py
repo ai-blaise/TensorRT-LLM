@@ -257,6 +257,8 @@ def test_r20_snapshot_hook_signal_probe_is_canary_only():
     assert "SIGRTMIN+6" in script
     assert "dynamo.trtllm" in script
     assert "optrt_snapshot_*_${phase}.ready.json" in script
+    assert "optrt_snapshot_probe_${CANARY_DGD}_$$_start.marker" in script
+    assert "-newer \"$probe_marker\"" in script
     assert "wait_for_phase_ready pre_snapshot 2 pre" in script
     assert script.index("wait_for_phase_ready pre_snapshot 2 pre") < script.index("signal_worker \"$prefill_pod\" post_restore 6")
     assert "wait_for_phase_ready post_restore 2 post" in script

@@ -178,6 +178,11 @@ PY
   echo "signal_phase=${phase}:pod=${pod}:offset=${offset}"
 }
 
+mkdir -p "$SNAPSHOT_HOOK_PROOF_DIR"
+probe_marker="$SNAPSHOT_HOOK_PROOF_DIR/optrt_snapshot_probe_${CANARY_DGD}_$$_start.marker"
+touch "$probe_marker"
+echo "probe_marker=$probe_marker"
+
 signal_worker "$prefill_pod" pre_snapshot 5
 signal_worker "$decode_pod" pre_snapshot 5
 
@@ -189,12 +194,12 @@ wait_for_phase_ready() {
 
   deadline=$((SECONDS + SIGNAL_TIMEOUT_S))
   while (( SECONDS < deadline )); do
-    count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name "optrt_snapshot_*_${phase}.ready.json" 2>/dev/null | wc -l | tr -d ' ')"
-    err_count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' 2>/dev/null | wc -l | tr -d ' ')"
+    count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -newer "$probe_marker" -name "optrt_snapshot_*_${phase}.ready.json" 2>/dev/null | wc -l | tr -d ' ')"
+    err_count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -newer "$probe_marker" -name 'optrt_snapshot_*.error.json' 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$err_count" != 0 ]]; then
       echo "probe_ready=failed"
       echo "reason=hook_error_files_present"
-      find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' -print
+      find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -newer "$probe_marker" -name 'optrt_snapshot_*.error.json' -print
       exit 4
     fi
     if (( count >= min_count )); then
