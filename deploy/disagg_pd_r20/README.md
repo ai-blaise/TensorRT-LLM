@@ -448,22 +448,35 @@ The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
   binding failures on this stack; decode keeps `NCCL_NVLS_ENABLE=1` for the
   non-CP TP4 decode side.
 
-Probe NIXL plugins before considering an alternative plugin backend:
+Probe NIXL plugins before considering an alternative plugin backend. Use the
+matrix probe first because it creates each backend in a separate `kubectl exec`
+process and records plugin-specific stderr/cleanup behavior without sending model
+traffic:
+
+```bash
+COMPONENT=prefill PLUGINS=UCX,LIBFABRIC,GDS,GDS_MT REQUIRE_PLUGINS=UCX,LIBFABRIC \
+  deploy/disagg_pd_r20/probe_nixl_plugin_matrix.sh
+```
+
+The matrix probe writes per-plugin artifacts under
+`/tmp/nixl_plugin_matrix_<timestamp>` and fails closed only for required plugins.
+The current gate requires UCX and LIBFABRIC to import, create a backend, and expose
+`VRAM_SEG`; non-required GDS/GDS_MT failures are recorded but do not block the
+peer-KV gate. UCX is the immediate NIXL gate plugin when it creates a VRAM-capable
+backend without cleanup stderr. LIBFABRIC remains an A/B-only candidate until a
+strict request-pinning smoke proves endpoint lifecycle and abort cleanup, because
+this runtime can emit `fi_close fabric failed ... Device or resource busy` cleanup
+warnings. `GDS` and `GDS_MT` can appear in `getAvailPlugins()`, but they are
+storage-oriented plugins rather than the live peer-to-peer KV transfer candidate;
+keep them out of the R20 pre-A/B gate unless the design explicitly moves to a
+supported GDS transfer path.
+
+The older combined-process probe is still useful for a compact dependency check:
 
 ```bash
 PLUGINS=UCX,LIBFABRIC COMPONENT=prefill \
   deploy/disagg_pd_r20/probe_nixl_plugins.sh
 ```
-
-The probe creates NIXL plugin backends in-process and verifies `VRAM_SEG` support
-without sending model traffic. On the current B200 image, both UCX and LIBFABRIC
-can be created, so LIBFABRIC is a valid one-at-a-time NIXL plugin A/B candidate.
-The current probe may emit LIBFABRIC `fi_close fabric failed ... Device or
-resource busy` cleanup warnings; they are captured in `plugin_probe.stderr` and are
-not throughput proof. `GDS` and `GDS_MT` can appear in `getAvailPlugins()`, but
-they are storage-oriented plugins rather than the live peer-to-peer KV transfer
-candidate. On this runtime `GDS_MT` returns `NIXL_ERR_NOT_ALLOWED` when probed in
-the same process as the KV candidates, so keep it out of the R20 pre-A/B gate.
 
 This is not a promotion claim: run the strict smoke and c16 throughput gate
 before selecting a plugin. The C++ NIXL transfer agent must also fail closed for

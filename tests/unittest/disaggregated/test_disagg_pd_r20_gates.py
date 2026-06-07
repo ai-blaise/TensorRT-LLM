@@ -301,6 +301,34 @@ def test_r20_nixl_plugin_probe_is_no_traffic_and_checks_vram_plugins():
     assert "kubectl delete" not in script
 
 
+def test_r20_nixl_plugin_matrix_probe_is_no_traffic_and_checks_cleanup():
+    script = (DEPLOY_DIR / "probe_nixl_plugin_matrix.sh").read_text()
+    readme = (DEPLOY_DIR / "README.md").read_text()
+
+    assert 'PLUGINS="${PLUGINS:-UCX,LIBFABRIC,GDS,GDS_MT}"' in script
+    assert 'REQUIRE_PLUGINS="${REQUIRE_PLUGINS:-UCX,LIBFABRIC}"' in script
+    assert "r20_nixl_plugin_matrix_" in script
+    assert "getAvailPlugins" in script
+    assert "getPluginParams" in script
+    assert "createBackend" in script
+    assert "VRAM_SEG" in script
+    assert "cleanup_warning" in script
+    assert "fi_close" in script
+    assert "Device or resource busy" in script
+    assert "current_nixl_gate_plugin" in script
+    assert "ab_candidate_cleanup_risk" in script
+    assert "not_peer_kv_gate" in script
+    assert "summary.json" in script
+    assert "result.json" in script
+    assert "stderr" in script
+    assert "/v1/completions" not in script
+    assert "kubectl apply" not in script
+    assert "kubectl delete" not in script
+    assert "probe_nixl_plugin_matrix.sh" in readme
+    assert "REQUIRE_PLUGINS=UCX,LIBFABRIC" in readme
+    assert "LIBFABRIC remains an A/B-only candidate" in readme
+
+
 def test_r20_nixl_plugin_variant_renderer_is_fail_closed():
     script = (DEPLOY_DIR / "render_nixl_plugin_variant.sh").read_text()
 
