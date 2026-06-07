@@ -620,20 +620,28 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    seq_len: int) -> torch.Tensor:
         sink_blocks = self.cfg.sink_tokens // self.cfg.group
         n_full = int(seq_len) // self.cfg.group
-        physical_blocks: list[int] = []
-        for logical_block in range(sink_blocks, n_full):
-            if logical_block >= len(block_ids):
-                raise RuntimeError(
-                    f"KVarN GQA missing packed decode block id for "
-                    f"logical_block={logical_block} ids={block_ids}")
-            block_start = logical_block * self.cfg.group
-            if not state.is_committed(self.layer_idx, slot, block_start):
-                raise NotImplementedError(
-                    "KVarN GQA packed decode found an uncommitted full block; "
-                    "speculative full-block draft/reject needs multi-tail or "
-                    "rollback-aware packed records before production enablement")
-            physical_blocks.append(int(block_ids[logical_block]))
-        return torch.tensor(physical_blocks, device=state.device, dtype=torch.long)
+        if n_full <= sink_blocks:
+            return torch.empty((0,), device=state.device, dtype=torch.long)
+        if n_full > state.max_committed_blocks:
+            raise RuntimeError(
+                f"KVarN GQA packed decode needs {n_full} block ids, but "
+                f"side-pool capacity is {state.max_committed_blocks}")
+
+        logical = torch.arange(sink_blocks, n_full, device=state.device,
+                               dtype=torch.long)
+        physical = state.block_ids[self.layer_idx, slot].index_select(0, logical)
+        if bool((physical < 0).any().item()):
+            raise RuntimeError(
+                f"KVarN GQA missing packed decode block id for logical range "
+                f"[{sink_blocks}, {n_full}); ids={block_ids}")
+
+        committed = state.committed[self.layer_idx, slot].index_select(0, logical)
+        if not bool(committed.all().item()):
+            raise NotImplementedError(
+                "KVarN GQA packed decode found an uncommitted full block; "
+                "speculative full-block draft/reject needs multi-tail or "
+                "rollback-aware packed records before production enablement")
+        return physical
 
     def _gather_sparse_kv_for_sample(self, k_states: torch.Tensor,
                                      v_states: torch.Tensor,

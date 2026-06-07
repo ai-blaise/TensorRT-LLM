@@ -308,7 +308,8 @@ Required completion:
   path, matching the dense MLA optimization level described in
   `docs/blaise/kvarn.md`. The branch has device-side block-table mirroring,
   physical-block generation tracking, receiver-side generation reconstruction,
-  amortized dequant, and packed decode/sparse-decode kernels that read/dequant
+  amortized dequant, packed decode full-block ids gathered from the mirrored
+  device table, and packed decode/sparse-decode kernels that read/dequant
   in-kernel; live parity/perf proof is still pending.
 - Keep the default production KV contract explicit: dense MLA defaults to
   `kvarn_k2v2`; the SMC-SD GQA draft/target model path must also be deployable

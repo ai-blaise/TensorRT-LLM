@@ -356,6 +356,41 @@ def test_kvarn_gqa_bdr_reconstructs_receiver_physical_generation(monkeypatch):
         0, slot, [], seq_len=3 * cfg.group, kv_pages=kv_pages, amortize=True)
     assert calls == []
 
+
+def test_kvarn_gqa_packed_decode_uses_device_block_table():
+    torch = _TORCH
+    cfg = KVarNGQAConfig(sinkhorn_iters=1)
+    state = _KVarNGQASidePool(
+        cfg,
+        num_layers=1,
+        max_batch_size=1,
+        max_blocks_per_seq=3,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    slot = state.slot_for_request(19)
+    state.update_block_ids(0, slot, [0, 11, 13])
+    state.committed[0, slot, 1:3] = True
+
+    attn = KVarNGQAAttention(0, num_heads=1, head_dim=cfg.head_dim, num_kv_heads=1)
+    attn.cfg = cfg
+
+    physical = attn._packed_decode_full_blocks(
+        state, slot, [], seq_len=3 * cfg.group)
+
+    assert physical.tolist() == [11, 13]
+    assert physical.device == state.block_ids.device
+
+    state.block_ids[0, slot, 2] = -1
+    with pytest.raises(RuntimeError, match="missing packed decode block id"):
+        attn._packed_decode_full_blocks(state, slot, [], seq_len=3 * cfg.group)
+
+    state.block_ids[0, slot, 2] = 13
+    state.committed[0, slot, 2] = False
+    with pytest.raises(NotImplementedError, match="uncommitted full block"):
+        attn._packed_decode_full_blocks(state, slot, [], seq_len=3 * cfg.group)
+
 def test_kvarn_gqa_sparse_kv_gather_is_per_kv_head():
     torch = _TORCH
     from tensorrt_llm._torch.attention_backend.interface import (
