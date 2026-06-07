@@ -35,10 +35,11 @@ back to an unknown-DP broadcast path before A/B testing.
   `ctx_dp_rank is None`. The service-level fail-closed gate prevents normal
   non-MORI traffic from reaching that branch without an explicitly proven
   override.
-- The r20 canary uses the C++ UCX transceiver. Its receive fanout is computed
-  from `DataTransceiverState` and MLA/cache formatter rank layout; request
-  pinning still supplies the stable producer request id and transfer metadata
-  to the executor before `requestAndReceive*` starts.
+- The r20 canary uses the C++ NIXL transceiver as the pre-A/B gate. Its receive
+  fanout is computed from `DataTransceiverState` and MLA/cache formatter rank
+  layout; request pinning still supplies the stable producer request id and
+  transfer metadata to the executor before `requestAndReceive*` starts. UCX is
+  retained only as an A/B comparison candidate.
 - The r20 canary emits request-pinning trace logs at both boundaries:
   `disagg request pin outbound` from the frontend's OpenAI client before it
   sends context/generation requests, and `disagg request pin received` from the
@@ -61,19 +62,20 @@ back to an unknown-DP broadcast path before A/B testing.
   - `cp_config.cp_type: LAYERSPLIT`
   - `sparse_attention_config.layersplit_enabled: true`
   - `sparse_attention_config.layersplit_all_cp_ranks_transfer: true`
+  - `sparse_attention_config.layersplit_owner_local_alloc: true`
+  - `cache_transceiver_config.backend: NIXL`
   - `disable_overlap_scheduler: false`
   - `mla_latent_kv_dtype: kvarn_k2v2`
 - Decode config:
   - `disable_overlap_scheduler: false`
-  - `speculative_config.decoding_type: SMC`
+  - `speculative_config.decoding_type: SMC` for the full production proof; use the explicit `SMC_GATE_MODE=deferred` smoke only while the SMC-SD kernel is behind the NIXL/LayerSplit gate.
   - `moe_config.backend: WARPDECODE`
   - `warp_decode.policy: force`
   - `warp_decode.allow_parallelism_fallback: false`
   - `mla_latent_kv_dtype: kvarn_k2v2`
 - No `cp_type: HELIX` or implicit HELIX fallback.
-- UCX remains explicit only for the current non-MORI baseline image. NIXL,
-  Mooncake, or MORI may replace it only after wrapper availability and E2E
-  throughput wins are proven.
+- NIXL is explicit for the current non-MORI pre-A/B baseline image. UCX,
+  Mooncake, and MORI are A/B-phase comparison candidates rather than gates.
 
 ## Rollout proof points
 
@@ -95,8 +97,8 @@ Collect these from the live rollout before A/B:
 - Prefill/decode engine args show `disable_overlap_scheduler: False`.
 - Prefill engine args show `cp_config={'cp_type': 'LAYERSPLIT'}` and
   `layersplit_enabled: True`.
-- Decode engine args show `decoding_type='SMC'`, WarpDecode enabled with
-  `policy='force'`, and no backend fallback.
+- Full production proof: decode engine args show `decoding_type='SMC'`, WarpDecode enabled with
+  `policy='force'`, and no backend fallback. The temporary NIXL/LayerSplit smoke may run with `SMC_GATE_MODE=deferred`; that mode does not clear the SMC-SD A/B item.
 - KVarN dense MLA shows `mla_latent_kv_dtype='kvarn_k2v2'` and amortized restore.
 - Worker pods have zero restarts through smoke and 16-concurrency warmup.
 
@@ -109,6 +111,9 @@ without putting load on the canary.
 
 ```bash
 deploy/disagg_pd_r20/smoke_request_pinning.sh
+
+# Temporary critical-path smoke while SMC-SD is deferred behind NIXL/LayerSplit:
+SMC_GATE_MODE=deferred deploy/disagg_pd_r20/smoke_request_pinning.sh
 ```
 
 Equivalent manual command sequence:

@@ -1,12 +1,7 @@
 # =============================================================================
 # Disagg P/D r20 -- DECODE worker engine config (cell1 DP2/TP4-disagg winner)
 # 1 decode worker, TP4 / EP4, enable_attention_dp=true, MNNVL, GPUs 4-7.
-# Custom pieces ON for decode: WarpDecode (NVFP4 MoE decode fast path) + SMC-SD
-# (Sequential Monte-Carlo speculative decoding, GLM-4-9B-FP8 draft).
-# Derived from the validated topo-c1-dp2tp4-disagg-smc ConfigMap decode.yaml
-# (deploy/smcsd_fiport/smc_configmap.yaml) + the SMC-SD agg path smc_agg_tp4.yaml
-# (deploy/smcsd_fiport/r12_001/), with WarpDecode flipped ON.
-#
+# Custom piece ON for decode: WarpDecode (NVFP4 MoE decode fast path).
 # WarpDecode ON knobs (warpdecode.md + llm_args.py WarpDecodeConfig):
 #   moe_config.backend: WARPDECODE          -> selects output-owned NVFP4 decode path
 #   moe_config.warp_decode.enabled: true    -> arm the decode fast path
@@ -15,9 +10,7 @@
 #   companion env (set in the manifest pod env): TRTLLM_WARP_DECODE_FIXED_TACTIC=1 (fixed-tactic overlay,
 #     default-on; pins the retuned NVFP4 tactic in-graph) + TRTLLM_ENABLE_PDL=1.
 #
-# SMC-SD ON: speculative_config block below (decode-only). Draft = GLM-4-9B-0414-FP8.
-# Requires NCCL_NET_PLUGIN=none in the worker env (set in the manifest; avoids the
-# libnccl double-free seen on the agg-TP4 SMC path) -- see smc_launch_001.sh.
+# Validate NIXL, LayerSplit, request pinning, WarpDecode, and dense KVarN here.
 # =============================================================================
 backend: pytorch
 tensor_parallel_size: 4
@@ -48,9 +41,9 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.45
   tokens_per_block: 64
 cache_transceiver_config:
-  # Explicit C++ UCX transceiver for the current r20 image. Do not set NIXL
-  # here unless the image also carries libtensorrt_llm_nixl_wrapper.so.
-  backend: UCX
+  # NIXL is the pre-A/B KV-transfer gate.
+  # UCX remains available only as an A/B comparison candidate.
+  backend: NIXL
   max_tokens_in_buffer: 131072
 moe_config:
   backend: WARPDECODE
@@ -84,13 +77,3 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   layersplit_enabled: false        # LayerSplit is the PREFILL piece; off on decode
-speculative_config:
-  decoding_type: SMC
-  speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
-  gamma: 6
-  n_particles: 4
-  resample_threshold: 0.5
-  draft_temperature: 0.7
-  target_temperature: 1.0
-  draft_attention_backend: triton
-  draft_kv_cache_dtype: bfloat16

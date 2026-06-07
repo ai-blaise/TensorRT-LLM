@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=local/dynamo-trtllm-optrt-custom:canonical-smc-r20-cpfix-ucx-20260605
+ARG BASE_IMAGE=local/dynamo-trtllm-optrt-custom:r20-nixl-layersplit-base
 FROM ${BASE_IMAGE}
 USER root
 
@@ -19,6 +19,11 @@ COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor_creator.py ${SI
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/model_engine.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/_util.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/sampler.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/guided_decoder.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/guided_decoder.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/interface.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/interface.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/model_drafter.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/smc.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/speculative/drafting_loops.py ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py
@@ -62,9 +67,14 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
-	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \
-	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \
-	    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py \
+		    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py \
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py \\
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/guided_decoder.py \\
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/interface.py \\
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/model_drafter.py \\
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/smc.py \\
+    ${SITE_PACKAGES}/tensorrt_llm/_torch/speculative/drafting_loops.py \\
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/model_config.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py \

@@ -73,6 +73,20 @@ def test_r20_overlay_carries_layersplit_and_request_pinning_sources():
     assert "tensorrt_llm/disaggregated_params.py" in dockerfile
 
 
+def test_r20_overlay_carries_moondream_smc_overlap_sources():
+    dockerfile = (DEPLOY_DIR / "Dockerfile.r20-overlay").read_text()
+
+    for source in [
+        "tensorrt_llm/_torch/pyexecutor/sampler.py",
+        "tensorrt_llm/_torch/pyexecutor/guided_decoder.py",
+        "tensorrt_llm/_torch/speculative/interface.py",
+        "tensorrt_llm/_torch/speculative/model_drafter.py",
+        "tensorrt_llm/_torch/speculative/smc.py",
+        "tensorrt_llm/_torch/speculative/drafting_loops.py",
+    ]:
+        assert source in dockerfile
+
+
 def test_r20_transceiver_backend_selection_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
 

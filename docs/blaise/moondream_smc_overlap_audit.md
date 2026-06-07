@@ -33,13 +33,19 @@ gate that prevents unknown-DP KV receive fanout before A/B.
   unless `ctx_request_id`, `disagg_request_id`, and `ctx_dp_rank` are present
   and tied to the expected disaggregated request id before decode asks for KV.
   This prevents the Python/native ADP `REQUEST_DATA` broadcast path from being
-  reachable via an unpinned request; the current r20 canary uses C++ UCX, whose
-  exact rank fanout is formatter/layout driven, but the same stable
-  `ContextPhaseParams` metadata is passed to the executor.
+  reachable via an unpinned request; the current r20 pre-A/B gate uses the C++
+  NIXL transceiver, whose exact rank fanout is formatter/layout driven, and the
+  same stable `ContextPhaseParams` metadata is passed to the executor.
 - **Overlay/source parity:** the r20 overlay carries the request-pinning service,
   OpenAI client/server trace points, OpenAI protocol conversion, and
   `DisaggregatedParams` dataclass together, so `ctx_dp_rank` serialization is
   not dependent on whatever happens to be present in the base runtime image.
+- **Moondream/SMC overlay source parity:** the r20 overlay now explicitly
+  carries `sampler.py`, `guided_decoder.py`, `speculative/interface.py`,
+  `speculative/model_drafter.py`, `speculative/smc.py`, and
+  `speculative/drafting_loops.py`, and the r20 gate test asserts those COPY
+  entries so SMC overlap/pinning cannot silently disappear in a thin overlay
+  rebuild.
 - **Live proof gate:** `deploy/disagg_pd_r20/smoke_request_pinning.sh` is the
   canonical pre-A/B smoke. It refuses to run before DGD/endpoints are ready,
   sends one normal request and one early-closed stream, then requires matching
@@ -78,13 +84,12 @@ are in `tests/unittest/disaggregated/test_disagg_pd_r20_gates.py`.
   covered by metadata preservation here; the GQA path now has packed-record
   primitives and HF config admission work, but still needs full production E2E
   proof before it can replace dense MLA KVarN in this canary.
-- **MORI/NIXL/Mooncake transport wins are not proven here.** This audit does not
-  replace the separate transport benchmark/integration gate.
-- **Current gen56 live blocker:** the `dcbf218` rollout had the right installed
-  request-pinning and SMC overlap sources, but decode had not become ready before
-  smoke. The observed restart was in C++ `CacheTransceiver` teardown with
-  `cudaStreamDestroy(... illegal memory access)`, so live request-pin proof must
-  wait for a ready decode endpoint and zero-restart smoke.
+- **Transport wins are not proven here.** This audit does not replace the NIXL
+  pre-A/B gate or the later UCX/Mooncake/MORI A/B transport benchmark.
+- **Current live SMC blocker:** SMC-SD decode is no longer on the immediate gate
+  path. The next live proof should validate LayerSplit, NIXL transfer, and
+  request pinning first, then re-enable SMC-SD for A/B once the GLM draft-kernel
+  path is stable.
 
 ## Rollout log signals to check
 
