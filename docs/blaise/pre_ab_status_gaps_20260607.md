@@ -309,8 +309,8 @@ Required completion:
   `docs/blaise/kvarn.md`. The branch has device-side block-table mirroring,
   physical-block generation tracking, receiver-side generation reconstruction,
   amortized dequant, packed decode full-block ids gathered from the mirrored
-  device table, and packed decode/sparse-decode kernels that read/dequant
-  in-kernel; live parity/perf proof is still pending.
+  device table with async CUDA validation, and packed decode/sparse-decode
+  kernels that read/dequant in-kernel; live parity/perf proof is still pending.
 - Keep the default production KV contract explicit: dense MLA defaults to
   `kvarn_k2v2`; the SMC-SD GQA draft/target model path must also be deployable
   from Hugging Face config with `kvarn_k2v2_g128` as its default once the backend
