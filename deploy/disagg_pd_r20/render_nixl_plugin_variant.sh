@@ -68,4 +68,5 @@ print(dst)
 PY_RENDER
 
 echo "rendered NIXL ${PLUGIN} plugin variant: $OUTPUT"
-echo "validate locally with: EXPECTED_NIXL_PLUGIN_BACKEND=$PLUGIN LOCAL_DGD_MANIFEST=$OUTPUT NIXL_AUDIT_MODE=local NIXL_AUDIT_OUT=/tmp/nixl_${PLUGIN,,}_local_audit deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh"
+plugin_lower="$(printf '%s' "$PLUGIN" | tr '[:upper:]' '[:lower:]')"
+echo "validate locally with: EXPECTED_NIXL_PLUGIN_BACKEND=$PLUGIN LOCAL_DGD_MANIFEST=$OUTPUT NIXL_AUDIT_MODE=local NIXL_AUDIT_OUT=/tmp/nixl_${plugin_lower}_local_audit deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh"

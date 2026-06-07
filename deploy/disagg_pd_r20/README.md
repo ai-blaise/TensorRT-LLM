@@ -518,9 +518,12 @@ The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
 - `cache_transceiver_config.max_tokens_in_buffer: 131072` on both prefill and
   decode. TRT-LLM C++ warns that dynamic transfer buffers can fail with NIXL;
   the pre-registered buffer must cover the 128k ISL target.
-- `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` on both workers. This selects the
-  NIXL libfabric plugin explicitly, avoiding the old direct UCX cache
-  transceiver and keeping the UCX NIXL plugin as an A/B-only candidate.
+- `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` on both workers. This still selects the
+  NIXL transfer runtime, not the old direct UCX cache transceiver. On the GCP
+  B200 r20 nodes, the NIXL LIBFABRIC plugin can create a backend but actual
+  VRAM registration fails because the available libfabric providers do not
+  expose a working HMEM path; the NIXL UCX plugin has passed the focused VRAM
+  side-state transfer probe with zero mismatches.
 - `TRTLLM_NIXL_ENABLE_COALESCE=1` on both workers. NIXL coalesces contiguous
   VMM-split descriptors during registration, deregistration, and transfer request
   creation, reducing descriptor count and hot-path overhead.
@@ -549,19 +552,18 @@ COMPONENT=prefill PLUGINS=UCX,LIBFABRIC,GDS,GDS_MT REQUIRE_PLUGINS=UCX,LIBFABRIC
 
 The matrix probe writes per-plugin artifacts under
 `/tmp/nixl_plugin_matrix_<timestamp>` and fails closed only for required plugins.
-The current gate requires UCX and LIBFABRIC to import, create a backend, and expose
-`VRAM_SEG`; non-required GDS/GDS_MT failures are recorded but do not block the
-peer-KV gate. LIBFABRIC is the immediate NIXL gate plugin because it creates a
-VRAM-capable backend while avoiding the direct UCX transceiver path. UCX remains
-available only as an A/B comparison candidate; do not switch the gate back to UCX
-without strict request-pinning smoke plus C16 throughput evidence. If LIBFABRIC
-emits `fi_close fabric failed ... Device or resource busy` cleanup warnings, keep
-the warning in the probe artifacts and require the strict smoke/abort-cleanup gate
-to pass before promotion. `GDS` and `GDS_MT` can appear in `getAvailPlugins()`,
-but they are storage-oriented plugins rather than the live peer-to-peer KV
-transfer candidate; keep them out of the R20 pre-A/B gate unless the design
-explicitly moves to a
-supported GDS transfer path.
+The current gate requires UCX and LIBFABRIC to import, create a backend, and
+expose `VRAM_SEG`; non-required GDS/GDS_MT failures are recorded but do not
+block the peer-KV gate. Backend creation alone is not a promotion claim. On the
+GCP B200 r20 nodes, live LIBFABRIC registration failed with `provider does not
+support FI_HMEM` followed by `registerMem` failure, while the focused NIXL UCX
+VRAM side-state probe completed with zero mismatches. Therefore the immediate
+pre-A/B peer-KV gate is the NIXL UCX plugin, with LIBFABRIC demoted to an A/B or
+provider-fix candidate until real VRAM registration and strict smoke pass.
+`GDS` and `GDS_MT` can appear in `getAvailPlugins()`, but they are
+storage-oriented plugins rather than the live peer-to-peer KV transfer
+candidate; keep them out of the R20 pre-A/B gate unless the design explicitly
+moves to a supported GDS transfer path.
 
 The older combined-process probe is still useful for a compact dependency check:
 
@@ -583,6 +585,19 @@ deploy/disagg_pd_r20/render_nixl_plugin_variant.sh \
 
 EXPECTED_NIXL_PLUGIN_BACKEND=LIBFABRIC \
 LOCAL_DGD_MANIFEST=/tmp/topo-c1-dp2tp4-disagg-r20-nixl-libfabric.yaml \
+NIXL_AUDIT_MODE=local \
+  deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
+```
+
+Render the current NIXL UCX gate variant with:
+
+```bash
+deploy/disagg_pd_r20/render_nixl_plugin_variant.sh \
+  --plugin UCX \
+  --output /tmp/topo-c1-dp2tp4-disagg-r20-nixl-ucx.yaml
+
+EXPECTED_NIXL_PLUGIN_BACKEND=UCX \
+LOCAL_DGD_MANIFEST=/tmp/topo-c1-dp2tp4-disagg-r20-nixl-ucx.yaml \
 NIXL_AUDIT_MODE=local \
   deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
 ```

@@ -263,7 +263,7 @@ spec:
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
         value: '0'
       - name: TRTLLM_NIXL_KVCACHE_BACKEND
-        value: LIBFABRIC
+        value: UCX
       - name: TRTLLM_NIXL_ENABLE_COALESCE
         value: '1'
       - name: TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP
@@ -448,7 +448,7 @@ spec:
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
         value: '0'
       - name: TRTLLM_NIXL_KVCACHE_BACKEND
-        value: LIBFABRIC
+        value: UCX
       - name: TRTLLM_NIXL_ENABLE_COALESCE
         value: '1'
       - name: TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP

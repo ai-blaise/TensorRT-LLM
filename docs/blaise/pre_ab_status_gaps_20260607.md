@@ -149,10 +149,14 @@ Current NIXL gate state:
 - The image now explicitly installs `msgpack`, and the smoke/audit check the
   native Python transfer import path so `transceiver_runtime: PYTHON` cannot be
   marked ready while its transfer worker dependency chain is broken.
-- The r20 gate now defaults to the NIXL libfabric plugin
-  (`TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`), not direct UCX and not the NIXL UCX
-  plugin. UCX, Mooncake, and MORI-IO remain A/B candidates until they prove
-  equal or better correctness and throughput under the same custom stack.
+- The r20 gate now defaults to the NIXL runtime with the UCX plugin
+  (`TRTLLM_NIXL_KVCACHE_BACKEND=UCX`), not the old direct UCX cache
+  transceiver. The GCP B200 libfabric provider set can create the NIXL
+  LIBFABRIC backend but failed live VRAM registration with missing HMEM support;
+  the focused NIXL UCX VRAM side-state probe completed with zero mismatches.
+  LIBFABRIC, Mooncake, and MORI-IO remain A/B/provider-fix candidates until
+  they prove equal or better correctness and throughput under the same custom
+  stack.
 
 Reference: https://github.com/ai-blaise/dynamo-prod-k8s/tree/main/docs/api/nixl-connect
 
