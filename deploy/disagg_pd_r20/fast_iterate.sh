@@ -14,6 +14,7 @@ SYNC=1
 FULL_SYNC=0
 BUILD=1
 PREWARM=0
+DRY_RUN=0
 USE_LOCAL_REGISTRY=0
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-localhost:5000}"
 LOCAL_REGISTRY_MODE="${LOCAL_REGISTRY_MODE:-push}"
@@ -49,6 +50,8 @@ Options:
   --deploy              Apply the DGD after build/import
   --prewarm             Run the lightweight cache/model visibility prewarm job
                         after build and before deploy
+  --dry-run             Print the resolved sync/build/deploy plan and exit before
+                        SSH, sync, build, prewarm, or deploy
   --use-local-registry  Tag the thin image with a VM-local registry name and
                         render pods with imagePullPolicy=IfNotPresent
   --local-registry HOST Registry host:port (default: $LOCAL_REGISTRY)
@@ -80,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --required-transport-wrappers) REQUIRED_TRANSPORT_WRAPPERS="$2"; shift 2 ;;
     --deploy) DEPLOY=1; shift ;;
     --prewarm) PREWARM=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --use-local-registry) USE_LOCAL_REGISTRY=1; shift ;;
     --local-registry) LOCAL_REGISTRY="$2"; shift 2 ;;
     --local-registry-mode) LOCAL_REGISTRY_MODE="$2"; shift 2 ;;
@@ -116,6 +120,55 @@ if [[ "$LOCAL_REGISTRY_MODE" == "resident" && "$USE_LOCAL_REGISTRY" != 1 ]]; the
   exit 2
 fi
 SSH_TARGET="${VM_USER}@${VM_HOST}"
+
+if [[ "$DRY_RUN" == 1 ]]; then
+  OVERLAY_SYNC_PATHS=(deploy .dockerignore)
+  while IFS= read -r overlay_path; do
+    OVERLAY_SYNC_PATHS+=("$overlay_path")
+  done < <(
+    awk '
+      /^COPY[[:space:]]/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^tensorrt_llm\//) {
+            print $i
+          }
+        }
+      }
+    ' deploy/disagg_pd_r20/Dockerfile.r20-overlay
+  )
+  image_pull_policy="Never"
+  if [[ "$USE_LOCAL_REGISTRY" == 1 ]]; then
+    image_pull_policy="IfNotPresent"
+  fi
+  cat <<EOF
+fast_iterate_dry_run=1
+root_dir=$ROOT_DIR
+vm_host=$VM_HOST
+vm_user=$VM_USER
+remote_repo=$REMOTE_REPO
+sync=$SYNC
+full_sync=$FULL_SYNC
+build=$BUILD
+prewarm=$PREWARM
+deploy=$DEPLOY
+dgd_name=$DGD_NAME
+target_node=$TARGET_NODE
+base_image=$BASE_IMAGE
+image_tag=$IMAGE_TAG
+deploy_image_tag=$DEPLOY_IMAGE_TAG
+image_pull_policy=$image_pull_policy
+use_local_registry=$USE_LOCAL_REGISTRY
+local_registry=$LOCAL_REGISTRY
+local_registry_mode=$LOCAL_REGISTRY_MODE
+allow_chained_overlay=$ALLOW_CHAINED_OVERLAY
+required_transport_wrappers=$REQUIRED_TRANSPORT_WRAPPERS
+overlay_sync_path_count=${#OVERLAY_SYNC_PATHS[@]}
+EOF
+  printf 'overlay_sync_paths='
+  printf '%s ' "${OVERLAY_SYNC_PATHS[@]}"
+  printf '\n'
+  exit 0
+fi
 
 if [[ "$SYNC" == 1 ]]; then
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "mkdir -p '$REMOTE_REPO'"

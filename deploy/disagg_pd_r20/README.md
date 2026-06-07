@@ -87,6 +87,22 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --tag-suffix swapab-host
 ```
 
+Render the resolved plan without SSH, sync, build, prewarm, or deploy. This is
+useful for checking local-registry/resident-mode tags before touching an active
+DGD:
+
+```bash
+deploy/disagg_pd_r20/fast_iterate.sh \
+  --vm 34.106.33.128 \
+  --target-node a4-us-001-rl9 \
+  --tag-suffix plan-check \
+  --use-local-registry \
+  --local-registry-mode resident \
+  --prewarm \
+  --deploy \
+  --dry-run
+```
+
 Build and apply the main DGD:
 
 ```bash
