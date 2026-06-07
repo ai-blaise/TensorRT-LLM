@@ -8,22 +8,22 @@ smoke-response, readiness result, or partial marker as production completion.
 ## Live deployment snapshot
 
 - Repo/branch: `ai-blaise/TensorRT-LLM`, branch `op-trt`.
-- Current pushed head before this doc refresh: `16daf92b3`
-  (`test(r20): accept quoted pin handoff markers`). This includes
-  `10d304924` (`fix(nixl): stamp C++ prefill pin endpoint`) plus the later
-  NIXL fail-closed, SMC/Moondream pinned-handoff, image-reuse, prewarm
-  dry-run, snapshot-composition, gap-status, and strict-smoke parsing commits.
+- Current pushed head before this doc refresh: `45a05fe19`
+  (`fix(nixl): preserve sender future timeout config`). This includes the
+  earlier NIXL fail-closed, SMC/Moondream pinned-handoff, image-reuse,
+  prewarm dry-run, snapshot-composition, gap-status, strict-smoke parsing,
+  idle-transfer-poll, stream-drain, strict preflight, NIXL plugin probe, and
+  sender future timeout preservation commits.
 - Live DGD: `topo-c1-dp2tp4-disagg-r20` in namespace `dynamo-system`.
-- Current DGD generation/observed generation: `99/99`; state `successful`.
+- Current DGD generation: `100`; DGD readiness is `True`.
 - Current live image:
-  `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-16daf92b33fc-idlepoll-streamdrain-nixlpin-overlay-20260607111918`.
+  `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-45a05fe19409-fullsrc45a-nixlpin-20260607T114045Z`.
 - Current live image digest:
-  `sha256:4f28e00ed645bd02f309507d7079b8c3debefde509fcc604149358f76e8535d5`.
-- Important image caveat: this is an endpoint-fixed full-source TensorRT-LLM
-  base plus a Python/config overlay for the stream-drain, idle-transfer-poll,
-  and stricter-smoke fixes. That is acceptable for this gate because the latest
-  changes are Python/shell/test/doc only. ABI-affecting C++/CUDA changes still
-  require a new full source build rather than a thin overlay.
+  `sha256:14a2a2b26ad75533f868ab6f900b9545c9f09163efec07c9c4c0d9b9541737d4`.
+- Image note: this is a full source TensorRT-LLM image built from `45a05fe19`,
+  not a thin overlay. It includes the C++/nanobind sender future timeout
+  preservation fix as well as the Python stream-drain and idle-transfer-poll
+  fixes.
 - Topology: one prefill worker on four B200 GPUs and one decode worker on four
   B200 GPUs, plus the Dynamo KV frontend.
 - Live readiness: frontend, prefill, and decode are `1/1 Running` with zero
@@ -57,13 +57,15 @@ SMC_GATE_MODE=deferred \
 ```
 
 Latest live result: green for the NIXL/request-pinning pre-A/B correctness
-gate on generation 99.
+gate on generation 100 using the full-source `45a05fe19` image.
 
 - Live NIXL audit passed:
-  `/tmp/nixl_gate_audit_live_20260607T112933Z_1651232`.
+  `/tmp/nixl_gate_audit_live_20260607T121624Z_2312782`.
+- Strict preflight passed before deploy:
+  `/tmp/r20-strict-smoke-preflight-fullsrc45a-20260607T114045Z`.
 - Strict smoke passed with:
-  `prefill=('8004734197287829', '0')`,
-  `decode=('5083464766601898', '1')`,
+  `prefill=('8531764574012418', '0')`,
+  `decode=('8849396450087062', '0')`,
   `dynamo_required=True`,
   `established=2`,
   `outbound=2`,
@@ -71,12 +73,13 @@ gate on generation 99.
   `cleanup_scheduled=1`,
   `positive_transfer_metrics=2`.
 - The checked pod set was ready and zero-restart:
-  `topo-c1-dp2tp4-disagg-r20-0-frontend-qgsng`,
-  `topo-c1-dp2tp4-disagg-r20-0-prefill-5k7jw`, and
-  `topo-c1-dp2tp4-disagg-r20-0-decode-rkwqf`.
-- Final log sanity after the smoke showed both smoke request ids had
-  `context_send_start` and `context_send_complete` on prefill, `gen_recv_start`
-  on decode, and no `KV cache transfer timeout` in the checked window.
+  `topo-c1-dp2tp4-disagg-r20-0-frontend-9ptgb`,
+  `topo-c1-dp2tp4-disagg-r20-0-prefill-c6hdf`, and
+  `topo-c1-dp2tp4-disagg-r20-0-decode-xrtt6`.
+- Final log sanity after the smoke showed smoke request ids `6310396876148736`
+  and `6310572160307201` had four CP-rank `context_send_start` entries and
+  matching `context_send_complete` entries on prefill, `gen_recv_start` on
+  decode, and no `KV cache transfer timeout` in the checked window.
 
 The previous gen88/gen89 `KV cache transfer timeout` bug remains a historical
 hard dependency. It is now covered by two fixes: cancelled/not-ready sender
