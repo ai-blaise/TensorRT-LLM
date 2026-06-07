@@ -1,4 +1,5 @@
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -143,6 +144,79 @@ def test_r20_snapshot_hooks_are_opt_in_and_readiness_checked():
     assert "trtllm_snapshot_hook_status configured" in readiness
     assert "optrt_snapshot_*_pre_snapshot.ready.json" in readiness
     assert "optrt_snapshot_*_post_restore.ready.json" in readiness
+
+
+def test_r20_render_snapshot_hooks_are_canary_only(tmp_path):
+    script = DEPLOY_DIR / "render_dgd.sh"
+    image = "localhost:5000/local/dynamo-trtllm-optrt-custom:test"
+    default_out = tmp_path / "default.yaml"
+    hook_out = tmp_path / "hook.yaml"
+    hook_dir = "/tmp/optrt-snapshot-hooks-canary"
+
+    subprocess.run(
+        [
+            str(script),
+            "--image",
+            image,
+            "--dgd-name",
+            "topo-c1-dp2tp4-disagg-r20",
+            "--out",
+            str(default_out),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    default_text = default_out.read_text()
+    assert "OPTRT_SNAPSHOT_HOOKS" not in default_text
+    assert "optrt-snapshot-hooks" not in default_text
+    assert "${SNAPSHOT_HOOK_" not in default_text
+
+    subprocess.run(
+        [
+            str(script),
+            "--image",
+            image,
+            "--dgd-name",
+            "topo-c1-dp2tp4-hook-canary",
+            "--enable-snapshot-hooks",
+            "--snapshot-hook-proof-dir",
+            hook_dir,
+            "--snapshot-hook-timeout-s",
+            "60",
+            "--out",
+            str(hook_out),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    docs = list(yaml.safe_load_all(hook_out.read_text()))
+    dgd = next(doc for doc in docs if doc and doc["kind"] == "DynamoGraphDeployment")
+    services = dgd["spec"]["services"]
+
+    for component in ["prefill", "decode"]:
+        envs = {item["name"]: item["value"] for item in services[component]["envs"]}
+        assert envs["OPTRT_SNAPSHOT_HOOKS"] == "1"
+        assert envs["OPTRT_SNAPSHOT_HOOK_DIR"] == hook_dir
+        assert envs["OPTRT_SNAPSHOT_HOOK_TIMEOUT_S"] == "60"
+        assert envs["DYN_COMPONENT"] == component
+
+        pod_spec = services[component]["extraPodSpec"]
+        mounts = pod_spec["mainContainer"]["volumeMounts"]
+        assert {"mountPath": hook_dir, "name": "optrt-snapshot-hooks"} in mounts
+        init_mounts = pod_spec["initContainers"][0]["volumeMounts"]
+        assert {"mountPath": hook_dir, "name": "optrt-snapshot-hooks"} in init_mounts
+        volumes = pod_spec["volumes"]
+        assert {
+            "name": "optrt-snapshot-hooks",
+            "hostPath": {"path": hook_dir, "type": "DirectoryOrCreate"},
+        } in volumes
+
+    frontend_text = yaml.dump(services["Frontend"])
+    assert "OPTRT_SNAPSHOT_HOOKS" not in frontend_text
 
 
 def test_r20_transceiver_backend_selection_is_fail_closed():

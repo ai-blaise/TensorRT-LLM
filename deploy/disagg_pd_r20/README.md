@@ -382,6 +382,24 @@ gated TensorRT-LLM pre-snapshot/post-restore hook and the proof gates in
 LayerSplit TP2xCP2 restore, dense KVarN/CUDA graph scratch restore, and
 `checkpointctl` restore-image tooling.
 
+Render a separate hook-enabled canary when validating the hook substrate. This
+does not change the default production render:
+
+```bash
+deploy/disagg_pd_r20/render_dgd.sh \
+  --image-from-dgd topo-c1-dp2tp4-disagg-r20 \
+  --dgd-name topo-c1-dp2tp4-hook-canary \
+  --enable-snapshot-hooks \
+  --snapshot-hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --server-dry-run
+```
+
+The hook render adds `OPTRT_SNAPSHOT_HOOKS=1`, `DYN_COMPONENT=prefill|decode`,
+and a writable hostPath proof directory only to the prefill/decode workers. Run
+`snapshot_readiness.sh --dgd-name topo-c1-dp2tp4-hook-canary
+--hook-proof-dir /tmp/optrt-snapshot-hooks-canary --strict` after the canary
+has generated both pre-snapshot and post-restore proof files.
+
 ## Knob provenance
 
 - WarpDecode: `tensorrt_llm/llmapi/llm_args.py` `WarpDecodeConfig`

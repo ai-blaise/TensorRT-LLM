@@ -89,8 +89,20 @@ Proof commands:
 # Offline/unit proof, no live pod mutation.
 python3 -m pytest tests/unittest/disaggregated/test_snapshot_hooks.py
 
-# Canary image proof only after unit tests pass.
-deploy/disagg_pd_r20/snapshot_readiness.sh --vm local --strict
+# Render-only canary validation. This does not apply or mutate a live DGD.
+deploy/disagg_pd_r20/render_dgd.sh \
+  --image-from-dgd topo-c1-dp2tp4-disagg-r20 \
+  --dgd-name topo-c1-dp2tp4-hook-canary \
+  --enable-snapshot-hooks \
+  --snapshot-hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --server-dry-run
+
+# Canary readiness proof after the hook-enabled DGD has generated proof files.
+deploy/disagg_pd_r20/snapshot_readiness.sh \
+  --vm local \
+  --dgd-name topo-c1-dp2tp4-hook-canary \
+  --hook-proof-dir /tmp/optrt-snapshot-hooks-canary \
+  --strict
 ```
 
 Pass criteria:
