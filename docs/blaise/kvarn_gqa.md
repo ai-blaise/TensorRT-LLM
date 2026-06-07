@@ -369,8 +369,8 @@ Current focused coverage:
   checker for THOP schema fragments, fused-op readiness surface, fail-closed
   readiness guard, BDR/device-table hooks, NIXL side-state fragment wiring,
   graph/sparse benchmark gates, the no-GPU `--dry-run` proof matrix, and
-  dense-MLA/Indexer separation. It runs without importing TensorRT-LLM Python
-  bindings.
+  source-level GQA/dense-MLA/Indexer config separation. It runs without
+  importing TensorRT-LLM Python bindings.
 - `benchmarks/python/bench_kvarn_gqa_micro.py`: light pack/restore/reference
   scoring timing for `M in {1,5,25}`. It enforces a restore-cosine floor and
   supports `--require-fused`, which fails until real

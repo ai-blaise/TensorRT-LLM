@@ -34,6 +34,18 @@ REQUIRED_MODEL_LOADER_SNIPPETS = (
     'sparse_attention_config.mla_latent_kv_dtype',
 )
 
+REQUIRED_CONFIG_SEPARATION_SNIPPETS = (
+    '"The data type to use for the generic GQA/MHA KV cache. Use \'auto\' "',
+    '"KVarN GQA dtypes use \'kvarn_k<key_bits>v<value_bits>_g<group>\' "',
+    '"MLA mla_latent_kv_dtype."',
+    '"kv_cache_config.dtype KVarN values require tokens_per_block=128 "',
+    '"Draft KV cache dtype. Supports auto, bfloat16, fp8_e4m3, "',
+    '"the SMC-SD GLM draft KV path."',
+    '"Indexer storage remains controlled by indexer_k_dtype."',
+    '"a dense-MLA KVarN read-path optimization; it does not change Indexer "',
+    '"indexcache-hisa requires indexer_k_dtype=\'fp4\'."',
+)
+
 REQUIRED_GQA_ATTENTION_SNIPPETS = (
     'self.block_ids = torch.full',
     'def restore_committed_blocks_amortized',
@@ -92,6 +104,7 @@ def main() -> None:
     thop = (repo / "cpp/tensorrt_llm/thop/kvarnGqaOp.cpp").read_text()
     kernels = (repo / "cpp/tensorrt_llm/kernels/kvarnGqaKernels.cu").read_text()
     loader = (repo / "tensorrt_llm/_torch/pyexecutor/model_loader.py").read_text()
+    llm_args = (repo / "tensorrt_llm/llmapi/llm_args.py").read_text()
     gqa = (repo / "tensorrt_llm/_torch/attention_backend/kvarn_gqa_attention.py").read_text()
     rank_info = (repo / "tensorrt_llm/_torch/disaggregation/native/rank_info.py").read_text()
     transfer = (repo / "tensorrt_llm/_torch/disaggregation/native/transfer.py").read_text()
@@ -102,6 +115,8 @@ def main() -> None:
         require_contains(thop, schema, "THOP schema")
     for snippet in REQUIRED_MODEL_LOADER_SNIPPETS:
         require_contains(loader, snippet, "model_loader gate")
+    for snippet in REQUIRED_CONFIG_SEPARATION_SNIPPETS:
+        require_contains(llm_args, snippet, "GQA/dense-MLA/Indexer config separation")
     for snippet in REQUIRED_GQA_ATTENTION_SNIPPETS:
         require_contains(gqa, snippet, "GQA attention path")
     disagg = rank_info + "\n" + transfer
