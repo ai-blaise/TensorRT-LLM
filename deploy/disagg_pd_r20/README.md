@@ -630,9 +630,13 @@ The gate pins `cache_transceiver_config.backend: NIXL`,
 Python import path (`nixl`, `msgpack`, and
 `tensorrt_llm._torch.disaggregation.native.transfer`) plus frontend
 `handoff_mode="generation_first"` markers; completed-prefill markers fail the
-NIXL write-mode gate. The gate defaults to the NIXL `LIBFABRIC` plugin; the
-NIXL `UCX` plugin remains available only as an A/B comparison candidate. The
-gate is fail-closed: explicit YAML backend selection
+NIXL write-mode gate. The current B200 pre-A/B peer-KV gate defaults to the
+NIXL runtime with the `UCX` plugin because the local libfabric provider set can
+create a NIXL backend but failed real VRAM registration on this fleet. The old
+direct UCX transceiver remains out of the gate; this is still the NIXL
+transceiver path. LIBFABRIC, Mooncake, direct UCX, and MORI-IO remain A/B or
+provider-fix candidates until they prove correctness and throughput under the
+same custom stack. The gate is fail-closed: explicit YAML backend selection
 wins over legacy `TRTLLM_USE_*_KVCACHE` environment toggles, conflicting UCX /
 Mooncake / MPI env selectors are rejected, and the smoke requires startup logs
 showing `Initializing NIXL Connect`, `cache_transceiver_config.backend=NIXL`,

@@ -27,6 +27,13 @@ class SideEntry:
     dst_tensor: object
 
 
+@dataclass
+class RegEntry:
+    name: str
+    ptr: int
+    size: int
+
+
 def _side_shapes(layers: int, slots: int, sink: int, group: int, kv_heads: int, head_dim: int):
     return {
         "sink_k": (layers, slots, sink, kv_heads, head_dim),
@@ -63,11 +70,12 @@ def dry_run(args: argparse.Namespace) -> None:
     print(
         f"KVARN_GQA_NIXL_SIDE_DRY_RUN layers={args.layers} slots={args.slots} "
         f"src_slot={args.src_slot} dst_slot={args.dst_slot} fragments={args.layers * 9} "
-        f"slot_bytes={total} backend={args.backend} op={args.op} memory={args.memory}"
+        f"slot_bytes={total} backend={args.backend} op={args.op} memory={args.memory} "
+        f"register_mode={args.register_mode}"
     )
 
 
-def _make_entries(torch, args: argparse.Namespace, device) -> list[SideEntry]:
+def _make_entries(torch, args: argparse.Namespace, device) -> tuple[list[SideEntry], list[RegEntry], list[RegEntry]]:
     dtypes = {
         "sink_k": torch.float16,
         "sink_v": torch.float16,
@@ -80,6 +88,8 @@ def _make_entries(torch, args: argparse.Namespace, device) -> list[SideEntry]:
         "commit_gen": torch.int64,
     }
     entries: list[SideEntry] = []
+    src_whole_regs: list[RegEntry] = []
+    dst_whole_regs: list[RegEntry] = []
     for name, shape in _side_shapes(args.layers, args.slots, args.sink_tokens, args.group,
                                     args.kv_heads, args.head_dim).items():
         dtype = dtypes[name]
@@ -95,6 +105,13 @@ def _make_entries(torch, args: argparse.Namespace, device) -> list[SideEntry]:
             src.copy_((torch.arange(src.numel(), device=device, dtype=torch.float32).reshape(shape) % 127).to(dtype))
             dst.zero_()
         for layer in range(args.layers):
+            whole_src_view = src[layer, 0]
+            whole_dst_view = dst[layer, 0]
+            whole_item_size = int(whole_src_view.numel() * whole_src_view.element_size())
+            src_whole_regs.append(RegEntry(f"layer{layer}.{name}", int(whole_src_view.data_ptr()),
+                                           whole_item_size * args.slots))
+            dst_whole_regs.append(RegEntry(f"layer{layer}.{name}", int(whole_dst_view.data_ptr()),
+                                           whole_item_size * args.slots))
             src_view = src[layer, args.src_slot]
             dst_view = dst[layer, args.dst_slot]
             item_size = int(src_view.numel() * src_view.element_size())
@@ -106,15 +123,22 @@ def _make_entries(torch, args: argparse.Namespace, device) -> list[SideEntry]:
                 src_tensor=src_view,
                 dst_tensor=dst_view,
             ))
-    return entries
+    return entries, src_whole_regs, dst_whole_regs
 
 
-def _register_descs(entries: Iterable[SideEntry], mem_type: str):
+def _fragment_reg_entries(entries: Iterable[SideEntry]) -> tuple[list[RegEntry], list[RegEntry]]:
+    return (
+        [RegEntry(e.name, e.src_ptr, e.item_size) for e in entries],
+        [RegEntry(e.name, e.dst_ptr, e.item_size) for e in entries],
+    )
+
+
+def _register_descs(src_regs: Iterable[RegEntry], dst_regs: Iterable[RegEntry], mem_type: str):
     from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
 
     return (
-        RegMemoryDescs(mem_type, [(e.src_ptr, e.item_size, 0, f"src.{e.name}") for e in entries]),
-        RegMemoryDescs(mem_type, [(e.dst_ptr, e.item_size, 0, f"dst.{e.name}") for e in entries]),
+        RegMemoryDescs(mem_type, [(e.ptr, e.size, 0, f"src.{e.name}") for e in src_regs]),
+        RegMemoryDescs(mem_type, [(e.ptr, e.size, 0, f"dst.{e.name}") for e in dst_regs]),
     )
 
 
@@ -143,6 +167,8 @@ def main() -> None:
     parser.add_argument("--backend", choices=("LIBFABRIC", "UCX"), default="LIBFABRIC")
     parser.add_argument("--memory", choices=("VRAM", "DRAM"), default="VRAM")
     parser.add_argument("--op", choices=("WRITE", "READ"), default="WRITE")
+    parser.add_argument("--register-mode", choices=("whole", "fragments"), default="whole",
+                        help="Register whole per-layer side buffers like TransferWorker, or exact slot fragments.")
     parser.add_argument("--timeout-ms", type=int, default=5000)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -168,12 +194,16 @@ def main() -> None:
         device = torch.device("cpu")
         mem_type = MemoryType.DRAM
 
-    entries = _make_entries(torch, args, device)
+    entries, src_whole_regs, dst_whole_regs = _make_entries(torch, args, device)
+    if args.register_mode == "whole":
+        src_regs, dst_regs = src_whole_regs, dst_whole_regs
+    else:
+        src_regs, dst_regs = _fragment_reg_entries(entries)
     src_name = "kvarn_gqa_side_src_probe"
     dst_name = "kvarn_gqa_side_dst_probe"
     src_agent = NixlTransferAgent(src_name, True, num_threads=int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "0")))
     dst_agent = NixlTransferAgent(dst_name, True, num_threads=int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "0")))
-    src_reg, dst_reg = _register_descs(entries, args.memory)
+    src_reg, dst_reg = _register_descs(src_regs, dst_regs, args.memory)
     src_agent.register_memory(src_reg)
     dst_agent.register_memory(dst_reg)
     src_agent.load_remote_agent(dst_name, dst_agent.get_local_agent_desc())
@@ -210,7 +240,8 @@ def main() -> None:
     print(
         f"KVARN_GQA_NIXL_SIDE_RESULT backend={args.backend} memory={args.memory} op={args.op} "
         f"wait={ok} done={status.is_completed()} fragments={len(entries)} "
-        f"bytes={sum(e.item_size for e in entries)} mismatches={len(mismatches)}"
+        f"bytes={sum(e.item_size for e in entries)} register_mode={args.register_mode} "
+        f"mismatches={len(mismatches)}"
     )
     if mismatches:
         print("KVARN_GQA_NIXL_SIDE_MISMATCH", mismatches[:8])

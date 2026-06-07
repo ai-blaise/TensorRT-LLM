@@ -402,7 +402,16 @@ Current focused coverage:
   request-slot keyed side-state fragment matrix and can attempt LIBFABRIC or UCX
   NIXL transfer of a nonzero source slot into a nonzero destination slot. A
   failing runtime probe is blocker evidence and must not be treated as backend
-  readiness.
+  readiness. The probe defaults to production-like whole side-buffer registration
+  and also supports exact fragment registration for diagnosis. In isolated B200
+  container checks, UCX moved both DRAM and VRAM side-state fragments with zero
+  mismatches, while LIBFABRIC DRAM completed without copying payload bytes and
+  LIBFABRIC VRAM failed with fi_cq_read Bad address. That matrix points at a
+  provider/service-context issue, not a malformed KVarN side-state fragment
+  layout. The current r20 gate therefore uses the NIXL runtime with the UCX
+  plugin. Production readiness for GQA KVarN still requires the same probe, or
+  the SMC-SD service path, to pass in the real multi-rank NIXL write-mode
+  deployment context before `kvarnGqaBackendReady()` can be promoted.
 
 Example:
 

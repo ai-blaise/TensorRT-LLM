@@ -5,20 +5,50 @@ r20 disaggregated prefill/decode rollout on the B200 canary. It is intentionally
 explicit about incomplete work so later commits do not accidentally treat a
 smoke-response, readiness result, or partial marker as production completion.
 
-## Live deployment snapshot
+## Current update - 2026-06-07 17:50 UTC
+
+- Pushed head after this integration pass includes `33eaba65f`
+  (`deploy(r20): gate NIXL on VRAM-proven UCX plugin`) plus the KVarN GQA
+  side-state probe registration update.
+- The live r20 DGD is generation `104` in `dynamo-system`, observed generation
+  `104`, state `pending`, Ready `False`.
+- Current live pods: frontend and prefill are running; decode is running but not
+  ready yet. The checked decode tail shows warmup/autotune cache misses,
+  attention-workspace sizing warnings, and readiness 503s, not the previous
+  NIXL VRAM registration crash.
+- The live image is still the 3457 LayerSplit/NIXL CP overlay. It contains the
+  LayerSplit Python transceiver fix required for owner-local CP, but not the
+  later documentation/test-only commits or the SMC/Moondream request-pinning
+  source slice. Do not rebuild/redeploy only for docs while the current rollout
+  is warming.
+- The current pre-A/B transport gate is the NIXL runtime with
+  `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` on both prefill and decode. This is not the
+  old direct UCX cache transceiver. LIBFABRIC was demoted because backend
+  creation was insufficient: real VRAM registration failed on the GCP B200
+  provider set, while the focused NIXL UCX VRAM side-state probe completed with
+  zero mismatches.
+- MORI-IO remains out of the pre-A/B gate. Test MORI-IO during A/B only after
+  NIXL UCX passes readiness, strict request-pinning smoke, positive transfer
+  proof, and c16 throughput gating.
+- SMC-SD, GQA KVarN, and Moondream-with-SMC decode remain behind the current
+  NIXL/LayerSplit gate. The clean SMC/Moondream pinned-handoff source slice is
+  upstream, but the SGLang-derived GLM kernels and production-complete GQA KVarN
+  backend are still not promoted.
+
+## Historical green deployment snapshot
 
 - Repo/branch: `ai-blaise/TensorRT-LLM`, branch `op-trt`.
-- Current pushed head before this doc refresh: `45a05fe19`
+- Historical pushed head before this doc was first written: `45a05fe19`
   (`fix(nixl): preserve sender future timeout config`). This includes the
   earlier NIXL fail-closed, SMC/Moondream pinned-handoff, image-reuse,
   prewarm dry-run, snapshot-composition, gap-status, strict-smoke parsing,
   idle-transfer-poll, stream-drain, strict preflight, NIXL plugin probe, and
   sender future timeout preservation commits.
 - Live DGD: `topo-c1-dp2tp4-disagg-r20` in namespace `dynamo-system`.
-- Current DGD generation: `100`; DGD readiness is `True`.
-- Current live image:
+- Historical DGD generation: `100`; DGD readiness was `True`.
+- Historical live image:
   `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-45a05fe19409-fullsrc45a-nixlpin-20260607T114045Z`.
-- Current live image digest:
+- Historical live image digest:
   `sha256:14a2a2b26ad75533f868ab6f900b9545c9f09163efec07c9c4c0d9b9541737d4`.
 - Image note: this is a full source TensorRT-LLM image built from `45a05fe19`,
   not a thin overlay. It includes the C++/nanobind sender future timeout
@@ -26,7 +56,7 @@ smoke-response, readiness result, or partial marker as production completion.
   fixes.
 - Topology: one prefill worker on four B200 GPUs and one decode worker on four
   B200 GPUs, plus the Dynamo KV frontend.
-- Live readiness: frontend, prefill, and decode are `1/1 Running` with zero
+- Historical readiness: frontend, prefill, and decode were `1/1 Running` with zero
   restarts on the current image.
 - Rollout note: chained thin overlays previously hit containerd rootfs
   `mount options is too long`. Do not deploy chained overlays for ABI-affecting
@@ -56,8 +86,10 @@ SMC_GATE_MODE=deferred \
 ./deploy/disagg_pd_r20/smoke_request_pinning.sh
 ```
 
-Latest live result: green for the NIXL/request-pinning pre-A/B correctness
-gate on generation 100 using the full-source `45a05fe19` image.
+Latest historical green result: green for the NIXL/request-pinning pre-A/B
+correctness gate on generation 100 using the full-source `45a05fe19` image. The
+current generation 104 rollout must repeat the live audit and strict smoke after
+decode readiness turns green.
 
 - Live NIXL audit passed:
   `/tmp/nixl_gate_audit_live_20260607T121624Z_2312782`.
@@ -130,10 +162,9 @@ Reference doc: `docs/source/features/layersplit.md`
 
 ### NIXL
 
-NIXL is the pre-A/B transfer gate and UCX is no longer accepted as the gate
-backend. The live config uses NIXL for both `cache_transceiver_config.backend`
-and `layersplit_transfer_backend`. The code path is fail-closed against implicit
-legacy backend selector conflicts.
+NIXL is the pre-A/B transfer gate. The live config uses NIXL for both
+`cache_transceiver_config.backend` and `layersplit_transfer_backend`. The code
+path is fail-closed against implicit legacy backend selector conflicts.
 
 Current NIXL gate state:
 

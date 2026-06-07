@@ -95,6 +95,10 @@ REQUIRED_NIXL_SIDE_PROBE_SNIPPETS = (
     "TransferOp.WRITE",
     "TransferOp.READ",
     "mismatches",
+    "--register-mode",
+    "register_mode={args.register_mode}",
+    "RegEntry",
+    "_fragment_reg_entries",
 )
 
 REQUIRED_BENCH_SNIPPETS = (
