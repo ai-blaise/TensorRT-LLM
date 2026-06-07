@@ -199,6 +199,60 @@ def test_runtime_state_contiguous_policy_propagates():
     assert state.is_owner(47) is False
 
 
+
+def test_layersplit_owner_map_uses_global_layer_domain_with_local_mask():
+    # Regression for the r20 TP2xCP2 prefill crash: DSACacheManager receives
+    # num_layers=sum(layer_mask) for its trimmed local pool, but ownership is
+    # queried with global layer ids. The owner table must be built over
+    # len(layer_mask), not the local pool length.
+    layer_mask = [False, False, True, True]
+    local_num_layers = sum(layer_mask)
+    ownership_num_layers = len(layer_mask)
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment="contiguous",
+            layersplit_owner_local_alloc=True,
+        ),
+        num_layers=ownership_num_layers,
+        cp_size=2,
+        cp_rank=1,
+        create_comm_stream=False,
+    )
+
+    assert local_num_layers == 2
+    assert state.ownership.num_layers == 4
+    assert state.is_owner(0) is False
+    assert state.is_owner(2) is True
+    assert state.is_owner(3) is True
+
+
+def test_dsa_non_owned_helper_ignores_out_of_domain_pool_offsets():
+    # Regression for the owner-local dense scratch warmup crash: some dense/KVarN
+    # callers probe local pool offsets while the LayerSplit ownership table is in
+    # the global layer-id domain. Those local offsets must not index the global
+    # owner tuple and crash before the scratch route can be used.
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment="contiguous",
+            layersplit_owner_local_alloc=True,
+        ),
+        num_layers=4,
+        cp_size=2,
+        cp_rank=1,
+        create_comm_stream=False,
+    )
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = state
+    mgr.layer_offsets = {2: 0, 4: 1, 99: 2}
+
+    assert mgr._layersplit_non_owned(0) is True
+    assert mgr._layersplit_non_owned(2) is False
+    assert mgr._layersplit_non_owned(4) is False
+    assert mgr._layersplit_non_owned(99) is False
+    assert mgr._layersplit_non_owned(100) is True
+
 def test_runtime_state_rejects_partial_rank_transfer():
     # The SparseAttentionConfig validator should already reject this, but
     # belt-and-suspenders: the runtime state factory rejects it too so a
@@ -1122,3 +1176,134 @@ def test_two_phase_pipeline_keeps_both_channels_pipelined():
     # Total broadcast calls: 2 sync (layer 0 indexer+kv) + 2*3 prefetches
     # (layers 1..3 on both channels)
     assert fake.broadcast.call_count == 2 + 6
+
+
+def test_owner_local_indexer_scratch_lazily_allocates_for_non_owned_layer():
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = SimpleNamespace(
+        enabled=True,
+        cp_size=2,
+        owner_local_alloc=True,
+        is_owner=lambda layer_idx: layer_idx >= 2,
+    )
+    mgr._layersplit_indexer_k_scratch = None
+    mgr.index_head_dim = 128
+    mgr.quant_block_size = 128
+    mgr.tokens_per_block = 4
+    mgr.num_blocks = 3
+    mgr.use_fp4 = True
+    mgr.indexer_k_cache_pool_per_layer = [
+        torch.empty((mgr.num_blocks, mgr.tokens_per_block * 68),
+                    dtype=torch.uint8)
+    ]
+    mgr.layer_offsets = {2: 0, 3: 1}
+
+    scratch = mgr.get_indexer_k_cache_buffers(0)
+
+    assert scratch is mgr._layersplit_indexer_k_scratch
+    assert scratch.shape == (mgr.num_blocks, mgr.tokens_per_block, 1, 68)
+
+
+def test_owner_local_hisa_scratch_lazily_allocates_for_non_owned_layer():
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = SimpleNamespace(
+        enabled=True,
+        cp_size=2,
+        owner_local_alloc=True,
+        is_owner=lambda layer_idx: layer_idx >= 2,
+    )
+    mgr.enable_hisa_page_reps = True
+    mgr._layersplit_hisa_pagerep_scratch = None
+    mgr._layersplit_hisa_pagecount_scratch = None
+    mgr.indexer_hisa_page_reps_per_layer = [torch.empty((3, 128))]
+    mgr.indexer_hisa_page_counts_per_layer = [torch.empty((3,), dtype=torch.int32)]
+    mgr.layer_offsets = {2: 0, 3: 1}
+
+    reps, counts = mgr.get_indexer_hisa_page_rep_buffers(0)
+
+    assert reps is mgr._layersplit_hisa_pagerep_scratch
+    assert counts is mgr._layersplit_hisa_pagecount_scratch
+    assert reps.shape == (3, 128)
+    assert counts.shape == (3,)
+
+
+
+def test_owner_local_dense_scratch_routing_lazily_builds_nonowned_rows():
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    class _Impl:
+        def get_primary_pool_data(self, local_offset):
+            assert local_offset == 0
+            return torch.empty((3, 4, 2), dtype=torch.uint8)
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = SimpleNamespace(
+        enabled=True,
+        cp_size=2,
+        cp_rank=1,
+        owner_local_alloc=True,
+        is_owner=lambda layer_idx: layer_idx >= 2,
+        ownership=SimpleNamespace(
+            num_layers=4,
+            owned_layers=lambda cp_rank: (2, 3),
+        ),
+    )
+    mgr._layersplit_dense_kv_scratch = None
+    mgr._layersplit_dense_scratch_pool_index = None
+    mgr._layersplit_kv_cache_pool_pointers_ls = None
+    mgr._layersplit_kv_cache_pool_mapping_ls = None
+    mgr._layersplit_nonowned_layer_rows = {}
+    mgr.layer_offsets = {2: 0, 3: 1}
+    mgr.impl = _Impl()
+    mgr.kv_cache_pool_pointers = torch.tensor([[123, 0]], dtype=torch.int64)
+    mgr.kv_cache_pool_mapping = torch.tensor([[0, 0], [0, 1]], dtype=torch.int32)
+    mgr.host_kv_cache_block_offsets = torch.zeros((1, 2, 2, 4), dtype=torch.int32)
+    mgr.num_local_layers = 2
+    mgr.dtype = None
+
+    assert mgr._ensure_layersplit_dense_scratch_routing() is True
+
+    assert mgr._layersplit_dense_kv_scratch.shape == (3, 4, 2)
+    assert mgr._layersplit_dense_scratch_pool_index == 1
+    assert mgr._layersplit_nonowned_layer_rows == {0: 2, 1: 3}
+    assert mgr._layersplit_kv_cache_pool_pointers_ls.shape == (2, 2)
+    assert mgr._layersplit_kv_cache_pool_mapping_ls.tolist() == [
+        [0, 0],
+        [0, 1],
+        [1, 0],
+        [1, 0],
+    ]
+    assert mgr.host_kv_cache_block_offsets.shape[0] == 2
+    assert mgr.get_buffers(0) is mgr._layersplit_dense_kv_scratch
+
+
+def test_owner_local_global_owned_layer_bypasses_owner_map_bounds_check():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = SimpleNamespace(
+        enabled=True,
+        cp_size=2,
+        cp_rank=1,
+        owner_local_alloc=True,
+        ownership=SimpleNamespace(
+            num_layers=31,
+            is_owner=lambda layer_idx, cp_rank: (_ for _ in ()).throw(IndexError()),
+        ),
+        is_owner=lambda layer_idx: (_ for _ in ()).throw(IndexError()),
+    )
+    mgr.layer_offsets = {31: 0}
+
+    assert mgr._layersplit_non_owned(31) is False
+    assert mgr._layersplit_non_owned(0) is True
+    assert mgr._layersplit_non_owned(62) is True

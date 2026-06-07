@@ -213,6 +213,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         if self.kv_cache_manager is None:
             return None
+        ensure = getattr(self.kv_cache_manager,
+                         "_ensure_layersplit_dense_scratch_routing", None)
+        if ensure is not None:
+            ensure()
         augmented = getattr(self.kv_cache_manager,
                             "_layersplit_kv_cache_pool_pointers_ls", None)
         if augmented is not None:
@@ -230,6 +234,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         if self.kv_cache_manager is None:
             return None
+        ensure = getattr(self.kv_cache_manager,
+                         "_ensure_layersplit_dense_scratch_routing", None)
+        if ensure is not None:
+            ensure()
         augmented = getattr(self.kv_cache_manager,
                             "_layersplit_kv_cache_pool_mapping_ls", None)
         if augmented is not None:
@@ -308,6 +316,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is not None:
+            ensure = getattr(self.kv_cache_manager,
+                             "_ensure_layersplit_dense_scratch_routing", None)
+            if ensure is not None:
+                ensure()
             # Size the device block-offset tensor from the host tensor's pool
             # dimension so it tracks any extra pools the manager adds beyond
             # num_pools (LayerSplit owner-local alloc appends one dense scratch
@@ -1202,6 +1214,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # scratch routing exists (e.g. replicated posture should always
             # resolve, or the scratch could not be allocated), surface the gap
             # as a clear error instead of silently reading the wrong KV.
+            ensure = getattr(metadata.kv_cache_manager,
+                             "_ensure_layersplit_dense_scratch_routing", None)
+            if ensure is not None:
+                ensure()
             nonowned_rows = getattr(metadata.kv_cache_manager,
                                     "_layersplit_nonowned_layer_rows", None)
             if nonowned_rows and self.layer_idx in nonowned_rows:

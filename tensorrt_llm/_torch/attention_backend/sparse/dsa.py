@@ -4321,9 +4321,18 @@ class DSACacheManager(KVCacheManager):
         # without instantiating the C++ WindowBlockManager parent.
         cp_size = getattr(mapping, "cp_size", 1) if mapping is not None else 1
         cp_rank = getattr(mapping, "cp_rank", 0) if mapping is not None else 0
+        # ``num_layers`` has already been trimmed to sum(layer_mask) when the
+        # LayerSplit owner-local mask is active, but the runtime queries
+        # ownership with global layer ids (for example layer_idx=0 in
+        # get_buffers()). Build the owner table over the global layer domain so
+        # state.is_owner(global_layer_idx) remains valid on every CP rank.
+        layersplit_owner_num_layers = (
+            len(layer_mask) if layer_mask is not None and bool(
+                getattr(sparse_attn_config, "layersplit_enabled", False)) else
+            num_layers)
         self.layersplit_state = LayerSplitRuntimeState.from_sparse_config(
             sparse_attn_config=sparse_attn_config,
-            num_layers=num_layers,
+            num_layers=layersplit_owner_num_layers,
             cp_size=cp_size,
             cp_rank=cp_rank,
         )
@@ -4353,7 +4362,7 @@ class DSACacheManager(KVCacheManager):
                 "Replicated-materialization (M3) + owner-local alloc (M4) "
                 "+ broadcast scaffold (M5) all installed; KV payload "
                 "plumbing is M5c.",
-                num_layers,
+                layersplit_owner_num_layers,
                 cp_size,
                 self.layersplit_state.ownership.policy,
                 self.layersplit_state.transfer_backend,
@@ -4623,6 +4632,9 @@ class DSACacheManager(KVCacheManager):
         path is unaffected (it uses the Python pool list + scratch, not these
         C++ pool pointers).
         """
+        if (self._layersplit_dense_scratch_pool_index is not None
+                and self._layersplit_nonowned_layer_rows):
+            return
         owned = self.layersplit_state.ownership.owned_layers(
             self.layersplit_state.cp_rank)
         owned_set = set(owned)
@@ -4709,6 +4721,45 @@ class DSACacheManager(KVCacheManager):
             "scratch slot).", scratch_pool_idx, len(non_owned),
             int(base_mapping.shape[0]), next_row - 1)
 
+    def _ensure_layersplit_dense_scratch_routing(self) -> bool:
+        """Ensure owner-local non-owned dense layers have C++ scratch routing.
+
+        Some runtime constructions make the C++ pool pointer/mapping tensors
+        available only after ``DSACacheManager.__init__`` has already attempted
+        the eager build. Repair that lazily before metadata buffer allocation,
+        block-offset copies, or attention local-layer lookup. The repair keeps
+        owner-local memory savings: one shared dense scratch slot is appended as
+        a single-layer pool and every non-owned layer maps to that slot.
+        """
+        if not (self.layersplit_state.enabled
+                and self.layersplit_state.cp_size > 1
+                and self.layersplit_state.owner_local_alloc):
+            return False
+        if (self._layersplit_dense_scratch_pool_index is not None
+                and self._layersplit_nonowned_layer_rows):
+            return True
+
+        if self._layersplit_dense_kv_scratch is None:
+            try:
+                local_offsets = list(getattr(self, "layer_offsets", {}).values())
+                local_offset = local_offsets[0] if local_offsets else 0
+                dense_template = self.impl.get_primary_pool_data(local_offset)
+                if dense_template is not None:
+                    self._layersplit_dense_kv_scratch = torch.empty_like(
+                        dense_template)
+                    logger.info(
+                        "LayerSplit owner-local lazily allocated dense KV scratch "
+                        "from local pool offset %d: %s.", local_offset,
+                        tuple(self._layersplit_dense_kv_scratch.shape))
+            except (KeyError, IndexError, AttributeError, RuntimeError):
+                return False
+
+        if self._layersplit_dense_kv_scratch is None:
+            return False
+        self._build_layersplit_dense_scratch_pool()
+        return (self._layersplit_dense_scratch_pool_index is not None
+                and bool(self._layersplit_nonowned_layer_rows))
+
     @staticmethod
     def _dense_scale_row_shape(scale_pool: torch.Tensor) -> Tuple[int, ...]:
         """Per-block row shape of a dense block-scale pool slot.
@@ -4737,6 +4788,7 @@ class DSACacheManager(KVCacheManager):
         row ``b`` holds global block ``b``; kv_factor=1 for SELFKONLY). When the
         scratch pool is inactive this is exactly the base behavior.
         """
+        self._ensure_layersplit_dense_scratch_routing()
         scratch_idx = self._layersplit_dense_scratch_pool_index
         host = self.host_kv_cache_block_offsets
         if scratch_idx is not None and host.shape[0] > scratch_idx:
@@ -4770,6 +4822,70 @@ class DSACacheManager(KVCacheManager):
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
+
+    def _layersplit_non_owned(self, layer_idx: int) -> bool:
+        if not (self.layersplit_state.enabled
+                and self.layersplit_state.cp_size > 1
+                and self.layersplit_state.owner_local_alloc):
+            return False
+        # Under owner-local allocation, the local layer-offset table is the
+        # authoritative allocation map for this rank. The LayerSplit ownership
+        # table may be local-slice indexed while callers pass global layer ids,
+        # so check the allocated layer map before querying owner_map.
+        if layer_idx in getattr(self, 'layer_offsets', {}):
+            return False
+        ownership = getattr(self.layersplit_state, 'ownership', None)
+        if ownership is not None and 0 <= layer_idx < ownership.num_layers:
+            return not ownership.is_owner(layer_idx, self.layersplit_state.cp_rank)
+        try:
+            return not self.layersplit_state.is_owner(layer_idx)
+        except (IndexError, KeyError):
+            return True
+
+    def _ensure_layersplit_indexer_k_scratch(self):
+        """Lazily allocate the non-owned-layer indexer-K scratch slot.
+
+        The eager constructor path normally builds this from the first owned
+        layer. Some production mappings trim ``layer_offsets`` before the global
+        owner table can be queried, so the eager path can miss even though this
+        rank still has a local indexer pool. The scratch only needs to mirror one
+        pool slot; building it from local offset 0 preserves owner-local memory
+        savings and keeps non-owned writes/reads on the LayerSplit scratch path.
+        """
+        if self._layersplit_indexer_k_scratch is None:
+            pools = getattr(self, "indexer_k_cache_pool_per_layer", None)
+            if pools:
+                block_size = self.tokens_per_block
+                data_bytes = (self.index_head_dim // 2
+                              if self.use_fp4 else self.index_head_dim)
+                per_token_size = (data_bytes + self.index_head_dim
+                                  // self.quant_block_size * 4)
+                template = pools[0].view(self.num_blocks, block_size, 1,
+                                         per_token_size)
+                self._layersplit_indexer_k_scratch = torch.empty_like(template)
+                logger.info(
+                    "LayerSplit owner-local lazily allocated indexer-K scratch "
+                    "from local pool offset 0: %s.",
+                    tuple(self._layersplit_indexer_k_scratch.shape))
+        return self._layersplit_indexer_k_scratch
+
+    def _ensure_layersplit_hisa_scratch(self):
+        """Lazily allocate HISA page-rep scratch for non-owned layers."""
+        if (self._layersplit_hisa_pagerep_scratch is None
+                and self.enable_hisa_page_reps
+                and self.indexer_hisa_page_reps_per_layer
+                and self.indexer_hisa_page_counts_per_layer):
+            self._layersplit_hisa_pagerep_scratch = torch.empty_like(
+                self.indexer_hisa_page_reps_per_layer[0])
+            self._layersplit_hisa_pagecount_scratch = torch.empty_like(
+                self.indexer_hisa_page_counts_per_layer[0])
+            logger.info(
+                "LayerSplit owner-local lazily allocated HISA scratch from "
+                "local pool offset 0: reps=%s counts=%s.",
+                tuple(self._layersplit_hisa_pagerep_scratch.shape),
+                tuple(self._layersplit_hisa_pagecount_scratch.shape))
+        return (self._layersplit_hisa_pagerep_scratch,
+                self._layersplit_hisa_pagecount_scratch)
 
     @property
     def kvarn_enabled(self) -> bool:
@@ -4814,9 +4930,14 @@ class DSACacheManager(KVCacheManager):
         the shape mirrors a pool slot exactly. On the off-path or for
         owned layers, fall through to the pool-backed accessor.
         """
-        if (self._layersplit_indexer_k_scratch is not None
-                and not self.layersplit_state.is_owner(layer_idx)):
-            return self._layersplit_indexer_k_scratch
+        if self._layersplit_non_owned(layer_idx):
+            scratch = self._ensure_layersplit_indexer_k_scratch()
+            if scratch is None:
+                raise RuntimeError(
+                    "LayerSplit owner-local indexer-K scratch is unavailable "
+                    f"for non-owned layer {layer_idx}; cannot fall through to "
+                    "the owned layer pool without breaking ownership.")
+            return scratch
         return self._get_indexer_k_cache_buffers_owned(layer_idx)
 
     def get_buffers(self,
@@ -4831,9 +4952,16 @@ class DSACacheManager(KVCacheManager):
         base ``KVCacheManager.get_buffers``.
         """
         if (self._layersplit_dense_kv_scratch is not None
-                and not self.layersplit_state.is_owner(layer_idx)
-                and kv_layout == "NHD"):
+                and self._layersplit_non_owned(layer_idx) and kv_layout == "NHD"):
             return self._layersplit_dense_kv_scratch
+        if self._layersplit_non_owned(layer_idx) and kv_layout == "NHD":
+            self._ensure_layersplit_dense_scratch_routing()
+            if self._layersplit_dense_kv_scratch is not None:
+                return self._layersplit_dense_kv_scratch
+            raise RuntimeError(
+                "LayerSplit owner-local dense KV scratch is unavailable for "
+                f"non-owned layer {layer_idx}; cannot fall through to the owned "
+                "dense pool without breaking ownership.")
         return super().get_buffers(layer_idx, kv_layout=kv_layout)
 
     def get_dense_block_scale_pool(self) -> torch.Tensor:
@@ -4899,10 +5027,14 @@ class DSACacheManager(KVCacheManager):
         """
         if not self.enable_hisa_page_reps:
             raise RuntimeError("HISA page representatives are not enabled")
-        if (self._layersplit_hisa_pagerep_scratch is not None
-                and not self.layersplit_state.is_owner(layer_idx)):
-            return (self._layersplit_hisa_pagerep_scratch,
-                    self._layersplit_hisa_pagecount_scratch)
+        if self._layersplit_non_owned(layer_idx):
+            page_reps, page_counts = self._ensure_layersplit_hisa_scratch()
+            if page_reps is None or page_counts is None:
+                raise RuntimeError(
+                    "LayerSplit owner-local HISA scratch is unavailable for "
+                    f"non-owned layer {layer_idx}; cannot fall through to the "
+                    "owned HISA pool without breaking ownership.")
+            return (page_reps, page_counts)
         return self._get_indexer_hisa_page_rep_buffers_owned(layer_idx)
 
     def shutdown(self):
