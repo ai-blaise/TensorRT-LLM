@@ -64,7 +64,7 @@ Indexer/HISA sparse K path.
 | CUDA graph lifecycle | **Partially guarded, not production-ready** | Side tensors are preallocated and the side pool now has an explicit `release_request()` cleanup path that clears sink/tail/commit state for abort/reuse. The BDR readable pool and `restored_gen`/`physical_commit_gen` tensors are preallocated/lazy-grown outside the hot restore. End-to-end request lifecycle hooks and CUDA graph capture proof are still missing. |
 | Sparse packed reads | **Missing** | HISA/Indexer sparse selection over packed KVarN records needs a dedicated read/dequant path. |
 | BDR fold / amortized dequant | **Prototype implemented; production fusion still gated** | GQA has a physical-block keyed readable pool plus device int64 commit/restored generation metadata. The BDR restore path gathers logical full blocks from the request block table, maps them to physical block ids, masks by valid and changed generation state, applies torch.unique, and batched-dequants only churn blocks into the persistent readable pool. The CUDA decode hook now bypasses the readable-pool restore for safe generation/FULL-mask reads and calls the GQA packed decode op, which reads packed 2-bit records and folds Hadamard dequant into scoring/value accumulation. The decode kernel is now block-parallel, but production readiness remains false until runtime parity, transfer, graph lifecycle, sparse-read, and B200 perf gates pass. |
-| Fused B200 store/decode kernels | **Store/decode prototypes wired for safe cases; not production-ready** | The GQA store op remains an experimental serial correctness kernel; the decode op now has a first block-parallel packed read kernel. CUDA full-block commits call the store op; CUDA generation q_len=1 and FULL-mask reads call the packed decode op directly over byte pages, fp16 sink, and fp16 tail. The decode op now launches a block-parallel SM100/B200 kernel with one CTA per (query, head), 256 threads per CTA, shared-memory Q rotation, block reductions for softmax max/denom, and in-kernel packed 2-bit K/V dequant folded into scoring/value accumulation. Causal multi-token prefill, sliding-window, q_scaling, sparse reads, and uncommitted full speculative blocks fail closed. Disaggregated side-state transfer, sparse packed reads, graph lifecycle, runtime parity, optimized store, and measured B200 performance proof are still missing, so backend readiness remains false. |
+| Fused B200 store/decode kernels | **Store/decode prototypes wired for safe cases; not production-ready** | The GQA store op remains an experimental serial correctness kernel; the decode op now has a first block-parallel packed read kernel. CUDA full-block commits call the store op; CUDA generation q_len=1 and FULL-mask reads call the packed decode op directly over byte pages, fp16 sink, and fp16 tail. The decode op now launches a block-parallel SM100/B200 kernel with one CTA per (query, head), 256 threads per CTA, shared-memory Q rotation, block reductions for softmax max/denom, and in-kernel packed 2-bit K/V dequant folded into scoring/value accumulation. For total sink+packed+tail length <=256 it dispatches a no-atomic small decoder that stores logits/weights in shared memory and assigns one thread per rotated-V channel. Causal multi-token prefill, sliding-window, q_scaling, sparse reads, and uncommitted full speculative blocks fail closed. Disaggregated side-state transfer, sparse packed reads, graph lifecycle, runtime parity, optimized store, and measured B200 performance proof are still missing, so backend readiness remains false. |
 | Correctness vs fp16/fp8 KV | **Partial only** | Pack/dequant round-trip, finite restore, cosine floor, side-state, and fail-close tests exist. Full attention/logit parity against fp16/fp8 GQA KV is not run/proven. |
 | Performance proof | **Missing** | Microbench has a correctness floor and `--require-fused` promotion guard, but no fused B200 numbers or c16 tok/s/user proof exist. |
 | Production enablement | **Blocked** | Requires fused kernels, disagg side-state transfer, sparse packed reads, graph-safe lifecycle, fp16/fp8 correctness proof, and c16 E2E performance proof. |
@@ -139,6 +139,37 @@ HF examples:
 
 Set `kv_cache_dtype` to `"auto"`, `"none"`, or set
 `quantization_config.kvarn.gqa.enabled=false` to disable the HF default.
+
+## B200 decode proof snapshot
+
+A low-memory GPU probe on `a4-us-002` built the GQA THOP extension from the
+workspace sources and ran `torch.ops.trtllm.kvarn_gqa_decode` on one B200. The
+probe used true GQA grouping (`num_heads=8`, `num_kv_heads=2`), k2v2/g128
+packed records, fp16 and bf16 runtime dtypes, compact and paged layouts, and
+odd SMC query counts `M in {1, 5, 25}`. The block-parallel no-atomic small
+decode path is faster than the torch restore+score reference for packed full
+blocks:
+
+| dtype | layout | M | max_abs | packed decode us | restore+score ref us |
+|---|---|---:|---:|---:|---:|
+| fp16 | compact | 1 | 0.000088 | 111.12 | 403.97 |
+| fp16 | compact | 5 | 0.000121 | 112.56 | 405.59 |
+| fp16 | compact | 25 | 0.000120 | 118.24 | 399.05 |
+| fp16 | paged | 1 | 0.000114 | 105.49 | 395.72 |
+| fp16 | paged | 5 | 0.000120 | 107.51 | 355.46 |
+| fp16 | paged | 25 | 0.000122 | 115.86 | 398.30 |
+| bf16 | compact | 1 | 0.000876 | 111.53 | 379.19 |
+| bf16 | compact | 5 | 0.000959 | 113.06 | 419.22 |
+| bf16 | compact | 25 | 0.000970 | 116.12 | 423.98 |
+| bf16 | paged | 1 | 0.000966 | 106.35 | 351.60 |
+| bf16 | paged | 5 | 0.000958 | 107.38 | 358.64 |
+| bf16 | paged | 25 | 0.000975 | 115.84 | 398.21 |
+
+Side-state decode (`sink=16`, one packed block, `tail=7`) is correct but still
+slower than the reference: about 579-680 us versus 358-459 us. The bottleneck is
+fp16 sink/tail Hadamard rotation on read. The next optimization is to store or
+transfer rotated sink/tail side buffers, or add a dedicated side-token tile path,
+so side-state does not recompute 128-wide Hadamard rotations during decode.
 
 ## Remaining production work
 
