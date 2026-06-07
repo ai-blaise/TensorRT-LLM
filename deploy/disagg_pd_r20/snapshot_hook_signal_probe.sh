@@ -180,37 +180,42 @@ PY
 
 signal_worker "$prefill_pod" pre_snapshot 5
 signal_worker "$decode_pod" pre_snapshot 5
+
+wait_for_phase_ready() {
+  local phase="$1"
+  local min_count="$2"
+  local label="$3"
+  local deadline count err_count
+
+  deadline=$((SECONDS + SIGNAL_TIMEOUT_S))
+  while (( SECONDS < deadline )); do
+    count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name "optrt_snapshot_*_${phase}.ready.json" 2>/dev/null | wc -l | tr -d ' ')"
+    err_count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$err_count" != 0 ]]; then
+      echo "probe_ready=failed"
+      echo "reason=hook_error_files_present"
+      find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' -print
+      exit 4
+    fi
+    if (( count >= min_count )); then
+      printf 'hook_%s_ready_count=%s\n' "$label" "$count"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "probe_ready=failed"
+  echo "reason=timeout_waiting_for_${phase}_proof_files"
+  printf 'hook_%s_ready_count=%s\n' "$label" "${count:-0}"
+  exit 4
+}
+
+wait_for_phase_ready pre_snapshot 2 pre
+
 signal_worker "$prefill_pod" post_restore 6
 signal_worker "$decode_pod" post_restore 6
-
-deadline=$((SECONDS + SIGNAL_TIMEOUT_S))
-while (( SECONDS < deadline )); do
-  pre_count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*_pre_snapshot.ready.json' 2>/dev/null | wc -l | tr -d ' ')"
-  post_count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*_post_restore.ready.json' 2>/dev/null | wc -l | tr -d ' ')"
-  err_count="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "$err_count" != 0 ]]; then
-    echo "probe_ready=failed"
-    echo "reason=hook_error_files_present"
-    find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' -print
-    exit 4
-  fi
-  if (( pre_count >= 2 && post_count >= 2 )); then
-    echo "hook_pre_ready_count=$pre_count"
-    echo "hook_post_ready_count=$post_count"
-    probe_ready=ok
-    echo "probe_ready=ok"
-    break
-  fi
-  sleep 2
-done
-
-if [[ "${probe_ready:-}" != ok ]]; then
-  echo "probe_ready=failed"
-  echo "reason=timeout_waiting_for_hook_proof_files"
-  echo "hook_pre_ready_count=${pre_count:-0}"
-  echo "hook_post_ready_count=${post_count:-0}"
-  exit 4
-fi
+wait_for_phase_ready post_restore 2 post
+echo "probe_ready=ok"
 
 readiness_args=(
   --vm local
