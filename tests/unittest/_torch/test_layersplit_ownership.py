@@ -253,6 +253,33 @@ def test_dsa_non_owned_helper_ignores_out_of_domain_pool_offsets():
     assert mgr._layersplit_non_owned(99) is False
     assert mgr._layersplit_non_owned(100) is True
 
+
+def test_owner_local_transfer_state_uses_real_model_layers_not_padded_mask():
+    # r20 TP2xCP2 prefill -> TP4 decode uses a padded owner-local mask so
+    # every CP rank has the same local pool row count. The C++ transfer state
+    # must still advertise the real attention-layer domain (61), not the
+    # padded mask/ownership domain or the local pool row count.
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+        _normalise_layersplit_total_kv_heads_per_layer,
+    )
+
+    mgr = SimpleNamespace(
+        layersplit_state=SimpleNamespace(
+            enabled=True,
+            owner_local_alloc=True,
+            ownership=SimpleNamespace(num_layers=62),
+        ),
+        layersplit_model_num_layers=61,
+        layersplit_cache_transfer_model_layers=61,
+        layersplit_local_pool_layers=31,
+    )
+
+    transfer_heads = _normalise_layersplit_total_kv_heads_per_layer(
+        mgr, [1] * 31)
+
+    assert len(transfer_heads) == 61
+    assert set(transfer_heads) == {1}
+
 def test_runtime_state_rejects_partial_rank_transfer():
     # The SparseAttentionConfig validator should already reject this, but
     # belt-and-suspenders: the runtime state factory rejects it too so a

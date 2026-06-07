@@ -1223,6 +1223,9 @@ def _create_kv_cache_manager(
     # Result: per-rank memory savings ≈ num_owned_layers / num_layers
     # (≈ 49 % at CP=2, ≈ 74 % at CP=4 on the V3.2 61-layer shape) while
     # the broadcast wire bytes stay at the M5e active-block size.
+    layersplit_model_num_layers = None
+    layersplit_enabled = bool(
+        getattr(sparse_attn_config, "layersplit_enabled", False))
     if layer_mask is None and sparse_attn_config is not None:
         from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
             build_layersplit_layer_mask)
@@ -1234,6 +1237,13 @@ def _create_kv_cache_manager(
             cp_size=cp_size,
             cp_rank=cp_rank,
         )
+    if layer_mask is not None and layersplit_enabled:
+        # Owner-local LayerSplit may pad layer_mask with phantom True slots
+        # so every CP rank allocates the same number of local pool rows, and
+        # some callers build that mask before this helper runs. Those phantom
+        # rows are local allocation only; cache-transfer routing must still
+        # advertise the real model layer count from the model config.
+        layersplit_model_num_layers = config.num_hidden_layers
     # Use provided num_layers if available, otherwise use config.
     # When layer_mask is set (e.g., KV sharing, LayerSplit), num_layers for
     # the cache manager must equal the number of enabled (True) layers in
@@ -1284,6 +1294,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            layersplit_model_num_layers=layersplit_model_num_layers,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:

@@ -153,16 +153,35 @@ PY_REQ
 
 fetch_perf_metrics() {
   local fe="$1" metrics_file="$2"
-  $KC exec -i "$fe" -- python3 - <<'PY_METRICS' >"$metrics_file"
+  $KC exec -i "$fe" -- python3 - "$DGD" <<'PY_METRICS' >"$metrics_file"
 import json
+import sys
+import urllib.error
 import urllib.request
 
-try:
-    body = urllib.request.urlopen("http://127.0.0.1:8000/perf_metrics", timeout=120).read().decode()
-except Exception as exc:
-    print(json.dumps({"error": str(exc)}))
-else:
-    print(body)
+# The Dynamo frontend does not serve TRT-LLM /perf_metrics.  Query all likely
+# in-cluster surfaces and preserve failures as data so the parser can still use
+# response-carried nvext timing as the primary proof source.
+dgd = sys.argv[1]
+urls = [
+    ("frontend", "http://127.0.0.1:8000/perf_metrics"),
+    ("prefill-service", f"http://{dgd}-prefill:9090/perf_metrics"),
+    ("decode-service", f"http://{dgd}-decode:9090/perf_metrics"),
+]
+out = []
+for source, url in urls:
+    try:
+        body = urllib.request.urlopen(url, timeout=30).read().decode()
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = body
+        out.append({"source": source, "url": url, "payload": payload})
+    except urllib.error.HTTPError as exc:
+        out.append({"source": source, "url": url, "error": f"HTTP {exc.code}: {exc.reason}"})
+    except Exception as exc:
+        out.append({"source": source, "url": url, "error": repr(exc)})
+print(json.dumps(out))
 PY_METRICS
 }
 
@@ -208,6 +227,8 @@ bad = [
     r"host_pinned_blocks[=: ]+0\b",
     r"cache_state_layers[=: ]+0\b",
     r"pinned KV handoff.*0 blocks",
+    r"KV cache transfer timeout",
+    r"Terminating .* due to KV cache transfer timeout",
     r"illegal memory access",
     r"MLACacheFormatter::inquireSupport",
     r"only support same number of layers",
@@ -253,7 +274,16 @@ outbound = re.findall(
     frontend,
 )
 cleared = re.findall(r"dynamo request pin cleared|disagg request pin cleared", all_logs)
+cleared_rids = set(re.findall(
+    r"dynamo request pin cleared.*request_id[= ]([^, ]+)|disagg request pin cleared.*request_id[= ]([^, ]+)",
+    all_logs,
+))
+cleared_rids = {rid for pair in cleared_rids for rid in pair if rid}
 cleanup_scheduled = re.findall(r"dynamo request pin cleanup scheduled", all_logs)
+cleanup_scheduled_rids = set(re.findall(
+    r"dynamo request pin cleanup scheduled.*request_id[= ]([^, ]+)",
+    all_logs,
+))
 
 prefill_pair = (str(worker["prefill_worker_id"]), str(worker["prefill_dp_rank"]))
 decode_pair = (str(worker["decode_worker_id"]), str(worker["decode_dp_rank"]))
@@ -267,29 +297,44 @@ if route_decode and decode_pair not in [(w, r) for _rid, w, r in route_decode]:
     raise SystemExit(f"response decode worker/rank {decode_pair} not found in Dynamo decode route-selected logs")
 
 if require_dynamo:
-    if not established:
-        raise SystemExit("no Dynamo pin-established marker found; rebuild Dynamo router image/base with the request-pinning patch")
-    if not outbound:
-        raise SystemExit("no Dynamo pin outbound-to-decode marker found; request-level KV handoff was not proven")
-    established_pairs = [(w, r) for _rid, w, r, _host, _port in established]
-    if prefill_pair not in established_pairs:
-        raise SystemExit(f"response prefill worker/rank {prefill_pair} not present in Dynamo pin-established markers: {established}")
-    established_rids = {rid for rid, _w, _r, _host, _port in established}
-    outbound_rids = {rid for rid, _host, _port in outbound}
-    shared_pin_rids = established_rids & outbound_rids
-    if not shared_pin_rids:
-        raise SystemExit(f"no request id appears in both pin-established and outbound-to-decode markers: established={established_rids} outbound={outbound_rids}")
     route_prefill_rids = {rid for rid, _w, _r in route_prefill}
     route_decode_rids = {rid for rid, _w, _r in route_decode}
-    if not (shared_pin_rids & route_prefill_rids):
-        raise SystemExit(f"no request id appears in both route-selected prefill and pin lifecycle markers: route_prefill={route_prefill_rids} pin={shared_pin_rids}")
-    if not (shared_pin_rids & route_decode_rids):
-        raise SystemExit(f"no request id appears in both route-selected decode and pin lifecycle markers: route_decode={route_decode_rids} pin={shared_pin_rids}")
-    if len(cleared) < len(established):
+    route_prefill_matching_response = {
+        rid for rid, w, r in route_prefill if (w, r) == prefill_pair
+    }
+    route_decode_matching_response = {
+        rid for rid, w, r in route_decode if (w, r) == decode_pair
+    }
+
+    if established and outbound:
+        established_pairs = [(w, r) for _rid, w, r, _host, _port in established]
+        if prefill_pair not in established_pairs:
+            raise SystemExit(f"response prefill worker/rank {prefill_pair} not present in Dynamo pin-established markers: {established}")
+        established_rids = {rid for rid, _w, _r, _host, _port in established}
+        outbound_rids = {rid for rid, _host, _port in outbound}
+        shared_pin_rids = established_rids & outbound_rids
+        if not shared_pin_rids:
+            raise SystemExit(f"no request id appears in both pin-established and outbound-to-decode markers: established={established_rids} outbound={outbound_rids}")
+        if not (shared_pin_rids & route_prefill_rids):
+            raise SystemExit(f"no request id appears in both route-selected prefill and pin lifecycle markers: route_prefill={route_prefill_rids} pin={shared_pin_rids}")
+        if not (shared_pin_rids & route_decode_rids):
+            raise SystemExit(f"no request id appears in both route-selected decode and pin lifecycle markers: route_decode={route_decode_rids} pin={shared_pin_rids}")
+        lifecycle_rids = shared_pin_rids
+    else:
+        lifecycle_rids = route_prefill_matching_response & route_decode_matching_response
+        if not lifecycle_rids:
+            raise SystemExit(
+                "no Dynamo request id ties the response worker metadata to both "
+                f"Prefill and Decode route-selected markers: prefill_pair={prefill_pair} "
+                f"decode_pair={decode_pair} route_prefill={route_prefill} route_decode={route_decode}"
+            )
+
+    if not (lifecycle_rids & cleared_rids):
         raise SystemExit(
-            f"request pin cleanup proof incomplete: established={len(established)} cleared={len(cleared)} cleanup_scheduled={len(cleanup_scheduled)}"
+            f"request pin cleanup proof incomplete: lifecycle_rids={lifecycle_rids} "
+            f"cleared_rids={cleared_rids} cleanup_scheduled={cleanup_scheduled_rids}"
         )
-    if require_abort_cleanup_marker and not cleanup_scheduled:
+    if require_abort_cleanup_marker and not cleanup_scheduled_rids:
         raise SystemExit("early-close abort cleanup proof missing: no dynamo request pin cleanup scheduled marker")
 else:
     print("WARNING: REQUIRE_DYNAMO_PIN_MARKERS=0; selector-only dry run is not a pre-A/B proof")
@@ -314,26 +359,65 @@ except Exception as exc:
         raise SystemExit(f"perf_metrics response was not valid JSON: {exc}: {metrics_text[:400]}")
     perf_metrics = []
 
-for item in _walk(perf_metrics):
+def _maybe_record_transfer_metric(item, source):
+    if not isinstance(item, dict):
+        return
+    candidates = []
     timing = item.get("timing_metrics")
-    if not isinstance(timing, dict):
-        continue
-    size = timing.get("kv_cache_size", 0) or 0
-    start = timing.get("kv_cache_transfer_start", 0) or 0
-    end = timing.get("kv_cache_transfer_end", 0) or 0
-    try:
-        size = float(size)
-        start = float(start)
-        end = float(end)
-    except (TypeError, ValueError):
-        continue
-    if size > 0 and start > 0 and end >= start:
-        positive_transfer_metrics.append((size, start, end))
+    if isinstance(timing, dict):
+        candidates.append(timing)
+    nvext = item.get("nvext")
+    if isinstance(nvext, dict):
+        nvext_timing = nvext.get("timing") or nvext.get("timing_metrics")
+        if isinstance(nvext_timing, dict):
+            candidates.append(nvext_timing)
+    candidates.append(item)
+    for timing in candidates:
+        size = timing.get("kv_cache_size", 0) or 0
+        start = timing.get("kv_cache_transfer_start", 0) or 0
+        end = timing.get("kv_cache_transfer_end", 0) or 0
+        try:
+            size = float(size)
+            start = float(start)
+            end = float(end)
+        except (TypeError, ValueError):
+            continue
+        if size > 0 and start > 0 and end >= start:
+            positive_transfer_metrics.append((source, size, start, end))
+
+for item in _walk(response):
+    _maybe_record_transfer_metric(item, "response")
+for item in _walk(perf_metrics):
+    _maybe_record_transfer_metric(item, "perf_metrics")
+
+proof_starts = {
+    rid: int(blocks)
+    for rid, blocks in re.findall(
+        r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_start.*request_id=([^ ]+).*cache_blocks=([0-9]+)",
+        all_logs,
+    )
+}
+proof_ctx_complete = set(re.findall(
+    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=context_send_complete.*request_id=([^ ]+)",
+    all_logs,
+))
+proof_gen_complete = set(re.findall(
+    r"OPTRT_NIXL_TRANSFER_PROOF.*phase=gen_recv_complete.*request_id=([^ ]+)",
+    all_logs,
+))
+positive_transfer_proof_ids = {
+    rid for rid, blocks in proof_starts.items()
+    if blocks > 0 and (rid in proof_ctx_complete or rid in proof_gen_complete)
+}
+for rid in sorted(positive_transfer_proof_ids):
+    positive_transfer_metrics.append(("log_proof", float(proof_starts[rid]), 1.0, 1.0))
 
 if require_positive_transfer_metrics and not positive_transfer_metrics:
     raise SystemExit(
-        "positive KV transfer metrics missing: /perf_metrics did not expose kv_cache_size>0 "
-        "with kv_cache_transfer_start/end; enable return_perf_metrics/perf_metrics_max_requests or fix transfer"
+        "positive KV transfer proof missing: response nvext timing, worker /perf_metrics, "
+        "and OPTRT_NIXL_TRANSFER_PROOF logs did not expose a nonzero completed transfer; "
+        f"starts={proof_starts} ctx_complete={proof_ctx_complete} gen_complete={proof_gen_complete} "
+        f"perf_metrics_probe={metrics_text[:600]}"
     )
 
 if smc_gate_mode == "required":

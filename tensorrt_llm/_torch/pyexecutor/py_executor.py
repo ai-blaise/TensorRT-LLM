@@ -3950,9 +3950,17 @@ class PyExecutor:
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
+                print(
+                    "OPTRT_NIXL_TRANSFER_PROOF "
+                    f"phase=gen_recv_start request_id={req.py_request_id} mode=sync",
+                    flush=True)
                 self.kv_cache_transceiver.request_and_receive_sync(req)
         else:
             for req in new_gen_reqs:
+                print(
+                    "OPTRT_NIXL_TRANSFER_PROOF "
+                    f"phase=gen_recv_start request_id={req.py_request_id} mode=async",
+                    flush=True)
                 self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -4000,6 +4008,29 @@ class PyExecutor:
                             req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
+                    def _count_cache_blocks(indices):
+                        if indices is None:
+                            return 0
+                        if isinstance(indices, dict):
+                            return sum(_count_cache_blocks(v) for v in indices.values())
+                        if isinstance(indices, (list, tuple, set)):
+                            if all(not isinstance(v, (dict, list, tuple, set)) for v in indices):
+                                return len(indices)
+                            return sum(_count_cache_blocks(v) for v in indices)
+                        return 1
+
+                    transfer_block_count = None
+                    try:
+                        transfer_block_count = _count_cache_blocks(
+                            self.kv_cache_manager.get_cache_indices(req))
+                    except Exception as e:
+                        logger.warning(
+                            f"Unable to count KV transfer blocks for request {req.py_request_id}: {e}")
+                    print(
+                        "OPTRT_NIXL_TRANSFER_PROOF "
+                        f"phase=context_send_start request_id={req.py_request_id} "
+                        f"cache_blocks={transfer_block_count}",
+                        flush=True)
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
@@ -4046,6 +4077,17 @@ class PyExecutor:
 
         for request_id in completed_req_ids:
 
+            if request_id in finished_requests:
+                print(
+                    "OPTRT_NIXL_TRANSFER_PROOF "
+                    f"phase=context_send_complete request_id={request_id}",
+                    flush=True)
+            if request_id in error_requests:
+                print(
+                    "OPTRT_NIXL_TRANSFER_PROOF "
+                    f"phase=context_send_error request_id={request_id}",
+                    flush=True)
+
             if request_id not in requests_in_transfer:
                 logger.warning(
                     f"Request {request_id} not found in transfer manager")
@@ -4077,6 +4119,20 @@ class PyExecutor:
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
         result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         if isinstance(result, tuple):
+            finished_gen_reqs = result[0] if len(result) > 0 else []
+            error_gen_reqs = result[1] if len(result) > 1 else []
+            for req in finished_gen_reqs:
+                req_id = req.py_request_id if hasattr(req, 'py_request_id') else req
+                print(
+                    "OPTRT_NIXL_TRANSFER_PROOF "
+                    f"phase=gen_recv_complete request_id={req_id}",
+                    flush=True)
+            for req in error_gen_reqs:
+                req_id = req.py_request_id if hasattr(req, 'py_request_id') else req
+                print(
+                    "OPTRT_NIXL_TRANSFER_PROOF "
+                    f"phase=gen_recv_error request_id={req_id}",
+                    flush=True)
             _, _, cancelled_reqs = result
             user_canceled_set = set(self.canceled_req_ids)
             for req in cancelled_reqs:

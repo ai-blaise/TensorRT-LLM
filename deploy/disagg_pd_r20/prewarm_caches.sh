@@ -7,7 +7,6 @@ TARGET_NODE="${TARGET_NODE:-a4-us-001-rl9}"
 IMAGE="${IMAGE:-}"
 IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Never}"
 MODEL_PATH="${MODEL_PATH:-/models/BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft}"
-DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP}"
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -31,7 +30,6 @@ Options:
   --user USER            SSH user (default: $VM_USER)
   --target-node NAME     Kubernetes nodeSelector hostname (default: $TARGET_NODE)
   --model PATH           Main model path (default: production DeepSeek path)
-  --draft-model PATH     SMC draft model path (default: production GLM path)
   -h, --help             Show this help
 EOF
 }
@@ -44,7 +42,6 @@ while [[ $# -gt 0 ]]; do
     --user) VM_USER="$2"; shift 2 ;;
     --target-node) TARGET_NODE="$2"; shift 2 ;;
     --model) MODEL_PATH="$2"; shift 2 ;;
-    --draft-model) DRAFT_MODEL_PATH="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -128,7 +125,7 @@ spec:
                       continue
                   raise
           from transformers import AutoConfig, AutoTokenizer
-          for model in ["$MODEL_PATH", "$DRAFT_MODEL_PATH"]:
+          for model in ["$MODEL_PATH"]:
               print(f"prewarm_model={model}")
               AutoConfig.from_pretrained(model, trust_remote_code=True, local_files_only=True)
               try:
@@ -191,5 +188,5 @@ sudo -E /usr/local/bin/k3s kubectl -n dynamo-system delete job "$JOB_NAME" --ign
 EOS
 
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' DRAFT_MODEL_PATH='$DRAFT_MODEL_PATH' JOB_NAME='$JOB_NAME' bash -s" \
+  "IMAGE='$IMAGE' IMAGE_PULL_POLICY='$IMAGE_PULL_POLICY' TARGET_NODE='$TARGET_NODE' MODEL_PATH='$MODEL_PATH' JOB_NAME='$JOB_NAME' bash -s" \
   <<<"$REMOTE_SCRIPT"

@@ -455,12 +455,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Trim each CP rank's DSA KV/indexer pools to its owned layers and "
         "route non-owned layers through a shared broadcast scratch (the "
-        "M5d-tight memory-savings posture). Keep False (replicated pools on "
-        "every rank) for the dense-MLA attention path: that path resolves KV "
-        "through the C++ pool pointer, which cannot read the scratch, so a "
-        "trimmed non-owned layer would have no readable KV slot. Set True only "
-        "once the dense-attention path can source KV from the broadcast "
-        "scratch.")
+        "M5d-tight memory-savings posture). In the disaggregated TP2xCP2 "
+        "prefill -> TP4xCP1 decode path, the C++ transceiver serializes the "
+        "owner-local layer counts and decode reassembles the CP shards before "
+        "generation. Keep this enabled only when the LayerSplit broadcast and "
+        "cache-transfer path are both active and validated.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):

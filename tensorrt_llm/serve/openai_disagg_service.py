@@ -252,6 +252,13 @@ class OpenAIDisaggregatedService(OpenAIService):
                 "Request pinning requires ctx_dp_rank before generation KV "
                 f"receive. disagg_request_id={disagg_request_id!r}, "
                 f"ctx_request_id={params.ctx_request_id!r}.")
+        if params.ctx_info_endpoint is None:
+            raise ValueError(
+                "Request pinning requires ctx_info_endpoint before generation KV "
+                f"receive. disagg_request_id={disagg_request_id!r}, "
+                f"ctx_request_id={params.ctx_request_id!r}, "
+                f"ctx_dp_rank={params.ctx_dp_rank!r}.")
+
 
     @staticmethod
     def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:

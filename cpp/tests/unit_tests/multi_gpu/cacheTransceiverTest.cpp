@@ -2449,7 +2449,7 @@ TEST(targetTest, CacheStateNODP)
             /*expectTPDomain*/ 1, /*expectCPDomain*/ 4, /*expectNeedSend*/ false);
     }
 
-    // Production LayerSplit disagg shape: TP2xCP2 prefill feeds TP4xCP1 decode.
+    // Replicated LayerSplit compatibility shape: TP2xCP2 prefill feeds TP4xCP1 decode.
     {
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
         tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
@@ -2476,6 +2476,52 @@ TEST(targetTest, CacheStateNODP)
         EXPECT_EQ(1, genRank3TargetInfo.mDomainTPSize);
         EXPECT_EQ(2, genRank3TargetInfo.mDomainCPSize);
         EXPECT_FALSE(genRank3TargetInfo.mPeerLayerShardedByCP);
+    }
+
+    // Owner-local production LayerSplit shape: TP2xCP2 prefill rank-local
+    // layer shards feed TP4xCP1 decode. Use an odd layer count so decode must
+    // reassemble unequal CP shards (31 + 30), matching the DeepSeek 61-layer case.
+    {
+        int const ownerLocalNumLayers = 61;
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+        tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
+        std::vector<SizeType32> const contextAttentionLayerNumPerPP{31};
+        std::vector<SizeType32> const genAttentionLayerNumPerPP{ownerLocalNumLayers};
+        auto const attentionType = texec::kv_cache::CacheState::AttentionType::kMLA;
+        auto const sharedModelConfig = texec::kv_cache::CacheState::ModelConfig{
+            std::vector(ownerLocalNumLayers, numHeads), sizePerHead, tokensPerBlock};
+        auto const contextCache = texec::kv_cache::CacheState(
+            sharedModelConfig, contextWC, contextAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+        auto const genCache = texec::kv_cache::CacheState(
+            sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+
+        auto const genRank0TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, 0);
+        EXPECT_EQ((std::vector<int>{0, 1}), genRank0TargetInfo.mIRanks);
+        EXPECT_EQ(1, genRank0TargetInfo.mDomainPPSize);
+        EXPECT_EQ(1, genRank0TargetInfo.mDomainTPSize);
+        EXPECT_EQ(2, genRank0TargetInfo.mDomainCPSize);
+        EXPECT_TRUE(genRank0TargetInfo.mPeerLayerShardedByCP);
+        EXPECT_EQ((std::vector<int>{0, 31}), genRank0TargetInfo.mPeerLayerStartInDomainRanks);
+        EXPECT_EQ((std::vector<int>{31, 30}), genRank0TargetInfo.mPeerLayerNumInDomainRanks);
+        EXPECT_EQ(31, genRank0TargetInfo.getPeerDomainRankLayerNum(0));
+        EXPECT_EQ(30, genRank0TargetInfo.getPeerDomainRankLayerNum(1));
+
+        auto const genRank3TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, 3);
+        EXPECT_EQ((std::vector<int>{2, 3}), genRank3TargetInfo.mIRanks);
+        EXPECT_EQ(1, genRank3TargetInfo.mDomainPPSize);
+        EXPECT_EQ(1, genRank3TargetInfo.mDomainTPSize);
+        EXPECT_EQ(2, genRank3TargetInfo.mDomainCPSize);
+        EXPECT_TRUE(genRank3TargetInfo.mPeerLayerShardedByCP);
+        EXPECT_EQ((std::vector<int>{0, 31}), genRank3TargetInfo.mPeerLayerStartInDomainRanks);
+        EXPECT_EQ((std::vector<int>{31, 30}), genRank3TargetInfo.mPeerLayerNumInDomainRanks);
+
+        auto const ctxRank1TargetInfo = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, 1);
+        EXPECT_EQ((std::vector<int>{0, 1}), ctxRank1TargetInfo.mIRanks);
+        EXPECT_EQ(1, ctxRank1TargetInfo.mDomainPPSize);
+        EXPECT_EQ(2, ctxRank1TargetInfo.mDomainTPSize);
+        EXPECT_EQ(1, ctxRank1TargetInfo.mDomainCPSize);
+        EXPECT_EQ((std::vector<int>{30}), ctxRank1TargetInfo.mPeerLayerNumInDomainPP);
+        EXPECT_TRUE(MLACacheFormatter::needSendCache(contextCache, genCache, 1));
     }
 }
 

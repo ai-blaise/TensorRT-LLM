@@ -555,6 +555,22 @@ class TestDisaggRequestPinning:
                 ctx_server_info={"server_info": {"disaggregated_params": {}}},
             )
 
+    def test_missing_ctx_info_endpoint_fails_closed_before_gen_receive(self):
+        svc = _make_service("generation_first")
+        request = CompletionRequest(model="test-model", prompt="hello")
+
+        with pytest.raises(ValueError, match="ctx_info_endpoint"):
+            svc._get_gen_request(
+                request,
+                ctx_response=None,
+                disagg_request_id=42,
+                ctx_server_info={
+                    "server_info": {
+                        "disaggregated_params": {"ctx_dp_rank": 0}
+                    }
+                },
+            )
+
     @pytest.mark.asyncio
     async def test_request_pin_lifecycle_clears_after_non_streaming_response(self):
         service = _make_service("context_first")

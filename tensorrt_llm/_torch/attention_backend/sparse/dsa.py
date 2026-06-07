@@ -4116,6 +4116,8 @@ class DSATrtllmAttention(TrtllmAttention):
         tpb = mgr.tokens_per_block
         sink_blocks = mgr.kvarn_cfg.sink_tokens // tpb
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
+        if pool is None:
+            return
         bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime  # host, per (all) seqs
         lo, hi = self._kvarn_seq_range(metadata, is_generation)
@@ -4161,6 +4163,8 @@ class DSATrtllmAttention(TrtllmAttention):
             return
         tpb = mgr.tokens_per_block
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
+        if pool is None:
+            return
         kv_lens = metadata.kv_lens_runtime
         lo, hi = self._kvarn_seq_range(metadata, True)
         if hi <= lo:
@@ -4307,6 +4311,7 @@ class DSACacheManager(KVCacheManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         sparse_attn_config: "SparseAttentionConfig",
+        layersplit_model_num_layers: Optional[int] = None,
         **kwargs,
     ) -> None:
         """Initialize cache manager with indexer K-cache pool per layer."""
@@ -4327,9 +4332,16 @@ class DSACacheManager(KVCacheManager):
         # get_buffers()). Build the owner table over the global layer domain so
         # state.is_owner(global_layer_idx) remains valid on every CP rank.
         layersplit_owner_num_layers = (
-            len(layer_mask) if layer_mask is not None and bool(
+            layersplit_model_num_layers
+            if layersplit_model_num_layers is not None else
+            (len(layer_mask) if layer_mask is not None and bool(
                 getattr(sparse_attn_config, "layersplit_enabled", False)) else
-            num_layers)
+             num_layers))
+        self.layersplit_model_num_layers = layersplit_owner_num_layers
+        self.layersplit_local_pool_layers = num_layers
+        self.layersplit_cache_transfer_model_layers = layersplit_owner_num_layers
+        self.layersplit_cache_transfer_local_pool_layers = num_layers
+        self.layersplit_cache_transfer_layer_mask_len = len(layer_mask) if layer_mask is not None else None
         self.layersplit_state = LayerSplitRuntimeState.from_sparse_config(
             sparse_attn_config=sparse_attn_config,
             num_layers=layersplit_owner_num_layers,
@@ -4405,6 +4417,52 @@ class DSACacheManager(KVCacheManager):
             indexer_k_cache_use_fp4=self.use_fp4,
             **kwargs,
         )
+
+        # Owner-local LayerSplit trims the actual C++ KV/indexer/KVarN pools
+        # to this CP rank's owned layers. Disaggregated transfer metadata is a
+        # different contract: C++ target-rank selection and MLA split/concat use
+        # mNbKvHeadsPerLayer.size() as the global attention-layer domain and
+        # mAttentionLayerNumPerPP as the local shard size. Publish an explicit
+        # transfer-only global vector so the transceiver does not serialize the
+        # trimmed local pool shape and make decode reject TP2xCP2 -> TP4xCP1
+        # handoff as a layer-count mismatch.
+        self.layersplit_transfer_num_kv_heads_per_layer = None
+        if (self.layersplit_state.enabled
+                and self.layersplit_state.cp_size > 1
+                and self.layersplit_state.owner_local_alloc
+                and self.layersplit_state.ownership is not None):
+            local_attention_heads = [
+                int(h) for h in self.num_kv_heads_per_layer if int(h) > 0
+            ]
+            if not local_attention_heads:
+                raise RuntimeError(
+                    "LayerSplit owner-local transfer cannot infer global "
+                    "KV-head metadata from an empty local layer vector")
+            if len(set(local_attention_heads)) != 1:
+                raise RuntimeError(
+                    "LayerSplit owner-local transfer requires an explicit "
+                    "global KV-head vector for heterogeneous per-layer heads")
+            transfer_layers = int(
+                getattr(self, "layersplit_cache_transfer_model_layers", 0)
+                or getattr(self, "layersplit_model_num_layers", 0)
+                or self.layersplit_state.ownership.num_layers)
+            self.layersplit_transfer_num_kv_heads_per_layer = [
+                local_attention_heads[0] for _ in range(transfer_layers)
+            ]
+            logger.info(
+                "LayerSplit owner-local transfer metadata: local_layers=%d, "
+                "global_layers=%d, kv_heads_per_layer=%d",
+                len(local_attention_heads), transfer_layers,
+                local_attention_heads[0])
+            print(
+                "OPTRT_DSA_LAYERSPLIT_DEBUG "
+                f"cp_rank={self.layersplit_state.cp_rank} "
+                f"cp_size={self.layersplit_state.cp_size} "
+                f"local_attention_layers={len(local_attention_heads)} "
+                f"global_layers={transfer_layers} "
+                f"local_pool_layers={len(getattr(self, 'num_kv_heads_per_layer', []))} "
+                f"layer_offsets={list(getattr(self, 'layer_offsets', {}).keys())[:8]}...",
+                flush=True)
         self.num_blocks = self.blocks_in_primary_pool
 
         # KVarN dense-MLA-latent side-pool (parallels the indexer-K pool):
@@ -4518,10 +4576,18 @@ class DSACacheManager(KVCacheManager):
         if (self.layersplit_state.enabled
                 and self.layersplit_state.cp_size > 1
                 and self.layersplit_state.owner_local_alloc):
-            owned = self.layersplit_state.ownership.owned_layers(
-                self.layersplit_state.cp_rank)
+            owned = self._layersplit_local_pool_layers()
+            expected_owned = tuple(
+                self.layersplit_state.ownership.owned_layers(
+                    self.layersplit_state.cp_rank))
+            if expected_owned and set(expected_owned) != set(owned):
+                logger.warning(
+                    "LayerSplit owner-local pool ownership differs from policy "
+                    "helper: policy=%s actual_pool_layers=%s. Using "
+                    "layer_offsets as the dense/indexer read-path source of "
+                    "truth.", expected_owned, owned)
             if owned:
-                # Use the first owned layer's pool-slot tensor as the
+                # Use the first actual local pool layer's pool-slot tensor as the
                 # template — same shape / dtype / device as every
                 # non-owned layer's slot would have if it were allocated.
                 first_owned = owned[0]
@@ -4597,6 +4663,26 @@ class DSACacheManager(KVCacheManager):
                 and self._layersplit_dense_kv_scratch is not None):
             self._build_layersplit_dense_scratch_pool()
 
+    def _layersplit_local_pool_layers(self) -> Tuple[int, ...]:
+        """Global layer ids with real local C++ KV/indexer/KVarN pool slots."""
+        return tuple(sorted(int(layer) for layer in self.layer_offsets.keys()))
+
+    def _layersplit_should_use_scratch(self, layer_idx: int) -> bool:
+        return bool(self.layersplit_state.enabled
+                    and self.layersplit_state.cp_size > 1
+                    and self.layersplit_state.owner_local_alloc
+                    and int(layer_idx) not in self.layer_offsets)
+
+    def _layersplit_nonlocal_pool_layers(self) -> Tuple[int, ...]:
+        if not (self.layersplit_state.enabled
+                and self.layersplit_state.owner_local_alloc
+                and self.layersplit_state.ownership is not None):
+            return ()
+        owned_set = set(self._layersplit_local_pool_layers())
+        total_layers = self.layersplit_state.ownership.num_layers
+        return tuple(layer for layer in range(total_layers)
+                     if layer not in owned_set)
+
     def _build_layersplit_dense_scratch_pool(self) -> None:
         """Expose the non-owned-layer dense scratch as a real C++-addressable pool.
 
@@ -4635,11 +4721,8 @@ class DSACacheManager(KVCacheManager):
         if (self._layersplit_dense_scratch_pool_index is not None
                 and self._layersplit_nonowned_layer_rows):
             return
-        owned = self.layersplit_state.ownership.owned_layers(
-            self.layersplit_state.cp_rank)
-        owned_set = set(owned)
-        total_layers = self.layersplit_state.ownership.num_layers
-        non_owned = [l for l in range(total_layers) if l not in owned_set]
+        owned = self._layersplit_local_pool_layers()
+        non_owned = list(self._layersplit_nonlocal_pool_layers())
         if not non_owned:
             return
 
@@ -4741,7 +4824,7 @@ class DSACacheManager(KVCacheManager):
 
         if self._layersplit_dense_kv_scratch is None:
             try:
-                local_offsets = list(getattr(self, "layer_offsets", {}).values())
+                local_offsets = list(getattr(self, 'layer_offsets', {}).values())
                 local_offset = local_offsets[0] if local_offsets else 0
                 dense_template = self.impl.get_primary_pool_data(local_offset)
                 if dense_template is not None:
@@ -4824,23 +4907,7 @@ class DSACacheManager(KVCacheManager):
             self.num_blocks, block_size, 1, per_token_size)
 
     def _layersplit_non_owned(self, layer_idx: int) -> bool:
-        if not (self.layersplit_state.enabled
-                and self.layersplit_state.cp_size > 1
-                and self.layersplit_state.owner_local_alloc):
-            return False
-        # Under owner-local allocation, the local layer-offset table is the
-        # authoritative allocation map for this rank. The LayerSplit ownership
-        # table may be local-slice indexed while callers pass global layer ids,
-        # so check the allocated layer map before querying owner_map.
-        if layer_idx in getattr(self, 'layer_offsets', {}):
-            return False
-        ownership = getattr(self.layersplit_state, 'ownership', None)
-        if ownership is not None and 0 <= layer_idx < ownership.num_layers:
-            return not ownership.is_owner(layer_idx, self.layersplit_state.cp_rank)
-        try:
-            return not self.layersplit_state.is_owner(layer_idx)
-        except (IndexError, KeyError):
-            return True
+        return self._layersplit_should_use_scratch(layer_idx)
 
     def _ensure_layersplit_indexer_k_scratch(self):
         """Lazily allocate the non-owned-layer indexer-K scratch slot.
@@ -4892,10 +4959,19 @@ class DSACacheManager(KVCacheManager):
         return bool(self.kvarn_latent_pool_per_layer)
 
     def get_kvarn_latent_pool(self, layer_idx: int) -> "KVarNLatentPool":
-        """KVarN side-pool for a LOCAL layer (None when disabled)."""
+        """KVarN side-pool for a local dense-MLA layer.
+
+        Owner-local LayerSplit trims dense MLA side-pools to the same actual
+        local layer set as the C++ KV pool. Non-local layers read dense KV from
+        the broadcast scratch and must not commit/restore KVarN entries on the
+        receiving rank; the owner rank handles the side-pool for that layer.
+        """
         if not self.kvarn_enabled:
             return None
-        return self.kvarn_latent_pool_per_layer[self.layer_offsets[layer_idx]]
+        layer_offset = self.layer_offsets.get(layer_idx)
+        if layer_offset is None:
+            return None
+        return self.kvarn_latent_pool_per_layer[layer_offset]
 
     def kvarn_store_block(self, layer_idx: int, block_id: int,
                           ckv, k_pe) -> None:
@@ -4996,10 +5072,12 @@ class DSACacheManager(KVCacheManager):
         scale_scratch = getattr(self, "_layersplit_dense_scale_scratch", None)
         if scale_scratch is None or self.dtype != DataType.NVFP4:
             return None
-        if not self.layersplit_state.is_owner(layer_idx):
+        if self._layersplit_non_owned(layer_idx):
             return scale_scratch
+        layer_offset = self.layer_offsets.get(layer_idx)
+        if layer_offset is None:
+            return None
         scale_pool = self.get_dense_block_scale_pool()
-        layer_offset = self.layer_offsets[layer_idx]
         # Block-first layout [num_blocks, num_layers, kv_factor, scale...].
         return scale_pool[:, layer_offset]
 

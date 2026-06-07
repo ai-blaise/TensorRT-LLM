@@ -106,6 +106,7 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
         r"host_pinned_blocks[=: ]+0\b",
         r"cache_state_layers[=: ]+0\b",
         r"pinned KV handoff.*0 blocks",
+        r"KV cache transfer timeout",
         r"illegal memory access",
         r"Traceback",
     ]

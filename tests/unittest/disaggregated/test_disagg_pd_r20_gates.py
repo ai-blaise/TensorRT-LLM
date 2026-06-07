@@ -98,6 +98,17 @@ def test_r20_transceiver_backend_selection_is_fail_closed():
     assert "received multiple" in source
 
 
+def test_r20_executor_emits_nixl_transfer_proof_markers():
+    source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "py_executor.py").read_text()
+
+    assert "OPTRT_NIXL_TRANSFER_PROOF" in source
+    assert "phase=context_send_start" in source
+    assert "phase=context_send_complete" in source
+    assert "phase=gen_recv_start" in source
+    assert "phase=gen_recv_complete" in source
+    assert "cache_blocks=" in source
+
+
 def test_r20_request_pinning_smoke_is_fail_closed():
     script = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
 
@@ -114,10 +125,16 @@ def test_r20_request_pinning_smoke_is_fail_closed():
     assert "route-selected decode" in script
     assert "Selected worker: worker_type=prefill" in script
     assert "nvext.worker_id" in script
+    assert "prefill-service" in script
+    assert "decode-service" in script
     assert "REQUIRE_DYNAMO_PIN_MARKERS" in script
     assert "REQUIRE_POSITIVE_TRANSFER_METRICS" in script
     assert "REQUIRE_ABORT_CLEANUP_MARKER" in script
     assert "positive KV transfer metrics missing" in script
+    assert "response nvext timing and worker /perf_metrics" in script
+    assert "KV cache transfer timeout" in script
+    assert "OPTRT_NIXL_TRANSFER_PROOF" in script
+    assert "positive KV transfer proof missing" in script
     assert "ctx_dp_rank is None" in script
     assert "SMC-SD must remain deferred" in script
     assert "SMC_GATE_MODE" in script
