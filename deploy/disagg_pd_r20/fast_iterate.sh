@@ -40,6 +40,7 @@ Options:
   --user USER           SSH user (default: $VM_USER)
   --remote-repo PATH    Remote rsync/build directory (default: $REMOTE_REPO)
   --image-repo NAME     Image repository (default: $IMAGE_REPO)
+  --deploy-image IMAGE  Existing image to prewarm/deploy; skips build/import
   --base-image IMAGE    Existing runtime image used as overlay base
   --target-node NAME    Kubernetes nodeSelector hostname (default: $TARGET_NODE)
   --dgd-name NAME       DGD/ConfigMap name; use a suffix for warm canaries
@@ -76,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --user) VM_USER="$2"; shift 2 ;;
     --remote-repo) REMOTE_REPO="$2"; shift 2 ;;
     --image-repo) IMAGE_REPO="$2"; shift 2 ;;
+    --deploy-image) DEPLOY_IMAGE_TAG="$2"; BUILD=0; shift 2 ;;
     --base-image) BASE_IMAGE="$2"; shift 2 ;;
     --target-node) TARGET_NODE="$2"; shift 2 ;;
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
@@ -107,7 +109,7 @@ STAMP="$(date -u +%Y%m%d%H%M%S)"
 IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:optrt-${SHA}-${TAG_SUFFIX}-${STAMP}}"
 DEPLOY_IMAGE_TAG="${DEPLOY_IMAGE_TAG:-$IMAGE_TAG}"
 if [[ "$USE_LOCAL_REGISTRY" == 1 && "$DEPLOY_IMAGE_TAG" != "$LOCAL_REGISTRY/"* ]]; then
-  image_path="${IMAGE_TAG#docker.io/}"
+  image_path="${DEPLOY_IMAGE_TAG#docker.io/}"
   image_path="${image_path#${LOCAL_REGISTRY}/}"
   DEPLOY_IMAGE_TAG="${LOCAL_REGISTRY}/${image_path}"
 fi
@@ -166,6 +168,7 @@ local_registry=$LOCAL_REGISTRY
 local_registry_mode=$LOCAL_REGISTRY_MODE
 allow_chained_overlay=$ALLOW_CHAINED_OVERLAY
 required_transport_wrappers=$REQUIRED_TRANSPORT_WRAPPERS
+transport_check_image=$DEPLOY_IMAGE_TAG
 overlay_sync_path_count=${#OVERLAY_SYNC_PATHS[@]}
 EOF
   printf 'overlay_sync_paths='
@@ -325,7 +328,7 @@ if [[ "$BUILD" == 1 ]]; then
 fi
 
 if [[ -n "$REQUIRED_TRANSPORT_WRAPPERS" ]]; then
-  check_image="$BUILD_IMAGE_TAG"
+  check_image="$DEPLOY_IMAGE_TAG"
   check_script='
 set -euo pipefail
 base="/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs"

@@ -108,6 +108,21 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --dry-run
 ```
 
+Reuse an already-built image in the normal prewarm/deploy flow without rebuilding
+or importing another overlay. This is useful for strict smoke retries, rollback
+checks, and router/config-only iterations where `check_image_handoff.sh` already
+proved the image is resident or available from the VM-local registry:
+
+```bash
+deploy/disagg_pd_r20/fast_iterate.sh \
+  --vm local \
+  --deploy-image localhost:5000/local/dynamo-trtllm-optrt-custom:<known-good-tag> \
+  --use-local-registry \
+  --prewarm \
+  --deploy \
+  --dry-run
+```
+
 Render and API-server-validate the DGD with the currently active image, without
 building/importing a new image and without applying the DGD. This is the fastest
 router/deploy-YAML check when only the DynamoGraphDeployment/config changed.
