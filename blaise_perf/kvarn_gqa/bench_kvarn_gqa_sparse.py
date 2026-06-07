@@ -60,6 +60,31 @@ def timed_us(fn, iters: int, warmup: int) -> float:
     return start.elapsed_time(end) * 1000.0 / iters
 
 
+def capture_tensor_op(fn):
+    eager = fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fn()
+    graph.replay()
+    torch.cuda.synchronize()
+    return eager, captured, graph
+
+
+def capture_store_op(fn, packed: torch.Tensor):
+    fn()
+    eager = packed.detach().clone()
+    packed.zero_()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    packed.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    return eager, packed.detach().clone(), graph
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default="/workspace")
@@ -71,6 +96,8 @@ def main() -> None:
     parser.add_argument("--sparse-topk", type=int, default=64)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--graph-replay", action="store_true",
+                        help="capture/replay store, dense decode, and sparse decode and compare against eager outputs")
     args = parser.parse_args()
 
     torch.cuda.set_device(args.device)
@@ -97,6 +124,11 @@ def main() -> None:
     store()
     store_us = timed_us(store, args.iters, args.warmup)
     store()
+    if args.graph_replay:
+        eager_packed, replay_packed, _ = capture_store_op(store, packed)
+        store_graph_diff = (replay_packed.to(torch.int16) - eager_packed.to(torch.int16)).abs().max().item()
+        store()
+        print(f"GRAPH_STORE dtype={args.dtype} max_abs_byte={store_graph_diff}")
 
     print(f"STORE dtype={args.dtype} blocks={num_blocks} kv_heads={args.kv_heads} store_us={store_us:.2f}")
     for m in args.m:
@@ -124,6 +156,19 @@ def main() -> None:
         dense_us = timed_us(dense, args.iters, args.warmup)
         sparse_full_us = timed_us(sparse_full, args.iters, args.warmup)
         sparse_us = timed_us(sparse, args.iters, args.warmup)
+        if args.graph_replay:
+            eager_dense, replay_dense, _ = capture_tensor_op(dense)
+            eager_sparse_full, replay_sparse_full, _ = capture_tensor_op(sparse_full)
+            eager_sparse, replay_sparse, _ = capture_tensor_op(sparse)
+            graph_dense = (replay_dense - eager_dense).abs().max().item()
+            graph_sparse_full = (replay_sparse_full - eager_sparse_full).abs().max().item()
+            graph_sparse = (replay_sparse - eager_sparse).abs().max().item()
+            print(
+                f"GRAPH_DECODE dtype={args.dtype} M={m} topk={topk} "
+                f"dense_replay_max_abs={graph_dense:.6f} "
+                f"sparse_full_replay_max_abs={graph_sparse_full:.6f} "
+                f"sparse_topk_replay_max_abs={graph_sparse:.6f}"
+            )
         print(
             f"DECODE dtype={args.dtype} M={m} topk={topk} max_abs_full={max_abs:.6f} "
             f"dense_us={dense_us:.2f} sparse_full_us={sparse_full_us:.2f} sparse_topk_us={sparse_us:.2f}"

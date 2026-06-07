@@ -300,18 +300,28 @@ cleanup. It is not production-default yet.
 Required completion:
 
 - Prove multi-rank NIXL transfer for packed GQA KVarN pages plus side-state
-  fragments.
-- Add/finish BDR fold with in-kernel dequant-on-read for the GQA 2-bit path,
-  matching the dense MLA optimization level described in `docs/blaise/kvarn.md`.
+  fragments. The integration branch has side-state metadata/fragments and unit
+  coverage for nonzero request-pinned slot offsets; it still needs the real
+  multi-rank NIXL run.
+- Finish and prove BDR fold with in-kernel dequant-on-read for the GQA 2-bit
+  path, matching the dense MLA optimization level described in
+  `docs/blaise/kvarn.md`. The branch has physical-block generation tracking,
+  amortized dequant, and packed decode/sparse-decode kernels that read/dequant
+  in-kernel; live parity/perf proof is still pending.
 - Keep the default production KV contract explicit: dense MLA defaults to
   `kvarn_k2v2`; the SMC-SD GQA draft/target model path must also be deployable
-  from Hugging Face config with `kvarn_k2v2` as its default once the backend is
-  proven. KVarN must never be applied to the Indexer K path.
+  from Hugging Face config with `kvarn_k2v2_g128` as its default once the backend
+  is proven. KVarN must never be applied to the Indexer K path.
 - Fuse sparse top-k packed read, dequant, and scoring instead of staging through
-  a slow dense restore path.
-- Prove CUDA graph capture/replay for the SMC-SD GQA path.
-- Optimize the store kernel; the prior subagent report still called out a slow
-  store path that is not acceptable for production default.
+  a slow dense restore path. The branch adds
+  `torch.ops.trtllm.kvarn_gqa_decode_sparse` for top-k<=256; B200 sparse parity
+  and E2E HISA composition are still pending.
+- Prove CUDA graph capture/replay for the SMC-SD GQA path. The branch adds a
+  `--graph-replay` low-memory harness for store, dense decode, and sparse decode;
+  it still needs a free B200 run.
+- Optimize the store kernel; the branch writes packed 2-bit bytes directly rather
+  than zeroing and read/OR/writing every byte, but post-optimization store timing
+  still needs to be measured.
 - Validate HF-config deployability and default selection for both dense MLA and
   SMC-SD GQA model paths.
 

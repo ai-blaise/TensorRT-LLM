@@ -409,10 +409,15 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
         dtype=torch.float16,
         device=torch.device("cpu"),
     )
+    # Exercise nonzero request-pinned slots; NIXL transfers use base pointer
+    # plus item_size * slot, so slot-zero-only tests miss bad offset math.
+    assert src_pool.slot_for_request(901) == 0
+    assert dst_pool.slot_for_request(901) == 0
+    assert dst_pool.slot_for_request(902) == 1
     src_slot = src_pool.slot_for_request(123)
     dst_slot = dst_pool.slot_for_request(123)
-    assert src_slot == 0
-    assert dst_slot == 0
+    assert src_slot == 1
+    assert dst_slot == 2
 
     src_meta = src_pool.transfer_meta(device_id=0)
     dst_meta = dst_pool.transfer_meta(device_id=0)
@@ -438,6 +443,8 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
         unique_rid=123,
         kvarn_gqa_side_slot=dst_slot,
     )
+    req_info = RecvReqInfo.from_bytes(req_info.to_bytes())
+    assert req_info.kvarn_gqa_side_slot == dst_slot
     task = SimpleNamespace(_unique_rid=123, _slice=SimpleNamespace(is_last_slice=True))
 
     src_ptrs, dst_ptrs, sizes = Sender._collect_kvarn_gqa_side_frags(
@@ -445,8 +452,14 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
     )
 
     assert torch.equal(torch.from_numpy(sizes), torch.from_numpy(src_meta.item_sizes))
-    assert torch.equal(torch.from_numpy(src_ptrs), torch.from_numpy(src_meta.ptrs))
-    assert torch.equal(torch.from_numpy(dst_ptrs), torch.from_numpy(dst_meta.ptrs))
+    assert torch.equal(
+        torch.from_numpy(src_ptrs),
+        torch.from_numpy(src_meta.ptrs + src_meta.item_sizes * src_slot),
+    )
+    assert torch.equal(
+        torch.from_numpy(dst_ptrs),
+        torch.from_numpy(dst_meta.ptrs + dst_meta.item_sizes * dst_slot),
+    )
 
     # Non-final slices carry packed pages only; final slice carries side state.
     task._slice.is_last_slice = False
