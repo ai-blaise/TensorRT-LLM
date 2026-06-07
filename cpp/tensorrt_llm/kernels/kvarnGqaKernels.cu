@@ -45,6 +45,16 @@ static constexpr int kVSRowAbsOffset = 9216;
 static constexpr int kVZpAbsOffset = 9472;
 static constexpr float kHadamardScale = 0.08838834764831845f; // 1 / sqrt(128)
 
+void checkKvarnGqaCuda(cudaError_t err, char const* what)
+{
+    TLLM_CHECK_WITH_INFO(err == cudaSuccess, "%s failed: %s", what, cudaGetErrorString(err));
+}
+
+void checkKvarnGqaLaunch(char const* what)
+{
+    checkKvarnGqaCuda(cudaGetLastError(), what);
+}
+
 struct PackedRecordView
 {
     std::uint8_t const* ptr;
@@ -989,19 +999,22 @@ void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* pac
     constexpr std::size_t kSharedBytes = kSharedFloats * sizeof(float);
     if (useBf16)
     {
-        cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(kSharedBytes));
+        checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__nv_bfloat16>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes)),
+            "kvarn_gqa_store bf16 dynamic smem attribute");
         kvarnGqaStoreParallelKernel<__nv_bfloat16><<<grid, kThreads, kSharedBytes, stream>>>(
             static_cast<__nv_bfloat16 const*>(k), static_cast<__nv_bfloat16 const*>(v), view, blockIds, numBlocks,
             numKvHeads);
     }
     else
     {
-        cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__half>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(kSharedBytes));
+        checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__half>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes)),
+            "kvarn_gqa_store fp16 dynamic smem attribute");
         kvarnGqaStoreParallelKernel<__half><<<grid, kThreads, kSharedBytes, stream>>>(static_cast<__half const*>(k),
             static_cast<__half const*>(v), view, blockIds, numBlocks, numKvHeads);
     }
+    checkKvarnGqaLaunch("kvarn_gqa kernel launch");
 }
 
 void invokeKvarnGqaDecodeSparseK2V2G128(void const* q, std::uint8_t const* packedRecords,
@@ -1039,6 +1052,7 @@ void invokeKvarnGqaDecodeSparseK2V2G128(void const* q, std::uint8_t const* packe
             static_cast<__half*>(output), numQueries, numBlocks, numHeads, numKvHeads, seqLensCount, sinkTokens,
             sinkBatch, tailTokens, tailBatch, sparseTopk, sparseStrideKv, sparseStrideQuery, sparseStrideTopk);
     }
+    checkKvarnGqaLaunch("kvarn_gqa kernel launch");
 }
 
 void invokeKvarnGqaDequantAmortizedK2V2G128(std::uint8_t const* packedRecords, std::int64_t const* blockIds,
@@ -1069,6 +1083,7 @@ void invokeKvarnGqaDequantAmortizedK2V2G128(std::uint8_t const* packedRecords, s
             static_cast<__half*>(readableK), static_cast<__half*>(readableV), numChurnBlocks, numPhysicalBlocks,
             numKvHeads);
     }
+    checkKvarnGqaLaunch("kvarn_gqa kernel launch");
 }
 
 void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecords,
@@ -1122,6 +1137,7 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
                 numQueries, numBlocks, numHeads, numKvHeads, seqLensCount, sinkTokens, sinkBatch, tailTokens, tailBatch);
         }
     }
+    checkKvarnGqaLaunch("kvarn_gqa kernel launch");
 }
 
 } // namespace kernels

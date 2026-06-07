@@ -379,7 +379,10 @@ Current focused coverage:
   `torch.ops.trtllm.kvarn_gqa_backend_ready()` are registered and ready.
   `blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py` is the focused low-memory
   B200 harness for the new packed sparse top-k op: it builds the THOP extension
-  from the checkout, times store/dense decode/sparse-full/sparse-topk plus
+  from the checkout. The CUDA invoke paths check dynamic-smem attributes and
+  store/sparse/dequant/dense launch errors at the op boundary without pulling
+  in broader CUDA helpers that conflict with Torch extension half-conversion flags. The harness
+  times store/dense decode/sparse-full/sparse-topk plus
   `kvarn_gqa_dequant_amortized` full-vs-churn BDR dequant, optionally runs
   `--graph-replay`, accepts `--blocks` and `--bdr-churn-blocks` to prove dequant
   cost scales with churn rather than resident working set, and checks sparse-full

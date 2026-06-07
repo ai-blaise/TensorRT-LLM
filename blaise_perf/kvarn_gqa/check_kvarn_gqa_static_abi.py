@@ -46,6 +46,14 @@ REQUIRED_CONFIG_SEPARATION_SNIPPETS = (
     '"indexcache-hisa requires indexer_k_dtype=\'fp4\'."',
 )
 
+REQUIRED_KERNEL_LAUNCH_SNIPPETS = (
+    'void checkKvarnGqaCuda(cudaError_t err, char const* what)',
+    'void checkKvarnGqaLaunch(char const* what)',
+    'checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__nv_bfloat16>',
+    'checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__half>',
+    'checkKvarnGqaLaunch("kvarn_gqa kernel launch");',
+)
+
 REQUIRED_GQA_ATTENTION_SNIPPETS = (
     'self.block_ids = torch.full',
     'def restore_committed_blocks_amortized',
@@ -121,6 +129,10 @@ def main() -> None:
         require_contains(loader, snippet, "model_loader gate")
     for snippet in REQUIRED_CONFIG_SEPARATION_SNIPPETS:
         require_contains(llm_args, snippet, "GQA/dense-MLA/Indexer config separation")
+    for snippet in REQUIRED_KERNEL_LAUNCH_SNIPPETS:
+        require_contains(kernels, snippet, "GQA CUDA launch hardening")
+    if kernels.count('checkKvarnGqaLaunch("kvarn_gqa kernel launch");') < 4:
+        raise SystemExit("missing GQA CUDA launch hardening: expected launch checks for store/sparse/dequant/dense")
     for snippet in REQUIRED_GQA_ATTENTION_SNIPPETS:
         require_contains(gqa, snippet, "GQA attention path")
     disagg = rank_info + "\n" + transfer
