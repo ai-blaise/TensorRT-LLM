@@ -28,7 +28,7 @@ Options:
                          keep the manifest value (default: template)
   --namespace NAME       Namespace for --image-from-dgd and server dry-run
                          (default: dynamo-system)
-  --out PATH             Output path (default: /tmp/<dgd-name>-render.yaml)
+  --out PATH             Output path (default: /tmp/<user>-<dgd-name>-render.yaml)
   --server-dry-run       Run kubectl apply --dry-run=server against the output
   -h, --help             Show this help
 EOF
@@ -89,7 +89,7 @@ if [[ -z "$IMAGE" ]]; then
 fi
 
 if [[ -z "$OUT" ]]; then
-  OUT="/tmp/${DGD_NAME}-render.yaml"
+  OUT="/tmp/${USER:-optrt}-${DGD_NAME}-render.yaml"
 fi
 out_dir="$(dirname "$OUT")"
 if [[ ! -d "$out_dir" ]]; then

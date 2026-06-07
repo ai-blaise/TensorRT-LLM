@@ -24,6 +24,9 @@ Pass criteria:
 - The rendered image matches the active DGD image and `imagePullPolicy` is
   explicit for the intended path (`IfNotPresent` for local registry/resident
   images, `Never` for strictly preloaded images).
+- `check_image_handoff.sh --vm local --image-from-dgd topo-c1-dp2tp4-disagg-r20 --mode auto --require`
+  reports `handoff_ready=yes` and a recommended pull policy before prewarm or
+  deploy spends time on the wrong image handoff path.
 - `cache_report.sh --vm local` shows the active image is resident in k3s
   containerd and persistent cache directories exist.
 - `prewarm_caches.sh --dry-run` renders the cache prewarm Job for the same image

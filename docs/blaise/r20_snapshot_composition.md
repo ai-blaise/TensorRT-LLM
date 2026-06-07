@@ -42,6 +42,8 @@ R20 already has the cache and image pieces that should compose with snapshots:
   HF, XDG, pip, Torch extension, TorchInductor, Triton, CUDA JIT, DeepGEMM, and
   TRT-LLM generated-artifact caches.
 - `cache_report.sh` for read-only cache and image residency reporting.
+- `check_image_handoff.sh` for exact-image resident/local-registry preflight
+  before prewarm or deploy.
 - `render_dgd.sh` for API-server validation with the active image, avoiding a
   build/import loop for deploy-YAML and router checks.
 - `foundry_prepare.sh` for read-only Foundry source/build readiness reporting.

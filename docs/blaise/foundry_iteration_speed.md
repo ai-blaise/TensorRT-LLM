@@ -29,12 +29,19 @@ Foundry:
 
 ai-blaise comparison inputs:
 
-- `ai-blaise/criu-snapshots`, default branch `main`, private GitHub repo read
-  via the GitHub connector because the VM has no GitHub credentials.
-- `ai-blaise/infrastructure`:
-  `scripts/dynamo-reap/deploy-a4-snapshots.sh`.
-- VM worktrees:
-  `/tmp/tensorrt-llm-op-trt-clean`, `/home/spencer/work/TensorRT-LLM-op-trt-ls`,
+- `ai-blaise/criu-snapshots`: private GitHub repo is not cloneable from the VM
+  without credentials (`git ls-remote` fails for authentication), so this pass
+  used the live/rendered chart trees at `/tmp/criu-chart-live`,
+  `/tmp/criu-chart-k3s-test`, the host install at `/opt/criu-snapshots`, and
+  `dynamo-prod-k8s` production addon/runbook references to that repo.
+- `ai-blaise/dynamo-prod-k8s`, audited on the VM at commit
+  `48045c49d434b36621d4938488a8b4bbfe314352`.
+- `ai-blaise/infrastructure` VM artifact:
+  `/tmp/infra-prod-20260528T225729Z/scripts/dynamo-reap/deploy-a4-production.sh`.
+- VM worktrees/artifacts:
+  `/tmp/tensorrt-llm-op-trt-clean`, `/tmp/optrt-origin-op-trt-audit`,
+  `/tmp/dynamo-prod-k8s-audit`, `/tmp/criu-chart-live`,
+  `/tmp/criu-chart-k3s-test`, `/opt/criu-snapshots`,
   `/home/spencer/optimization-playground`, and `/tmp/foundry-org-foundry-audit`.
 - `ai-blaise/sglang` `main` was checked for `SGLANG_SNAPSHOT_HOOKS` / CRIU
   hook files; those hook files were not present there as of this audit. The
@@ -144,6 +151,40 @@ snapshot hooks that `criu-snapshots` expects:
 It also carries other state-reuse mechanisms, such as HiCache and checkpoint
 engine weight loading. Those are SGLang-specific and complementary to CRIU;
 they do not provide a TensorRT-LLM Foundry hook surface.
+
+## Repo Comparison Refresh - 2026-06-07
+
+`ai-blaise/dynamo-prod-k8s` confirms that CRIU/snapshot support is already a
+production addon and runbook path, not an `op-trt`-local format. The audited
+commit `48045c49d434b36621d4938488a8b4bbfe314352` contains:
+
+- `deploy/production/addons/criu-snapshots/` for the controller, daemon, CRDs,
+  GHCR artifact wiring, and GitOps app ordering;
+- `deploy/production/runbooks/criu-snapshots.md` with the operational
+  take/promote/restore-verify/rotate flow and the load-bearing constraints for
+  driver, GPU topology, image digest, NCCL teardown/reinit, MIG/MPS, UVM, and
+  single-node multi-GPU restore;
+- `deploy/production/examples/deepseek-v32-reap-sglang-snapshotted.yaml`, which
+  shows the current snapshot-enabled production shape is SGLang-specific:
+  snapshot annotations, `SGLANG_SNAPSHOT_HOOKS=1`, `snapshot-pull`,
+  `/opt/criu-snapshots`, and `sglang-criu-entrypoint`;
+- `deploy/production/examples/deepseek-v32-nextn-optrt-r20.yaml`, which shows
+  the current TensorRT-LLM R20 path already uses `/var/lib/optrt-cache` mounted
+  as `/cache/optrt`, but does not include snapshot annotations, snapshot-pull,
+  TensorRT-LLM snapshot hooks, or Foundry runtime markers.
+
+The VM-local `criu-snapshots` chart trees match that shape: CRDs for
+`DynamoGraphDeploymentSnapshot` and `MegatronTrainingSnapshot`, controller and
+daemon templates, kubelet checkpoint and containerd socket mounts, and host
+installation into `/opt/criu-snapshots`. The live R20 readiness probe sees the
+same substrate but still reports `safe_to_take_snapshot=0` because the
+TensorRT-LLM hook and restore proofs are missing.
+
+This refresh does not change the decision: Foundry is complementary only after
+CRIU/op-trt restore is proven. It is not redundant with CRIU because it targets
+CUDA graph materialization rather than the whole process/container runtime, but
+it is redundant to integrate now because `op-trt` cannot safely consume it
+without TensorRT-LLM Foundry hooks and allocation/replay parity tests.
 
 ## Comparison
 

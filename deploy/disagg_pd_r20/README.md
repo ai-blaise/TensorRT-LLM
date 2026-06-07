@@ -135,7 +135,7 @@ deploy/disagg_pd_r20/render_dgd.sh \
   --target-node a4-us-001-rl9 \
   --dgd-name r20-render-check \
   --image-pull-policy IfNotPresent \
-  --out /tmp/r20-render-check.yaml \
+  --out /tmp/${USER:-optrt}-r20-render-check.yaml \
   --server-dry-run
 ```
 
