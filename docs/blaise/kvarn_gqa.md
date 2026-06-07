@@ -368,8 +368,9 @@ Current focused coverage:
 - `blaise_perf/kvarn_gqa/check_kvarn_gqa_static_abi.py`: source-only ABI/API
   checker for THOP schema fragments, fused-op readiness surface, fail-closed
   readiness guard, BDR/device-table hooks, NIXL side-state fragment wiring,
-  graph/sparse benchmark gates, and dense-MLA/Indexer separation. It runs
-  without importing TensorRT-LLM Python bindings.
+  graph/sparse benchmark gates, the no-GPU `--dry-run` proof matrix, and
+  dense-MLA/Indexer separation. It runs without importing TensorRT-LLM Python
+  bindings.
 - `benchmarks/python/bench_kvarn_gqa_micro.py`: light pack/restore/reference
   scoring timing for `M in {1,5,25}`. It enforces a restore-cosine floor and
   supports `--require-fused`, which fails until real
@@ -397,6 +398,8 @@ python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --kv-heads 8 --i
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --runtime-dtype fp16 --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 --try-store-op --try-decode-op --try-side-op
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --runtime-dtype bf16 --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 --try-store-op --try-decode-op --try-side-op
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --require-fused
+python blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py --repo /workspace --device 0 --dtype fp16 --blocks 1 --m 1 5 25 --sparse-topk 64 --graph-replay --dry-run
+python blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py --repo /workspace --device 0 --dtype fp16 --blocks 1 --m 1 5 25 --sparse-topk 64 --graph-replay
 ```
 
 

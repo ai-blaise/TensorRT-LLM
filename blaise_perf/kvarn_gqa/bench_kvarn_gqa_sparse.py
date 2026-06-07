@@ -15,11 +15,11 @@ import argparse
 import os
 from pathlib import Path
 
-import torch
-from torch.utils.cpp_extension import load
 
 
 def build_ops(repo: Path) -> None:
+    from torch.utils.cpp_extension import load
+
     libs = "/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs"
     load(
         name="kvarn_gqa_sparse_bench_ext",
@@ -85,6 +85,31 @@ def capture_store_op(fn, packed: torch.Tensor):
     return eager, packed.detach().clone(), graph
 
 
+
+def dry_run(args: argparse.Namespace) -> None:
+    group = 128
+    head_dim = 128
+    if args.blocks <= 0:
+        raise ValueError("--blocks must be positive")
+    total_tokens = args.blocks * group
+    topk = min(args.sparse_topk, total_tokens)
+    sparse_full = total_tokens <= 256
+    print("KVARN_GQA_BENCH_DRY_RUN")
+    print(
+        f"repo={args.repo} device={args.device} dtype={args.dtype} "
+        f"heads={args.heads} kv_heads={args.kv_heads} head_dim={head_dim} "
+        f"blocks={args.blocks} tokens={total_tokens} group={group} "
+        f"topk={topk} sparse_full_check={int(sparse_full)} graph_replay={int(args.graph_replay)}"
+    )
+    for m in args.m:
+        print(
+            f"PLAN STORE+DECODE dtype={args.dtype} M={m} "
+            f"resident_blocks={args.blocks} dense_decode=1 "
+            f"sparse_topk={topk} sparse_full_parity={int(sparse_full)} "
+            f"graph_replay={int(args.graph_replay)}"
+        )
+    print("No CUDA context was created; rerun without --dry-run during an isolated B200 window.")
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default="/workspace")
@@ -100,7 +125,16 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--graph-replay", action="store_true",
                         help="capture/replay store, dense decode, and sparse decode and compare against eager outputs")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the proof matrix without importing torch or creating a CUDA context")
     args = parser.parse_args()
+
+    if args.dry_run:
+        dry_run(args)
+        return
+
+    global torch
+    import torch
 
     torch.cuda.set_device(args.device)
     repo = Path(args.repo)
