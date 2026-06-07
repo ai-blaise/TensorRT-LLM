@@ -119,6 +119,10 @@ if [[ "$LOCAL_REGISTRY_MODE" == "resident" && "$USE_LOCAL_REGISTRY" != 1 ]]; the
   echo "--local-registry-mode=resident requires --use-local-registry" >&2
   exit 2
 fi
+if (( ${#DGD_NAME} + 8 > 45 )); then
+  echo "DGD name too long for r20 Frontend pod naming: ${#DGD_NAME}+8 > 45 ($DGD_NAME)" >&2
+  exit 2
+fi
 SSH_TARGET="${VM_USER}@${VM_HOST}"
 
 if [[ "$DRY_RUN" == 1 ]]; then

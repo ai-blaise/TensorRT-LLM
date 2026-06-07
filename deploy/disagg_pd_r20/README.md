@@ -103,6 +103,22 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --dry-run
 ```
 
+Render and API-server-validate the DGD with the currently active image, without
+building/importing a new image and without applying the DGD. This is the fastest
+router/deploy-YAML check when only the DynamoGraphDeployment/config changed.
+Keep alternate DGD names short enough for the `Frontend` service name; the
+helpers fail fast when `len(DGD_NAME) + 8 > 45`:
+
+```bash
+deploy/disagg_pd_r20/render_dgd.sh \
+  --image-from-dgd topo-c1-dp2tp4-disagg-r20 \
+  --target-node a4-us-001-rl9 \
+  --dgd-name r20-render-check \
+  --image-pull-policy IfNotPresent \
+  --out /tmp/r20-render-check.yaml \
+  --server-dry-run
+```
+
 Build and apply the main DGD:
 
 ```bash
@@ -200,6 +216,8 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
   (identical to the ConfigMap data blocks) for review / diff / reuse.
 - `fast_iterate.sh` -- fast rsync/build/import/apply helper for thin overlay
   iterations and alternate-name canary deployments.
+- `render_dgd.sh` -- render and optionally server-dry-run the DGD with an
+  existing image, so router/deploy-YAML checks do not require a new image loop.
 - `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
   prewarm/validation job.
 - `smoke_request_pinning.sh` -- ready-only live gate for non-MORI request
