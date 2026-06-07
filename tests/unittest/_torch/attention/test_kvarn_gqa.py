@@ -8,6 +8,7 @@ _TORCH = pytest.importorskip("torch")
 
 from tensorrt_llm._torch.attention_backend import kvarn_gqa_attention as _gqa_attention  # noqa: E402
 from tensorrt_llm._torch.attention_backend.kvarn_gqa_attention import (  # noqa: E402
+    KVarNGQAAttention,
     _KVarNGQASidePool,
     _write_record_to_page,
 )
@@ -296,3 +297,68 @@ def test_kvarn_gqa_bdr_restore_scales_with_churn_not_working_set(monkeypatch):
     assert not bool(state.physical_valid[0, 4].item())
     assert not bool(state.physical_valid[0, 6].item())
     assert int(state.restored_gen[0, torch.tensor([2, 4, 6])].sum().item()) == 0
+
+
+def test_kvarn_gqa_packed_decode_guards_causal_multitoken_and_scaling():
+    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+
+    attn = KVarNGQAAttention(layer_idx=0, num_heads=2, num_kv_heads=1,
+                             head_dim=128)
+    assert attn._packed_decode_supported_or_raise(
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        q_len=1,
+        attention_window_size=None)
+    assert attn._packed_decode_supported_or_raise(
+        attention_mask=PredefinedAttentionMask.FULL,
+        q_len=25,
+        attention_window_size=None)
+
+    with pytest.raises(NotImplementedError, match="causal multi-token prefill"):
+        attn._packed_decode_supported_or_raise(
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            q_len=5,
+            attention_window_size=None)
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        attn._packed_decode_supported_or_raise(
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            q_len=1,
+            attention_window_size=1024)
+
+    scaled = KVarNGQAAttention(layer_idx=0, num_heads=2, num_kv_heads=1,
+                               head_dim=128, q_scaling=0.5)
+    with pytest.raises(NotImplementedError, match="q_scaling"):
+        scaled._packed_decode_supported_or_raise(
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            q_len=1,
+            attention_window_size=None)
+
+
+def test_kvarn_gqa_packed_decode_block_list_uses_committed_physical_blocks():
+    torch = _TORCH
+    cfg = KVarNGQAConfig()
+    attn = KVarNGQAAttention(layer_idx=0, num_heads=2, num_kv_heads=1,
+                             head_dim=128)
+    state = _KVarNGQASidePool(
+        cfg,
+        num_layers=1,
+        max_batch_size=1,
+        max_blocks_per_seq=4,
+        num_kv_heads=1,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    slot = state.slot_for_request(91)
+    # Logical block 0 is the fp16 sink. Packed decode should pass only full
+    # committed post-sink physical blocks to the CUDA op.
+    state.mark_committed(0, slot, 91, cfg.group, physical_block_id=5)
+    state.mark_committed(0, slot, 91, cfg.group * 2, physical_block_id=7)
+
+    packed = attn._packed_decode_full_blocks(
+        state, slot, [0, 5, 7, 9], seq_len=3 * cfg.group)
+
+    assert packed.dtype == torch.long
+    assert packed.tolist() == [5, 7]
+
+    with pytest.raises(NotImplementedError, match="uncommitted full block"):
+        attn._packed_decode_full_blocks(
+            state, slot, [0, 5, 7, 9], seq_len=4 * cfg.group)

@@ -340,6 +340,16 @@ def _record_views_from_pages(pages: torch.Tensor, cfg: KVarNGQAConfig) -> torch.
         pages.shape[0], pages.shape[2], cfg.tile_bytes_aligned)
 
 
+def _required_trtllm_op(name: str):
+    trtllm_ops = getattr(torch.ops, "trtllm", None)
+    op = getattr(trtllm_ops, name, None) if trtllm_ops is not None else None
+    if op is None:
+        raise NotImplementedError(
+            f"KVarN GQA CUDA path requires torch.ops.trtllm.{name}; "
+            "refusing to fall back to fp16/fp8/NVFP4 KV")
+    return op
+
+
 class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
     """Reference runnable KVarN GQA backend using packed 128-token records."""
 
@@ -405,8 +415,16 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not allow_commit or not state.tail_is_full(layer, slot):
             return
         tail_k, tail_v = state.tail_tensors(layer, slot)
-        record = quantize_gqa_tile(tail_k, tail_v, self.cfg)
-        _write_record_to_page(kv_pages[block_id, 0], record, self.cfg)
+        if tail_k.is_cuda:
+            op = _required_trtllm_op("kvarn_gqa_store")
+            block_ids = torch.tensor([int(block_id)], device=tail_k.device,
+                                     dtype=torch.long)
+            op(tail_k.unsqueeze(0).contiguous(),
+               tail_v.unsqueeze(0).contiguous(), kv_pages, block_ids,
+               layer, self.cfg.head_dim, self.cfg.group)
+        else:
+            record = quantize_gqa_tile(tail_k, tail_v, self.cfg)
+            _write_record_to_page(kv_pages[block_id, 0], record, self.cfg)
         state.mark_committed(layer, slot, request_id, block_start,
                              physical_block_id=block_id)
 
@@ -476,6 +494,90 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                 dtype=dtype, device=device)
             return empty, empty
         return torch.cat(pieces_k, dim=0), torch.cat(pieces_v, dim=0)
+
+    def _packed_decode_supported_or_raise(self, *, attention_mask: AttentionMask,
+                                          q_len: int,
+                                          attention_window_size: Optional[int]) -> bool:
+        if attention_window_size is not None:
+            raise NotImplementedError(
+                "KVarN GQA packed decode does not support sliding-window attention; "
+                "refusing to fall back to dense fp16/fp8 KV")
+        if self.q_scaling is not None and float(self.q_scaling) != 1.0:
+            raise NotImplementedError(
+                "KVarN GQA packed decode does not yet accept q_scaling; "
+                "refusing to fall back to dense fp16/fp8 KV")
+        if attention_mask == PredefinedAttentionMask.FULL:
+            return True
+        if attention_mask == PredefinedAttentionMask.CAUSAL and q_len == 1:
+            return True
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            raise NotImplementedError(
+                "KVarN GQA packed decode currently supports causal decode only "
+                "for q_len=1; causal multi-token prefill needs a per-query "
+                "packed read kernel, so no fallback is allowed")
+        raise ValueError("Unexpected attention mask type")
+
+    def _packed_decode_full_blocks(self, state: _KVarNGQASidePool,
+                                   slot: int, block_ids: list[int],
+                                   seq_len: int) -> torch.Tensor:
+        sink_blocks = self.cfg.sink_tokens // self.cfg.group
+        n_full = int(seq_len) // self.cfg.group
+        physical_blocks: list[int] = []
+        for logical_block in range(sink_blocks, n_full):
+            if logical_block >= len(block_ids):
+                raise RuntimeError(
+                    f"KVarN GQA missing packed decode block id for "
+                    f"logical_block={logical_block} ids={block_ids}")
+            block_start = logical_block * self.cfg.group
+            if not state.is_committed(self.layer_idx, slot, block_start):
+                raise NotImplementedError(
+                    "KVarN GQA packed decode found an uncommitted full block; "
+                    "speculative full-block draft/reject needs multi-tail or "
+                    "rollback-aware packed records before production enablement")
+            physical_blocks.append(int(block_ids[logical_block]))
+        return torch.tensor(physical_blocks, device=state.device, dtype=torch.long)
+
+    def _decode_with_packed_records(self, state: _KVarNGQASidePool,
+                                    kv_pages: torch.Tensor, slot: int,
+                                    block_ids: list[int], total_kv_len: int,
+                                    single_q: torch.Tensor, q_view: torch.Tensor,
+                                    attention_mask: AttentionMask,
+                                    attention_window_size: Optional[int]) -> Optional[torch.Tensor]:
+        if not single_q.is_cuda:
+            return None
+        q_len = int(q_view.size(2))
+        self._packed_decode_supported_or_raise(
+            attention_mask=attention_mask, q_len=q_len,
+            attention_window_size=attention_window_size)
+        op = _required_trtllm_op("kvarn_gqa_decode")
+
+        sink_n = min(int(total_kv_len), self.cfg.sink_tokens)
+        if sink_n > 0:
+            sink_k, sink_v = state.sink_tensors(self.layer_idx, slot, sink_n)
+        else:
+            sink_k = single_q.new_empty((0,))
+            sink_v = single_q.new_empty((0,))
+
+        block_ids_t = self._packed_decode_full_blocks(state, slot, block_ids,
+                                                      total_kv_len)
+        tail_len = int(total_kv_len) - (int(total_kv_len) // self.cfg.group) * self.cfg.group
+        if total_kv_len > self.cfg.sink_tokens and tail_len > 0:
+            tail_start = (int(total_kv_len) // self.cfg.group) * self.cfg.group
+            tail_k, tail_v = state.active_tail_tensors(self.layer_idx, slot,
+                                                       tail_start, tail_len)
+        else:
+            tail_k = single_q.new_empty((0,))
+            tail_v = single_q.new_empty((0,))
+
+        seq_lens = torch.full((q_len,), int(total_kv_len),
+                              device=single_q.device, dtype=torch.int32)
+        q_decode = single_q.view(q_len, self.num_heads, self.head_dim).contiguous()
+        out = op(q_decode, kv_pages, block_ids_t.contiguous(),
+                 sink_k.contiguous(), sink_v.contiguous(),
+                 tail_k.contiguous(), tail_v.contiguous(), seq_lens,
+                 self.num_heads, self.num_kv_heads, self.cfg.head_dim,
+                 self.cfg.group)
+        return out.transpose(0, 1).contiguous()
 
     def _make_mask(self, attention_mask: AttentionMask, past_seen_token: int,
                    kv_len: int, q_device: torch.device, q_len: int,
@@ -566,15 +668,21 @@ class KVarNGQAAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self._store_new_tokens(state, kv_pages, request_id, slot, block_ids, past,
                                    k_view, v_view, allow_commit=allow_commit)
             total_kv_len = past + new_kv_len
-            k_states, v_states = self._load_sequence(state, kv_pages, request_id,
-                                                     slot, block_ids, total_kv_len,
-                                                     single_q.dtype, single_q.device)
-            attn_mask, is_causal = self._make_mask(forward_args.attention_mask,
-                                                   past, new_kv_len, single_q.device,
-                                                   q_view.size(2),
-                                                   forward_args.attention_window_size)
-            outputs.append(self._attend(q_view, k_states, v_states,
-                                        is_causal, attn_mask).squeeze(0))
+            packed_out = self._decode_with_packed_records(
+                state, kv_pages, slot, block_ids, total_kv_len, single_q, q_view,
+                forward_args.attention_mask, forward_args.attention_window_size)
+            if packed_out is not None:
+                outputs.append(packed_out)
+            else:
+                k_states, v_states = self._load_sequence(state, kv_pages, request_id,
+                                                         slot, block_ids, total_kv_len,
+                                                         single_q.dtype, single_q.device)
+                attn_mask, is_causal = self._make_mask(forward_args.attention_mask,
+                                                       past, new_kv_len, single_q.device,
+                                                       q_view.size(2),
+                                                       forward_args.attention_window_size)
+                outputs.append(self._attend(q_view, k_states, v_states,
+                                            is_causal, attn_mask).squeeze(0))
             offset_q += q_len
             offset_kv += kv_len
 
