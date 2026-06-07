@@ -276,7 +276,7 @@ established = [
 established.extend(
     (rid, worker_id, dp_rank, "completed_prefill", ctx_info_endpoint)
     for rid, worker_id, dp_rank, ctx_info_endpoint in re.findall(
-        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]\"?completed_prefill\"?",
         frontend,
     )
 )
@@ -290,7 +290,7 @@ outbound = [
 outbound.extend(
     (rid, "completed_prefill", ctx_info_endpoint)
     for rid, ctx_info_endpoint in re.findall(
-        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]\"?completed_prefill\"?",
         frontend,
     )
 )
