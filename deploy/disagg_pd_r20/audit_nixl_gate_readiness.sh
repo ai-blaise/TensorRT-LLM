@@ -102,12 +102,19 @@ require_config_shape() {
 
   [[ "$(count_fixed 'max_tokens_in_buffer: 131072' "$cfg")" -ge 2 ]] \
     || fail "max_tokens_in_buffer must be at least ${MIN_MAX_TOKENS_IN_BUFFER} for 128k NIXL transfer buffer coverage"
-  [[ "$(count_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND' "$cfg")" -ge 2 ]] \
-    || fail "TRTLLM_NIXL_KVCACHE_BACKEND must be explicit on prefill and decode"
-  [[ "$(count_fixed 'TRTLLM_NIXL_ENABLE_COALESCE' "$cfg")" -ge 2 ]] \
-    || fail "TRTLLM_NIXL_ENABLE_COALESCE must be explicit on prefill and decode"
-  require_fixed 'value: UCX' "$cfg" "NIXL UCX plugin backend value"
-  require_fixed "value: '1'" "$cfg" "enabled boolean env values"
+  if [[ "$MODE" == "live" ]]; then
+    require_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND=UCX' "$OUTPUT_DIR/prefill.env" "prefill NIXL UCX plugin backend env"
+    require_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND=UCX' "$OUTPUT_DIR/decode.env" "decode NIXL UCX plugin backend env"
+    require_fixed 'TRTLLM_NIXL_ENABLE_COALESCE=1' "$OUTPUT_DIR/prefill.env" "prefill NIXL descriptor coalescing env"
+    require_fixed 'TRTLLM_NIXL_ENABLE_COALESCE=1' "$OUTPUT_DIR/decode.env" "decode NIXL descriptor coalescing env"
+  else
+    [[ "$(count_fixed 'TRTLLM_NIXL_KVCACHE_BACKEND' "$cfg")" -ge 2 ]] \
+      || fail "TRTLLM_NIXL_KVCACHE_BACKEND must be explicit on prefill and decode"
+    [[ "$(count_fixed 'TRTLLM_NIXL_ENABLE_COALESCE' "$cfg")" -ge 2 ]] \
+      || fail "TRTLLM_NIXL_ENABLE_COALESCE must be explicit on prefill and decode"
+    require_fixed 'value: UCX' "$cfg" "NIXL UCX plugin backend value"
+    require_fixed "value: '1'" "$cfg" "enabled boolean env values"
+  fi
   require_fixed 'UCX_CUDA_IPC_ENABLE_MNNVL' "$cfg" "UCX CUDA IPC MNNVL guard"
   require_fixed 'NVIDIA_GDRCOPY' "$cfg" "GDRCopy env"
   require_fixed 'NCCL_NET_PLUGIN' "$cfg" "NCCL net plugin guard"
