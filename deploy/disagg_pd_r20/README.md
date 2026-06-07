@@ -140,6 +140,22 @@ Use `--mode resident` when the pod spec will use `imagePullPolicy: Never`, and
 `--mode registry` when the tag must be available from the VM-local registry with
 `imagePullPolicy: IfNotPresent`.
 
+Build a full-source image when the change touches C++/CUDA or any ABI-sensitive
+TRT-LLM path. This compiles the current checkout and layers the resulting
+TRT-LLM package/native libraries onto the selected runtime base:
+
+```bash
+deploy/disagg_pd_r20/build_fullsource_image.sh \
+  --build-base localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-7618a22e008a-fullwheel-nixl-ls-20260607T055418Z \
+  --runtime-base localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-082db1d80-dynrouterpin-63319d9684-20260607T070644Z \
+  --tag-suffix endpointfix
+```
+
+Use the emitted image tag for prewarm/DGD rendering. Do not use the thin overlay
+path for fixes such as C++ LayerSplit handoff or
+`ContextPhaseParams.disagg_info_endpoint` stamping; those require rebuilt native
+libraries in the runtime image.
+
 Build and apply the main DGD:
 
 ```bash
@@ -233,6 +249,8 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
   the `DynamoGraphDeployment` (`topo-c1-dp2tp4-disagg-r20`). Apply this one file.
 - `Dockerfile.r20-overlay` -- configurable-base thin overlay image for
   Python/config iterations.
+- `Dockerfile.r20-fullsource` and `build_fullsource_image.sh` -- full-source
+  TRT-LLM rebuild path for C++/CUDA/native-library changes.
 - `prefill.yaml` / `decode.yaml` -- standalone copies of the two engine configs
   (identical to the ConfigMap data blocks) for review / diff / reuse.
 - `fast_iterate.sh` -- fast rsync/build/import/apply helper for thin overlay

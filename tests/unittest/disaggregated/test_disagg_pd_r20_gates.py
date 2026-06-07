@@ -101,6 +101,25 @@ def test_r20_overlay_py_compile_block_is_docker_parseable():
     assert "RUN /opt/dynamo/venv/bin/python -m py_compile \\\n" in dockerfile
 
 
+def test_r20_fullsource_build_path_exists_for_native_fixes():
+    dockerfile = (DEPLOY_DIR / "Dockerfile.r20-fullsource").read_text()
+    script = (DEPLOY_DIR / "build_fullsource_image.sh").read_text()
+    readme = (DEPLOY_DIR / "README.md").read_text()
+
+    assert "ARG BUILD_BASE" in dockerfile
+    assert "ARG RUNTIME_BASE" in dockerfile
+    assert "--configure-only" in dockerfile
+    assert "--target tensorrt_llm th_common bindings" in dockerfile
+    assert "BUILD_DEEP_EP=OFF" in dockerfile
+    assert "ENABLE_NVSHMEM=OFF" in dockerfile
+    assert "OPTRT_SOURCE_SHA" in dockerfile
+    assert "ai.blaise.optrt.fullsource" in dockerfile
+    assert "--build-base" in script
+    assert "--runtime-base" in script
+    assert "Dockerfile.r20-fullsource" in script
+    assert "C++/CUDA/native-library changes" in readme
+
+
 def test_r20_transceiver_backend_selection_is_fail_closed():
     source = (REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "kv_cache_transceiver.py").read_text()
 

@@ -1,0 +1,84 @@
+ARG BUILD_BASE
+ARG RUNTIME_BASE
+
+FROM ${BUILD_BASE} AS build
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ibverbs-providers libibverbs-dev \
+    && ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so \
+    && ln -sf /opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/include/nccl.h /usr/include/nccl.h \
+    && ln -sfn /opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/include/nccl_device /usr/include/nccl_device \
+    && ln -sf /opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/include/nccl_device.h /usr/include/nccl_device.h \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcublas.so.13 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcublas.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcublasLt.so.13 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcublasLt.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcurand.so.10 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcurand.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcusolver.so.12 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcusolver.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcusolverMg.so.12 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcusolverMg.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcusparse.so.12 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcusparse.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcufft.so.12 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcufft.so \
+    && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcufftw.so.12 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcufftw.so \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN /opt/dynamo/venv/bin/python3 -m pip install --no-cache-dir cmake==3.31.6 conan==2.14.0
+
+WORKDIR /workspace/TensorRT-LLM
+COPY . /workspace/TensorRT-LLM
+
+ARG FULL_BUILD_JOBS=48
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${FULL_BUILD_JOBS}
+ENV PYTHONPATH=/workspace/TensorRT-LLM/cpp/build/_deps/cutlass-src/python
+
+RUN /opt/dynamo/venv/bin/python3 scripts/build_wheel.py \
+    --no-venv \
+    --cuda_architectures=100-real \
+    --build_type=Release \
+    --job_count=${FULL_BUILD_JOBS} \
+    --nccl_root=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl \
+    --nvrtc_dynamic_linking \
+    --skip-stubs \
+    --configure-only \
+    --use-3rdparty-cache \
+    --extra-cmake-vars BUILD_TESTS=OFF \
+    --extra-cmake-vars BUILD_BENCHMARKS=OFF \
+    --extra-cmake-vars BUILD_DEEP_EP=OFF \
+    --extra-cmake-vars NCCL_INCLUDE_DIR=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/include \
+    --extra-cmake-vars NCCL_LIBRARY=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
+    --extra-cmake-vars USING_OSS_CUTLASS_ALLREDUCE_GEMM=ON \
+    --extra-cmake-vars ENABLE_NVSHMEM=OFF
+
+RUN cmake --build /workspace/TensorRT-LLM/cpp/build \
+    --config Release \
+    --parallel ${FULL_BUILD_JOBS} \
+    --target tensorrt_llm th_common bindings
+
+FROM ${RUNTIME_BASE}
+USER root
+
+ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages
+ARG OPTRT_SOURCE_SHA=unknown
+
+COPY --from=build --chown=dynamo:0 /workspace/TensorRT-LLM/tensorrt_llm ${SITE_PACKAGES}/tensorrt_llm
+COPY --from=build --chown=dynamo:0 /workspace/TensorRT-LLM/cpp/build/tensorrt_llm /tmp/tensorrt_llm_build_artifacts
+
+RUN set -eux; \
+    mkdir -p "${SITE_PACKAGES}/tensorrt_llm/libs" /opt/ai-blaise; \
+    find /tmp/tensorrt_llm_build_artifacts -maxdepth 1 -type f -name '*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/nanobind -maxdepth 1 -type f -name 'bindings*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/executor/cache_transmission/nixl_utils -maxdepth 1 -type f -name 'tensorrt_llm_transfer_agent_binding*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/executor/cache_transmission/nixl_utils -maxdepth 1 -type f -name 'lib*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/executor/cache_transmission/ucx_utils -maxdepth 1 -type f -name 'lib*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/kernels/decoderMaskedMultiheadAttention -maxdepth 1 -type f -name 'libdecoder_attention_*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/runtime/utils -maxdepth 1 -type f -name 'libpg_utils.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/" \;; \
+    if [ -f /tmp/tensorrt_llm_build_artifacts/libtensorrt_llm.so ]; then \
+      cp -v /tmp/tensorrt_llm_build_artifacts/libtensorrt_llm.so "${SITE_PACKAGES}/tensorrt_llm/libs/"; \
+    fi; \
+    if [ -f /tmp/tensorrt_llm_build_artifacts/thop/libth_common.so ]; then \
+      cp -v /tmp/tensorrt_llm_build_artifacts/thop/libth_common.so "${SITE_PACKAGES}/tensorrt_llm/libs/"; \
+    fi; \
+    echo "${OPTRT_SOURCE_SHA}" > /opt/ai-blaise/optrt_source_sha; \
+    rm -rf /tmp/tensorrt_llm_build_artifacts; \
+    chown -R dynamo:0 "${SITE_PACKAGES}/tensorrt_llm" /opt/ai-blaise
+
+LABEL ai.blaise.optrt.fullsource="true"
+USER dynamo
