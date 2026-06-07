@@ -1430,6 +1430,24 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
 template <typename T, typename TCache>
 void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
     int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream)
+{
+    invokeMLALoadPagedKV<T, TCache>(compressed_kv_ptr, k_pe_ptr, kv_cache, num_contexts, cu_ctx_cached_kv_lens,
+        max_input_seq_len, lora_size, rope_size, kv_scale_quant_orig_ptr, stream, nullptr, 4);
+}
+
+template <typename T, typename TCache>
+void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr)
+{
+    invokeMLALoadPagedKV<T, TCache>(compressed_kv_ptr, k_pe_ptr, kv_cache, num_contexts, cu_ctx_cached_kv_lens,
+        max_input_seq_len, lora_size, rope_size, kv_scale_quant_orig_ptr, stream, kvarn_scale_pool_ptr, 4);
+}
+
+template <typename T, typename TCache>
+void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
     float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr, int const kvarn_bits)
 {
     TLLM_CHECK_WITH_INFO(kvarn_bits == 2 || kvarn_bits == 4,
@@ -1556,6 +1574,13 @@ INSTANTIATE_MLA_QUANTIZE(half);
 INSTANTIATE_MLA_QUANTIZE(__nv_bfloat16);
 
 #define INSTANTIATE_RW_KVCACHE_MLA(T, TCache)                                                                          \
+    template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \
+        int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
+        int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);          \
+    template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \
+        int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
+        int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream,           \
+        void const* kvarn_scale_pool_ptr);                                                                             \
     template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \
         int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
         int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream,           \

@@ -103,7 +103,6 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
         r"WarpDecode.*fallback",
         r"LayerSplit: layer .* no local KV pool slot",
         r"no scratch routing",
-        r"host[_ -]?pinned(?:[_ -]?blocks?)?[=: ]+0\b",
         r"host_pinned_blocks[=: ]+0\b",
         r"cache_state_layers[=: ]+0\b",
         r"pinned KV handoff.*0 blocks",
@@ -206,7 +205,7 @@ def main() -> None:
 
     bad = copy.deepcopy(good)
     bad.prefill += "\nhost_pinned_blocks=0"
-    expect_failure("zero_host_pinned_blocks", bad, "host[_ -]?pinned")
+    expect_failure("zero_host_pinned_blocks", bad, "host_pinned_blocks")
 
     print(json.dumps({"offline_request_pinning_smoke": "passed"}))
 

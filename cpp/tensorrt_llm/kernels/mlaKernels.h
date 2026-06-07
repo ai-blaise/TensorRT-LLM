@@ -138,8 +138,17 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
 template <typename T, typename TCache>
 void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
     int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
-    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr = nullptr,
-    int const kvarn_bits = 4);
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
+
+template <typename T, typename TCache>
+void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr);
+
+template <typename T, typename TCache>
+void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream, void const* kvarn_scale_pool_ptr, int const kvarn_bits);
 
 // KVarN/BDR: fused block-diagonal-Hadamard + per-(token,sub-block) low-bit
 // quantize of the post-RoPE dense MLA latent ckv. Launch after the RoPE kernel

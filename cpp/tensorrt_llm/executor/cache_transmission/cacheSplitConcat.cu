@@ -1374,8 +1374,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         TLLM_LOG_DEBUG("windowNum:%d, inputBlockLayerNumSum:%d, ", windowNum, inputBlockLayerNumSum);
     }
 
-    dim3 gridDim{gridDimx, gridDimy};
-
     T const** inputBlockPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
     T** outputCachePtrsDev = static_cast<T**>(PtrsDeviceBuffer->data()) + inputBlockNumSum;
     uint64_t* prefixLayerNumDevPtr
@@ -1383,9 +1381,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
     int const selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
-    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
-    int const outputStartLayerId
-        = getRankLayerSpan(selfCacheState, selfParallelConfig.mAttentionLayerNumPerPP, selfIdx).start;
+    int const physicalNumLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
+    auto const rankLayerSpan = getRankLayerSpan(selfCacheState, selfParallelConfig.mAttentionLayerNumPerPP, selfIdx);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
 
     int const dimsPerHead = computeDimsPerHead(selfCacheState, isIndexerKCache);
@@ -1396,11 +1393,19 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     int const kvFactor = selfAttentionConfig.mKvFactor;
     bool const isMLA = selfAttentionConfig.mAttentionType == CacheState::AttentionType::kMLA;
     constexpr int mlaSubWarpSize = 16;
+    int const numLayers = isMLA && isContiguousCPLayerShard(selfCacheState, selfParallelConfig.mAttentionLayerNumPerPP)
+        ? rankLayerSpan.count
+        : physicalNumLayers;
+    if (isMLA && !isWindow)
+    {
+        gridDimx = numLayers;
+    }
+    dim3 gridDim{gridDimx, gridDimy};
 
     TLLM_LOG_DEBUG(
-        "splitKVCache - numLayers: %d, headNum: %d, domainPPSize: %d, domainTPSize: %d, "
+        "splitKVCache - numLayers: %d, physicalNumLayers: %d, headNum: %d, domainPPSize: %d, domainTPSize: %d, "
         "headsPerDomainTP: %d",
-        numLayers, headNum, domainPPSize, domainTPSize, headNumDomainTP);
+        numLayers, physicalNumLayers, headNum, domainPPSize, domainTPSize, headNumDomainTP);
 
     int const remainder = dimsPerHead * sizeof(T) % 16;
     switch (remainder)
