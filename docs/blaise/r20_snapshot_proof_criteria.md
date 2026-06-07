@@ -11,6 +11,28 @@ No item here requires mutating the live `topo-c1-dp2tp4-disagg-r20` deployment
 while it is serving traffic. The order is deliberate: prove hooks and local
 restore mechanics before any production DGDS `take`.
 
+## Gate -1: Cached Deploy Loop
+
+This gate is not a snapshot proof. It is the fast path for deployment/config
+iterations that should not pay build, image import, model download, or compile
+costs.
+
+Pass criteria:
+
+- `render_dgd.sh --image-from-dgd topo-c1-dp2tp4-disagg-r20 --dgd-name <short-canary> --server-dry-run`
+  succeeds without applying anything.
+- The rendered image matches the active DGD image and `imagePullPolicy` is
+  explicit for the intended path (`IfNotPresent` for local registry/resident
+  images, `Never` for strictly preloaded images).
+- `cache_report.sh --vm local` shows the active image is resident in k3s
+  containerd and persistent cache directories exist.
+- `prewarm_caches.sh --dry-run` renders the cache prewarm Job for the same image
+  before an operator runs a real prewarm.
+
+This gate is the highest-ROI non-disruptive path today: it turns router/YAML/DGD
+checks into API-server validation against an already-resident image instead of a
+new build/import/download/compile loop.
+
 ## Gate 0: Sidecar Substrate
 
 Pass criteria:

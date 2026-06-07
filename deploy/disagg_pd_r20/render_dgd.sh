@@ -91,6 +91,19 @@ fi
 if [[ -z "$OUT" ]]; then
   OUT="/tmp/${DGD_NAME}-render.yaml"
 fi
+out_dir="$(dirname "$OUT")"
+if [[ ! -d "$out_dir" ]]; then
+  echo "output directory does not exist: $out_dir" >&2
+  exit 2
+fi
+if [[ -e "$OUT" && ! -w "$OUT" ]]; then
+  echo "output path exists but is not writable: $OUT" >&2
+  exit 2
+fi
+if [[ ! -e "$OUT" && ! -w "$out_dir" ]]; then
+  echo "output directory is not writable: $out_dir" >&2
+  exit 2
+fi
 
 TARGET_NODE="$TARGET_NODE" \
 UNIFIED_IMAGE="$IMAGE" \
