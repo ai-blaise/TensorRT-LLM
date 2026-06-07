@@ -2,7 +2,7 @@
 
 This directory documents the custom kernels, fused ops, and system-level
 optimizations added to `op-trt` (the `ai-blaise/TensorRT-LLM` fork, branch
-`op-trt-ls`) to drive **tok/s/user after first token** (decode throughput at
+`op-trt`) to drive **tok/s/user after first token** (decode throughput at
 fixed concurrency) on the **DeepSeek-V3.2-Exp / REAP NVFP4** target on
 **8×B200**.
 
@@ -45,7 +45,7 @@ a correctness signal — see "Validation philosophy" below).
 | 18 | Topology + deploy: DP2/TP4 disaggregated decode | [topology_deploy.md](topology_deploy.md) | DP2/TP4 best (64/49/41/40) | deployment choice |
 
 > LayerSplit (17) has its canonical long-form doc at
-> `docs/source/features/layersplit.md` (already on `op-trt-ls`); WarpDecode
+> `docs/source/features/layersplit.md` (on `op-trt`); WarpDecode
 > (12) has its canonical doc + deployment guide under `docs/source/features/`
 > that land with the WarpDecode kernel branch. The `docs/blaise/` pages here
 > are self-contained campaign-context entries (figures + file map +
@@ -113,7 +113,7 @@ ordering constraint. The detailed contracts are in each piece's doc.
 
 ## Source-of-record
 
-- Campaign main: `op-trt-ls` (this branch's base, `7bf235e8`).
+- Campaign main: `op-trt`.
 - Push policy: validated work lands on the `ai-blaise` fork only; never
   upstream to `sgl-project` / `NVIDIA`.
 - Concurrency target: **c16**.

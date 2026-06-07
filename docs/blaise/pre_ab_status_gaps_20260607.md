@@ -8,8 +8,11 @@ smoke-response, readiness result, or partial marker as production completion.
 ## Live deployment snapshot
 
 - Repo/branch: `ai-blaise/TensorRT-LLM`, branch `op-trt`.
-- Current pushed head: `197b5f35b` (`chore(r20): harden cached DGD validation`),
-  which includes `10d304924` (`fix(nixl): stamp C++ prefill pin endpoint`).
+- Current pushed head before this doc refresh: `0ce15ea7f`
+  (`docs(r20): tighten snapshot composition gates`). This includes
+  `10d304924` (`fix(nixl): stamp C++ prefill pin endpoint`) plus the later
+  NIXL fail-closed, SMC/Moondream pinned-handoff, image-reuse, prewarm
+  dry-run, and snapshot-composition commits.
 - Live DGD: `topo-c1-dp2tp4-disagg-r20` in namespace `dynamo-system`.
 - Current DGD generation/observed generation: `95/95`; state `successful`.
 - Current live image:
@@ -17,8 +20,8 @@ smoke-response, readiness result, or partial marker as production completion.
 - Important image caveat: the live image carries the newer Dynamo router wheel,
   but the TensorRT-LLM runtime layer was built before the C++ completed-prefill
   endpoint fix. The next NIXL/request-pinning proof image must be a full
-  source-built TensorRT-LLM image containing `10d304924`, not a Python-only
-  overlay over this live base.
+  source-built TensorRT-LLM image containing the latest `op-trt` head, not a
+  Python-only overlay over this live base.
 - Topology: one prefill worker on four B200 GPUs and one decode worker on four
   B200 GPUs, plus the Dynamo KV frontend.
 - Live readiness: frontend, prefill, and decode are `1/1 Running` with zero
@@ -114,8 +117,9 @@ legacy backend selector conflicts.
 
 Remaining NIXL gaps:
 
-- Build and deploy a full source image that contains `10d304924`, the NIXL
-  timeout fix, and the current r20 LayerSplit/KVarN/request-pinning sources.
+- Build and deploy a full source image that contains the current `op-trt` head,
+  including `10d304924`, the NIXL timeout fix, NIXL plugin fail-closed behavior,
+  and the current r20 LayerSplit/KVarN/request-pinning sources.
 - Prove positive nonzero NIXL KV transfer under strict smoke.
 - Ensure request-pinning metadata is actually propagated into the NIXL handoff,
   including a non-empty completed-prefill `ctx_info_endpoint`, not only logged
@@ -242,6 +246,10 @@ Required completion:
   https://arxiv.org/pdf/2604.15672.
 - Import/port any remaining SGLang kernels needed by
   `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`.
+- Treat the SGLang GLM path as the practical source implementation where it
+  already has optimized kernels. Port/copy the required kernels directly, then
+  adapt the TensorRT-LLM runner/resource-manager APIs rather than re-deriving
+  the kernel family from scratch.
 - Review the June 6 `op-trt` commits before further kernel work so the port does
   not duplicate or regress already-imported SGLang pieces.
 - Validate the GLM draft model path with the target `DeepSeekV32` main model,
@@ -267,6 +275,10 @@ Required completion:
   fragments.
 - Add/finish BDR fold with in-kernel dequant-on-read for the GQA 2-bit path,
   matching the dense MLA optimization level described in `docs/blaise/kvarn.md`.
+- Keep the default production KV contract explicit: dense MLA defaults to
+  `kvarn_k2v2`; the SMC-SD GQA draft/target model path must also be deployable
+  from Hugging Face config with `kvarn_k2v2` as its default once the backend is
+  proven. KVarN must never be applied to the Indexer K path.
 - Fuse sparse top-k packed read, dequant, and scoring instead of staging through
   a slow dense restore path.
 - Prove CUDA graph capture/replay for the SMC-SD GQA path.
@@ -290,8 +302,8 @@ is committed, but the live image does not contain it yet.
 
 Required completion:
 
-- Deploy a full source image containing `10d304924`, then emit the full
-  pin-established and outbound-to-decode lifecycle markers from the
+- Deploy a full source image containing the latest `op-trt` head, then emit the
+  full pin-established and outbound-to-decode lifecycle markers from the
   router/front-end path.
 - Ensure the same request id and non-null `ctx_dp_rank` reach prefill and decode.
 - Ensure completed-prefill metadata includes non-empty `ctx_info_endpoint`; the
@@ -300,6 +312,8 @@ Required completion:
   compared later without changing correctness semantics.
 - Keep MORI-IO out of the pre-A/B gate for now; use it in A/B only after NIXL is
   proven.
+- NIXL replaces UCX as the pre-A/B KV-pool gate. UCX, Mooncake, and MORI-IO are
+  comparison candidates only after the NIXL correctness gate is green.
 
 ### Optimized disaggregated deployment
 
@@ -312,6 +326,12 @@ Required completion:
 - Prove strict NIXL/request-pinning smoke.
 - Verify every custom piece is active, composable, and no implicit fallback is
   being used.
+- Confirm the exact r20 custom stack in the accepted manifest: prefill TP2xCP2
+  LayerSplit with owner-local allocation, all-CP transfer, and NIXL transfer;
+  decode TP4/CP1 with WarpDecode forced on and no kernel-backend fallback;
+  dense MLA `kvarn_k2v2` with BDR/amortized restore; HISA/Indexer K remaining
+  fp4; Moondream overlap enabled; SMC-SD deferred until its GLM/GQA pieces are
+  proven.
 - Warm/cache all recurring autotune shapes so cache-miss fallback tactics do not
   dominate perf runs.
 - Keep TP vs EP, memory fraction, kernel backend, and transport variants as A/B
@@ -345,14 +365,16 @@ Required A/B axes include at minimum:
 - [x] Moondream-style overlap is enabled while SMC-SD is deferred.
 - [x] Routerpin image reaches route-selected and cleanup markers.
 - [x] Current pushed `op-trt` head includes the C++ completed-prefill endpoint
-  source fix.
+  source fix, NIXL plugin fail-closed behavior, SMC/Moondream pinned-handoff
+  guard, image reuse helper, prewarm dry-run path, and snapshot-composition
+  hardening.
 - [x] Static C++ endpoint audit passes from a clean VM checkout.
 - [x] Offline request-pinning smoke, including negative endpoint and SMC
   handoff cases, passes.
 - [x] Cached DGD render/server-dry-run validation passes with the active image.
 - [x] Live NIXL gate readiness audit passes on the current generation.
-- [ ] Full source image containing `10d304924` is built, imported/resident, and
-  deployed.
+- [ ] Full source image containing the latest `op-trt` head is built,
+  imported/resident, and deployed.
 - [ ] Routerpin emits full pin-established/outbound decode lifecycle markers
   with non-empty completed-prefill `ctx_info_endpoint`.
 - [ ] Strict request-pinning smoke passes.
@@ -360,6 +382,12 @@ Required A/B axes include at minimum:
 - [ ] Prior KV transfer timeout warning stays absent after the endpoint-fixed
   full-source rollout.
 - [ ] SMC-SD live E2E with GLM draft model passes.
+- [ ] Remaining SGLang GLM kernels are ported/adapted for
+  `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`.
 - [ ] GQA KVarN 2-bit path is production-complete and optimized.
+- [ ] GQA KVarN BDR fold is implemented and benchmarked against the dense
+  restore path.
+- [ ] Moondream pipelining is proven with SMC-SD decode enabled, not only in the
+  current SMC-deferred gate.
 - [ ] Setup scripts are committed to infra repo and snapshot artifact is taken.
 - [ ] 16-user A/B matrix is run and tokens/second/user target is met.
