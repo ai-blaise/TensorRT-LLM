@@ -299,10 +299,10 @@ token selection, and lifecycle cleanup. It is not production-default yet.
 
 Required completion:
 
-- Keep HF/default config fail-closed and strict. Explicit non-GQA-KVarN dtypes
-  in `kv_cache_dtype` or `quantization_config.kvarn.gqa.dtype` must fail instead
-  of silently rewriting to `kvarn_k2v2_g128`; omitted enabled `gqa.dtype` remains
-  the production-default request.
+- Keep HF/default config fail-closed and strict. Explicit invalid `kvarn_*` top-level dtypes and non-GQA-KVarN nested
+  `quantization_config.kvarn.gqa.dtype` values must fail instead of silently
+  rewriting to `kvarn_k2v2_g128`; omitted enabled `gqa.dtype` remains the
+  production-default request.
 - Prove multi-rank NIXL transfer for packed GQA KVarN pages plus side-state
   fragments. The integration branch has side-state metadata/fragments,
   receiver-side device block-table mirroring, physical generation reconstruction

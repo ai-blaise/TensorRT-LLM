@@ -105,7 +105,10 @@ def _hf_kvarn_gqa_kv_dtype(pretrained_config) -> Optional[str]:
     if _is_disabled(top_dtype):
         return None
     if top_dtype is not None:
-        return _strict_kvarn_gqa_dtype(top_dtype, "kv_cache_dtype")
+        top_dtype = str(top_dtype).lower()
+        if top_dtype.startswith("kvarn_"):
+            return _strict_kvarn_gqa_dtype(top_dtype, "kv_cache_dtype")
+        return None
 
     quant_config = _as_dict(getattr(pretrained_config, "quantization_config", None)) or {}
     roots = [
