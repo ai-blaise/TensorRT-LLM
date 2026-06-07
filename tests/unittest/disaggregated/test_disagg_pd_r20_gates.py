@@ -73,6 +73,7 @@ def test_r20_overlay_carries_layersplit_and_request_pinning_sources():
 
     assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py" in dockerfile
+    assert "tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py" in dockerfile
     assert "tensorrt_llm/serve/openai_disagg_service.py" in dockerfile
     assert "tensorrt_llm/serve/openai_client.py" in dockerfile
     assert "tensorrt_llm/serve/openai_protocol.py" in dockerfile
@@ -118,6 +119,30 @@ def test_r20_fullsource_build_path_exists_for_native_fixes():
     assert "--runtime-base" in script
     assert "Dockerfile.r20-fullsource" in script
     assert "C++/CUDA/native-library changes" in readme
+
+
+def test_r20_snapshot_hooks_are_opt_in_and_readiness_checked():
+    source = (
+        REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "snapshot_hooks.py"
+    ).read_text()
+    executor = (
+        REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "py_executor.py"
+    ).read_text()
+    readiness = (DEPLOY_DIR / "snapshot_readiness.sh").read_text()
+
+    assert "OPTRT_SNAPSHOT_HOOKS" in source
+    assert "SIGRTMIN" in source
+    assert "pre_snapshot" in source
+    assert "post_restore" in source
+    assert "queue.active = False" in source
+    assert "queue.active = True" in source
+    assert "has_any_inflight_requests" in source
+    assert "check_gen_transfer_complete" in source
+    assert "SnapshotHookController.maybe_install" in executor
+    assert "SNAPSHOT_HOOK_PROOF_DIR" in readiness
+    assert "trtllm_snapshot_hook_status configured" in readiness
+    assert "optrt_snapshot_*_pre_snapshot.ready.json" in readiness
+    assert "optrt_snapshot_*_post_restore.ready.json" in readiness
 
 
 def test_r20_transceiver_backend_selection_is_fail_closed():

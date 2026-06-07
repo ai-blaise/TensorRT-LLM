@@ -68,6 +68,21 @@ Required patch shape:
   routing, proves a local health or first-token path, and writes a restore-ready
   file.
 
+Current implementation status:
+
+- `tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py` provides the first
+  opt-in signal substrate and is installed from `PyExecutor` only when
+  `OPTRT_SNAPSHOT_HOOKS=1`.
+- The current pre-snapshot hook blocks new queue admission, waits for no active
+  requests plus no async transfer-manager work, checks generation transfer
+  completion when the transceiver exposes it, synchronizes CUDA, and writes
+  per-pid JSON proof files.
+- The current post-restore hook synchronizes CUDA, reopens queue admission, and
+  writes per-pid JSON proof files.
+- This does not yet satisfy the full restore gate: process-group teardown and
+  rebuild, explicit NIXL reconnect proof, LayerSplit/KVarN restore proof, and
+  first-token restore proof remain required before `safe_to_take_snapshot=1`.
+
 Proof commands:
 
 ```bash
@@ -84,6 +99,9 @@ Pass criteria:
 - Ready/error files include pid, rank, component, and phase.
 - `snapshot_readiness.sh` reports `OPTRT_SNAPSHOT_HOOKS_configured=1` only for a
   canary DGD, not the live production DGD.
+- `snapshot_readiness.sh --hook-proof-dir <dir>` sees both
+  `optrt_snapshot_*_pre_snapshot.ready.json` and
+  `optrt_snapshot_*_post_restore.ready.json` without matching error files.
 
 ## Gate 2: NIXL In-Flight Restore
 

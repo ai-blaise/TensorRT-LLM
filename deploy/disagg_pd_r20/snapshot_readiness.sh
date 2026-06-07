@@ -9,6 +9,7 @@ SNAPSHOT_NAMESPACE="${SNAPSHOT_NAMESPACE:-criu-snapshots}"
 TARGET_NODE="${TARGET_NODE:-a4-us-001-rl9}"
 RUN_HOST_PREFLIGHT="${RUN_HOST_PREFLIGHT:-0}"
 STRICT="${STRICT:-0}"
+SNAPSHOT_HOOK_PROOF_DIR="${SNAPSHOT_HOOK_PROOF_DIR:-/tmp/optrt-snapshot-hooks}"
 SSH_OPTS=(
   -o BatchMode=yes
   -o IdentitiesOnly=yes
@@ -33,6 +34,8 @@ Options:
   --dgd-name NAME           DGD name (default: $DGD_NAME)
   --snapshot-namespace NS   criu-snapshots namespace (default: $SNAPSHOT_NAMESPACE)
   --target-node NAME        Expected Kubernetes node name (default: $TARGET_NODE)
+  --hook-proof-dir PATH     Host-visible directory containing hook ready/error
+                            proof files (default: $SNAPSHOT_HOOK_PROOF_DIR)
   --run-host-preflight      Run /opt/criu-snapshots/bin/snapshot-preflight if present
   --strict                  Exit nonzero when a blocking prerequisite is missing
   -h, --help                Show this help
@@ -49,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --dgd-name) DGD_NAME="$2"; shift 2 ;;
     --snapshot-namespace) SNAPSHOT_NAMESPACE="$2"; shift 2 ;;
     --target-node) TARGET_NODE="$2"; shift 2 ;;
+    --hook-proof-dir) SNAPSHOT_HOOK_PROOF_DIR="$2"; shift 2 ;;
     --run-host-preflight) RUN_HOST_PREFLIGHT=1; shift ;;
     --strict) STRICT=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -85,6 +89,7 @@ kv dgd_namespace "$DGD_NAMESPACE"
 kv dgd_name "$DGD_NAME"
 kv snapshot_namespace "$SNAPSHOT_NAMESPACE"
 kv target_node "$TARGET_NODE"
+kv snapshot_hook_proof_dir "$SNAPSHOT_HOOK_PROOF_DIR"
 kv live_workload_modified 0
 kv snapshot_resource_created 0
 
@@ -234,8 +239,10 @@ ${config_yaml}"
   for marker in SGLANG_SNAPSHOT_HOOKS OPTRT_SNAPSHOT_HOOKS TRTLLM_SNAPSHOT_HOOKS; do
     if grep -q "$marker" <<<"$target_yaml"; then
       kv "${marker}_configured" 1
+      printf -v "${marker}_configured" '%s' 1
     else
       kv "${marker}_configured" 0
+      printf -v "${marker}_configured" '%s' 0
     fi
   done
   if grep -Eiq 'foundry|LD_PRELOAD|libcuda_hook|graph_extension' <<<"$target_yaml"; then
@@ -289,13 +296,36 @@ else
   blockers+=(optrt_cache_hostpath)
 fi
 
-kv trtllm_snapshot_hook_status missing
-kv trtllm_snapshot_hook_proof missing
+if [[ "${OPTRT_SNAPSHOT_HOOKS_configured:-0}" == 1 || "${TRTLLM_SNAPSHOT_HOOKS_configured:-0}" == 1 ]]; then
+  kv trtllm_snapshot_hook_status configured
+else
+  kv trtllm_snapshot_hook_status missing
+  blockers+=(trtllm_snapshot_hook_status)
+fi
+if [[ -d "$SNAPSHOT_HOOK_PROOF_DIR" ]]; then
+  pre_ready="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*_pre_snapshot.ready.json' 2>/dev/null | head -1 || true)"
+  post_ready="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*_post_restore.ready.json' 2>/dev/null | head -1 || true)"
+  hook_errors="$(find "$SNAPSHOT_HOOK_PROOF_DIR" -maxdepth 1 -type f -name 'optrt_snapshot_*.error.json' 2>/dev/null | head -5 | paste -sd, - || true)"
+  kv trtllm_snapshot_hook_pre_ready "${pre_ready:-missing}"
+  kv trtllm_snapshot_hook_post_ready "${post_ready:-missing}"
+  kv trtllm_snapshot_hook_errors "${hook_errors:-none}"
+  if [[ -n "$pre_ready" && -n "$post_ready" && -z "$hook_errors" ]]; then
+    kv trtllm_snapshot_hook_proof present
+  else
+    kv trtllm_snapshot_hook_proof missing
+    blockers+=(trtllm_snapshot_hook_proof)
+  fi
+else
+  kv trtllm_snapshot_hook_pre_ready missing
+  kv trtllm_snapshot_hook_post_ready missing
+  kv trtllm_snapshot_hook_errors proof_dir_missing
+  kv trtllm_snapshot_hook_proof missing
+  blockers+=(trtllm_snapshot_hook_proof)
+fi
 kv nixl_inflight_restore_proof missing
 kv layersplit_tp2cp2_restore_proof missing
 kv kvarn_cuda_graph_scratch_restore_proof missing
 kv checkpointctl_restore_proof missing
-blockers+=(trtllm_snapshot_hook_proof)
 blockers+=(nixl_inflight_restore_proof)
 blockers+=(layersplit_tp2cp2_restore_proof)
 blockers+=(kvarn_cuda_graph_scratch_restore_proof)
@@ -322,10 +352,11 @@ EOS
 if [[ "$VM_HOST" == "local" ]]; then
   DGD_NAMESPACE="$DGD_NAMESPACE" DGD_NAME="$DGD_NAME" \
     SNAPSHOT_NAMESPACE="$SNAPSHOT_NAMESPACE" TARGET_NODE="$TARGET_NODE" \
+    SNAPSHOT_HOOK_PROOF_DIR="$SNAPSHOT_HOOK_PROOF_DIR" \
     RUN_HOST_PREFLIGHT="$RUN_HOST_PREFLIGHT" STRICT="$STRICT" bash -s \
     <<<"$REMOTE_SCRIPT"
 else
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-    "DGD_NAMESPACE='$DGD_NAMESPACE' DGD_NAME='$DGD_NAME' SNAPSHOT_NAMESPACE='$SNAPSHOT_NAMESPACE' TARGET_NODE='$TARGET_NODE' RUN_HOST_PREFLIGHT='$RUN_HOST_PREFLIGHT' STRICT='$STRICT' bash -s" \
+    "DGD_NAMESPACE='$DGD_NAMESPACE' DGD_NAME='$DGD_NAME' SNAPSHOT_NAMESPACE='$SNAPSHOT_NAMESPACE' TARGET_NODE='$TARGET_NODE' SNAPSHOT_HOOK_PROOF_DIR='$SNAPSHOT_HOOK_PROOF_DIR' RUN_HOST_PREFLIGHT='$RUN_HOST_PREFLIGHT' STRICT='$STRICT' bash -s" \
     <<<"$REMOTE_SCRIPT"
 fi
