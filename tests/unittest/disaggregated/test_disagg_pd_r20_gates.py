@@ -64,6 +64,8 @@ def test_r20_manifest_has_no_helix_or_smc_fallback():
     assert "backend: NIXL" in manifest
     assert manifest.count("transceiver_runtime: PYTHON") >= 2
     assert manifest.count("TRTLLM_NIXL_KVCACHE_BACKEND") >= 2
+    assert manifest.count("value: LIBFABRIC") >= 2
+    assert "value: UCX" not in manifest
     assert manifest.count("TRTLLM_NIXL_ENABLE_COALESCE") >= 2
     assert "UCX_CUDA_IPC_ENABLE_MNNVL" in manifest
     assert "NVIDIA_GDRCOPY" in manifest
@@ -473,6 +475,7 @@ def test_r20_nixl_gate_readiness_audit_is_read_only_and_fail_closed():
     assert "LOCAL_DGD_MANIFEST" in script
     assert "nixl_gate_audit_${MODE}" in script
     assert "TRTLLM_NIXL_KVCACHE_BACKEND" in script
+    assert 'EXPECTED_NIXL_PLUGIN_BACKEND="${EXPECTED_NIXL_PLUGIN_BACKEND:-LIBFABRIC}"' in script
     assert "UCX|LIBFABRIC" in script
     assert "TRTLLM_NIXL_ENABLE_COALESCE" in script
     assert "max_tokens_in_buffer must be at least" in script
@@ -531,7 +534,7 @@ def test_r20_nixl_plugin_matrix_probe_is_no_traffic_and_checks_cleanup():
     assert "kubectl delete" not in script
     assert "probe_nixl_plugin_matrix.sh" in readme
     assert "REQUIRE_PLUGINS=UCX,LIBFABRIC" in readme
-    assert "LIBFABRIC remains an A/B-only candidate" in readme
+    assert "NIXL `UCX` plugin remains available only as an A/B comparison candidate" in readme
 
 
 def test_r20_nixl_plugin_variant_renderer_is_fail_closed():

@@ -518,8 +518,9 @@ The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
 - `cache_transceiver_config.max_tokens_in_buffer: 131072` on both prefill and
   decode. TRT-LLM C++ warns that dynamic transfer buffers can fail with NIXL;
   the pre-registered buffer must cover the 128k ISL target.
-- `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` on both workers. This selects the UCX plugin
-  inside NIXL explicitly; it is not the old direct UCX cache transceiver.
+- `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` on both workers. This selects the
+  NIXL libfabric plugin explicitly, avoiding the old direct UCX cache
+  transceiver and keeping the UCX NIXL plugin as an A/B-only candidate.
 - `TRTLLM_NIXL_ENABLE_COALESCE=1` on both workers. NIXL coalesces contiguous
   VMM-split descriptors during registration, deregistration, and transfer request
   creation, reducing descriptor count and hot-path overhead.
@@ -606,8 +607,9 @@ The gate pins `cache_transceiver_config.backend: NIXL`,
 Python import path (`nixl`, `msgpack`, and
 `tensorrt_llm._torch.disaggregation.native.transfer`) plus frontend
 `handoff_mode="generation_first"` markers; completed-prefill markers fail the
-NIXL write-mode gate. UCX remains available only as an A/B comparison
-candidate. The gate is fail-closed: explicit YAML backend selection
+NIXL write-mode gate. The gate defaults to the NIXL `LIBFABRIC` plugin; the
+NIXL `UCX` plugin remains available only as an A/B comparison candidate. The
+gate is fail-closed: explicit YAML backend selection
 wins over legacy `TRTLLM_USE_*_KVCACHE` environment toggles, conflicting UCX /
 Mooncake / MPI env selectors are rejected, and the smoke requires startup logs
 showing `Initializing NIXL Connect`, `cache_transceiver_config.backend=NIXL`,

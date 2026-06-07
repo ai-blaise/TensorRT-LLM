@@ -263,7 +263,7 @@ spec:
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
         value: '0'
       - name: TRTLLM_NIXL_KVCACHE_BACKEND
-        value: UCX
+        value: LIBFABRIC
       - name: TRTLLM_NIXL_ENABLE_COALESCE
         value: '1'
       - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
@@ -444,7 +444,7 @@ spec:
       - name: UCX_CUDA_IPC_ENABLE_MNNVL
         value: '0'
       - name: TRTLLM_NIXL_KVCACHE_BACKEND
-        value: UCX
+        value: LIBFABRIC
       - name: TRTLLM_NIXL_ENABLE_COALESCE
         value: '1'
       - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
