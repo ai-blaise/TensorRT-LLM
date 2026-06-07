@@ -32,8 +32,8 @@ def _base_fixture() -> Fixture:
         [
             "Selected worker: worker_type=prefill, worker_id=0 dp_rank=0",
             f"dynamo request pin route selected request_id={rid} worker_id=0 dp_rank=0 phase=Prefill",
-            f"dynamo disagg request pin established request_id={rid} prefill_worker_id=0 prefill_dp_rank=Some(0) bootstrap_host=10.0.0.10 bootstrap_port=9000",
-            f"dynamo disagg request pin outbound to decode request_id={rid} bootstrap_host=10.0.0.10 bootstrap_port=9000 ctx_info_endpoint=nixl://ctx/0 ctx_dp_rank=0",
+            f"dynamo disagg request pin established request_id={rid} disagg_request_id={rid} prefill_worker_id=0 prefill_dp_rank=Some(0) ctx_info_endpoint=nixl://ctx/0 handoff_mode=completed_prefill",
+            f"dynamo disagg request pin outbound to decode request_id={rid} disagg_request_id={rid} ctx_info_endpoint=nixl://ctx/0 ctx_dp_rank=0 handoff_mode=completed_prefill",
             "Selected worker: worker_type=decode, worker_id=1 dp_rank=1",
             f"dynamo request pin route selected request_id={rid} worker_id=1 dp_rank=1 phase=Decode",
             f"dynamo request pin cleanup scheduled request_id={rid} reason=stream_closed",
@@ -125,13 +125,33 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
         r"dynamo request pin route selected.*request_id[= ]([^, ]+).*worker_id[= ](\d+).*dp_rank[= ](\d+).*phase[= ](Prefill|Decode|Aggregated)",
         fixture.frontend,
     )
-    established = re.findall(
-        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?(\d+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
-        fixture.frontend,
+    established = [
+        (rid, worker_id, dp_rank, "bootstrap", f"{host}:{port}")
+        for rid, worker_id, dp_rank, host, port in re.findall(
+            r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?(\d+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
+            fixture.frontend,
+        )
+    ]
+    established.extend(
+        (rid, worker_id, dp_rank, "completed_prefill", ctx_info_endpoint)
+        for rid, worker_id, dp_rank, ctx_info_endpoint in re.findall(
+            r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?(\d+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+            fixture.frontend,
+        )
     )
-    outbound = re.findall(
-        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
-        fixture.frontend,
+    outbound = [
+        (rid, "bootstrap", f"{host}:{port}")
+        for rid, host, port in re.findall(
+            r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
+            fixture.frontend,
+        )
+    ]
+    outbound.extend(
+        (rid, "completed_prefill", ctx_info_endpoint)
+        for rid, ctx_info_endpoint in re.findall(
+            r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+            fixture.frontend,
+        )
     )
     cleared = re.findall(r"dynamo request pin cleared|disagg request pin cleared", all_logs)
     cleanup_scheduled = re.findall(r"dynamo request pin cleanup scheduled", all_logs)
@@ -139,6 +159,12 @@ def validate(fixture: Fixture, *, smc_required: bool = True) -> None:
         raise AssertionError("missing pin-established marker")
     if not outbound:
         raise AssertionError("missing outbound-to-decode marker")
+    placeholder_completed = [
+        item for item in [*established, *outbound]
+        if item[-2] == "completed_prefill" and item[-1] in {"", "completed_prefill", "None", "null"}
+    ]
+    if placeholder_completed:
+        raise AssertionError("completed-prefill pin marker missing real ctx_info_endpoint")
     shared_pin_rids = {rid for rid, *_ in established} & {rid for rid, *_ in outbound}
     if not shared_pin_rids:
         raise AssertionError("no request id shared by established and outbound markers")

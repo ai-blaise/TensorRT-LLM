@@ -266,13 +266,33 @@ route_selected = re.findall(
     r"dynamo request pin route selected.*request_id[= ]([^, ]+).*worker_id[= ](\d+).*dp_rank[= ](\d+).*phase[= ](Prefill|Decode|Aggregated)",
     frontend,
 )
-established = re.findall(
-    r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
-    frontend,
+established = [
+    (rid, worker_id, dp_rank, "bootstrap", f"{host}:{port}")
+    for rid, worker_id, dp_rank, host, port in re.findall(
+        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
+        frontend,
+    )
+]
+established.extend(
+    (rid, worker_id, dp_rank, "completed_prefill", ctx_info_endpoint)
+    for rid, worker_id, dp_rank, ctx_info_endpoint in re.findall(
+        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+        frontend,
+    )
 )
-outbound = re.findall(
-    r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
-    frontend,
+outbound = [
+    (rid, "bootstrap", f"{host}:{port}")
+    for rid, host, port in re.findall(
+        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*bootstrap_host[= ]([^, ]+).*bootstrap_port[= ](\d+)",
+        frontend,
+    )
+]
+outbound.extend(
+    (rid, "completed_prefill", ctx_info_endpoint)
+    for rid, ctx_info_endpoint in re.findall(
+        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]completed_prefill",
+        frontend,
+    )
 )
 cleared = re.findall(r"dynamo request pin cleared|disagg request pin cleared", all_logs)
 cleared_rids = set(re.findall(
@@ -307,28 +327,29 @@ if require_dynamo:
         rid for rid, w, r in route_decode if (w, r) == decode_pair
     }
 
-    if established and outbound:
-        established_pairs = [(w, r) for _rid, w, r, _host, _port in established]
-        if prefill_pair not in established_pairs:
-            raise SystemExit(f"response prefill worker/rank {prefill_pair} not present in Dynamo pin-established markers: {established}")
-        established_rids = {rid for rid, _w, _r, _host, _port in established}
-        outbound_rids = {rid for rid, _host, _port in outbound}
-        shared_pin_rids = established_rids & outbound_rids
-        if not shared_pin_rids:
-            raise SystemExit(f"no request id appears in both pin-established and outbound-to-decode markers: established={established_rids} outbound={outbound_rids}")
-        if not (shared_pin_rids & route_prefill_rids):
-            raise SystemExit(f"no request id appears in both route-selected prefill and pin lifecycle markers: route_prefill={route_prefill_rids} pin={shared_pin_rids}")
-        if not (shared_pin_rids & route_decode_rids):
-            raise SystemExit(f"no request id appears in both route-selected decode and pin lifecycle markers: route_decode={route_decode_rids} pin={shared_pin_rids}")
-        lifecycle_rids = shared_pin_rids
-    else:
-        lifecycle_rids = route_prefill_matching_response & route_decode_matching_response
-        if not lifecycle_rids:
-            raise SystemExit(
-                "no Dynamo request id ties the response worker metadata to both "
-                f"Prefill and Decode route-selected markers: prefill_pair={prefill_pair} "
-                f"decode_pair={decode_pair} route_prefill={route_prefill} route_decode={route_decode}"
-            )
+    if not established:
+        raise SystemExit("missing Dynamo pin-established marker; route-selected logs alone are not a pre-A/B pinning proof")
+    if not outbound:
+        raise SystemExit("missing Dynamo outbound-to-decode marker; route-selected logs alone are not a pre-A/B pinning proof")
+    placeholder_completed = [
+        item for item in [*established, *outbound]
+        if item[-2] == "completed_prefill" and item[-1] in {"", "completed_prefill", "None", "null"}
+    ]
+    if placeholder_completed:
+        raise SystemExit(f"completed-prefill pin marker missing real ctx_info_endpoint: {placeholder_completed}")
+    established_pairs = [(w, r) for _rid, w, r, _mode, _anchor in established]
+    if prefill_pair not in established_pairs:
+        raise SystemExit(f"response prefill worker/rank {prefill_pair} not present in Dynamo pin-established markers: {established}")
+    established_rids = {rid for rid, _w, _r, _mode, _anchor in established}
+    outbound_rids = {rid for rid, _mode, _anchor in outbound}
+    shared_pin_rids = established_rids & outbound_rids
+    if not shared_pin_rids:
+        raise SystemExit(f"no request id appears in both pin-established and outbound-to-decode markers: established={established_rids} outbound={outbound_rids}")
+    if not (shared_pin_rids & route_prefill_rids):
+        raise SystemExit(f"no request id appears in both route-selected prefill and pin lifecycle markers: route_prefill={route_prefill_rids} pin={shared_pin_rids}")
+    if not (shared_pin_rids & route_decode_rids):
+        raise SystemExit(f"no request id appears in both route-selected decode and pin lifecycle markers: route_decode={route_decode_rids} pin={shared_pin_rids}")
+    lifecycle_rids = shared_pin_rids
 
     if not (lifecycle_rids & cleared_rids):
         raise SystemExit(
@@ -415,7 +436,7 @@ for rid in sorted(positive_transfer_proof_ids):
 
 if require_positive_transfer_metrics and not positive_transfer_metrics:
     raise SystemExit(
-        "positive KV transfer proof missing: response nvext timing, worker /perf_metrics, "
+        "positive KV transfer proof missing: positive KV transfer metrics missing; response nvext timing, worker /perf_metrics, "
         "and OPTRT_NIXL_TRANSFER_PROOF logs did not expose a nonzero completed transfer; "
         f"starts={proof_starts} ctx_complete={proof_ctx_complete} gen_complete={proof_gen_complete} "
         f"perf_metrics_probe={metrics_text[:600]}"
