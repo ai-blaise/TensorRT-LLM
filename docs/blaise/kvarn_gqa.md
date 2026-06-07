@@ -367,8 +367,9 @@ Current focused coverage:
   fail-close, and side-state snapshot shape.
 - `blaise_perf/kvarn_gqa/check_kvarn_gqa_static_abi.py`: source-only ABI/API
   checker for THOP schema fragments, fused-op readiness surface, fail-closed
-  readiness guard, BDR/device-table hooks, and dense-MLA/Indexer separation. It
-  runs without importing TensorRT-LLM Python bindings.
+  readiness guard, BDR/device-table hooks, NIXL side-state fragment wiring,
+  graph/sparse benchmark gates, and dense-MLA/Indexer separation. It runs
+  without importing TensorRT-LLM Python bindings.
 - `benchmarks/python/bench_kvarn_gqa_micro.py`: light pack/restore/reference
   scoring timing for `M in {1,5,25}`. It enforces a restore-cosine floor and
   supports `--require-fused`, which fails until real

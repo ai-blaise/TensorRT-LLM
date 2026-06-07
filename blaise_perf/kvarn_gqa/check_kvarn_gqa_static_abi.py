@@ -46,6 +46,30 @@ REQUIRED_GQA_ATTENTION_SNIPPETS = (
     'torch._assert_async(torch.all(committed))',
 )
 
+REQUIRED_DISAGG_SNIPPETS = (
+    "kvarn_gqa_side_meta: Optional[KVarNGQASidePoolMeta] = None",
+    'data["kvarn_gqa_side_meta"]',
+    "KVarNGQASidePoolMeta.from_dict",
+    "def _collect_kvarn_gqa_side_frags",
+    "if not task._slice.is_last_slice",
+    "packed pages alone are incomplete",
+    "src_meta.ptrs + src_meta.item_sizes * int(src_slot)",
+    "dst_meta.ptrs + dst_meta.item_sizes * int(dst_slot)",
+    "side_frags = self._collect_kvarn_gqa_side_frags",
+    "kvarn_gqa_side_slot=kvarn_side_slot",
+    "transfer_meta(device_id=config.device_id)",
+    "Registered KVarN GQA side-state memory",
+)
+
+REQUIRED_BENCH_SNIPPETS = (
+    'parser.add_argument("--sparse-topk"',
+    'parser.add_argument("--blocks"',
+    'parser.add_argument("--graph-replay"',
+    "max_abs_full",
+    "STORE dtype=",
+    "DECODE dtype=",
+)
+
 
 def _compact(text: str) -> str:
     return " ".join(text.split())
@@ -66,6 +90,9 @@ def main() -> None:
     kernels = (repo / "cpp/tensorrt_llm/kernels/kvarnGqaKernels.cu").read_text()
     loader = (repo / "tensorrt_llm/_torch/pyexecutor/model_loader.py").read_text()
     gqa = (repo / "tensorrt_llm/_torch/attention_backend/kvarn_gqa_attention.py").read_text()
+    rank_info = (repo / "tensorrt_llm/_torch/disaggregation/native/rank_info.py").read_text()
+    transfer = (repo / "tensorrt_llm/_torch/disaggregation/native/transfer.py").read_text()
+    bench = (repo / "blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py").read_text()
     docs = (repo / "docs/blaise/kvarn_gqa.md").read_text()
 
     for schema in REQUIRED_THOP_SCHEMA_FRAGMENTS:
@@ -74,6 +101,11 @@ def main() -> None:
         require_contains(loader, snippet, "model_loader gate")
     for snippet in REQUIRED_GQA_ATTENTION_SNIPPETS:
         require_contains(gqa, snippet, "GQA attention path")
+    disagg = rank_info + "\n" + transfer
+    for snippet in REQUIRED_DISAGG_SNIPPETS:
+        require_contains(disagg, snippet, "GQA disaggregated transfer path")
+    for snippet in REQUIRED_BENCH_SNIPPETS:
+        require_contains(bench, snippet, "GQA benchmark gate")
 
     require_contains(kernels, "bool kvarnGqaBackendReady()", "readiness symbol")
     require_contains(kernels, "return false;", "fail-closed readiness guard")
