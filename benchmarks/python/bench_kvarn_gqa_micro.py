@@ -226,7 +226,12 @@ def main() -> None:
                 raise SystemExit(
                     f"store op restore mismatch layout={layout} dtype={args.runtime_dtype}: "
                     f"max_abs={store_max_abs:.6f} atol={args.store_op_atol:.6f}")
-            print(f"store_op_layout={layout} dtype={args.runtime_dtype} restore_max_abs={store_max_abs:.6f}")
+            store_us = _bench(lambda: trtllm_ops.kvarn_gqa_store(
+                k.unsqueeze(0).contiguous(), v.unsqueeze(0).contiguous(),
+                op_container, block_ids, 0, cfg.head_dim, cfg.group),
+                max(args.decode_op_iters, 1), device)
+            print(f"store_op_layout={layout} dtype={args.runtime_dtype} "
+                  f"restore_max_abs={store_max_abs:.6f} store_us={store_us:.2f}")
 
     if args.try_decode_op:
         for layout in args.layouts:

@@ -220,101 +220,132 @@ __device__ float tileStd(float const* tile, float const* logCol, float const* lo
     return sqrtf(fmaxf(var, 0.0f));
 }
 
-__device__ float tileImbalance(float const* tile, float const* logCol, float const* logRow)
-{
-    float minCol = FLT_MAX;
-    float maxCol = 0.0f;
-    float minRow = FLT_MAX;
-    float maxRow = 0.0f;
-    for (int i = 0; i < Layout::kGroupSize; ++i)
-    {
-        float sc = tileStd(tile, logCol, logRow, true, i);
-        float sr = tileStd(tile, logCol, logRow, false, i);
-        minCol = fminf(minCol, sc);
-        maxCol = fmaxf(maxCol, sc);
-        minRow = fminf(minRow, sr);
-        maxRow = fmaxf(maxRow, sr);
-    }
-    return maxCol / fmaxf(minCol, 1e-8f) + maxRow / fmaxf(minRow, 1e-8f);
-}
-
 template <bool IsKey, typename T>
-__device__ void quantizeAndWriteTile(T const* src, PackedRecordWriteView view, std::int64_t blockId, int inputBlock, int kvHead,
-    int numKvHeads)
+__device__ void quantizeAndWriteTileParallel(T const* src, PackedRecordWriteView view, std::int64_t blockId,
+    int inputBlock, int kvHead, int numKvHeads, float* smem)
 {
-    float tile[Layout::kGroupSize * Layout::kHeadDim];
-    float logCol[Layout::kHeadDim];
-    float logRow[Layout::kGroupSize];
-    float bestCol[Layout::kHeadDim];
-    float bestRow[Layout::kGroupSize];
+    float* tile = smem;
+    float* logCol = tile + Layout::kGroupSize * Layout::kHeadDim;
+    float* logRow = logCol + Layout::kHeadDim;
+    float* bestCol = logRow + Layout::kGroupSize;
+    float* bestRow = bestCol + Layout::kHeadDim;
+    float* tmpCol = bestRow + Layout::kGroupSize;
+    float* tmpRow = tmpCol + Layout::kHeadDim;
+    float* scalar = tmpRow + Layout::kGroupSize;
+    int tid = threadIdx.x;
 
-    for (int i = 0; i < Layout::kHeadDim; ++i)
+    for (int i = tid; i < Layout::kHeadDim; i += blockDim.x)
     {
         logCol[i] = 0.0f;
         bestCol[i] = 1.0f;
     }
-    for (int i = 0; i < Layout::kGroupSize; ++i)
+    for (int i = tid; i < Layout::kGroupSize; i += blockDim.x)
     {
         logRow[i] = 0.0f;
         bestRow[i] = 1.0f;
     }
+    __syncthreads();
 
-    for (int r = 0; r < Layout::kGroupSize; ++r)
+    int total = Layout::kGroupSize * Layout::kHeadDim;
+    for (int linear = tid; linear < total; linear += blockDim.x)
     {
-        for (int c = 0; c < Layout::kHeadDim; ++c)
+        int r = linear / Layout::kHeadDim;
+        int c = linear - r * Layout::kHeadDim;
+        int token = IsKey ? c : r;
+        int rotDim = IsKey ? r : c;
+        float acc = 0.0f;
+        for (int j = 0; j < Layout::kHeadDim; ++j)
         {
-            int token = IsKey ? c : r;
-            int rotDim = IsKey ? r : c;
-            float acc = 0.0f;
-            for (int j = 0; j < Layout::kHeadDim; ++j)
-            {
-                std::int64_t srcIdx
-                    = ((static_cast<std::int64_t>(inputBlock) * Layout::kGroupSize + token) * numKvHeads + kvHead)
-                    * Layout::kHeadDim + j;
-                acc += loadScalar(src + srcIdx) * static_cast<float>(hadamardSign(j, rotDim));
-            }
-            tile[r * Layout::kHeadDim + c] = acc * kHadamardScale;
+            std::int64_t srcIdx
+                = ((static_cast<std::int64_t>(inputBlock) * Layout::kGroupSize + token) * numKvHeads + kvHead)
+                * Layout::kHeadDim + j;
+            acc += loadScalar(src + srcIdx) * static_cast<float>(hadamardSign(j, rotDim));
         }
+        tile[linear] = acc * kHadamardScale;
     }
+    __syncthreads();
 
-    float bestImbalance = tileImbalance(tile, logCol, logRow);
+    if (tid < Layout::kHeadDim)
+    {
+        tmpCol[tid] = tileStd(tile, logCol, logRow, true, tid);
+        tmpRow[tid] = tileStd(tile, logCol, logRow, false, tid);
+    }
+    __syncthreads();
+    if (tid == 0)
+    {
+        float minCol = FLT_MAX;
+        float maxCol = 0.0f;
+        float minRow = FLT_MAX;
+        float maxRow = 0.0f;
+        for (int i = 0; i < Layout::kGroupSize; ++i)
+        {
+            minCol = fminf(minCol, tmpCol[i]);
+            maxCol = fmaxf(maxCol, tmpCol[i]);
+            minRow = fminf(minRow, tmpRow[i]);
+            maxRow = fmaxf(maxRow, tmpRow[i]);
+        }
+        scalar[0] = maxCol / fmaxf(minCol, 1e-8f) + maxRow / fmaxf(minRow, 1e-8f);
+    }
+    __syncthreads();
+
     for (int iter = 0; iter < 16; ++iter)
     {
-        for (int c = 0; c < Layout::kHeadDim; ++c)
+        if (tid < Layout::kHeadDim)
         {
-            float std = clampf(tileStd(tile, logCol, logRow, true, c), 1e-3f, 1e3f);
-            logCol[c] = clampf(logCol[c] + logf(std), -0.3f, 10.0f);
+            float std = clampf(tileStd(tile, logCol, logRow, true, tid), 1e-3f, 1e3f);
+            logCol[tid] = clampf(logCol[tid] + logf(std), -0.3f, 10.0f);
         }
-        for (int r = 0; r < Layout::kGroupSize; ++r)
+        __syncthreads();
+        if (tid < Layout::kGroupSize)
         {
-            float std = clampf(tileStd(tile, logCol, logRow, false, r), 1e-3f, 1e3f);
-            logRow[r] = clampf(logRow[r] + logf(std), -0.3f, 10.0f);
+            float std = clampf(tileStd(tile, logCol, logRow, false, tid), 1e-3f, 1e3f);
+            logRow[tid] = clampf(logRow[tid] + logf(std), -0.3f, 10.0f);
         }
-        float imb = tileImbalance(tile, logCol, logRow);
-        if (imb <= bestImbalance)
+        __syncthreads();
+        if (tid < Layout::kHeadDim)
         {
-            bestImbalance = imb;
-            for (int c = 0; c < Layout::kHeadDim; ++c)
+            tmpCol[tid] = tileStd(tile, logCol, logRow, true, tid);
+            tmpRow[tid] = tileStd(tile, logCol, logRow, false, tid);
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            float minCol = FLT_MAX;
+            float maxCol = 0.0f;
+            float minRow = FLT_MAX;
+            float maxRow = 0.0f;
+            for (int i = 0; i < Layout::kGroupSize; ++i)
             {
-                bestCol[c] = expf(logCol[c]);
+                minCol = fminf(minCol, tmpCol[i]);
+                maxCol = fmaxf(maxCol, tmpCol[i]);
+                minRow = fminf(minRow, tmpRow[i]);
+                maxRow = fmaxf(maxRow, tmpRow[i]);
             }
-            for (int r = 0; r < Layout::kGroupSize; ++r)
+            float imb = maxCol / fmaxf(minCol, 1e-8f) + maxRow / fmaxf(minRow, 1e-8f);
+            if (imb <= scalar[0])
             {
-                bestRow[r] = expf(logRow[r]);
+                scalar[0] = imb;
+                for (int i = 0; i < Layout::kHeadDim; ++i)
+                {
+                    bestCol[i] = expf(logCol[i]);
+                    bestRow[i] = expf(logRow[i]);
+                }
             }
         }
+        __syncthreads();
     }
 
     int packedOffset = IsKey ? kKPackedOffset : kVPackedOffset;
     int sRowOffset = IsKey ? kKSRowAbsOffset : kVSRowAbsOffset;
     int zpOffset = IsKey ? kKZpAbsOffset : kVZpAbsOffset;
     int sColOffset = IsKey ? kKSColOffset : kVSColOffset;
-    for (int i = 0; i < 4096; ++i)
+    for (int i = tid; i < 4096; i += blockDim.x)
     {
         writeRecordByte(view, blockId, kvHead, packedOffset + i, 0);
     }
+    __syncthreads();
 
-    for (int r = 0; r < Layout::kGroupSize; ++r)
+    for (int r = tid; r < Layout::kGroupSize; r += blockDim.x)
     {
         float lo = FLT_MAX;
         float hi = -FLT_MAX;
@@ -340,25 +371,28 @@ __device__ void quantizeAndWriteTile(T const* src, PackedRecordWriteView view, s
             writeRecordByte(view, blockId, kvHead, byteIdx, old | static_cast<std::uint8_t>(q << shift));
         }
     }
-    for (int c = 0; c < Layout::kHeadDim; ++c)
+    for (int c = tid; c < Layout::kHeadDim; c += blockDim.x)
     {
         writePackedFp16(view, blockId, kvHead, sColOffset + c * 2, bestCol[c]);
     }
+    __syncthreads();
 }
 
 template <typename T>
-__global__ void kvarnGqaStoreReferenceKernel(T const* k, T const* v, PackedRecordWriteView records,
+__global__ void kvarnGqaStoreParallelKernel(T const* k, T const* v, PackedRecordWriteView records,
     std::int64_t const* blockIds, int numBlocks, int numKvHeads)
 {
     int inputBlock = blockIdx.x;
     int kvHead = blockIdx.y;
-    if (inputBlock >= numBlocks || kvHead >= numKvHeads || threadIdx.x != 0)
+    if (inputBlock >= numBlocks || kvHead >= numKvHeads)
     {
         return;
     }
+    extern __shared__ float smem[];
     std::int64_t blockId = blockIds[inputBlock];
-    quantizeAndWriteTile<true>(k, records, blockId, inputBlock, kvHead, numKvHeads);
-    quantizeAndWriteTile<false>(v, records, blockId, inputBlock, kvHead, numKvHeads);
+    quantizeAndWriteTileParallel<true>(k, records, blockId, inputBlock, kvHead, numKvHeads, smem);
+    __syncthreads();
+    quantizeAndWriteTileParallel<false>(v, records, blockId, inputBlock, kvHead, numKvHeads, smem);
 }
 
 template <typename T>
@@ -804,7 +838,7 @@ __global__ void kvarnGqaDecodeParallelKernel(T const* q, PackedRecordView record
 
 bool kvarnGqaBackendReady()
 {
-    // The store kernel and BDR helpers are still experimental correctness paths.
+    // The store/decode kernels are block-parallel packed KVarN paths, while BDR helpers remain guarded.
     // Decode now uses a block-parallel packed read/dequant/scoring kernel, but readiness must stay false
     // until disaggregated side-state transfer, sparse reads, CUDA graph lifecycle,
     // runtime correctness, and B200 performance gates pass.
@@ -821,14 +855,22 @@ void invokeKvarnGqaStoreK2V2G128(void const* k, void const* v, std::uint8_t* pac
     TLLM_CHECK_WITH_INFO(numBlocks >= 0 && numKvHeads > 0, "kvarn_gqa_store got invalid sizes");
     PackedRecordWriteView view{packedRecords, pageLayout, strideBlock, strideToken, strideHead, strideByte};
     dim3 grid(numBlocks, numKvHeads);
+    constexpr int kThreads = 256;
+    constexpr std::size_t kSharedFloats = Layout::kGroupSize * Layout::kHeadDim + 6 * Layout::kHeadDim + 1;
+    constexpr std::size_t kSharedBytes = kSharedFloats * sizeof(float);
     if (useBf16)
     {
-        kvarnGqaStoreReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__nv_bfloat16 const*>(k),
-            static_cast<__nv_bfloat16 const*>(v), view, blockIds, numBlocks, numKvHeads);
+        cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kSharedBytes));
+        kvarnGqaStoreParallelKernel<__nv_bfloat16><<<grid, kThreads, kSharedBytes, stream>>>(
+            static_cast<__nv_bfloat16 const*>(k), static_cast<__nv_bfloat16 const*>(v), view, blockIds, numBlocks,
+            numKvHeads);
     }
     else
     {
-        kvarnGqaStoreReferenceKernel<<<grid, 1, 0, stream>>>(static_cast<__half const*>(k),
+        cudaFuncSetAttribute(kvarnGqaStoreParallelKernel<__half>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kSharedBytes));
+        kvarnGqaStoreParallelKernel<__half><<<grid, kThreads, kSharedBytes, stream>>>(static_cast<__half const*>(k),
             static_cast<__half const*>(v), view, blockIds, numBlocks, numKvHeads);
     }
 }
