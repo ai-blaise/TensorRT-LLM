@@ -85,6 +85,26 @@ def capture_store_op(fn, packed: torch.Tensor):
     return eager, packed.detach().clone(), graph
 
 
+def capture_dequant_op(fn, readable_k: torch.Tensor, readable_v: torch.Tensor):
+    readable_k.zero_()
+    readable_v.zero_()
+    fn()
+    eager_k = readable_k.detach().clone()
+    eager_v = readable_v.detach().clone()
+    readable_k.zero_()
+    readable_v.zero_()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    readable_k.zero_()
+    readable_v.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    max_abs = max((readable_k - eager_k).abs().max().item(),
+                  (readable_v - eager_v).abs().max().item())
+    return max_abs, graph
+
 
 def dry_run(args: argparse.Namespace) -> None:
     group = 128
@@ -94,18 +114,21 @@ def dry_run(args: argparse.Namespace) -> None:
     total_tokens = args.blocks * group
     topk = min(args.sparse_topk, total_tokens)
     sparse_full = total_tokens <= 256
+    bdr_churn = min(max(args.bdr_churn_blocks, 0), args.blocks)
     print("KVARN_GQA_BENCH_DRY_RUN")
     print(
         f"repo={args.repo} device={args.device} dtype={args.dtype} "
         f"heads={args.heads} kv_heads={args.kv_heads} head_dim={head_dim} "
         f"blocks={args.blocks} tokens={total_tokens} group={group} "
-        f"topk={topk} sparse_full_check={int(sparse_full)} graph_replay={int(args.graph_replay)}"
+        f"topk={topk} sparse_full_check={int(sparse_full)} "
+        f"bdr_churn_blocks={bdr_churn} graph_replay={int(args.graph_replay)}"
     )
     for m in args.m:
         print(
             f"PLAN STORE+DECODE dtype={args.dtype} M={m} "
             f"resident_blocks={args.blocks} dense_decode=1 "
             f"sparse_topk={topk} sparse_full_parity={int(sparse_full)} "
+            f"bdr_full_blocks={args.blocks} bdr_churn_blocks={bdr_churn} "
             f"graph_replay={int(args.graph_replay)}"
         )
     print("No CUDA context was created; rerun without --dry-run during an isolated B200 window.")
@@ -121,6 +144,8 @@ def main() -> None:
     parser.add_argument("--sparse-topk", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=1,
                         help="resident committed 128-token packed blocks to store/read")
+    parser.add_argument("--bdr-churn-blocks", type=int, default=1,
+                        help="dirty/churn physical blocks for amortized dequant timing")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--graph-replay", action="store_true",
@@ -142,6 +167,7 @@ def main() -> None:
     assert hasattr(torch.ops.trtllm, "kvarn_gqa_store")
     assert hasattr(torch.ops.trtllm, "kvarn_gqa_decode")
     assert hasattr(torch.ops.trtllm, "kvarn_gqa_decode_sparse")
+    assert hasattr(torch.ops.trtllm, "kvarn_gqa_dequant_amortized")
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
     device = torch.device("cuda", args.device)
@@ -169,7 +195,42 @@ def main() -> None:
         store()
         print(f"GRAPH_STORE dtype={args.dtype} max_abs_byte={store_graph_diff}")
 
+    readable_k = torch.empty((num_blocks, group, args.kv_heads, head_dim), device=device, dtype=dtype)
+    readable_v = torch.empty_like(readable_k)
+    bdr_churn = min(max(args.bdr_churn_blocks, 0), num_blocks)
+    churn_ids = block_ids[:bdr_churn].contiguous()
+    dequant_full = lambda: torch.ops.trtllm.kvarn_gqa_dequant_amortized(
+        packed, block_ids, readable_k, readable_v, args.kv_heads, head_dim, group)
+    dequant_churn = lambda: torch.ops.trtllm.kvarn_gqa_dequant_amortized(
+        packed, churn_ids, readable_k, readable_v, args.kv_heads, head_dim, group)
+    dequant_full()
+    full_k = readable_k.detach().clone()
+    full_v = readable_v.detach().clone()
+    bdr_full_us = timed_us(dequant_full, max(args.iters // 10, 1), args.warmup)
+    bdr_churn_us = timed_us(dequant_churn, args.iters, args.warmup) if bdr_churn else 0.0
+    if bdr_churn:
+        dequant_churn()
+        bdr_churn_max_abs = max(
+            (readable_k[:bdr_churn] - full_k[:bdr_churn]).abs().max().item(),
+            (readable_v[:bdr_churn] - full_v[:bdr_churn]).abs().max().item(),
+        )
+    else:
+        bdr_churn_max_abs = 0.0
+    if args.graph_replay:
+        bdr_full_graph_diff, _ = capture_dequant_op(dequant_full, readable_k, readable_v)
+        bdr_churn_graph_diff = (capture_dequant_op(dequant_churn, readable_k, readable_v)[0]
+                                if bdr_churn else 0.0)
+        print(
+            f"GRAPH_BDR_DEQUANT dtype={args.dtype} "
+            f"full_replay_max_abs={bdr_full_graph_diff:.6f} "
+            f"churn_replay_max_abs={bdr_churn_graph_diff:.6f}"
+        )
     print(f"STORE dtype={args.dtype} blocks={num_blocks} kv_heads={args.kv_heads} store_us={store_us:.2f}")
+    print(
+        f"BDR_DEQUANT dtype={args.dtype} blocks={num_blocks} churn_blocks={bdr_churn} "
+        f"full_us={bdr_full_us:.2f} churn_us={bdr_churn_us:.2f} "
+        f"churn_max_abs={bdr_churn_max_abs:.6f}"
+    )
     for m in args.m:
         q = torch.randn((m, args.heads, head_dim), device=device, dtype=dtype)
         seq_lens = torch.full((m,), total_tokens, device=device, dtype=torch.int32)

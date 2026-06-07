@@ -24,7 +24,8 @@ def test_sparse_bench_dry_run_prints_store_decode_graph_matrix(capsys):
         kv_heads=2,
         m=[1, 5, 25],
         sparse_topk=64,
-        blocks=1,
+        blocks=8,
+        bdr_churn_blocks=1,
         graph_replay=True,
     )
 
@@ -32,10 +33,12 @@ def test_sparse_bench_dry_run_prints_store_decode_graph_matrix(capsys):
 
     out = capsys.readouterr().out
     assert "KVARN_GQA_BENCH_DRY_RUN" in out
-    assert "tokens=128" in out
-    assert "sparse_full_check=1" in out
+    assert "tokens=1024" in out
+    assert "sparse_full_check=0" in out
+    assert "bdr_churn_blocks=1" in out
     assert "graph_replay=1" in out
     assert "PLAN STORE+DECODE dtype=fp16 M=1" in out
     assert "PLAN STORE+DECODE dtype=fp16 M=5" in out
     assert "PLAN STORE+DECODE dtype=fp16 M=25" in out
+    assert "bdr_full_blocks=8" in out
     assert "No CUDA context was created" in out

@@ -379,9 +379,11 @@ Current focused coverage:
   `torch.ops.trtllm.kvarn_gqa_backend_ready()` are registered and ready.
   `blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py` is the focused low-memory
   B200 harness for the new packed sparse top-k op: it builds the THOP extension
-  from the checkout, times store/dense decode/sparse-full/sparse-topk, optionally
-  runs `--graph-replay`, accepts `--blocks` to compare fixed top-k against larger
-  resident packed KV, and checks sparse-full equality against dense packed decode
+  from the checkout, times store/dense decode/sparse-full/sparse-topk plus
+  `kvarn_gqa_dequant_amortized` full-vs-churn BDR dequant, optionally runs
+  `--graph-replay`, accepts `--blocks` and `--bdr-churn-blocks` to prove dequant
+  cost scales with churn rather than resident working set, and checks sparse-full
+  equality against dense packed decode
   for odd M values when the resident set is <=256 tokens. The earlier
   `--try-store-op`, `--try-decode-op`, and `--try-side-op` development parity
   checks cover FP16/BF16 runtime tensors, compact records, paged KV-cache layout,
@@ -398,8 +400,8 @@ python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --kv-heads 8 --i
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --runtime-dtype fp16 --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 --try-store-op --try-decode-op --try-side-op
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --runtime-dtype bf16 --sinkhorn-iters 16 --layouts compact paged --queries 1 5 25 --try-store-op --try-decode-op --try-side-op
 python benchmarks/python/bench_kvarn_gqa_micro.py --device cuda --require-fused
-python blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py --repo /workspace --device 0 --dtype fp16 --blocks 1 --m 1 5 25 --sparse-topk 64 --graph-replay --dry-run
-python blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py --repo /workspace --device 0 --dtype fp16 --blocks 1 --m 1 5 25 --sparse-topk 64 --graph-replay
+python blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py --repo /workspace --device 0 --dtype fp16 --blocks 8 --bdr-churn-blocks 1 --m 1 5 25 --sparse-topk 64 --graph-replay --dry-run
+python blaise_perf/kvarn_gqa/bench_kvarn_gqa_sparse.py --repo /workspace --device 0 --dtype fp16 --blocks 8 --bdr-churn-blocks 1 --m 1 5 25 --sparse-topk 64 --graph-replay
 ```
 
 
