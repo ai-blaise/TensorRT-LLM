@@ -20,7 +20,7 @@ RUN apt-get update \
     && ln -sf /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcufftw.so.12 /usr/local/cuda-13.1/targets/x86_64-linux/lib/libcufftw.so \
     && rm -rf /var/lib/apt/lists/*
 
-RUN /opt/dynamo/venv/bin/python3 -m pip install --no-cache-dir cmake==3.31.6 conan==2.14.0
+RUN /opt/dynamo/venv/bin/python3 -m pip install --no-cache-dir cmake==3.31.6 conan==2.14.0 msgpack==1.1.1
 
 WORKDIR /workspace/TensorRT-LLM
 COPY . /workspace/TensorRT-LLM

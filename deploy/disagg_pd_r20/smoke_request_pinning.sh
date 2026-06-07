@@ -65,6 +65,8 @@ require_runtime_nixl_gate() {
       || die "$pod selected UCX cache transceiver in logs"
     grep -q 'OPTRT_LAYERSPLIT_XFER_DEBUG' <<<"$log_dump" || die "$pod missing LayerSplit transfer debug proof"
     grep -q 'global_layers=61' <<<"$log_dump" || die "$pod did not advertise global_layers=61 to CacheTransceiver"
+    $KC exec "$pod" -- sh -lc 'py=$(command -v python3 || command -v python); "$py" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"nixl\") and importlib.util.find_spec(\"msgpack\") else 1)" && "$py" -c "import tensorrt_llm._torch.disaggregation.native.transfer"' \
+      >/dev/null 2>&1 || die "$pod cannot import Python/native NIXL transfer path (nixl + msgpack required)"
   done
 
   grep -q 'transfer_attr=True' <<<"$($KC logs "$pre" 2>/dev/null || true)" \
@@ -81,6 +83,8 @@ require_config_gate() {
   grep -q 'layersplit_transfer_backend: nixl' <<<"$cfg" || die "LayerSplit transfer backend is not NIXL"
   grep -q 'layersplit_owner_local_alloc: true' <<<"$cfg" || die "LayerSplit owner-local allocation is not enabled"
   [[ "$(grep -c 'backend: NIXL' <<<"$cfg")" -ge 2 ]] || die "prefill/decode NIXL cache transceivers are not both configured"
+  [[ "$(grep -c 'transceiver_runtime: PYTHON' <<<"$cfg")" -ge 2 ]] \
+    || die "prefill/decode NIXL transceiver_runtime=PYTHON is required for generation-first/write-mode handoff"
   ! grep -q 'backend: UCX' <<<"$cfg" || die "UCX cache transceiver backend is present; NIXL is the pre-A/B baseline"
   grep -q 'mla_latent_kv_dtype: kvarn_k2v2' <<<"$cfg" || die "dense MLA KVarN kvarn_k2v2 is not configured"
   ! grep -q 'mla_latent_kv_dtype: auto' <<<"$cfg" || die "dense MLA KVarN fell back to auto dtype"
@@ -281,9 +285,9 @@ established = [
     )
 ]
 established.extend(
-    (rid, worker_id, dp_rank, "completed_prefill", ctx_info_endpoint)
-    for rid, worker_id, dp_rank, ctx_info_endpoint in re.findall(
-        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]\"?completed_prefill\"?",
+    (rid, worker_id, dp_rank, "generation_first", params)
+    for rid, worker_id, dp_rank, params in re.findall(
+        r"dynamo disagg request pin established.*request_id[= ]([^, ]+).*prefill_worker_id[= ](\d+).*prefill_dp_rank[= ](?:Some\()?([0-9]+).*disaggregated_params[= ]([^\\n]+).*handoff_mode[= ]\"?generation_first\"?",
         frontend,
     )
 )
@@ -295,9 +299,9 @@ outbound = [
     )
 ]
 outbound.extend(
-    (rid, "completed_prefill", ctx_info_endpoint)
-    for rid, ctx_info_endpoint in re.findall(
-        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*ctx_info_endpoint[= ]([^, ]+).*handoff_mode[= ]\"?completed_prefill\"?",
+    (rid, "generation_first", params)
+    for rid, params in re.findall(
+        r"dynamo disagg request pin outbound to decode.*request_id[= ]([^, ]+).*disaggregated_params[= ]([^\\n]+).*handoff_mode[= ]\"?generation_first\"?",
         frontend,
     )
 )
@@ -338,6 +342,16 @@ if require_dynamo:
         raise SystemExit("missing Dynamo pin-established marker; route-selected logs alone are not a pre-A/B pinning proof")
     if not outbound:
         raise SystemExit("missing Dynamo outbound-to-decode marker; route-selected logs alone are not a pre-A/B pinning proof")
+    if not any(mode == "generation_first" for _rid, _w, _r, mode, _anchor in established):
+        raise SystemExit(f"NIXL write-mode gate requires generation_first pin-established marker, got {established}")
+    if not any(mode == "generation_first" for _rid, mode, _anchor in outbound):
+        raise SystemExit(f"NIXL write-mode gate requires generation_first outbound-to-decode marker, got {outbound}")
+    completed_prefill_markers = [
+        item for item in [*established, *outbound]
+        if item[-2] == "completed_prefill"
+    ]
+    if completed_prefill_markers:
+        raise SystemExit(f"NIXL write-mode gate forbids completed-prefill handoff markers: {completed_prefill_markers}")
     placeholder_completed = [
         item for item in [*established, *outbound]
         if item[-2] == "completed_prefill" and item[-1] in {"", "completed_prefill", "None", "null"}

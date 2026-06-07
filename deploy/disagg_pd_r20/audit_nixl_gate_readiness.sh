@@ -91,6 +91,8 @@ require_config_shape() {
   local cfg="$OUTPUT_DIR/config_combined.yaml"
 
   [[ "$(count_fixed 'backend: NIXL' "$cfg")" -ge 2 ]] || fail "prefill/decode cache_transceiver_config.backend are not both NIXL"
+  [[ "$(count_fixed 'transceiver_runtime: PYTHON' "$cfg")" -ge 2 ]] \
+    || fail "prefill/decode NIXL transceiver runtime must be PYTHON for generation-first/write-mode handoff"
   reject_fixed 'backend: UCX' "$cfg" "direct UCX backend in NIXL gate"
   reject_fixed 'backend: MOONCAKE' "$cfg" "Mooncake backend in NIXL gate"
   require_fixed 'layersplit_transfer_backend: nixl' "$cfg" "LayerSplit NIXL transfer"
@@ -155,6 +157,9 @@ require_live_runtime() {
   require_fixed 'Initializing NIXL Connect' "$all_logs" "NIXL Connect startup"
   require_regex "cache_transceiver_config.*backend.*NIXL|cache_transceiver_config: \{'backend': 'NIXL'" "$all_logs" "runtime NIXL backend log"
   reject_regex "cache_transceiver_config.*backend.*UCX|cache_transceiver_config: \{'backend': 'UCX'|Using UCX kv-cache transceiver" "$all_logs" "direct UCX runtime fallback"
+  require_regex 'dynamo disagg request pin established.*handoff_mode="?generation_first"?' "$OUTPUT_DIR/frontend.log" "generation-first request pin marker"
+  require_regex 'dynamo disagg request pin outbound to decode.*handoff_mode="?generation_first"?' "$OUTPUT_DIR/frontend.log" "generation-first outbound marker"
+  reject_regex 'handoff_mode="?completed_prefill"?' "$OUTPUT_DIR/frontend.log" "completed-prefill handoff in NIXL write-mode gate"
   require_fixed 'OPTRT_LAYERSPLIT_XFER_DEBUG' "$all_logs" "LayerSplit transfer debug marker"
   require_fixed 'global_layers=61' "$all_logs" "global 61-layer transfer metadata"
   require_fixed 'transfer_attr=True' "$OUTPUT_DIR/prefill.log" "prefill DSACacheManager transfer metadata"
@@ -164,9 +169,9 @@ require_live_runtime() {
   if [[ "$CHECK_RUNTIME_LIBS" == "1" ]]; then
     for pod in "$pre" "$dec"; do
       note "checking NIXL runtime libs in $pod"
-      $KC exec "$pod" -- sh -lc 'py=$(command -v python3 || command -v python); "$py" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"nixl\") else 1)" && find /usr /opt -name "libtensorrt_llm_nixl_wrapper.so*" -print -quit | grep -q .' \
+      $KC exec "$pod" -- sh -lc 'py=$(command -v python3 || command -v python); "$py" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"nixl\") and importlib.util.find_spec(\"msgpack\") else 1)" && "$py" -c "import tensorrt_llm._torch.disaggregation.native.transfer" && find /usr /opt -name "libtensorrt_llm_nixl_wrapper.so*" -print -quit | grep -q .' \
         >"$OUTPUT_DIR/$(basename "$pod")_nixl_runtime.txt" 2>&1 \
-        || fail "$pod missing Python nixl package or libtensorrt_llm_nixl_wrapper.so; see $OUTPUT_DIR/$(basename "$pod")_nixl_runtime.txt"
+        || fail "$pod missing Python nixl/msgpack, native NIXL transfer import, or libtensorrt_llm_nixl_wrapper.so; see $OUTPUT_DIR/$(basename "$pod")_nixl_runtime.txt"
     done
   fi
 }

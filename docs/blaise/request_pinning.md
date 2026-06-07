@@ -17,10 +17,10 @@ back to an unknown-DP broadcast path before A/B testing.
 - `ctx_dp_rank` is present before decode asks for KV. Missing `ctx_dp_rank` is
   a hard error because it would otherwise broadcast `REQUEST_DATA` across
   context DP groups.
-- `ctx_info_endpoint` must be present for completed-prefill handoff. It is
-  treated as request-local transfer metadata. Context response metadata wins
-  over static server metadata; static server metadata only backfills missing
-  fields.
+- `ctx_info_endpoint` must be present before decode asks for KV. In the
+  generation-first/write-mode NIXL path, static prefill worker metadata seeds
+  the decode request; completed-prefill response metadata remains the fallback
+  proof for serial/read-style A/B candidates.
 - Request pins are cleared on normal completion, error, generation-first
   validation failure, generation-first context errors, and when a streaming
   response is consumed or closed.
@@ -36,16 +36,17 @@ back to an unknown-DP broadcast path before A/B testing.
   `ctx_dp_rank is None`. The service-level fail-closed gate prevents normal
   non-MORI traffic from reaching that branch without an explicitly proven
   override.
-- The r20 canary uses the C++ NIXL transceiver as the pre-A/B gate. Its receive
-  fanout is computed from `DataTransceiverState` and MLA/cache formatter rank
-  layout; request pinning still supplies the stable producer request id and
-  transfer metadata to the executor before `requestAndReceive*` starts. UCX is
-  retained only as an A/B comparison candidate.
-- The C++ transceiver stamps `ContextPhaseParams.disagg_info_endpoint` from the
-  concrete `CommState` identity before prefill responds. Python result handling
-  propagates that as `ctx_info_endpoint`, allowing Dynamo to fail closed when a
-  completed-prefill response lacks endpoint metadata instead of routing decode
-  through an unpinned fallback.
+- The r20 canary uses the V2 Python/native NIXL transceiver as the pre-A/B
+  write-mode gate. The legacy C++ transceiver can prove completed-prefill
+  handoff, but it does not expose early `get_disaggregated_params()` metadata
+  and is therefore not acceptable for the write-mode NIXL gate.
+- The production image must carry the native Python transfer dependencies,
+  including `msgpack`; otherwise `transceiver_runtime: PYTHON` can be
+  configured but fail during the native transfer worker import.
+- The prefill worker publishes generation-first `ctx_info_endpoint` metadata
+  before traffic is admitted. Dynamo must fail closed when that metadata is
+  absent instead of routing decode through an unpinned or completed-prefill
+  fallback.
 - The r20 canary emits request-pinning trace logs at both boundaries:
   `disagg request pin outbound` from the frontend's OpenAI client before it
   sends context/generation requests, and `disagg request pin received` from the

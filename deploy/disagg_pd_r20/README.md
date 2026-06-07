@@ -28,10 +28,12 @@ not a Python-only overlay over an older base. The C++ MLA cache formatter must
 include the CP-domain reassembly path (`mDomainCPSize > 1`) or decode KV receive
 will reject the LayerSplit handoff.
 
-Completed-prefill request pinning also depends on the C++ NIXL transceiver
-stamping `ContextPhaseParams.disagg_info_endpoint` from its concrete
-`CommState`. Without that source-built fix, Dynamo correctly rejects the handoff
-as unpinned because the prefill response has no `ctx_info_endpoint`.
+Generation-first/write-mode request pinning depends on the V2 Python/native
+NIXL transceiver (`cache_transceiver_config.transceiver_runtime: PYTHON`).
+The legacy C++ transceiver remains useful for completed-prefill proofs, but it
+does not publish early `ctx_info_endpoint` metadata and therefore cannot satisfy
+the MORI-style write-mode gate. The r20 image must also include `msgpack`
+because TRT-LLM's Python/native transfer worker imports it on startup.
 
 ## Deploy (orchestrator only -- gated)
 
@@ -595,13 +597,17 @@ deploy/disagg_pd_r20/run_c16_transport_bench.sh \
 ## KV handoff shape
 
 The deployment uses the TRT-LLM disaggregated KV transceiver, not vLLM MORI-IO.
-The MORI-IO write-mode shape remains an A/B-phase reference only: prefill is the
-KV producer, decode owns pre-allocated KV blocks, and transfer metadata must
-describe block and layer layout precisely. The current r20 image ships both the
-C++ NIXL wrapper (`libtensorrt_llm_nixl_wrapper.so`) and Python `nixl`, so the
-pre-A/B gate pins `cache_transceiver_config.backend: NIXL` and
-`layersplit_transfer_backend: nixl`. UCX remains available only as an A/B
-comparison candidate. The gate is fail-closed: explicit YAML backend selection
+The pre-A/B NIXL target follows MORI-IO's write-mode shape: prefill is the KV
+producer, decode is launched early with pre-allocated KV blocks, and prefill
+pushes/writes KV to the decode side while decode waits for transfer completion.
+The gate pins `cache_transceiver_config.backend: NIXL`,
+`cache_transceiver_config.transceiver_runtime: PYTHON`, and
+`layersplit_transfer_backend: nixl`. The smoke/audit require the native NIXL
+Python import path (`nixl`, `msgpack`, and
+`tensorrt_llm._torch.disaggregation.native.transfer`) plus frontend
+`handoff_mode="generation_first"` markers; completed-prefill markers fail the
+NIXL write-mode gate. UCX remains available only as an A/B comparison
+candidate. The gate is fail-closed: explicit YAML backend selection
 wins over legacy `TRTLLM_USE_*_KVCACHE` environment toggles, conflicting UCX /
 Mooncake / MPI env selectors are rejected, and the smoke requires startup logs
 showing `Initializing NIXL Connect`, `cache_transceiver_config.backend=NIXL`,

@@ -66,6 +66,9 @@ data:
       # NIXL is the pre-A/B KV-transfer gate.
       # UCX remains available only as an A/B comparison candidate.
       backend: NIXL
+      # Generation-first/write-mode handoff requires the V2 NIXL runtime; the
+      # legacy C++ transceiver only supports completed-prefill metadata.
+      transceiver_runtime: PYTHON
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE
@@ -138,6 +141,9 @@ data:
       # NIXL is the pre-A/B KV-transfer gate.
       # UCX remains available only as an A/B comparison candidate.
       backend: NIXL
+      # Generation-first/write-mode handoff requires the V2 NIXL runtime; the
+      # legacy C++ transceiver only supports completed-prefill metadata.
+      transceiver_runtime: PYTHON
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE

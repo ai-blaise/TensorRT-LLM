@@ -141,6 +141,14 @@ Current NIXL gate state:
 - Positive nonzero NIXL KV transfer is proven under strict smoke.
 - Request-pinning metadata reaches the NIXL handoff, including non-empty
   completed-prefill endpoint metadata.
+- The r20 gate config/source now pins
+  `cache_transceiver_config.transceiver_runtime: PYTHON` and requires
+  generation-first/write-mode markers. The previous live proof is still a
+  correctness proof for NIXL transfer, but it is not the MORI-style write-mode
+  target because the frontend logs show `handoff_mode="completed_prefill"`.
+- The image now explicitly installs `msgpack`, and the smoke/audit check the
+  native Python transfer import path so `transceiver_runtime: PYTHON` cannot be
+  marked ready while its transfer worker dependency chain is broken.
 - UCX remains only the current NIXL plugin backend (`TRTLLM_NIXL_KVCACHE_BACKEND=UCX`),
   not a direct UCX cache-transceiver gate. Native NIXL plugin alternatives such
   as LIBFABRIC, Mooncake, and MORI-IO remain A/B-only until they prove equal or

@@ -25,6 +25,7 @@ def test_r20_prefill_canary_gates():
     assert cfg["sparse_attention_config"]["mla_latent_kv_dtype"] == "kvarn_k2v2"
     assert cfg["sparse_attention_config"]["mla_latent_kv_amortize"] is True
     assert cfg["cache_transceiver_config"]["backend"] == "NIXL"
+    assert cfg["cache_transceiver_config"]["transceiver_runtime"] == "PYTHON"
     assert cfg["moe_config"]["warp_decode"]["enabled"] is False
 
 
@@ -35,6 +36,7 @@ def test_r20_decode_canary_gates():
     assert cfg["enable_attention_dp"] is True
     assert cfg["context_parallel_size"] == 1
     assert cfg["cache_transceiver_config"]["backend"] == "NIXL"
+    assert cfg["cache_transceiver_config"]["transceiver_runtime"] == "PYTHON"
     assert cfg["moe_config"]["backend"] == "WARPDECODE"
     assert cfg["moe_config"]["warp_decode"]["enabled"] is True
     assert cfg["moe_config"]["warp_decode"]["policy"] == "force"
@@ -60,6 +62,7 @@ def test_r20_manifest_has_no_helix_or_smc_fallback():
     assert "layersplit_transfer_backend: nixl" in manifest
     assert "layersplit_owner_local_alloc: true" in manifest
     assert "backend: NIXL" in manifest
+    assert manifest.count("transceiver_runtime: PYTHON") >= 2
     assert manifest.count("TRTLLM_NIXL_KVCACHE_BACKEND") >= 2
     assert manifest.count("TRTLLM_NIXL_ENABLE_COALESCE") >= 2
     assert "UCX_CUDA_IPC_ENABLE_MNNVL" in manifest
@@ -72,6 +75,7 @@ def test_r20_manifest_has_no_helix_or_smc_fallback():
 def test_r20_overlay_carries_layersplit_and_request_pinning_sources():
     dockerfile = (DEPLOY_DIR / "Dockerfile.r20-overlay").read_text()
 
+    assert "msgpack==1.1.1" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/py_executor_creator.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py" in dockerfile
     assert "tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py" in dockerfile
@@ -110,6 +114,7 @@ def test_r20_fullsource_build_path_exists_for_native_fixes():
 
     assert "ARG BUILD_BASE" in dockerfile
     assert "ARG RUNTIME_BASE" in dockerfile
+    assert "msgpack==1.1.1" in dockerfile
     assert "--configure-only" in dockerfile
     assert "--target tensorrt_llm th_common bindings" in dockerfile
     assert "BUILD_DEEP_EP=OFF" in dockerfile
@@ -120,6 +125,17 @@ def test_r20_fullsource_build_path_exists_for_native_fixes():
     assert "--runtime-base" in script
     assert "Dockerfile.r20-fullsource" in script
     assert "C++/CUDA/native-library changes" in readme
+
+
+def test_r20_nixl_gate_requires_generation_first_write_mode():
+    smoke = (DEPLOY_DIR / "smoke_request_pinning.sh").read_text()
+    audit = (DEPLOY_DIR / "audit_nixl_gate_readiness.sh").read_text()
+
+    assert "tensorrt_llm._torch.disaggregation.native.transfer" in smoke
+    assert "importlib.util.find_spec(\\\"msgpack\\\")" in smoke
+    assert "handoff_mode=\\\"?generation_first\\\"?" in audit
+    assert "completed-prefill handoff in NIXL write-mode gate" in audit
+    assert "NIXL write-mode gate forbids completed-prefill handoff markers" in smoke
 
 
 def test_r20_snapshot_hooks_are_opt_in_and_readiness_checked():
