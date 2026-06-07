@@ -70,6 +70,7 @@ a correctness signal — see "Validation philosophy" below).
 8. [warpdecode.md](warpdecode.md) — the MoE decode fast path.
 9. [smc_sd.md](smc_sd.md) — speculative decode (multiplies the others).
 10. [foundry_iteration_speed.md](foundry_iteration_speed.md) — Foundry vs CRIU snapshot decision for iteration/runtime reuse.
+11. [r20_snapshot_composition.md](r20_snapshot_composition.md) — R20 CRIU snapshot readiness and next hook patch.
 
 ## Validation philosophy
 

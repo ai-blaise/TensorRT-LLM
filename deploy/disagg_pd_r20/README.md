@@ -191,6 +191,9 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
   close cleanup before A/B.
 - `cache_report.sh` -- read-only VM report for persistent-cache growth, local
   registry availability, and k3s/containerd image residency.
+- `snapshot_readiness.sh` -- read-only CRIU snapshot composition report for the
+  R20 DGD; it checks host/Kubernetes substrate and reports the TensorRT-LLM hook
+  blocker without creating snapshot resources or touching live pods.
 - `Dockerfile.r20-overlay.dockerignore` -- overlay-specific build-context
   allowlist so thin-image rebuilds do not ship the full repo to Docker/BuildKit.
 
@@ -207,6 +210,19 @@ Run this after the first cold rollout and again after the next overlay rollout.
 The useful signal is whether `triton`, `cuda`, `deep_gemm`, and
 `tensorrt_llm/*` grow and then stabilize; if they remain empty, the workers are
 not writing to the intended persistent cache paths.
+
+Inspect CRIU snapshot composition readiness without touching pods:
+
+```bash
+deploy/disagg_pd_r20/snapshot_readiness.sh \
+  --vm 34.106.33.128 \
+  --dgd-name topo-c1-dp2tp4-disagg-r20
+```
+
+This is a preflight only. `safe_to_take_snapshot=0` is expected until R20 has a
+gated TensorRT-LLM pre-snapshot/post-restore hook that drains requests, quiesces
+NIXL, destroys/rebuilds process groups, and proves TP4 decode plus TP2xCP2
+LayerSplit prefill restore parity.
 
 ## Knob provenance
 
