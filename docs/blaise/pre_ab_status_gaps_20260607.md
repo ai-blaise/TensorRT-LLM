@@ -3,19 +3,27 @@
 This note records the current state of the `op-trt` custom-stack gate after the
 r20 disaggregated prefill/decode rollout on the B200 canary. It is intentionally
 explicit about incomplete work so later commits do not accidentally treat a
-smoke-response or partial marker as production completion.
+smoke-response, readiness result, or partial marker as production completion.
 
 ## Live deployment snapshot
 
 - Repo/branch: `ai-blaise/TensorRT-LLM`, branch `op-trt`.
 - Live DGD: `topo-c1-dp2tp4-disagg-r20` in namespace `dynamo-system`.
-- Current generation observed: gen89.
-- Current image:
+- Current generation observed: gen91.
+- Current stable image:
   `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-2750d5541c-nixl-ls-real61fix-cppsplitabi2-202606070338-routerpin-052c9a3-20260607T034750Z-routerpin-cppsplitabi2`.
+- Current-head proof image under preparation:
+  `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-a3b1c19a481e-headproof-flat-20260607044600`.
 - Topology: one prefill worker on four B200 GPUs and one decode worker on four
   B200 GPUs, plus the Dynamo KV frontend.
-- Live readiness after rollout: frontend, prefill, and decode reached `1/1
-  Running` with zero restarts.
+- Live readiness after rollback: frontend, prefill, and decode are `1/1
+  Running` with zero restarts on the stable image.
+- Rollout note: the unflattened current-head thin overlay
+  (`optrt-a3b1c19a481e-headproof-20260607042547`) carried the expected source
+  markers but failed at pod start with containerd rootfs `mount options is too
+  long`. Do not deploy chained overlays for this gate. Flatten the current-head
+  image, import it into k3s containerd, verify source markers in the flattened
+  image, and only then roll it into the DGD.
 - Active custom stack in live config:
   - NIXL cache transceiver on prefill and decode.
   - LayerSplit prefill with `TP2 x CP2`, `cp_type: LAYERSPLIT`, owner-local
@@ -60,9 +68,12 @@ frontend emits and preserves the full pin lifecycle:
   explicit `OPTRT_NIXL_TRANSFER_PROOF` logs.
 
 The smoke has also been hardened so `KV cache transfer timeout` is a fail-closed
-bad pattern. A prior gen88 run completed responses but logged `Terminating
-context request ... due to KV cache transfer timeout` on prefill ranks; that must
-remain a hard NIXL gate failure until root-caused.
+bad pattern. A prior gen88/gen89 run completed responses but logged
+`Terminating context request ... due to KV cache transfer timeout` on prefill
+ranks; that must remain a hard NIXL gate failure until root-caused. The
+current-head proof image adds explicit `OPTRT_NIXL_TRANSFER_PROOF` and
+`OPTRT_LAYERSPLIT_XFER_DEBUG` markers so the next strict smoke can distinguish a
+missing proof marker from a real transfer timeout.
 
 ## Completed or partially integrated pieces
 
@@ -144,6 +155,10 @@ Remaining infrastructure gaps:
 - Keep final snapshotting separate from speculative Foundry runtime integration;
   Foundry remains a potential complement to `ai-blaise/criu-snapshots`, not a
   proven production dependency.
+- Preserve the flat-image escape hatch in the iteration docs. It is required
+  when an overlay-on-overlay rebuild reaches containerd rootfs mount-option
+  limits; it should not replace full source builds for ABI-affecting C++/CUDA
+  changes.
 
 ## Major remaining gaps requested by the user
 
@@ -159,6 +174,8 @@ Required completion:
   https://arxiv.org/pdf/2604.15672.
 - Import/port any remaining SGLang kernels needed by
   `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`.
+- Review the June 6 `op-trt` commits before further kernel work so the port does
+  not duplicate or regress already-imported SGLang pieces.
 - Validate the GLM draft model path with the target `DeepSeekV32` main model,
   dense MLA KVarN, NIXL, request pinning, WarpDecode, and LayerSplit.
 - Re-enable `SMC_GATE_MODE=required` only after live E2E is stable.
@@ -255,6 +272,8 @@ Required A/B axes include at minimum:
 - [x] WarpDecode is forced on decode with kernel-backend fallback disabled.
 - [x] Moondream-style overlap is enabled while SMC-SD is deferred.
 - [x] Routerpin image reaches route-selected and cleanup markers.
+- [x] Current-head thin overlay source markers are present.
+- [ ] Current-head flattened image is imported into k3s containerd and deployed.
 - [ ] Routerpin emits full pin-established/outbound decode lifecycle markers.
 - [ ] Strict request-pinning smoke passes.
 - [ ] Positive nonzero NIXL KV transfer proof passes.

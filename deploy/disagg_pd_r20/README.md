@@ -69,6 +69,15 @@ lets k3s/containerd pull only missing thin layers instead of importing a full
 `docker save` archive. Keep the default import path when you need the most
 conservative `imagePullPolicy: Never` behavior.
 
+If a deliberately chained thin overlay reaches containerd's rootfs mount option
+limit (`failed to mount rootfs component: mount options is too long`), do not
+continue rolling that tag. Roll back to the last ready image, flatten the
+current-head image with `docker export | docker import`, import the flattened tag
+into k3s containerd, and re-run the source-marker check before applying the DGD.
+The flattened tag should carry `ai.blaise.flattened=true` and should only be
+used as an iteration artifact; ABI-affecting C++/CUDA changes still require a
+fresh full source build.
+
 Build only:
 
 ```bash
