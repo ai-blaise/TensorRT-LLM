@@ -79,6 +79,10 @@ REQUIRED_DISAGG_SNIPPETS = (
     "kvarn_gqa_side_slot=kvarn_side_slot",
     "transfer_meta(device_id=config.device_id)",
     "Registered KVarN GQA side-state memory",
+    "kvarn_side_slot = self._kvarn_gqa_side_pool.slot_for_request(task._unique_rid)",
+    "if not task._slice.is_last_slice",
+    "packed pages alone are incomplete",
+    "self._agent.register_memory(reg_side_desc)",
 )
 
 REQUIRED_BENCH_SNIPPETS = (
