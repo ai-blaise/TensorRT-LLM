@@ -5625,13 +5625,16 @@ class DSACacheManager(KVCacheManager):
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
 
-        # The indexer K cache is a separate, already-packed payload; its
-        # per-token footprint is a fixed byte count (indexer data bytes + int32
-        # scale bytes per kv head). It must be added as raw bytes rather than
-        # folded into the dense element count — under NVFP4 the dense path packs
-        # two codes per byte and feeds a scale-factor sizer that requires a
-        # 16-divisible element count (head_dim=576 is, head_dim+surcharge is
-        # not).
+        # The indexer K cache is a separate, already-packed payload physically
+        # allocated as raw UINT8 in WindowBlockManager::allocatePools
+        # (poolDtype = kUINT8); its per-token footprint is a fixed byte count
+        # (indexer data bytes + int32 scale bytes per kv head) and is NOT
+        # scaled by the KV cache dtype. It must be added as raw bytes rather
+        # than folded into the dense element count — under NVFP4 the dense
+        # path packs two codes per byte and feeds a scale-factor sizer that
+        # requires a 16-divisible element count (head_dim=576 is,
+        # head_dim+surcharge is not); under BF16 folding would double the
+        # indexer bytes.
         indexer_bytes_per_token = (indexer_data_dim +
                                    index_head_dim // quant_block_size * 4)
 
@@ -5653,8 +5656,10 @@ class DSACacheManager(KVCacheManager):
         mem_per_token = 2
         if quant_mode is not None and quant_mode.has_fp8_kv_cache():
             mem_per_token = 1
-        mem_per_token *= num_attention_layers * (head_dim +
-                                                 indexer_bytes_per_token)
+        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
+        mem_per_token *= num_attention_layers * head_dim
+        # Indexer K cache: raw UINT8 bytes, unscaled by the KV dtype.
+        mem_per_token += num_attention_layers * indexer_bytes_per_token
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
@@ -5662,14 +5667,17 @@ class DSACacheManager(KVCacheManager):
         # The dense MLA latent (self.kv_factor * head_dim, i.e. the 512+64=576
         # kv_lora_rank + qk_rope_head_dim payload) is the part that is stored in
         # the configured KV dtype. The indexer K cache is a separate,
-        # already-packed payload whose per-token footprint is a fixed byte
-        # count (indexer data bytes + int32 scale bytes); it must NOT be folded
-        # into the dense element count, otherwise an NVFP4 KV dtype both
+        # already-packed payload physically allocated as raw UINT8 in
+        # WindowBlockManager::allocatePools (poolDtype = kUINT8): its per-token
+        # footprint is a fixed byte count (indexer data bytes + int32 scale
+        # bytes) that is NOT scaled by the KV cache dtype and must NOT be
+        # folded into the dense element count, otherwise an NVFP4 KV dtype both
         # mis-sizes those bytes (E2M1 packs two codes per byte) and feeds a
         # non-16-divisible element count into the scale-factor sizer (the dense
-        # 576 latent is 16-divisible, but 576 + indexer surcharge is not).
-        # Under FP4 the indexer data portion is halved (two E2M1 codes per
-        # byte); the int32 scale bytes are unchanged.
+        # 576 latent is 16-divisible, but 576 + indexer surcharge is not),
+        # while a BF16 KV dtype doubles them. Under FP4 the indexer data
+        # portion is halved (two E2M1 codes per byte); the int32 scale bytes
+        # are unchanged.
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
             raise ValueError(f'Cannot support {self.dtype} KV cache.')
@@ -5693,10 +5701,11 @@ class DSACacheManager(KVCacheManager):
                 dense_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
-            cache_size_bytes_per_token += indexer_bytes_per_token
         else:
-            cache_size_per_token = math.ceil(dense_size_per_token +
-                                             indexer_bytes_per_token)
             cache_size_bytes_per_token = get_size_in_bytes(
-                cache_size_per_token, self.dtype)
+                math.ceil(dense_size_per_token), self.dtype)
+
+        # Indexer K cache bytes: raw UINT8, unscaled by the KV dtype (see
+        # comment at function top).
+        cache_size_bytes_per_token += indexer_bytes_per_token
         return cache_size_bytes_per_token
