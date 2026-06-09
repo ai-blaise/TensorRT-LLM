@@ -43,6 +43,7 @@ a correctness signal — see "Validation philosophy" below).
 | 16 | SMC-SD: static-particle speculative decode | [smc_sd.md](smc_sd.md) | draft validated; e2e in progress | opt-in (draft model) |
 | 17 | LayerSplit: per-layer CP KV/indexer-K split | [../source/features/layersplit.md](../source/features/layersplit.md) | 21× broadcast latency @ scale | opt-in (`layersplit_enabled`) |
 | 18 | Topology + deploy: DP2/TP4 disaggregated decode | [topology_deploy.md](topology_deploy.md) | DP2/TP4 best (64/49/41/40) | deployment choice |
+| 19 | tok/s/user optimization candidates (open levers) | [optimization_candidates.md](optimization_candidates.md) | ranked plan: HISA band-gate, host/MoE/kernel | living hill-climb plan |
 
 > LayerSplit (17) has its canonical long-form doc at
 > `docs/source/features/layersplit.md` (on `op-trt`); WarpDecode
