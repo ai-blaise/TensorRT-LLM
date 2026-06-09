@@ -798,7 +798,7 @@ class ModelConfig(Generic[TConfig]):
                                                      False)
                         layersplit_owner_assignment = getattr(
                             sparse_attention_config,
-                            "layersplit_owner_assignment", "round_robin")
+                            "layersplit_owner_assignment", "contiguous")
                         layersplit_transfer_backend = getattr(
                             sparse_attention_config,
                             "layersplit_transfer_backend", "auto")
@@ -896,7 +896,7 @@ class ModelConfig(Generic[TConfig]):
                         # enable it. Production enablement flows only through
                         # SparseAttentionConfig.layersplit_* runtime config.
                         layersplit_enabled = False
-                        layersplit_owner_assignment = "round_robin"
+                        layersplit_owner_assignment = "contiguous"
                         layersplit_transfer_backend = "auto"
                         layersplit_all_cp_ranks_transfer = True
                         layersplit_owner_local_alloc = False

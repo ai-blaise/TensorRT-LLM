@@ -4,9 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tensorrt_llm._torch.attention_backend.sparse.layersplit as _layersplit_mod
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
-    LayerSplitOwnership, LayerSplitRuntimeState, build_layersplit_layer_mask,
-    compute_owner_assignment)
+    LayerSplitOwnership, LayerSplitRuntimeState, _all_cp_groups_from_mapping,
+    build_layersplit_layer_mask, compute_owner_assignment,
+    ensure_cp_process_group)
 
 
 def test_cp_size_1_collapses_all_layers_to_rank_0():
@@ -1314,6 +1316,67 @@ def test_owner_local_dense_scratch_routing_lazily_builds_nonowned_rows():
     assert mgr.get_buffers(0) is mgr._layersplit_dense_kv_scratch
 
 
+def test_owner_local_get_buffers_routes_non_nhd_to_scratch_not_keyerror():
+    # 1B-ii-a: a non-owned layer under owner_local_alloc must route to the
+    # dense scratch for EVERY kv_layout, not only NHD. The previous
+    # `kv_layout == "NHD"` guard let an HND request fall through to
+    # super().get_buffers, which does self.layer_offsets[layer_idx] and
+    # KeyErrors on a trimmed (non-owned) layer. The scratch mirrors the raw
+    # pool row (the bytes the C++ kernel reads via the augmented pool pointer),
+    # which is layout-independent, so returning it for any layout is correct.
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = SimpleNamespace(
+        enabled=True,
+        cp_size=2,
+        cp_rank=1,
+        owner_local_alloc=True,
+        is_owner=lambda layer_idx: layer_idx >= 2,
+        ownership=SimpleNamespace(num_layers=4,
+                                  owned_layers=lambda cp_rank: (2, 3)),
+    )
+    # Owned layers present in layer_offsets; non-owned (0, 1) are trimmed out.
+    mgr.layer_offsets = {2: 0, 3: 1}
+    scratch = torch.empty((3, 4, 2), dtype=torch.uint8)
+    mgr._layersplit_dense_kv_scratch = scratch
+
+    # Non-owned layer 0 under HND and NHD both return the scratch (no KeyError,
+    # no fall-through to the trimmed pool).
+    assert mgr.get_buffers(0, kv_layout="HND") is scratch
+    assert mgr.get_buffers(0, kv_layout="NHD") is scratch
+    assert mgr.get_buffers(1, kv_layout="HND") is scratch
+
+
+def test_owner_local_get_buffers_non_owned_without_scratch_fails_closed():
+    # When the dense scratch genuinely cannot be built (and the lazy repair
+    # also fails) a non-owned-layer access must fail closed with a clear
+    # message instead of silently reading the wrong (owned) KV slot.
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.layersplit_state = SimpleNamespace(
+        enabled=True,
+        cp_size=2,
+        cp_rank=1,
+        owner_local_alloc=True,
+        is_owner=lambda layer_idx: layer_idx >= 2,
+        ownership=SimpleNamespace(num_layers=4,
+                                  owned_layers=lambda cp_rank: (2, 3)),
+    )
+    mgr.layer_offsets = {2: 0, 3: 1}
+    mgr._layersplit_dense_kv_scratch = None
+    mgr._layersplit_dense_scratch_pool_index = None
+    mgr._layersplit_nonowned_layer_rows = {}
+    # Make the lazy repair a no-op that leaves scratch None.
+    mgr._ensure_layersplit_dense_scratch_routing = lambda: False
+
+    with pytest.raises(RuntimeError, match="dense KV scratch is unavailable"):
+        mgr.get_buffers(0, kv_layout="HND")
+
+
 def test_owner_local_global_owned_layer_bypasses_owner_map_bounds_check():
     from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 
@@ -1334,3 +1397,188 @@ def test_owner_local_global_owned_layer_bypasses_owner_map_bounds_check():
     assert mgr._layersplit_non_owned(31) is False
     assert mgr._layersplit_non_owned(0) is True
     assert mgr._layersplit_non_owned(62) is True
+
+
+# ---------------------------------------------------------------------------
+# ensure_cp_process_group (Phase 1A: CP ProcessGroup binding under MPI)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_cp_group_none_mapping_returns_none():
+    assert ensure_cp_process_group(None) == (None, None)
+
+
+def test_ensure_cp_group_cp_size_1_short_circuits():
+    # cp_size <= 1 needs no group and must NOT touch torch.distributed at all
+    # (no bootstrap, no new_group). Patch the bootstrap to explode so any
+    # accidental call fails loudly.
+    mapping = SimpleNamespace(cp_size=1, world_size=4, rank=0,
+                              cp_groups=[[0], [1], [2], [3]])
+    with patch.object(_layersplit_mod,
+                      "_ensure_torch_distributed_under_mpi",
+                      side_effect=AssertionError("must not bootstrap")):
+        assert ensure_cp_process_group(mapping) == (None, None)
+
+
+def test_ensure_cp_group_prefers_device_mesh_pg_without_creating():
+    # When mapping.cp_group_pg is implemented (DeviceMesh / Ray path) reuse it
+    # verbatim and never bootstrap or call new_group (no double-create).
+    sentinel_pg = object()
+    mapping = SimpleNamespace(cp_size=2, world_size=4, rank=2,
+                              cp_group_pg=sentinel_pg,
+                              cp_group=[2, 3],
+                              cp_groups=[[0, 1], [2, 3]])
+    with patch.object(_layersplit_mod,
+                      "_ensure_torch_distributed_under_mpi",
+                      side_effect=AssertionError("must not bootstrap")):
+        pg, ranks = ensure_cp_process_group(mapping)
+    assert pg is sentinel_pg
+    assert ranks == (2, 3)
+
+
+def _mpi_mapping_property(cp_group_pg_raises=True, **attrs):
+    """Build a Mapping-like object whose cp_group_pg property raises
+    NotImplementedError (mirrors the base Mapping under MPI)."""
+
+    class _M:
+        pass
+
+    m = _M()
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    if cp_group_pg_raises:
+        type(m).cp_group_pg = property(
+            lambda self: (_ for _ in ()).throw(NotImplementedError()))
+    return m
+
+
+def test_ensure_cp_group_mpi_path_creates_subgroup_collectively():
+    # Under MPI cp_group_pg raises NotImplementedError. ensure_cp_process_group
+    # must bootstrap (stubbed True here), then call dist.new_group ONCE PER CP
+    # group in the world (collective requirement) and keep the handle for the
+    # group this rank belongs to, with the correct global-rank tuple.
+    _layersplit_mod._CP_PROCESS_GROUP_CACHE.clear()
+    mapping = _mpi_mapping_property(
+        cp_size=2,
+        world_size=8,
+        rank=3,  # rank 3 -> CP group [2, 3]
+        cp_groups=[[0, 1], [2, 3], [4, 5], [6, 7]],
+    )
+    created = []
+
+    def _fake_new_group(ranks=None, backend=None):
+        created.append((tuple(ranks), backend))
+        return f"pg{tuple(ranks)}"
+
+    import torch.distributed as _dist
+    with patch.object(_layersplit_mod,
+                      "_ensure_torch_distributed_under_mpi",
+                      return_value=True), \
+         patch.object(_dist, "new_group", _fake_new_group), \
+         patch.object(_dist, "get_rank", return_value=3):
+        pg, ranks = ensure_cp_process_group(mapping)
+
+    # One new_group per CP group in the world (4 groups), every rank
+    # participates in every creation.
+    assert [c[0] for c in created] == [(0, 1), (2, 3), (4, 5), (6, 7)]
+    # NVLS-coexistence backend string is the same NCCL+gloo combo the runtime
+    # local-comm uses.
+    assert all(c[1] == "cuda:nccl,cpu:gloo" for c in created)
+    # This rank keeps ONLY its own group's handle and the matching ranks.
+    assert pg == "pg(2, 3)"
+    assert ranks == (2, 3)
+
+
+def test_ensure_cp_group_mpi_path_caches_across_managers():
+    # A second DSACacheManager in the same process (e.g. a draft KV manager)
+    # must reuse the already-created groups, not race a second collective
+    # new_group round.
+    _layersplit_mod._CP_PROCESS_GROUP_CACHE.clear()
+    mapping = _mpi_mapping_property(
+        cp_size=2, world_size=4, rank=0, cp_groups=[[0, 1], [2, 3]])
+    calls = {"n": 0}
+
+    def _fake_new_group(ranks=None, backend=None):
+        calls["n"] += 1
+        return f"pg{tuple(ranks)}"
+
+    import torch.distributed as _dist
+    with patch.object(_layersplit_mod,
+                      "_ensure_torch_distributed_under_mpi",
+                      return_value=True), \
+         patch.object(_dist, "new_group", _fake_new_group), \
+         patch.object(_dist, "get_rank", return_value=0):
+        pg1, ranks1 = ensure_cp_process_group(mapping)
+        n_after_first = calls["n"]
+        pg2, ranks2 = ensure_cp_process_group(mapping)
+
+    assert pg1 == pg2 == "pg(0, 1)"
+    assert ranks1 == ranks2 == (0, 1)
+    # 2 groups created on the first call, ZERO on the second (cache hit).
+    assert n_after_first == 2
+    assert calls["n"] == 2
+
+
+def test_ensure_cp_group_graceful_noop_when_cannot_bootstrap():
+    # If torch.distributed cannot be bootstrapped under MPI (CPU-only unit
+    # test, mpi4py absent, etc.) the helper returns (None, None) so the
+    # broadcast collapses to a no-op rather than crashing model load.
+    _layersplit_mod._CP_PROCESS_GROUP_CACHE.clear()
+    mapping = _mpi_mapping_property(
+        cp_size=2, world_size=4, rank=0, cp_groups=[[0, 1], [2, 3]])
+    with patch.object(_layersplit_mod,
+                      "_ensure_torch_distributed_under_mpi",
+                      return_value=False):
+        assert ensure_cp_process_group(mapping) == (None, None)
+
+
+def test_all_cp_groups_uses_mapping_list_verbatim():
+    mapping = SimpleNamespace(cp_groups=[[2, 3]], world_size=8, cp_size=2)
+    assert _all_cp_groups_from_mapping(mapping) == ((2, 3), )
+
+
+def test_all_cp_groups_derives_contiguous_layout_when_list_absent():
+    mapping = SimpleNamespace(world_size=8, cp_size=2)
+    assert _all_cp_groups_from_mapping(mapping) == (
+        (0, 1), (2, 3), (4, 5), (6, 7))
+
+
+def test_all_cp_groups_none_when_indivisible():
+    mapping = SimpleNamespace(world_size=7, cp_size=2)
+    assert _all_cp_groups_from_mapping(mapping) is None
+
+
+def test_ensure_cp_group_binds_into_runtime_state_end_to_end():
+    # Integration of ensure_cp_process_group with bind_cp_group +
+    # broadcast_src_rank: a simulated initialized MPI world yields a real
+    # group + global-rank tuple, and the runtime state then translates a
+    # CP-local owner into the correct global src rank.
+    _layersplit_mod._CP_PROCESS_GROUP_CACHE.clear()
+    mapping = _mpi_mapping_property(
+        cp_size=2, world_size=8, rank=2, cp_groups=[[0, 1], [2, 3], [4, 5],
+                                                    [6, 7]])
+
+    import torch.distributed as _dist
+    with patch.object(_layersplit_mod,
+                      "_ensure_torch_distributed_under_mpi",
+                      return_value=True), \
+         patch.object(_dist, "new_group",
+                      side_effect=lambda ranks=None, backend=None: f"pg{tuple(ranks)}"), \
+         patch.object(_dist, "get_rank", return_value=2):
+        cp_group, cp_group_ranks = ensure_cp_process_group(mapping)
+
+    state = LayerSplitRuntimeState.from_sparse_config(
+        sparse_attn_config=_sparse_cfg(
+            layersplit_owner_assignment="contiguous"),
+        num_layers=8,
+        cp_size=2,
+        cp_rank=0,
+        create_comm_stream=False,
+    )
+    state.bind_cp_group(cp_group, cp_group_ranks)
+    assert state.cp_group == "pg(2, 3)"
+    assert state.cp_group_ranks == (2, 3)
+    # contiguous cp_size=2, 8 layers: rank 0 owns 0..3, rank 1 owns 4..7.
+    # Layer 0's CP-local owner is 0 -> global rank 2; layer 7's is 1 -> 3.
+    assert state.broadcast_src_rank(0) == 2
+    assert state.broadcast_src_rank(7) == 3

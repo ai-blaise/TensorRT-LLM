@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs, AttentionInputType, MLAParams,
     PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
-    LayerSplitOwnership, LayerSplitRuntimeState)
+    LayerSplitOwnership, LayerSplitRuntimeState, ensure_cp_process_group)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
     KVarNLatentPool, kvarn_latent_bytes_per_token, resolve_kvarn_config)
 
@@ -82,6 +82,92 @@ def _layersplit_compute_active_block_ids(metadata):
     if selected.numel() == 0:
         return None
     return torch.unique(selected)
+
+
+def _layersplit_compute_read_block_ids(metadata):
+    """Compute the unique block ids the indexer-K kernel READS this step.
+
+    Companion to :func:`_layersplit_compute_active_block_ids`. The active
+    (write) set is only the blocks the current step SCATTERS into
+    (``[kv_lens - seq_lens, kv_lens)`` per request). But the DSA indexer
+    scores each query token causally against the FULL per-request KV
+    prefix ``[0, kv_len[i])`` (confirmed: ``prepare_one_prefill_chunk``
+    gathers indexer-K over ``[host_ctx_kv_indptr[req], +num_cached+chunk]``
+    and ``cu_seqlen_ks`` starts at the request KV base, ``cu_seqlen_ke``
+    runs to ``num_cached + local_q_pos + 1``), so under chunked prefill /
+    prefix reuse the cached prefix blocks ``[0, num_cached)`` are read but
+    never appear in the write set. A write-set-only broadcast leaves the
+    non-owner's indexer-K scratch STALE for the prefix on chunk >= 2,
+    yielding wrong logits / TopK.
+
+    This returns the READ set: the union over requests of the block_table
+    rows for the full range ``[0, kv_len[i])`` — i.e. exactly
+    :func:`_layersplit_compute_active_block_ids` with
+    ``start_block_in_seq = 0``. The owner broadcasts these so the
+    non-owner presents a complete prefix to the (CP-unaware) indexer.
+
+    Returns ``None`` on any path that can't compute the set, so the hook's
+    broadcast helper short-circuits to a no-op rather than publishing
+    garbage.
+    """
+    if metadata is None:
+        return None
+    kv_lens = getattr(metadata, "kv_lens", None)
+    block_table = getattr(metadata, "block_table", None)
+    num_seqs = getattr(metadata, "num_seqs", 0)
+    kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+    if (kv_lens is None or block_table is None or num_seqs <= 0
+            or kv_cache_manager is None):
+        return None
+    tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", None)
+    if tokens_per_block is None or tokens_per_block <= 0:
+        return None
+
+    device = block_table.device
+    kv_lens_slice = kv_lens[:num_seqs].to(device=device, dtype=torch.int64)
+    # Full prefix [0, kv_len) -> blocks [0, (kv_lens - 1) // tpb] inclusive.
+    end_block_in_seq = (kv_lens_slice - 1) // tokens_per_block  # (num_seqs,)
+
+    max_blocks_per_seq = block_table.shape[1]
+    block_arange = torch.arange(max_blocks_per_seq,
+                                device=device,
+                                dtype=torch.int64).unsqueeze(0)  # (1, B)
+    mask = block_arange <= end_block_in_seq.unsqueeze(1)  # (S, B)
+    table_slice = block_table[:num_seqs].to(dtype=torch.int64)
+    selected = table_slice[mask]  # 1-D, may include -1 padding
+    selected = selected[selected >= 0]
+    if selected.numel() == 0:
+        return None
+    return torch.unique(selected)
+
+
+def _layersplit_topk_global_block_ids(topk_indices_global, stride_factor):
+    """Map global-token TopK indices -> the unique global BLOCK ids they hit.
+
+    ``transform_local_topk_reuse_or_compute`` (via convert_req_index_to_global)
+    returns global *token* indices into the flat (block, layer, token) pool:
+    ``g = base * stride_factor + (layer_id * block_size + tok % block_size)``
+    where ``base`` is the global block id (block_table entry) and
+    ``stride_factor = num_layers * tokens_per_block``. The in-block-plus-layer
+    offset is strictly ``< stride_factor``, so ``g // stride_factor == base``
+    recovers the global block id that indexes the dense KV / scale pool slot
+    (``cache_slot[block_id]``) — exactly the index space
+    ``maybe_broadcast_active_blocks`` scatters into. Padding entries (-1) are
+    dropped. Returns ``None`` (broadcast no-ops) when nothing valid remains.
+
+    This is the dense-KV READ set for the step: the union of every query
+    token's TopK-selected blocks (prefill TopK is per-query-token, so the
+    union spans all of them).
+    """
+    if (topk_indices_global is None or stride_factor is None
+            or stride_factor <= 0 or topk_indices_global.numel() == 0):
+        return None
+    flat = topk_indices_global.reshape(-1)
+    flat = flat[flat >= 0]
+    if flat.numel() == 0:
+        return None
+    block_ids = (flat.to(torch.int64) // int(stride_factor))
+    return torch.unique(block_ids)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -3087,6 +3173,27 @@ class Indexer(nn.Module):
         if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
             return
 
+        # LayerSplit note (owner_local_alloc + CpType.LAYERSPLIT): this write is
+        # ownership-blind ON PURPOSE and is LOAD-BEARING, not wasted work.
+        #   - get_indexer_k_cache_buffers returns the shared dense/indexer
+        #     scratch for a non-owned layer, the real pool slot for an owned
+        #     one. Either way this scatter is the SOLE writer of THIS step's
+        #     new-token K into that slot/scratch.
+        #   - The per-layer owner->peer broadcast (Indexer.forward, M5e) runs
+        #     BEFORE this write, so it cannot carry K that has not been
+        #     computed yet; it only resyncs previously-committed active blocks.
+        #     The indexer then gathers the FULL KV range (slot_mapping_*_fullkv)
+        #     from this slot, so the new tokens' K MUST be written here.
+        #   - It is correct on every CP rank because the indexer K projection
+        #     (Indexer.wk) carries no TP/CP mapping and runs over the
+        #     CP-replicated full hidden state, so each rank computes
+        #     bit-identical K. The HISA page-rep recompute below is likewise
+        #     correct (built from this same replicated K). Do NOT "optimize"
+        #     this away for non-owners -- skipping it drops the new tokens' K
+        #     on non-owner ranks. (The separate question of whether cached
+        #     PREFIX blocks of non-owned layers are covered by the active-block
+        #     broadcast set is a broadcast-COVERAGE concern, not a write
+        #     concern -- see the 1B report.)
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
 
@@ -3889,98 +3996,44 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        # LayerSplit (M5e): the owner CP rank for layer L publishes ONLY
-        # the cache blocks touched by THIS STEP's scatter — not the
-        # whole pool slot. Matches z.ai "Scaling Pain" §4 Figure 4(b)
-        # but at production-realistic bytes-on-the-wire (~2 MB / layer
-        # at decode batch=256 vs the M5d shipment's ~870 MB / layer at
-        # V3.2 long context, a ~400× wire reduction).
+        # LayerSplit indexer-K READ-SET broadcast: the owner CP rank for
+        # layer L publishes the cache blocks the indexer KERNEL READS this
+        # step — the FULL per-request KV prefix [0, kv_len) — not just the
+        # write set (the new-token blocks). z.ai "Scaling Pain" §4: the
+        # indexer scores every query token causally against the whole
+        # prefix, so under chunked prefill / prefix reuse a write-set-only
+        # broadcast (the old M5e) leaves the non-owner's indexer-K scratch
+        # STALE for the cached prefix on chunk >= 2, yielding wrong logits
+        # and wrong TopK. The read set is ~1/8 of total KV (z.ai's exposed
+        # broadcast cost) and is REQUIRED for correctness.
         #
-        # Active block ids = the set of block_ids referenced by the
-        # current step's batch within the per-layer slice they each
-        # actively wrote. For decode that's one block per request
-        # (the block holding the new token); for prefill chunked, that's
-        # ceil(chunk / tokens_per_block) blocks per request. All ranks
-        # see the same metadata, so they compute identical active sets
-        # — required for the NCCL broadcast to agree on buffer shape.
+        # The dense-KV + NVFP4-scale broadcasts are NOT here: the dense
+        # read set is the TopK-selected blocks, which are only known AFTER
+        # the indexer runs. They are issued in
+        # DSATrtllmAttention.sparse_attn_predict, after topk_indices_global
+        # is computed and before the sparse-MLA dense read consumes it.
         #
+        # All ranks see the same metadata, so they compute identical read
+        # sets — required for the NCCL broadcast to agree on buffer shape.
         # All paths are no-ops on the LayerSplit-off / cp_size=1 / no
         # process-group / no-CUDA branches so this is safe to drop in
-        # unconditionally — and it ONLY engages for DSA models because
-        # this file is the DSA attention backend (LayerSplit's only
-        # home; non-DSA models never construct a DSACacheManager).
+        # unconditionally — and it ONLY engages for DSA models because this
+        # file is the DSA attention backend (LayerSplit's only home;
+        # non-DSA models never construct a DSACacheManager).
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
-            # Compute the active block id set ONCE per layer; reused
-            # across BOTH the indexer-K (M5e) and dense KV (M5f) pools
-            # because both caches use the same per-layer block_table.
-            active_block_ids = _layersplit_compute_active_block_ids(metadata)
+            read_block_ids = _layersplit_compute_read_block_ids(metadata)
 
-            # M5e indexer-K broadcast.
             indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
             layersplit_state.maybe_broadcast_active_blocks(
                 layer_idx=self.layer_idx,
                 cache_slot=indexer_slot,
-                active_block_ids=active_block_ids,
+                active_block_ids=read_block_ids,
                 cp_group=layersplit_state.cp_group,
             )
-
-            # M5f dense KV broadcast.
-            # get_buffers may return None for layers outside the current
-            # manager (PP-partitioned drafts etc.) — skip the dense
-            # broadcast silently in that case so the indexer-K
-            # broadcast still runs.
-            try:
-                dense_kv_slot = kv_cache_manager.get_buffers(self.layer_idx)
-            except (AttributeError, IndexError, KeyError):
-                dense_kv_slot = None
-            if dense_kv_slot is not None:
-                flat_dense = dense_kv_slot.view(dense_kv_slot.shape[0], -1)
-                layersplit_state.maybe_broadcast_active_blocks(
-                    layer_idx=self.layer_idx,
-                    cache_slot=flat_dense,
-                    active_block_ids=active_block_ids,
-                    cp_group=layersplit_state.cp_group,
-                )
-
-            # M5f-scale: under NVFP4 the dense KV has a sibling block-scale pool
-            # whose non-owned-layer scratch slot the dense-MLA kernel also reads
-            # (via the augmented pool pointers' scale column). Broadcast the
-            # active blocks' scales alongside the data so the non-owner has both
-            # halves; no-op when there is no dense scale scratch (non-NVFP4 /
-            # replicated / owner-only). Owners share the same block-offset table
-            # for data and scale, so active_block_ids index both consistently.
-            get_scale_slot = getattr(kv_cache_manager, "get_dense_scale_slot",
-                                     None)
-            if get_scale_slot is not None:
-                try:
-                    dense_scale_slot = get_scale_slot(self.layer_idx)
-                except (AttributeError, IndexError, KeyError, RuntimeError):
-                    dense_scale_slot = None
-                if dense_scale_slot is not None:
-                    flat_scale = dense_scale_slot.reshape(
-                        dense_scale_slot.shape[0], -1)
-                    layersplit_state.maybe_broadcast_active_blocks(
-                        layer_idx=self.layer_idx,
-                        cache_slot=flat_scale,
-                        active_block_ids=active_block_ids,
-                        cp_group=layersplit_state.cp_group,
-                    )
-
-            # M5g (system-level fusion) tested and measured to be
-            # 0.77x slower than the separate path at V3.2 production
-            # scale (num_blocks=262144, active=4096, 61 layers, CP=2):
-            # the torch.cat / split kernels needed to pack/unpack the
-            # two cache rows add more launch overhead than the single
-            # saved NCCL broadcast. The fused helper
-            # (maybe_broadcast_active_blocks_fused) stays in the
-            # runtime state for regimes where NCCL launch overhead
-            # dominates (e.g. very small batches with sub-microsecond
-            # per-cache bytes) or for future cross-layer batching, but
-            # production today uses the separate-call path above.
 
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
@@ -4061,6 +4114,65 @@ class DSATrtllmAttention(TrtllmAttention):
             forward_args.topk_indices, metadata,
             self.get_local_layer_idx(metadata), self.indexer.skip_topk,
             is_generation)
+
+        # LayerSplit dense-KV + NVFP4-scale READ-SET broadcast. The indexer-K
+        # broadcast (the full prefix) ran in Indexer.forward; the dense read
+        # set is the TopK-SELECTED blocks, knowable only now. The owner CP rank
+        # for this layer publishes exactly those blocks into the non-owner's
+        # dense scratch (and its sibling NVFP4 block-scale scratch) BEFORE the
+        # sparse-MLA read consumes topk_indices_global in the same forward
+        # (TrtllmAttention.forward: sparse_attn_predict -> _run, the dense
+        # read). Map the global-token TopK indices to their unique global block
+        # ids (g // stride_factor) — the index space the broadcast scatters
+        # into. No-ops on LayerSplit-off / cp_size<=1 / no-group / empty set.
+        kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+        layersplit_state = getattr(kv_cache_manager, "layersplit_state",
+                                   None) if kv_cache_manager is not None else None
+        if layersplit_state is not None and layersplit_state.enabled:
+            stride_factor = getattr(metadata, "_cached_stride_factor", None)
+            dense_block_ids = _layersplit_topk_global_block_ids(
+                topk_indices_global, stride_factor)
+
+            # M5f dense KV broadcast. get_buffers may raise for layers outside
+            # the current manager (PP-partitioned drafts etc.) — skip the dense
+            # broadcast silently in that case.
+            try:
+                dense_kv_slot = kv_cache_manager.get_buffers(self.layer_idx)
+            except (AttributeError, IndexError, KeyError):
+                dense_kv_slot = None
+            if dense_kv_slot is not None:
+                flat_dense = dense_kv_slot.view(dense_kv_slot.shape[0], -1)
+                layersplit_state.maybe_broadcast_active_blocks(
+                    layer_idx=self.layer_idx,
+                    cache_slot=flat_dense,
+                    active_block_ids=dense_block_ids,
+                    cp_group=layersplit_state.cp_group,
+                )
+
+            # M5f-scale: under NVFP4 the dense KV has a sibling block-scale pool
+            # whose non-owned-layer scratch the dense-MLA kernel also reads (via
+            # the augmented pool pointers' scale column). Broadcast the same
+            # TopK blocks' scales; no-op when there is no dense scale scratch
+            # (non-NVFP4 / replicated / owner-only). Owners share the block-
+            # offset table for data and scale, so the block ids index both.
+            get_scale_slot = getattr(kv_cache_manager, "get_dense_scale_slot",
+                                     None)
+            if get_scale_slot is not None:
+                try:
+                    dense_scale_slot = get_scale_slot(self.layer_idx)
+                except (AttributeError, IndexError, KeyError, RuntimeError):
+                    dense_scale_slot = None
+                if dense_scale_slot is not None:
+                    # Pass the slot unflattened: the broadcast indexes dim 0
+                    # only, and reshape on a non-contiguous slice would copy —
+                    # silently dropping the index_copy_ write-through into the
+                    # real scale pool.
+                    layersplit_state.maybe_broadcast_active_blocks(
+                        layer_idx=self.layer_idx,
+                        cache_slot=dense_scale_slot,
+                        active_block_ids=dense_block_ids,
+                        cp_group=layersplit_state.cp_group,
+                    )
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
@@ -4273,8 +4385,16 @@ class DSATrtllmAttention(TrtllmAttention):
             self.mla_params.qk_rope_head_dim,
             self.mla_params.kv_lora_rank,
             block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            # LayerSplit owner-local: use the augmented pool pointers/mapping
+            # (the metadata property appends the shared dense scratch pool +
+            # one mapping row per non-owned layer) so the local_layer_idx
+            # returned by get_local_layer_idx for a non-owned layer -- which
+            # is that augmented mapping row -- indexes a valid pool. Reading
+            # the raw manager attribute here would feed an augmented row index
+            # into an UNaugmented mapping, an out-of-bounds / wrong-pool read.
+            # Identical to the unaugmented tensors in the replicated posture.
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
             None,  # kv_scale_orig_quant
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
@@ -4349,23 +4469,18 @@ class DSACacheManager(KVCacheManager):
             cp_rank=cp_rank,
         )
         if self.layersplit_state.enabled and mapping is not None:
-            # Best-effort cp_group resolution. The device-mesh path
-            # (cp_group_pg) is the canonical source, but it requires
-            # torch.distributed to be initialized and the mesh to be
-            # built. Failures here are non-fatal: the broadcast path
-            # gracefully collapses to a no-op when cp_group is None
-            # (the per-layer hook still wires through; M5c will plumb
-            # the real payload).
-            try:
-                cp_group = getattr(mapping, "cp_group_pg", None)
-            except Exception:  # pragma: no cover - defensive
-                cp_group = None
+            # Resolve (or create) the CP process group the per-layer
+            # owner->peer broadcast collectives ride on. ensure_cp_process_group
+            # prefers the canonical DeviceMesh cp_group_pg (Ray / mpi_disabled
+            # runtimes) and, under MPI -- where cp_group_pg raises
+            # NotImplementedError and torch.distributed is otherwise never
+            # initialized (the TP/EP collectives use the C++ custom-allreduce
+            # path) -- bootstraps a NCCL world and collectively carves the CP
+            # subgroup from mapping.cp_groups. Runs once at model load so the
+            # group is graph-stable. Failures are non-fatal: it returns
+            # (None, None) and the broadcast gracefully collapses to a no-op.
+            cp_group, cp_group_ranks = ensure_cp_process_group(mapping)
             if cp_group is not None:
-                cp_group_ranks = None
-                try:
-                    cp_group_ranks = getattr(mapping, "cp_group", None)
-                except Exception:  # pragma: no cover - defensive
-                    cp_group_ranks = None
                 self.layersplit_state.bind_cp_group(cp_group, cp_group_ranks)
         if self.layersplit_state.enabled:
             logger.info(
@@ -5023,23 +5138,37 @@ class DSACacheManager(KVCacheManager):
                     kv_layout: str = "NHD"):
         """Get dense KV cache buffer for a layer.
 
-        M5d-tight dispatch: non-owned layers read from
-        ``_layersplit_dense_kv_scratch`` (sized identically to the
-        per-layer pool slot, including the kv_layout-dependent reshape
-        the base accessor applies). Owned layers fall through to the
-        base ``KVCacheManager.get_buffers``.
+        M5d-tight dispatch: a non-owned layer under owner-local alloc has no
+        real pool slot (the C++ pool is trimmed to owned layers), so it must
+        read the shared ``_layersplit_dense_kv_scratch`` -- the same storage
+        whose ``data_ptr`` the augmented pool pointers expose to the dense-MLA
+        C++ kernel, filled in place by this layer's owner broadcast (M5f).
+
+        The scratch mirrors the RAW per-layer pool row (``[num_blocks,
+        kv_factor, block_size]``), not the kv_layout-dependent NHD/HND reshape
+        the base accessor applies for owned layers: the only consumers of a
+        NON-owned slot are (a) the M5f broadcast, which flattens to 2-D before
+        gather/scatter, and (b) the C++ kernel via the augmented pool pointer,
+        which addresses raw bytes -- neither depends on the logical NHD/HND
+        view. Routing every layout to the scratch is therefore correct AND
+        closes the latent fall-through: the previous ``kv_layout == "NHD"``
+        guard let an HND (or any non-NHD) request for a non-owned layer fall
+        through to ``super().get_buffers``, which does
+        ``self.layer_offsets[layer_idx]`` and KeyErrors on a trimmed layer
+        (silently reading the wrong KV would be worse). Owned layers always
+        fall through to the base accessor with the requested layout.
         """
-        if (self._layersplit_dense_kv_scratch is not None
-                and self._layersplit_non_owned(layer_idx) and kv_layout == "NHD"):
-            return self._layersplit_dense_kv_scratch
-        if self._layersplit_non_owned(layer_idx) and kv_layout == "NHD":
-            self._ensure_layersplit_dense_scratch_routing()
+        if self._layersplit_non_owned(layer_idx):
+            if self._layersplit_dense_kv_scratch is None:
+                self._ensure_layersplit_dense_scratch_routing()
             if self._layersplit_dense_kv_scratch is not None:
                 return self._layersplit_dense_kv_scratch
             raise RuntimeError(
                 "LayerSplit owner-local dense KV scratch is unavailable for "
-                f"non-owned layer {layer_idx}; cannot fall through to the owned "
-                "dense pool without breaking ownership.")
+                f"non-owned layer {layer_idx} (kv_layout={kv_layout!r}); "
+                "cannot fall through to the owned dense pool without breaking "
+                "ownership. Run with layersplit_owner_local_alloc=False "
+                "(replicated pools) if scratch allocation cannot be repaired.")
         return super().get_buffers(layer_idx, kv_layout=kv_layout)
 
     def get_dense_block_scale_pool(self) -> torch.Tensor:

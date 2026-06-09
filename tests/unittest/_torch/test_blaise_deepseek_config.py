@@ -153,6 +153,30 @@ def test_hisa_overrides_ignore_sibling_layersplit_block():
     assert all(not key.startswith("layersplit") for key in overrides)
 
 
+def test_layersplit_owner_assignment_defaults_to_contiguous():
+    # 1B-i: the Pydantic default must be 'contiguous' so the in-engine
+    # broadcast owner-map agrees with the C++ CP->non-CP reassembly
+    # (cacheSplitConcat.cu) and the NIXL handoff, which both REQUIRE
+    # contiguous balanced layer spans. A round_robin default would desync the
+    # owner-map from the contiguous-shard reassembly at the disagg handoff.
+    cfg = DeepSeekSparseAttentionConfig(index_head_dim=128)
+    assert cfg.layersplit_owner_assignment == "contiguous"
+
+
+def test_layersplit_owner_assignment_round_robin_still_selectable():
+    # contiguous is only the DEFAULT; round_robin must remain a valid choice
+    # (it matches the SGLang op-ls reference) for non-disaggregated use.
+    cfg = DeepSeekSparseAttentionConfig(index_head_dim=128,
+                                        layersplit_owner_assignment="round_robin")
+    assert cfg.layersplit_owner_assignment == "round_robin"
+    # Both values pass validation (the validator gates all_cp_ranks_transfer,
+    # not the owner-assignment policy).
+    cfg_c = DeepSeekSparseAttentionConfig(index_head_dim=128,
+                                          layersplit_enabled=True,
+                                          layersplit_owner_assignment="contiguous")
+    assert cfg_c.layersplit_owner_assignment == "contiguous"
+
+
 def test_sparse_attention_config_attaches_blaise_runtime_fields(monkeypatch):
     class RuntimeSparseAttentionConfig:
         model_fields = {

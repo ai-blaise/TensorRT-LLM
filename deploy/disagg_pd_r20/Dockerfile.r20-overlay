@@ -47,6 +47,7 @@ COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/interface.py ${SITE_
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/utils.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/kvarn_gqa.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/kvarn_gqa.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/dsa.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/layersplit.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/layersplit.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_mla.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_mla.py
@@ -100,6 +101,7 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/utils.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/kvarn_gqa.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/layersplit.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_mla.py \

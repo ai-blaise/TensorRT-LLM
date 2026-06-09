@@ -438,9 +438,16 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "context-parallel prefill. Runtime code must compose this with the "
         "active TP/EP/attention-DP/CP and cache-transceiver mapping.")
     layersplit_owner_assignment: Literal["round_robin", "contiguous"] = Field(
-        default="round_robin",
+        default="contiguous",
         description=
-        "How DSA layers are assigned to CP owners when LayerSplit is enabled.")
+        "How DSA layers are assigned to CP owners when LayerSplit is enabled. "
+        "Defaults to 'contiguous': the C++ CP->non-CP reassembly "
+        "(cacheSplitConcat.cu getRankLayerSpan / getBalancedPPLayerSpan) and "
+        "the NIXL handoff require contiguous balanced layer spans, and the "
+        "in-engine per-layer broadcast owner-map must agree with that "
+        "reassembly. 'round_robin' stays selectable (it matches the SGLang "
+        "op-ls reference) but must not be combined with the disaggregated "
+        "C++/NIXL CP shard handoff.")
     layersplit_transfer_backend: Literal["auto", "ucx", "nixl"] = Field(
         default="auto",
         description=

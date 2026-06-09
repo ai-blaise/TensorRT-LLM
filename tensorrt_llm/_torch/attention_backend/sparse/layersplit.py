@@ -39,6 +39,8 @@ Edge cases the policies must handle without surprise:
 """
 from __future__ import annotations
 
+import datetime
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -46,6 +48,15 @@ try:
     import torch
 except ImportError:  # pragma: no cover - torch is always available in prod
     torch = None  # type: ignore[assignment]
+
+try:
+    # Prefer the project logger when the full package is importable; fall back
+    # to a stdlib logger so the CPU-only importlib unit-test runner (which
+    # loads this module in isolation, bypassing tensorrt_llm.__init__) does not
+    # pull in the heavy package init chain.
+    from tensorrt_llm.logger import logger
+except Exception:  # pragma: no cover - exercised by the standalone runner
+    logger = logging.getLogger("tensorrt_llm.layersplit")
 
 _VALID_POLICIES = ("round_robin", "contiguous")
 _VALID_TRANSFER_BACKENDS = ("auto", "ucx", "nixl")
@@ -126,6 +137,228 @@ def compute_owner_assignment(
                                policy=policy)
 
 
+# Module-level cache of the CP NCCL subgroup keyed by the *full* CP group
+# layout of the world. Group creation is collective (every world rank must
+# call ``new_group`` for every CP group with an identical definition), so we
+# build all CP subgroups together once and keep them for the model's
+# lifetime. Keying on the immutable layout makes a second DSACacheManager in
+# the same process (e.g. a draft KV manager) reuse the already-created
+# groups rather than racing a second collective ``new_group`` round.
+_CP_PROCESS_GROUP_CACHE: Dict[Tuple[Tuple[int, ...], ...], Any] = {}
+
+
+def _all_cp_groups_from_mapping(mapping: Any) -> Optional[Tuple[Tuple[int, ...],
+                                                                ...]]:
+    """Return the full, world-wide list of CP groups (each a tuple of global
+    ranks) as a stable, hashable structure, or ``None`` if it cannot be
+    derived.
+
+    The production MPI mapping (``MpiTopology``) precomputes every CP group in
+    ``mapping.cp_groups`` (the same definition the C++ TP/CP allreduce and the
+    MPI ``cp_comm`` use), so reuse it verbatim. Fall back to deriving the
+    contiguous-CP layout from ``world_size`` / ``cp_size`` for mappings that do
+    not expose the list (keeps the helper testable without a full Mapping).
+    """
+    cp_groups = getattr(mapping, "cp_groups", None)
+    if cp_groups:
+        try:
+            return tuple(
+                tuple(int(r) for r in group) for group in cp_groups)
+        except (TypeError, ValueError):
+            return None
+
+    world_size = getattr(mapping, "world_size", None)
+    cp_size = getattr(mapping, "cp_size", None)
+    if not world_size or not cp_size or world_size % cp_size != 0:
+        return None
+    # MPI CP groups are consecutive ranks within each tp slice (see
+    # MpiTopology._init_parallel_groups); replicate that contiguous layout.
+    return tuple(
+        tuple(range(base, base + cp_size))
+        for base in range(0, world_size, cp_size))
+
+
+def _ensure_torch_distributed_under_mpi(mapping: Any) -> bool:
+    """Best-effort bootstrap of ``torch.distributed`` (NCCL) under the MPI
+    orchestrator.
+
+    Under MPI the TP/EP collectives run through a C++ custom-allreduce /
+    IPC-workspace path that never initializes ``torch.distributed`` (only the
+    Ray / torchrun paths call ``init_process_group``). LayerSplit's per-layer
+    owner->peer broadcast, however, is a ``torch.distributed`` NCCL collective,
+    so we must stand up a NCCL world process group ourselves. The rendezvous
+    address/port is chosen by world-rank 0 and published to every rank with an
+    MPI broadcast (the same primitive the runtime already uses for metadata),
+    so no external launcher env (MASTER_ADDR/RANK/WORLD_SIZE) is required.
+
+    Returns True iff ``torch.distributed`` is initialized on return (either it
+    already was, or this call initialized it). Returns False on any path where
+    a NCCL world cannot be created (no CUDA, single rank, mpi4py absent, etc.)
+    so the caller falls back to the graceful broadcast no-op.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return False
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        return False
+    if not dist.is_available():
+        return False
+    if dist.is_initialized():
+        return True
+
+    world_size = int(getattr(mapping, "world_size", 1) or 1)
+    rank = int(getattr(mapping, "rank", 0) or 0)
+    if world_size <= 1:
+        return False
+
+    # Pull MPI helpers lazily so CPU-only unit-test imports of this module
+    # never require mpi4py / the heavy tensorrt_llm package init.
+    try:
+        from tensorrt_llm._utils import mpi_barrier, mpi_broadcast
+    except ImportError:
+        return False
+
+    # World-rank 0 picks a free TCP port for the c10d rendezvous and shares
+    # it (with the local host address) over MPI so every rank dials the same
+    # store. localhost is correct for the single-node prefill/decode workers;
+    # multi-node CP would publish rank-0's routable address here instead.
+    import socket
+
+    if rank == 0:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", 0))
+        master_port = int(sock.getsockname()[1])
+        master_addr = "127.0.0.1"
+        sock.close()
+        rendezvous = (master_addr, master_port)
+    else:
+        rendezvous = None
+    master_addr, master_port = mpi_broadcast(rendezvous, root=0)
+
+    # NCCL_NVLS_ENABLE=0 (set in the prefill manifest) must be honored so the
+    # CP subgroup collectives coexist with the sibling serving NCCL tenant on
+    # the same NVSwitch fabric; init_process_group reads it from the env, so
+    # do not override it here. Use a TCPStore explicitly (init_method env://
+    # would require launcher-provided env that MPI does not set).
+    try:
+        store = dist.TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=world_size,
+            is_master=(rank == 0),
+            timeout=datetime.timedelta(seconds=600),
+        )
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:gloo",
+            store=store,
+            world_size=world_size,
+            rank=rank,
+        )
+        # Barrier so every rank has finished init before any rank tries to
+        # carve a subgroup (new_group is itself collective over the world).
+        mpi_barrier()
+    except Exception as exc:  # noqa: BLE001 - bootstrap must never crash load
+        logger.warning(
+            "LayerSplit: failed to bootstrap torch.distributed under MPI "
+            "(%s); per-layer broadcast will collapse to a no-op.", exc)
+        return False
+    return dist.is_initialized()
+
+
+def ensure_cp_process_group(
+        mapping: Any) -> Tuple[Optional[Any], Optional[Tuple[int, ...]]]:
+    """Resolve (or create) the CP ``torch.distributed`` process group for this
+    rank and return ``(cp_group, cp_group_ranks)``.
+
+    Resolution order:
+
+    1. ``mapping.cp_group_pg`` — the canonical DeviceMesh/Ray path. When it is
+       implemented (``mpi_disabled()`` runtimes) it already owns a built CP
+       subgroup, so reuse it and never double-create.
+    2. Under MPI (where ``cp_group_pg`` raises ``NotImplementedError``),
+       bootstrap ``torch.distributed`` if needed, then collectively create one
+       NCCL subgroup per CP group in the world and return the handle for the
+       group this rank belongs to.
+
+    Returns ``(None, None)`` on every path where no real group is needed or can
+    be created (LayerSplit context with ``cp_size <= 1``, no CUDA, no mapping,
+    dist unavailable, mpi4py absent), so the caller keeps the broadcast no-op
+    fallback intact. ``cp_group_ranks`` is the list of *global* ranks in this
+    rank's CP group, used by ``broadcast_src_rank`` to translate a CP-local
+    owner into the global ``src`` rank the NCCL broadcast expects.
+    """
+    if mapping is None:
+        return None, None
+    cp_size = int(getattr(mapping, "cp_size", 1) or 1)
+    if cp_size <= 1:
+        return None, None
+
+    # 1. Canonical DeviceMesh / Ray path: cp_group_pg is implemented and the
+    #    subgroup already exists. Do not create a second one.
+    try:
+        cp_group = getattr(mapping, "cp_group_pg", None)
+    except NotImplementedError:
+        cp_group = None
+    except Exception:  # pragma: no cover - defensive
+        cp_group = None
+    if cp_group is not None:
+        cp_group_ranks = None
+        try:
+            cp_group_ranks = getattr(mapping, "cp_group", None)
+        except Exception:  # pragma: no cover - defensive
+            cp_group_ranks = None
+        return cp_group, _as_rank_tuple(cp_group_ranks)
+
+    # 2. MPI path: stand up torch.distributed (if absent) and carve the CP
+    #    subgroup collectively from the world-wide CP group layout.
+    if not _ensure_torch_distributed_under_mpi(mapping):
+        return None, None
+
+    all_cp_groups = _all_cp_groups_from_mapping(mapping)
+    if not all_cp_groups:
+        return None, None
+
+    import torch.distributed as dist
+
+    mapped_rank = getattr(mapping, "rank", None)
+    this_rank = int(mapped_rank if mapped_rank is not None else dist.get_rank())
+    cache_key = all_cp_groups
+    if cache_key not in _CP_PROCESS_GROUP_CACHE:
+        my_group = None
+        # Collective: EVERY world rank iterates the SAME ordered list of CP
+        # groups and calls new_group for each. Ranks not in a given group
+        # still participate in its creation (a NCCL/c10d requirement); each
+        # rank keeps only the handle for the group it belongs to.
+        for group_ranks in all_cp_groups:
+            ranks = list(group_ranks)
+            pg = dist.new_group(ranks=ranks, backend="cuda:nccl,cpu:gloo")
+            if this_rank in ranks:
+                my_group = pg
+        _CP_PROCESS_GROUP_CACHE[cache_key] = my_group
+    cp_group = _CP_PROCESS_GROUP_CACHE[cache_key]
+    if cp_group is None:
+        return None, None
+
+    # Translate this rank's CP group to global ranks for broadcast_src_rank.
+    cp_group_ranks = None
+    for group_ranks in all_cp_groups:
+        if this_rank in group_ranks:
+            cp_group_ranks = group_ranks
+            break
+    return cp_group, _as_rank_tuple(cp_group_ranks)
+
+
+def _as_rank_tuple(ranks: Any) -> Optional[Tuple[int, ...]]:
+    """Coerce a rank container to a tuple of ints, or None."""
+    if ranks is None:
+        return None
+    try:
+        return tuple(int(r) for r in ranks)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class LayerSplitRuntimeState:
     """All LayerSplit state the DSA runtime needs for one model load.
@@ -173,14 +406,25 @@ class LayerSplitRuntimeState:
     # When True, the C++ KV/indexer pools are trimmed to this rank's owned
     # layers (the M5d-tight memory-savings posture) and the DSACacheManager
     # routes non-owned layers through a shared scratch buffer. When False
-    # (the default, correctness-first posture for prefill bring-up), every
-    # CP rank allocates the full per-layer pool and the per-layer broadcast
-    # writes the owner's active blocks straight into the real pool slot that
-    # the dense-MLA C++ attention kernels read. The trimmed posture is only
-    # correct once the dense-MLA path can read its KV from the broadcast
-    # scratch instead of the C++ pool pointer (an attention-backend refactor
-    # still pending), so it stays opt-in. See ``build_layersplit_layer_mask``
-    # and ``DSACacheManager._maybe_alloc_layersplit_scratch``.
+    # (the conservative replicated posture), every CP rank allocates the full
+    # per-layer pool and the per-layer broadcast writes the owner's active
+    # blocks straight into the real pool slot that the dense-MLA C++ attention
+    # kernels read.
+    #
+    # The trimmed posture is now correct for the dense-MLA read path: the
+    # non-owned dense scratch is exposed to the dense-MLA C++ attention as an
+    # appended single-layer pool (``_build_layersplit_dense_scratch_pool``
+    # augments ``kv_cache_pool_pointers`` / ``kv_cache_pool_mapping`` and
+    # ``get_local_layer_idx`` returns the matching augmented row), and the M5f
+    # broadcast fills exactly that scratch in place before the kernel reads it.
+    # The MLA attention ops therefore consume the augmented pointers via
+    # ``metadata.host_kv_cache_pool_pointers``. (Previously this was self-
+    # flagged "pending an attention-backend refactor"; that refactor landed --
+    # the scratch IS the pool slot the kernel reads.) It remains opt-in
+    # (default False) only because it depends on the per-layer broadcast being
+    # functional (Phase 1A binds the CP process group under MPI) and on the
+    # balanced layer_mask. See ``build_layersplit_layer_mask`` and
+    # ``DSACacheManager._build_layersplit_dense_scratch_pool``.
     owner_local_alloc: bool = False
     comm_stream: Optional[Any] = field(default=None, repr=False)
     cp_group: Optional[Any] = field(default=None, repr=False)
@@ -466,13 +710,44 @@ class LayerSplitRuntimeState:
             return False
 
         src_rank = self.broadcast_src_rank(layer_idx)
-        send_buffer = cache_slot.index_select(0, active_block_ids).contiguous()
+        # index_select / index_copy_ have no CUDA kernel for float8 cache dtypes
+        # (the fp8 dense MLA KV pool and the NVFP4 E4M3 block-scale pool), but
+        # the per-layer broadcast is a pure byte copy, so float8 slots go
+        # through a uint8 storage alias instead.
+        work = self._f8_byte_alias(cache_slot)
+        send_buffer = work.index_select(0, active_block_ids).contiguous()
         dist.broadcast(send_buffer,
                        src=src_rank,
                        group=cp_group,
                        async_op=False)
-        cache_slot.index_copy_(0, active_block_ids, send_buffer)
+        work.index_copy_(0, active_block_ids, send_buffer)
         return True
+
+    @staticmethod
+    def _f8_byte_alias(t):
+        """uint8 alias of a float8 tensor sharing storage AND strides.
+
+        float8 dtypes have no CUDA ``index_select``/``index_copy_`` kernels,
+        and the per-layer slot is typically a NON-contiguous slice of the
+        multi-layer pool (row stride = num_layers * row), so a plain
+        ``.view(torch.uint8)`` is unavailable. All float8 dtypes are 1 byte,
+        so re-pointing a uint8 tensor at the same untyped storage with the
+        same offset/size/stride is an exact byte alias — index ops on it hit
+        the real pool memory (write-through preserved). Non-float8 dtypes
+        pass through unchanged.
+        """
+        f8 = tuple(
+            getattr(torch, n)
+            for n in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz",
+                      "float8_e5m2fnuz") if hasattr(torch, n))
+        if t.dtype not in f8:
+            return t
+        if t.is_contiguous():
+            return t.view(torch.uint8)
+        alias = torch.empty(0, dtype=torch.uint8, device=t.device)
+        alias.set_(t.untyped_storage(), t.storage_offset(), t.size(),
+                   t.stride())
+        return alias
 
     def maybe_broadcast_active_blocks_fused(
             self,
@@ -529,6 +804,7 @@ class LayerSplitRuntimeState:
         row_widths = []
         for _, slot in slots:
             flat = slot if slot.dim() == 2 else slot.view(slot.shape[0], -1)
+            flat = self._f8_byte_alias(flat)
             g = flat.index_select(0, active_block_ids).contiguous()
             gathered.append(g)
             row_widths.append(g.shape[1])
@@ -548,6 +824,7 @@ class LayerSplitRuntimeState:
             chunk = send_buffer[:, offset:offset + width].contiguous()
             offset += width
             flat = slot if slot.dim() == 2 else slot.view(slot.shape[0], -1)
+            flat = self._f8_byte_alias(flat)
             flat.index_copy_(0, active_block_ids, chunk)
             # When we reshaped above, ``flat`` is a view of ``slot`` so
             # the index_copy_ already updated ``slot`` in place.
@@ -838,15 +1115,19 @@ def build_layersplit_layer_mask(
         return None
     if cp_size <= 1:
         return None
-    # Pool trimming (and the per-rank memory savings it buys) is only safe
-    # in the owner-local-alloc posture: it removes non-owned layers from the
-    # C++ pool, which makes layer_offsets miss those layers and forces the
+    # Pool trimming (and the per-rank memory savings it buys) is gated on the
+    # owner-local-alloc posture: it removes non-owned layers from the C++ pool,
+    # which makes layer_offsets miss those layers and forces the
     # DSACacheManager scratch dispatch. The dense-MLA C++ attention kernels
-    # read KV via the pool pointer, not the scratch, so they cannot serve a
-    # non-owned layer whose slot was trimmed. In the default (replicated)
-    # posture every rank keeps the full pool so every layer_offsets lookup
-    # resolves and the per-layer broadcast lands in the real pool slot the
-    # kernels read. Returning None here selects the regular all-layers
+    # resolve KV through the pool pointer; non-owned layers are served by an
+    # appended single-layer dense scratch pool that
+    # ``_build_layersplit_dense_scratch_pool`` wires into the augmented pool
+    # pointers/mapping (and ``get_local_layer_idx`` maps each non-owned layer
+    # to its augmented row), with the owner broadcast (M5f) filling that
+    # scratch in place before the kernel reads it. In the replicated posture
+    # (owner_local_alloc=False) every rank keeps the full pool so every
+    # layer_offsets lookup resolves and the broadcast lands directly in the
+    # real pool slot. Returning None here selects the regular all-layers
     # allocation path.
     if not bool(getattr(sparse_attn_config, "layersplit_owner_local_alloc",
                         False)):

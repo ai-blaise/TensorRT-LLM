@@ -1845,8 +1845,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.max_ctx_kv_len,
             metadata.ctx_kv_indptr,
             metadata.kv_cache_block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            # LayerSplit owner-local: the metadata host_kv_cache_pool_pointers/
+            # _mapping properties append the shared dense scratch pool and one
+            # mapping row per non-owned layer, matching the augmented row index
+            # get_local_layer_idx returns for a non-owned layer. The raw
+            # manager attribute is unaugmented, so pairing it with that index
+            # would read out of bounds / the wrong pool. For non-LayerSplit
+            # managers (and the replicated posture) the property returns the
+            # unaugmented tensor unchanged, so this is a no-op there.
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
             None,  # kv_scale_quant_orig
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
@@ -1890,8 +1898,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cu_chunked_seq_len,
             chunked_global_offset,
             metadata.kv_cache_block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            # LayerSplit owner-local augmented pool pointers (see
+            # load_paged_kv_cache_for_mla); no-op off LayerSplit.
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
             None,  # kv_scale_quant_orig
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
@@ -1933,8 +1943,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.qk_rope_head_dim,
             self.mla_params.kv_lora_rank,
             metadata.kv_cache_block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            # LayerSplit owner-local augmented pool pointers (see
+            # load_paged_kv_cache_for_mla); no-op off LayerSplit.
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
             None,  # kv_scale_orig_quant
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
@@ -2047,8 +2059,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.prompt_lens_cpu_runtime,  # host_context_lengths,
             metadata.num_contexts,
             metadata.kv_cache_block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            # LayerSplit owner-local augmented pool pointers (see
+            # load_paged_kv_cache_for_mla); this is the decode path, so the
+            # non-owned-layer scratch routing matters for tok/s/user after the
+            # first token. No-op off LayerSplit.
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
             None,  # kv_scale_orig_quant
             None,  # kv_scale_quant_orig
             out_scale,
