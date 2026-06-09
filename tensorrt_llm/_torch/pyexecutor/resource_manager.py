@@ -241,10 +241,16 @@ def _optrt_request_debug_fields(request: LlmRequest) -> List[str]:
     return fields
 
 
+# Cached at import: 50+ call sites, several on the per-step executor path
+# with eagerly-evaluated kwargs, so the off-path check must be a plain
+# module-global load.
+_OPTRT_KV_DEBUG_ENABLED = os.environ.get("TRTLLM_OPTRT_KV_DEBUG", "0") == "1"
+
+
 def _optrt_kv_debug(event: str,
                     request: Optional[LlmRequest] = None,
                     **fields: object) -> None:
-    if os.environ.get("TRTLLM_OPTRT_KV_DEBUG", "0") != "1":
+    if not _OPTRT_KV_DEBUG_ENABLED:
         return
     parts = ["OPTRT_KV_DEBUG", f"event={event}"]
     if request is not None:

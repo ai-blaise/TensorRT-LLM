@@ -69,8 +69,8 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
-                               ResourceManagerType, _optrt_kv_debug,
-                               request_context)
+                               ResourceManagerType, _OPTRT_KV_DEBUG_ENABLED,
+                               _optrt_kv_debug, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -3006,16 +3006,20 @@ class PyExecutor:
 
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
-                    _optrt_kv_debug(
-                        "executor_has_draft_batch_decision",
-                        has_draft_batch=has_draft_batch,
-                        previous_batch_present=self.previous_batch is not None,
-                        use_spec_decode=getattr(self, "use_spec_decode", None),
-                        num_context_requests=scheduled_batch.num_context_requests,
-                        scheduled_request_ids=[
-                            req.py_request_id
-                            for req in scheduled_batch.all_requests()
-                        ])
+                    if _OPTRT_KV_DEBUG_ENABLED:
+                        _optrt_kv_debug(
+                            "executor_has_draft_batch_decision",
+                            has_draft_batch=has_draft_batch,
+                            previous_batch_present=self.previous_batch
+                            is not None,
+                            use_spec_decode=getattr(self, "use_spec_decode",
+                                                    None),
+                            num_context_requests=scheduled_batch.
+                            num_context_requests,
+                            scheduled_request_ids=[
+                                req.py_request_id
+                                for req in scheduled_batch.all_requests()
+                            ])
                     # Reset the draft tokens to avoid preparing resources for the draft model.
                     if self.drafter is not None and self.use_spec_decode and not has_draft_batch:
                         for request in scheduled_batch.all_requests():
