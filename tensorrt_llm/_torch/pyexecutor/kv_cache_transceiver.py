@@ -301,19 +301,20 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             len(getattr(kv_cache_manager, 'num_kv_heads_per_layer', [])),
             pp_layer_num_per_pp_rank, mapping.tp_size, mapping.cp_size,
             mapping.enable_attention_dp)
-        print(
-            "OPTRT_LAYERSPLIT_XFER_DEBUG "
-            f"manager={type(kv_cache_manager).__name__} "
-            f"transfer_attr={layersplit_transfer_heads is not None} "
-            f"global_layers={len(total_num_kv_heads_per_layer)} "
-            f"local_attention_layers={pp_layer_num} "
-            f"local_pool_layers={len(getattr(kv_cache_manager, 'num_kv_heads_per_layer', []))} "
-            f"pp_layers={pp_layer_num_per_pp_rank} "
-            f"tp={mapping.tp_size} cp={mapping.cp_size} "
-            f"attention_dp={mapping.enable_attention_dp} "
-            f"layersplit_model={getattr(kv_cache_manager, 'layersplit_model_num_layers', None)} "
-            f"layersplit_transfer_model={getattr(kv_cache_manager, 'layersplit_cache_transfer_model_layers', None)}",
-            flush=True)
+        if getenv("TRTLLM_OPTRT_LAYERSPLIT_XFER_DEBUG", "0") == "1":
+            print(
+                "OPTRT_LAYERSPLIT_XFER_DEBUG "
+                f"manager={type(kv_cache_manager).__name__} "
+                f"transfer_attr={layersplit_transfer_heads is not None} "
+                f"global_layers={len(total_num_kv_heads_per_layer)} "
+                f"local_attention_layers={pp_layer_num} "
+                f"local_pool_layers={len(getattr(kv_cache_manager, 'num_kv_heads_per_layer', []))} "
+                f"pp_layers={pp_layer_num_per_pp_rank} "
+                f"tp={mapping.tp_size} cp={mapping.cp_size} "
+                f"attention_dp={mapping.enable_attention_dp} "
+                f"layersplit_model={getattr(kv_cache_manager, 'layersplit_model_num_layers', None)} "
+                f"layersplit_transfer_model={getattr(kv_cache_manager, 'layersplit_cache_transfer_model_layers', None)}",
+                flush=True)
 
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms

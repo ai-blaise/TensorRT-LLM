@@ -343,6 +343,64 @@ def test_peer_registrar_incompatible_peer_raises():
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
+def test_peer_registrar_allows_cp_layer_overlap():
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        tp_size=2,
+        tp_rank=1,
+        cp_size=2,
+        cp_rank=1,
+        kv_heads_per_rank=1,
+        is_mla=True,
+        layer_num_per_pp=[31],
+        page_table=make_page_table(global_layer_ids=[31, 32]),
+    )
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=3,
+        tp_size=4,
+        tp_rank=3,
+        dp_size=4,
+        dp_rank=3,
+        cp_size=1,
+        kv_heads_per_rank=1,
+        is_mla=True,
+        enable_attention_dp=True,
+        layer_num_per_pp=[61],
+        page_table=make_page_table(global_layer_ids=[0, 1, 31, 32, 60]),
+    )
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    assert reg.get_peer_rank_info("peer", 3) == peer_ri
+
+
+def test_peer_registrar_rejects_cp_without_layer_overlap():
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        cp_size=2,
+        cp_rank=1,
+        kv_heads_per_rank=1,
+        is_mla=True,
+        layer_num_per_pp=[31],
+        page_table=make_page_table(global_layer_ids=[31, 32]),
+    )
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=3,
+        cp_size=1,
+        kv_heads_per_rank=1,
+        is_mla=True,
+        layer_num_per_pp=[61],
+        page_table=make_page_table(global_layer_ids=[0, 1, 2]),
+    )
+
+    with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
 def test_peer_registrar_self_rank_info_property():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)

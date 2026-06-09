@@ -19,10 +19,14 @@ COPY --chown=dynamo:0 tensorrt_llm/mapping.py ${SITE_PACKAGES}/tensorrt_llm/mapp
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/request_utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/request_utils.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor_creator.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/model_engine.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/py_executor.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/resource_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/seq_slot_manager.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/seq_slot_manager.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/disaggregation/transceiver.py ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/transceiver.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/disaggregation/native/peer.py ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/native/peer.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/disaggregation/native/mixers/attention/peer.py ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/native/mixers/attention/peer.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/_util.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/pyexecutor/sampler.py ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py
@@ -39,6 +43,9 @@ COPY --chown=dynamo:0 tensorrt_llm/llmapi/llm_args.py ${SITE_PACKAGES}/tensorrt_
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/trtllm.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/flashinfer.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/triton_prefill.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/triton_prefill.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/interface.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/interface.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/utils.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/utils.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/kvarn_gqa.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/kvarn_gqa.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/dsa.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py
 COPY --chown=dynamo:0 tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py
@@ -69,10 +76,14 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/request_utils.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/model_engine.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/py_executor.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/resource_manager.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/seq_slot_manager.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/transceiver.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/native/peer.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/disaggregation/native/mixers/attention/peer.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/snapshot_hooks.py \
 		    ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/_util.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/pyexecutor/sampler.py \
@@ -85,6 +96,9 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/trtllm.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/flashinfer.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/triton_prefill.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/interface.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/utils.py \
+	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/kvarn_gqa.py \
 	    ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/dsa.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_core.py \
     ${SITE_PACKAGES}/tensorrt_llm/_torch/attention_backend/sparse/kvarn_backend.py \

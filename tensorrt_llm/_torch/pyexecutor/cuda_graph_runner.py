@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
 
@@ -27,6 +28,87 @@ from .scheduler import ScheduledRequests
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 KeyType: TypeAlias = Tuple[int, int, bool, bool]
+
+
+def _optrt_cg_debug_enabled(env_var: str) -> bool:
+    return os.environ.get(env_var, "0") == "1"
+
+
+def _optrt_cg_request_id(request: object) -> object:
+    return getattr(request, "py_request_id", getattr(request, "request_id", None))
+
+
+def _optrt_cg_debug_len(value: object) -> object:
+    if value is None:
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return "scalar"
+
+
+def _optrt_cg_debug_head(value: object, limit: int = 8) -> object:
+    if value is None:
+        return None
+    try:
+        values = list(value[:limit])
+    except TypeError:
+        return value
+    except Exception as exc:
+        return f"error:{type(exc).__name__}:{exc}"
+    result = []
+    for item in values:
+        try:
+            result.append(int(item))
+        except Exception:
+            result.append(repr(item))
+    return result
+
+
+def _optrt_cg_request_summary(request: object) -> tuple:
+    return (
+        _optrt_cg_request_id(request),
+        getattr(getattr(request, "state", None), "name",
+                getattr(request, "state", None)),
+        getattr(request, "seq_slot", None),
+        getattr(request, "context_remaining_length", None),
+        getattr(request, "py_decoding_iter", None),
+        getattr(request, "draft_token_length", None),
+        _optrt_cg_debug_len(getattr(request, "py_draft_tokens", None)),
+        _optrt_cg_debug_head(getattr(request, "py_draft_tokens", None)),
+        getattr(request, "is_cuda_graph_dummy", None),
+        getattr(request, "is_attention_dp_dummy", None),
+    )
+
+
+def _optrt_cg_batch_summary(batch: ScheduledRequests) -> str:
+    return (
+        f"batch_size={batch.batch_size} "
+        f"num_context={len(batch.context_requests)} "
+        f"num_generation={len(batch.generation_requests)} "
+        f"context={[_optrt_cg_request_summary(req) for req in batch.context_requests]} "
+        "generation="
+        f"{[_optrt_cg_request_summary(req) for req in batch.generation_requests]}")
+
+
+def _optrt_cg_debug(config: "CUDAGraphRunnerConfig", event: str,
+                    **kwargs) -> None:
+    mapping = config.mapping
+    parts = ["OPTRT_CG_DEBUG", f"event={event}"]
+    if mapping is not None:
+        parts.extend([
+            f"rank={mapping.rank}",
+            f"tp_rank={mapping.tp_rank}",
+            f"tp_size={mapping.tp_size}",
+            f"cp_rank={mapping.cp_rank}",
+            f"cp_size={mapping.cp_size}",
+            f"pp_rank={mapping.pp_rank}",
+            f"pp_size={mapping.pp_size}",
+            f"tp_group={list(mapping.tp_group)}",
+        ])
+    for key, value in kwargs.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
 
 
 @dataclass
@@ -254,18 +336,55 @@ class CUDAGraphRunner:
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            all_can_graph_batch = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            is_all_gen_only = all(all_can_graph[0]
-                                  for all_can_graph in all_can_graph_batch)
-            all_batch_size_equal = all(
-                all_gen_only[1] == all_can_graph_batch[0][1]
-                for all_gen_only in all_can_graph_batch)
+            debug_alignment = _optrt_cg_debug_enabled(
+                "TRTLLM_OPTRT_CG_PADDING_DEBUG")
+            skip_attention_dp_allgather = _optrt_cg_debug_enabled(
+                "TRTLLM_OPTRT_SKIP_ATTENTION_DP_CG_TP_ALLGATHER")
+            if skip_attention_dp_allgather:
+                if debug_alignment:
+                    _optrt_cg_debug(
+                        self.config,
+                        "maybe_get_attention_dp_allgather_skipped_by_env",
+                        payload=[can_run_cuda_graph, batch_size],
+                        batch=_optrt_cg_batch_summary(batch))
+            else:
+                if debug_alignment:
+                    _optrt_cg_debug(self.config,
+                                    "maybe_get_attention_dp_allgather_before",
+                                    payload=[can_run_cuda_graph, batch_size],
+                                    batch=_optrt_cg_batch_summary(batch))
+                all_can_graph_batch = self.config.dist.tp_allgather(
+                    [can_run_cuda_graph, batch_size])
+                if debug_alignment:
+                    _optrt_cg_debug(self.config,
+                                    "maybe_get_attention_dp_allgather_after",
+                                    gathered=all_can_graph_batch)
+                is_all_gen_only = all(
+                    all_can_graph[0] for all_can_graph in all_can_graph_batch)
+                all_batch_size_equal = all(
+                    all_gen_only[1] == all_can_graph_batch[0][1]
+                    for all_gen_only in all_can_graph_batch)
 
-            if not is_all_gen_only or not all_batch_size_equal:
-                return None, None, None
+                if not is_all_gen_only or not all_batch_size_equal:
+                    if debug_alignment:
+                        _optrt_cg_debug(
+                            self.config,
+                            "maybe_get_return",
+                            reason="attention_dp_consensus_failed",
+                            gathered=all_can_graph_batch)
+                    return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
+            if _optrt_cg_debug_enabled("TRTLLM_OPTRT_CG_PADDING_DEBUG"):
+                reasons = []
+                if not self.enabled:
+                    reasons.append("cuda_graph_disabled")
+                if not can_run_cuda_graph:
+                    reasons.append("batch_cannot_run_cuda_graph")
+                _optrt_cg_debug(self.config,
+                                "maybe_get_return",
+                                reason=",".join(reasons),
+                                batch=_optrt_cg_batch_summary(batch))
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager)
@@ -434,19 +553,92 @@ class CUDAGraphRunner:
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         new_batch_size = batch_size
+        debug_alignment = _optrt_cg_debug_enabled(
+            "TRTLLM_OPTRT_CG_PADDING_DEBUG")
+
+        if debug_alignment:
+            _optrt_cg_debug(self.config,
+                            "padding_enter",
+                            enabled=self.enabled,
+                            padding_enabled=self.padding_enabled,
+                            attention_dp=self.config.enable_attention_dp,
+                            max_supported_batch_size=(
+                                self.max_supported_batch_size),
+                            runtime_draft_len=runtime_draft_len,
+                            can_run_cuda_graph=can_run_cuda_graph,
+                            batch=_optrt_cg_batch_summary(batch))
+
+        if _optrt_cg_debug_enabled("TRTLLM_OPTRT_DISABLE_CUDA_GRAPH_PADDING"):
+            if debug_alignment:
+                _optrt_cg_debug(self.config,
+                                "padding_return",
+                                reason="disabled_by_env",
+                                batch_size=batch_size,
+                                runtime_draft_len=runtime_draft_len)
+            return 0
 
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_size = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            all_can_graph = all(graph_batch[0]
-                                for graph_batch in graph_batch_size)
-            if all_can_graph:
-                new_batch_size = max(gen_only_batch[1]
-                                     for gen_only_batch in graph_batch_size)
+            skip_attention_dp_allgather = _optrt_cg_debug_enabled(
+                "TRTLLM_OPTRT_SKIP_ATTENTION_DP_CG_TP_ALLGATHER")
+            if skip_attention_dp_allgather:
+                if debug_alignment:
+                    _optrt_cg_debug(
+                        self.config,
+                        "padding_attention_dp_allgather_skipped_by_env",
+                        payload=[can_run_cuda_graph, batch_size],
+                        runtime_draft_len=runtime_draft_len)
+            else:
+                if debug_alignment:
+                    _optrt_cg_debug(self.config,
+                                    "padding_attention_dp_allgather_before",
+                                    payload=[can_run_cuda_graph, batch_size],
+                                    runtime_draft_len=runtime_draft_len,
+                                    batch=_optrt_cg_batch_summary(batch))
+                graph_batch_size = self.config.dist.tp_allgather(
+                    [can_run_cuda_graph, batch_size])
+                if debug_alignment:
+                    _optrt_cg_debug(
+                        self.config,
+                        "padding_attention_dp_allgather_after",
+                        gathered=graph_batch_size,
+                        runtime_draft_len=runtime_draft_len)
+                all_can_graph = all(graph_batch[0]
+                                    for graph_batch in graph_batch_size)
+                if all_can_graph:
+                    new_batch_size = max(gen_only_batch[1]
+                                         for gen_only_batch in graph_batch_size)
+                    if debug_alignment:
+                        _optrt_cg_debug(self.config,
+                                        "padding_attention_dp_aligned",
+                                        new_batch_size=new_batch_size,
+                                        gathered=graph_batch_size)
+                elif debug_alignment:
+                    _optrt_cg_debug(self.config,
+                                    "padding_attention_dp_not_all_graph",
+                                    new_batch_size=new_batch_size,
+                                    gathered=graph_batch_size)
 
         if (not self.enabled or not self.padding_enabled
                 or not can_run_cuda_graph
                 or new_batch_size > self.max_supported_batch_size):
+            if debug_alignment:
+                reasons = []
+                if not self.enabled:
+                    reasons.append("cuda_graph_disabled")
+                if not self.padding_enabled:
+                    reasons.append("padding_disabled")
+                if not can_run_cuda_graph:
+                    reasons.append("batch_cannot_run_cuda_graph")
+                if new_batch_size > self.max_supported_batch_size:
+                    reasons.append("batch_too_large")
+                _optrt_cg_debug(self.config,
+                                "padding_return",
+                                reason=",".join(reasons),
+                                batch_size=batch_size,
+                                new_batch_size=new_batch_size,
+                                max_supported_batch_size=(
+                                    self.max_supported_batch_size),
+                                runtime_draft_len=runtime_draft_len)
             return 0
 
         # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
@@ -458,14 +650,48 @@ class CUDAGraphRunner:
                 new_batch_size, runtime_draft_len)
         else:
             padded_batch_size = self._round_up_batch_size(new_batch_size)
+        if debug_alignment:
+            _optrt_cg_debug(self.config,
+                            "padding_rounded",
+                            batch_size=batch_size,
+                            new_batch_size=new_batch_size,
+                            padded_batch_size=padded_batch_size,
+                            runtime_draft_len=runtime_draft_len,
+                            dynamic_draft_len=bool(
+                                self.spec_config
+                                and self.spec_config.draft_len_schedule))
 
         if batch_size == padded_batch_size:
+            if debug_alignment:
+                _optrt_cg_debug(self.config,
+                                "padding_return",
+                                reason="already_padded",
+                                batch_size=batch_size,
+                                padded_batch_size=padded_batch_size,
+                                runtime_draft_len=runtime_draft_len)
             return 0
 
         padding_size = padded_batch_size - batch_size
         if padding_size <= 0:
+            if debug_alignment:
+                _optrt_cg_debug(self.config,
+                                "padding_return",
+                                reason="non_positive_padding",
+                                batch_size=batch_size,
+                                padded_batch_size=padded_batch_size,
+                                padding_size=padding_size,
+                                runtime_draft_len=runtime_draft_len)
             return 0
         if padding_size + batch.batch_size > self.config.batch_size:
+            if debug_alignment:
+                _optrt_cg_debug(self.config,
+                                "padding_return",
+                                reason="exceeds_config_batch_size",
+                                batch_size=batch_size,
+                                config_batch_size=self.config.batch_size,
+                                padded_batch_size=padded_batch_size,
+                                padding_size=padding_size,
+                                runtime_draft_len=runtime_draft_len)
             return 0
 
         # No padding if it would create too many concurrent requests.
@@ -491,6 +717,15 @@ class CUDAGraphRunner:
                 draft_kv_cache_manager=draft_kv_cache_manager)
 
             if dummy_request is None:
+                if debug_alignment:
+                    _optrt_cg_debug(self.config,
+                                    "padding_return",
+                                    reason="dummy_request_allocation_failed",
+                                    dummy_request_id=dummy_request_id,
+                                    batch_size=batch_size,
+                                    padded_batch_size=padded_batch_size,
+                                    padding_size=padding_size,
+                                    runtime_draft_len=runtime_draft_len)
                 return 0
             else:
                 dummy_request = dummy_request[0]
@@ -501,9 +736,25 @@ class CUDAGraphRunner:
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([dummy_request_id])
             self.padding_dummy_requests[runtime_draft_len] = dummy_request
+            if debug_alignment:
+                _optrt_cg_debug(self.config,
+                                "padding_dummy_created",
+                                dummy_request_id=dummy_request_id,
+                                runtime_draft_len=runtime_draft_len,
+                                dummy=_optrt_cg_request_summary(dummy_request))
 
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
+        if debug_alignment:
+            _optrt_cg_debug(self.config,
+                            "padding_extend_done",
+                            batch_size=batch_size,
+                            padded_batch_size=padded_batch_size,
+                            padding_size=padding_size,
+                            runtime_draft_len=runtime_draft_len,
+                            dummy=_optrt_cg_request_summary(
+                                padding_dummy_request),
+                            batch=_optrt_cg_batch_summary(batch))
         return padding_size
 
     def _round_up_batch_size(self, batch_size: int) -> int:
@@ -550,6 +801,13 @@ class CUDAGraphRunner:
             if padding_size > 0:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
+                if _optrt_cg_debug_enabled("TRTLLM_OPTRT_CG_PADDING_DEBUG"):
+                    _optrt_cg_debug(self.config,
+                                    "padding_trim_done",
+                                    padding_size=padding_size,
+                                    runtime_draft_len=runtime_draft_len,
+                                    batch=_optrt_cg_batch_summary(
+                                        scheduled_requests))
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""

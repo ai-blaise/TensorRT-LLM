@@ -97,6 +97,18 @@ class PeerRegistrar:
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
         if self_layers != peer_layers:
+            cp_transfer_with_layer_overlap = (
+                (self._ri.cp_size != 1 or peer_ri.cp_size != 1)
+                and self._attention_policy.has_attention_layer_overlap(peer_ri)
+            )
+            if cp_transfer_with_layer_overlap:
+                logger.info(
+                    "PeerRegistrar allowing CP transfer layer-count mismatch "
+                    "with page-table layer overlap (local=%d, peer=%d).",
+                    self_layers,
+                    peer_layers,
+                )
+                return True
             logger.warning(
                 "PeerRegistrar: total layer count mismatch "
                 f"(local={self_layers}, peer={peer_layers})."

@@ -78,6 +78,115 @@ def build_smc_particle_choices(gamma: int, n_particles: int) -> list[list[int]]:
             choices.append([particle_idx] + [0] * (depth - 1))
     return choices
 
+
+def _smc_debug_scalar(value: object) -> object:
+    if torch.is_tensor(value):
+        if value.device.type == "cpu" and value.numel() == 1:
+            return int(value.item())
+        return f"tensor:{tuple(value.shape)}:{value.device.type}"
+    if hasattr(value, "name"):
+        return getattr(value, "name")
+    return value
+
+
+def _smc_debug_format(value: object) -> str:
+    value = _smc_debug_scalar(value)
+    if value is None:
+        return "None"
+    if isinstance(value, (bool, int, float, str)):
+        return str(value).replace(" ", "_").replace("\n", "\\n")
+    if isinstance(value, (list, tuple, set)):
+        values = [_smc_debug_scalar(item) for item in list(value)]
+        if len(values) <= 8 and all(
+                isinstance(item, (bool, int, float, str)) or item is None
+                for item in values):
+            return str(values).replace(" ", "_")
+        return f"len:{len(values)}"
+    if isinstance(value, dict):
+        return f"keys:{','.join(str(key) for key in value.keys())}"
+    return str(value).replace(" ", "_").replace("\n", "\\n")
+
+
+def _smc_debug_len(value: object) -> str:
+    if value is None:
+        return "None"
+    try:
+        return str(len(value))  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+
+
+def _smc_debug_head(value: object, limit: int = 8) -> str:
+    if value is None:
+        return "None"
+    if torch.is_tensor(value):
+        if value.device.type != "cpu":
+            return f"tensor:{tuple(value.shape)}:{value.device.type}"
+        value = value.reshape(-1)[:limit].tolist()
+    try:
+        values = list(value)[:limit]  # type: ignore[arg-type]
+    except TypeError:
+        return _smc_debug_format(value)
+    return _smc_debug_format(values)
+
+
+def _smc_debug_shape(value: object) -> str:
+    if value is None:
+        return "None"
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return "n/a"
+    return _smc_debug_format(tuple(shape))
+
+
+def _smc_debug(event: str,
+               request: LlmRequest | None = None,
+               **fields: object) -> None:
+    if os.environ.get("TRTLLM_OPTRT_SMC_DEBUG", "0") != "1":
+        return
+    parts = ["OPTRT_SMC_DEBUG", f"event={event}"]
+    if request is not None:
+        parts.extend([
+            f"request_id={_smc_debug_format(getattr(request, 'request_id', None))}",
+            f"py_request_id={_smc_debug_format(getattr(request, 'py_request_id', None))}",
+            f"state={_smc_debug_format(getattr(request, 'state', None))}",
+            f"seq_slot={_smc_debug_format(getattr(request, 'seq_slot', None))}",
+            f"py_seq_slot={_smc_debug_format(getattr(request, 'py_seq_slot', None))}",
+        ])
+        draft_tokens = getattr(request, "py_draft_tokens", None)
+        last_draft_tokens = getattr(request, "py_last_draft_tokens", None)
+        parts.extend([
+            f"py_draft_tokens_len={_smc_debug_len(draft_tokens)}",
+            f"py_draft_tokens_head={_smc_debug_head(draft_tokens)}",
+            f"py_last_draft_tokens_len={_smc_debug_len(last_draft_tokens)}",
+            f"py_last_draft_tokens_head={_smc_debug_head(last_draft_tokens)}",
+            "py_smc_draft_token_log_probs_shape="
+            f"{_smc_debug_shape(getattr(request, 'py_smc_draft_token_log_probs', None))}",
+            f"py_target_probs_shape={_smc_debug_shape(getattr(request, 'py_target_probs', None))}",
+        ])
+        disagg_params = getattr(request, "py_disaggregated_params", None)
+        if disagg_params is not None:
+            parts.extend([
+                "disagg_request_type="
+                f"{_smc_debug_format(getattr(disagg_params, 'request_type', None))}",
+                "disagg_request_id="
+                f"{_smc_debug_format(getattr(disagg_params, 'disagg_request_id', None))}",
+                "disagg_ctx_request_id="
+                f"{_smc_debug_format(getattr(disagg_params, 'ctx_request_id', None))}",
+                "disagg_ctx_dp_rank="
+                f"{_smc_debug_format(getattr(disagg_params, 'ctx_dp_rank', None))}",
+                "disagg_ctx_info_endpoint="
+                f"{_smc_debug_format(getattr(disagg_params, 'ctx_info_endpoint', None))}",
+                "disagg_draft_tokens_len="
+                f"{_smc_debug_len(getattr(disagg_params, 'draft_tokens', None))}",
+                "disagg_draft_tokens_head="
+                f"{_smc_debug_head(getattr(disagg_params, 'draft_tokens', None))}",
+            ])
+    parts.extend(
+        f"{key}={_smc_debug_format(value)}" for key, value in fields.items())
+    print(" ".join(parts), flush=True)
+
+
 @dataclass
 class SMCSpecMetadata(SpecMetadata):
     """Runtime metadata for two-model SMC-SD speculative decoding."""
@@ -299,14 +408,31 @@ class SMCModelDrafter(ModelDrafter):
 
     def process_static_draft_outputs(self, outputs, draft_batch) -> None:
         if not isinstance(outputs, dict) or "draft_token_log_probs" not in outputs:
+            _smc_debug(
+                "drafter_process_static_passthrough",
+                outputs_type=type(outputs).__name__,
+                has_draft_token_log_probs=isinstance(outputs, dict)
+                and "draft_token_log_probs" in outputs)
             super().process_static_draft_outputs(outputs, draft_batch)
             return
 
         sample_state = outputs.get("sample_state")
+        _smc_debug(
+            "drafter_process_static_enter",
+            sample_state_present=sample_state is not None,
+            new_draft_tokens_shape=_smc_debug_shape(
+                outputs.get("new_draft_tokens")),
+            draft_token_log_probs_shape=_smc_debug_shape(
+                outputs.get("draft_token_log_probs")),
+            draft_batch_size=len(draft_batch.all_requests()))
         if sample_state is not None:
             sample_state.sampler_event.synchronize()
             draft_tokens_host = sample_state.host.new_tokens
             used_pinned_host_tokens = True
+            _smc_debug(
+                "drafter_process_static_sample_state_ready",
+                host_new_tokens_shape=_smc_debug_shape(draft_tokens_host),
+                host_new_tokens_head=_smc_debug_head(draft_tokens_host))
         else:
             if os.environ.get("TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT", "0") != "1":
                 raise RuntimeError(
@@ -315,11 +441,26 @@ class SMCModelDrafter(ModelDrafter):
                     "only for explicit diagnostic fallback")
             draft_tokens_host = outputs["new_draft_tokens"].cpu()
             used_pinned_host_tokens = False
+            _smc_debug(
+                "drafter_process_static_unpinned_fallback",
+                host_new_tokens_shape=_smc_debug_shape(draft_tokens_host),
+                host_new_tokens_head=_smc_debug_head(draft_tokens_host))
         draft_token_log_probs = outputs["draft_token_log_probs"]
 
         for req_idx, req in enumerate(draft_batch.all_requests()):
             target_model_req = self.req_id_to_old_request[req.py_request_id]
+            _smc_debug(
+                "drafter_process_static_candidate",
+                target_model_req,
+                draft_request_id=req.py_request_id,
+                req_idx=req_idx,
+                used_pinned_host_tokens=used_pinned_host_tokens)
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                _smc_debug(
+                    "drafter_process_static_skip_non_generation",
+                    target_model_req,
+                    draft_request_id=req.py_request_id,
+                    req_idx=req_idx)
                 continue
             disagg_request_id, ctx_dp_rank, ctx_info_endpoint = (
                 validate_smc_decode_request_pin(target_model_req))
@@ -331,6 +472,16 @@ class SMCModelDrafter(ModelDrafter):
                 f"disagg_request_id={disagg_request_id} "
                 f"ctx_dp_rank={ctx_dp_rank} "
                 f"ctx_info_endpoint={ctx_info_endpoint}")
+            _smc_debug(
+                "drafter_process_static_commit_start",
+                target_model_req,
+                draft_request_id=req.py_request_id,
+                req_idx=req_idx,
+                disagg_request_id=disagg_request_id,
+                ctx_dp_rank=ctx_dp_rank,
+                ctx_info_endpoint=ctx_info_endpoint,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+                token_log_probs_shape=_smc_debug_shape(draft_token_log_probs))
             target_model_req.py_draft_tokens = []
             token_log_probs = []
             for token_idx in range(self.max_total_draft_tokens):
@@ -341,6 +492,13 @@ class SMCModelDrafter(ModelDrafter):
             target_model_req.py_draft_logits = None
             target_model_req.py_smc_draft_token_log_probs = torch.stack(
                 token_log_probs)
+            _smc_debug(
+                "drafter_process_static_commit_done",
+                target_model_req,
+                draft_request_id=req.py_request_id,
+                req_idx=req_idx,
+                committed_token_log_probs_shape=_smc_debug_shape(
+                    target_model_req.py_smc_draft_token_log_probs))
 
 
 class SMCSampler(TorchSampler):
@@ -397,16 +555,25 @@ class SMCSampler(TorchSampler):
         if isinstance(spec_manager, SMCResourceManager) and state.requests:
             group_ids: list[int] = []
             diff_rows: list[torch.Tensor] = []
+            _smc_debug(
+                "sampler_update_enter",
+                request_count=len(state.requests),
+                spec_manager=type(spec_manager).__name__)
             for request in state.requests:
                 if request.state == LlmRequestState.GENERATION_COMPLETE:
+                    _smc_debug("sampler_update_skip_generation_complete",
+                               request)
                     continue
-                draft_tokens = request.py_draft_tokens
+                draft_tokens = getattr(request, "py_draft_tokens", None)
                 if not draft_tokens:
+                    _smc_debug("sampler_update_skip_no_draft_tokens", request)
                     continue
                 if getattr(request, "py_target_probs", None) is None:
+                    _smc_debug("sampler_update_skip_no_target_probs", request)
                     continue
                 if getattr(request, "py_smc_draft_token_log_probs",
                            None) is None:
+                    _smc_debug("sampler_update_skip_no_smc_log_probs", request)
                     continue
                 group_ids.append(
                     int(getattr(request, "py_smc_group_id",
@@ -414,11 +581,22 @@ class SMCSampler(TorchSampler):
                 diff_rows.append(self._compute_particle_logprob_diffs(request))
             if group_ids:
                 logprob_diffs = torch.stack(diff_rows, dim=0)
+                _smc_debug(
+                    "sampler_update_select_particles_start",
+                    group_ids=group_ids,
+                    logprob_diffs_shape=_smc_debug_shape(logprob_diffs))
                 selected, ess = spec_manager.select_particles_batched(
                     group_ids, logprob_diffs)
                 for idx, group_id in enumerate(group_ids):
                     self._batched_selection[group_id] = (selected[idx],
                                                          ess[idx])
+                    _smc_debug(
+                        "sampler_update_select_particles_done",
+                        group_id=group_id,
+                        selected_particle=selected[idx],
+                        ess=ess[idx])
+            else:
+                _smc_debug("sampler_update_no_selectable_requests")
         super().update_requests(state, resource_manager)
         self._batched_selection = {}
 
@@ -432,12 +610,15 @@ class SMCSampler(TorchSampler):
     ) -> int:
         draft_tokens = request.py_draft_tokens
         if draft_tokens is None or len(draft_tokens) == 0:
+            _smc_debug("sampler_process_empty_draft_tokens", request)
             return self._process_draft_tokens_greedy(
                 request, new_tokens=new_tokens_list, finish_reasons=finish_reasons)
 
         if getattr(request, "py_target_probs", None) is None:
+            _smc_debug("sampler_process_missing_target_probs", request)
             raise RuntimeError("SMC-SD requires target token probabilities.")
         if getattr(request, "py_smc_draft_token_log_probs", None) is None:
+            _smc_debug("sampler_process_missing_smc_log_probs", request)
             raise RuntimeError(
                 "SMC-SD requires selected draft token log probabilities.")
 
@@ -450,10 +631,22 @@ class SMCSampler(TorchSampler):
             selected_particle, ess = cached
             setattr(request, "py_smc_effective_sample_size", ess)
             setattr(request, "py_smc_selected_particle", selected_particle)
+            _smc_debug(
+                "sampler_process_cached_selection",
+                request,
+                group_id=group_id,
+                selected_particle=selected_particle,
+                ess=ess)
         else:
             # Fallback (e.g. no SMC resource manager): per-request path.
             logprob_diffs = self._compute_particle_logprob_diffs(request)
             selected_particle = int(torch.argmax(logprob_diffs).item())
+            _smc_debug(
+                "sampler_process_fallback_selection_start",
+                request,
+                group_id=group_id,
+                selected_particle=selected_particle,
+                logprob_diffs_shape=_smc_debug_shape(logprob_diffs))
             if resource_manager is not None:
                 spec_manager = resource_manager.get_resource_manager(
                     ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -463,6 +656,12 @@ class SMCSampler(TorchSampler):
                     setattr(request, "py_smc_effective_sample_size", ess)
                     setattr(request, "py_smc_selected_particle",
                             selected_particle)
+                    _smc_debug(
+                        "sampler_process_fallback_selection_done",
+                        request,
+                        group_id=group_id,
+                        selected_particle=selected_particle,
+                        ess=ess)
 
         num_accepted = self._accept_selected_particle(
             request=request,
@@ -478,6 +677,12 @@ class SMCSampler(TorchSampler):
                 group_id = int(getattr(
                     request, "py_smc_group_id", request.py_request_id))
                 spec_manager.record_acceptance(group_id, num_accepted)
+        _smc_debug(
+            "sampler_process_done",
+            request,
+            group_id=group_id,
+            selected_particle=selected_particle,
+            num_accepted=num_accepted)
         return num_accepted
 
     def _get_particle_index_tensors(
@@ -579,6 +784,15 @@ class SMCSampler(TorchSampler):
         # Target tokens the model already sampled at every tree node (host).
         target_tokens = new_tokens_tensor[:num_nodes, seq_slot,
                                           DEFAULT_BEAM_IDX].tolist()
+        _smc_debug(
+            "accept_selected_enter",
+            request,
+            selected_particle=selected_particle,
+            token_indices=token_indices,
+            parent_steps=parent_steps_sel,
+            num_nodes=num_nodes,
+            target_tokens_head=_smc_debug_head(target_tokens),
+            new_tokens_tensor_shape=_smc_debug_shape(new_tokens_tensor))
 
         # Rejection-sampling acceptance (default): accept draft token t at depth d
         # with probability min(1, q/p) where q = P_target(t | parent) and
@@ -616,6 +830,8 @@ class SMCSampler(TorchSampler):
                     (q, p.to(q.dtype), u.to(q.dtype)), dim=0).tolist()
             else:
                 use_rejection = False
+                _smc_debug("accept_selected_disable_rejection_no_log_probs",
+                           request)
 
         if os.environ.get("SMC_ACCEPT_DEBUG") == "1" and not getattr(
                 SMCSampler, "_accept_dbg_done", False):
@@ -643,6 +859,14 @@ class SMCSampler(TorchSampler):
             # Defensive bound: a malformed parent index means we cannot verify
             # this depth -> stop accepting here (correctness over length).
             if parent >= num_nodes:
+                _smc_debug(
+                    "accept_selected_parent_out_of_bounds",
+                    request,
+                    selected_particle=selected_particle,
+                    depth=depth,
+                    parent=parent,
+                    num_nodes=num_nodes,
+                    num_accepted=num_accepted)
                 break
             draft_token = int(request.py_draft_tokens[token_idx])
             target_token = int(target_tokens[parent])
@@ -667,6 +891,19 @@ class SMCSampler(TorchSampler):
                                            max_seq_len=self.max_seq_len)
                 request.py_num_accepted_draft_tokens_indices = (
                     accepted_node_indices)
+                _smc_debug(
+                    "accept_selected_reject",
+                    request,
+                    selected_particle=selected_particle,
+                    depth=depth,
+                    token_idx=token_idx,
+                    parent=parent,
+                    draft_token=draft_token,
+                    target_token=target_token,
+                    use_rejection=use_rejection,
+                    accept_prob=accept_prob if use_rejection else None,
+                    num_accepted=num_accepted,
+                    accepted_node_indices=accepted_node_indices)
                 return num_accepted
             # Accept the draft token.
             new_tokens_tensor[num_accepted, seq_slot,
@@ -679,6 +916,15 @@ class SMCSampler(TorchSampler):
                                           max_seq_len=self.max_seq_len):
                 request.py_num_accepted_draft_tokens_indices = (
                     accepted_node_indices)
+                _smc_debug(
+                    "accept_selected_stop_on_draft",
+                    request,
+                    selected_particle=selected_particle,
+                    depth=depth,
+                    token_idx=token_idx,
+                    draft_token=draft_token,
+                    num_accepted=num_accepted,
+                    accepted_node_indices=accepted_node_indices)
                 return num_accepted
 
         request.py_num_accepted_draft_tokens_indices = accepted_node_indices
@@ -695,6 +941,13 @@ class SMCSampler(TorchSampler):
                               beam_idx=DEFAULT_BEAM_IDX, step=num_accepted)
         self.finish_if_reason(request, finish_reasons, step=num_accepted,
                               beam_idx=DEFAULT_BEAM_IDX)
+        _smc_debug(
+            "accept_selected_full_chain",
+            request,
+            selected_particle=selected_particle,
+            bonus_token=new_token,
+            num_accepted=num_accepted,
+            accepted_node_indices=accepted_node_indices)
         return num_accepted
 
     def _compute_logprob_diff(self, request, num_accepted: int) -> torch.Tensor | None:

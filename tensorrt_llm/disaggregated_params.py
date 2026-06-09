@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import IntEnum
+import os
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -10,6 +11,54 @@ import tensorrt as trt  # noqa
 # isort: on
 
 from tensorrt_llm.bindings import executor as tllme
+
+
+def _optrt_disagg_params_debug_format(value: object) -> str:
+    if value is None:
+        return "None"
+    if hasattr(value, "name"):
+        return str(getattr(value, "name"))
+    if isinstance(value, (bool, int, float, str)):
+        return str(value).replace(" ", "_").replace("\n", "\\n")
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+        if len(values) <= 8 and all(
+                item is None or isinstance(item, (bool, int, float, str))
+                for item in values):
+            return str(values).replace(" ", "_")
+        return f"len:{len(values)}"
+    if isinstance(value, dict):
+        return f"keys:{','.join(str(key) for key in value.keys())}"
+    return str(value).replace(" ", "_").replace("\n", "\\n")
+
+
+def _optrt_disagg_params_debug_len(value: object) -> str:
+    if value is None:
+        return "None"
+    try:
+        return str(len(value))  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+
+
+def _optrt_disagg_params_debug_head(value: object, limit: int = 8) -> str:
+    if value is None:
+        return "None"
+    try:
+        values = list(value)[:limit]  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+    return _optrt_disagg_params_debug_format(values)
+
+
+def _optrt_disagg_params_debug(event: str, **fields: object) -> None:
+    if os.environ.get("TRTLLM_OPTRT_DISAGG_PARAMS_DEBUG", "0") != "1":
+        return
+    parts = ["OPTRT_DISAGG_PARAMS_DEBUG", f"event={event}"]
+    parts.extend(
+        f"{key}={_optrt_disagg_params_debug_format(value)}"
+        for key, value in fields.items())
+    print(" ".join(parts), flush=True)
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -72,6 +121,22 @@ class DisaggregatedParams:
         )
         # `first_gen_tokens` is now required by bindings and cannot be None.
         first_gen_tokens = self.first_gen_tokens if self.first_gen_tokens is not None else []
+        _optrt_disagg_params_debug(
+            "get_context_phase_params",
+            request_type=self.request_type,
+            request_id=request_id,
+            ctx_request_id=self.ctx_request_id,
+            disagg_request_id=self.disagg_request_id,
+            ctx_dp_rank=self.ctx_dp_rank,
+            ctx_info_endpoint=self.ctx_info_endpoint,
+            first_gen_tokens_len=_optrt_disagg_params_debug_len(
+                first_gen_tokens),
+            first_gen_tokens_head=_optrt_disagg_params_debug_head(
+                first_gen_tokens),
+            draft_tokens_len=_optrt_disagg_params_debug_len(self.draft_tokens),
+            draft_tokens_head=_optrt_disagg_params_debug_head(
+                self.draft_tokens),
+            opaque_state_present=self.opaque_state is not None)
         return tllme.ContextPhaseParams(
             first_gen_tokens,
             request_id,

@@ -74,6 +74,103 @@ from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 
+def _optrt_me_debug_enabled() -> bool:
+    return os.environ.get("TRTLLM_OPTRT_MODEL_ENGINE_ADP_DEBUG", "0") == "1"
+
+
+def _optrt_me_shape(value: object) -> object:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        try:
+            return tuple(shape)
+        except TypeError:
+            return shape
+    return None
+
+
+def _optrt_me_len(value: object) -> object:
+    if value is None:
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return "scalar"
+
+
+def _optrt_me_attr(value: object, name: str, default: object = None) -> object:
+    try:
+        return getattr(value, name, default)
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        message = str(exc).splitlines()[0]
+        return f"<{type(exc).__name__}: {message[:160]}>"
+
+
+def _optrt_me_request_summary(request: LlmRequest) -> tuple:
+    return (
+        _optrt_me_attr(request, "py_request_id",
+                       _optrt_me_attr(request, "request_id")),
+        _optrt_me_attr(_optrt_me_attr(request, "state"), "name",
+                       _optrt_me_attr(request, "state")),
+        _optrt_me_attr(request, "py_batch_idx"),
+        _optrt_me_attr(request, "py_seq_slot",
+                       _optrt_me_attr(request, "seq_slot")),
+        _optrt_me_attr(request, "context_chunk_size"),
+        _optrt_me_attr(request, "context_current_position"),
+        _optrt_me_len(_optrt_me_attr(request, "py_draft_tokens")),
+        _optrt_me_attr(request, "py_draft_pages_allocated"),
+        _optrt_me_shape(
+            _optrt_me_attr(request, "py_smc_draft_token_log_probs")),
+        _optrt_me_shape(_optrt_me_attr(request, "py_target_probs")),
+        _optrt_me_attr(request, "is_attention_dp_dummy"),
+        _optrt_me_attr(request, "is_cuda_graph_dummy"),
+        _optrt_me_attr(request, "is_dummy_request"),
+        _optrt_me_attr(request, "py_decoding_iter"),
+    )
+
+
+def _optrt_me_batch_summary(batch: ScheduledRequests) -> str:
+    return (
+        f"batch_size={batch.batch_size} "
+        f"context={[_optrt_me_request_summary(req) for req in batch.context_requests]} "
+        "generation="
+        f"{[_optrt_me_request_summary(req) for req in batch.generation_requests]}")
+
+
+def _optrt_me_metadata_summary(metadata: object) -> tuple:
+    return (
+        type(metadata).__name__,
+        getattr(metadata, "num_tokens", None),
+        getattr(metadata, "num_contexts", None),
+        getattr(metadata, "num_generations", None),
+        getattr(metadata, "num_seqs", None),
+        getattr(metadata, "padded_num_tokens", None),
+        _optrt_me_shape(getattr(metadata, "seq_lens", None)),
+        getattr(metadata, "runtime_draft_len", None),
+        getattr(metadata, "max_total_draft_tokens", None),
+    )
+
+
+def _optrt_me_debug(dist: Distributed, event: str, **kwargs) -> None:
+    if not _optrt_me_debug_enabled():
+        return
+    parts = [
+        "OPTRT_ME_ADP_DEBUG",
+        f"event={event}",
+        f"rank={getattr(dist, 'rank', None)}",
+        f"tp_rank={getattr(dist, 'tp_rank', None)}",
+        f"tp_size={getattr(dist, 'tp_size', None)}",
+        f"cp_rank={getattr(dist, 'cp_rank', None)}",
+        f"cp_size={getattr(dist, 'cp_size', None)}",
+        f"pp_rank={getattr(dist, 'pp_rank', None)}",
+        f"pp_size={getattr(dist, 'pp_size', None)}",
+    ]
+    for key, value in kwargs.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -1886,13 +1983,39 @@ class PyTorchModelEngine(ModelEngine):
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-                return list(self.dist.tp_cp_allgather(num_tokens))
-            return list(self.dist.tp_allgather(num_tokens))
+                _optrt_me_debug(self.dist,
+                                "attn_num_tokens_tp_cp_allgather_before",
+                                num_tokens=num_tokens,
+                                metadata=_optrt_me_metadata_summary(
+                                    attn_metadata))
+                all_rank_num_tokens = list(
+                    self.dist.tp_cp_allgather(num_tokens))
+                _optrt_me_debug(self.dist,
+                                "attn_num_tokens_tp_cp_allgather_after",
+                                gathered=all_rank_num_tokens)
+                return all_rank_num_tokens
+            _optrt_me_debug(self.dist,
+                            "attn_num_tokens_tp_allgather_before",
+                            num_tokens=num_tokens,
+                            metadata=_optrt_me_metadata_summary(attn_metadata))
+            all_rank_num_tokens = list(self.dist.tp_allgather(num_tokens))
+            _optrt_me_debug(self.dist,
+                            "attn_num_tokens_tp_allgather_after",
+                            gathered=all_rank_num_tokens)
+            return all_rank_num_tokens
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(num_ctx_requests))
+            _optrt_me_debug(self.dist,
+                            "ctx_requests_tp_allgather_before",
+                            num_ctx_requests=num_ctx_requests)
+            all_rank_ctx_requests = list(
+                self.dist.tp_allgather(num_ctx_requests))
+            _optrt_me_debug(self.dist,
+                            "ctx_requests_tp_allgather_after",
+                            gathered=all_rank_ctx_requests)
+            return all_rank_ctx_requests
         return None
 
     def _get_padding_params(
@@ -2665,6 +2788,21 @@ class PyTorchModelEngine(ModelEngine):
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
 
+        _optrt_me_debug(
+            self.dist,
+            "prepare_tp_inputs_classified",
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len,
+            next_draft_tokens_shape=_optrt_me_shape(next_draft_tokens_device),
+            scheduled=_optrt_me_batch_summary(scheduled_requests),
+            extend=[_optrt_me_request_summary(req) for req in extend_requests],
+            generation=[
+                _optrt_me_request_summary(req) for req in generation_requests
+            ],
+            first_draft=[
+                _optrt_me_request_summary(req) for req in first_draft_requests
+            ])
+
         spec_config = self.spec_config if self.enable_spec_decode else None
         if not self._disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
@@ -3335,9 +3473,19 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
+                _optrt_me_debug(
+                    self.dist,
+                    "spec_metadata_tp_cp_allgather_before",
+                    spec_metadata=_optrt_me_metadata_summary(spec_metadata),
+                    num_sequence_lengths=len(sequence_lengths),
+                    request_ids=request_ids,
+                    batch=_optrt_me_batch_summary(scheduled_requests))
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
+                _optrt_me_debug(self.dist,
+                                "spec_metadata_tp_cp_allgather_after",
+                                gathered=all_rank_num_tokens)
 
                 spec_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
@@ -3739,8 +3887,14 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         if self.enable_attention_dp:
+            _optrt_me_debug(self.dist,
+                            "star_attn_num_tokens_tp_allgather_before",
+                            metadata=_optrt_me_metadata_summary(attn_metadata))
             all_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)
+            _optrt_me_debug(self.dist,
+                            "star_attn_num_tokens_tp_allgather_after",
+                            gathered=all_rank_num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return {
@@ -4049,6 +4203,19 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        _optrt_me_debug(
+            self.dist,
+            "forward_enter",
+            enable_spec_decode=self.enable_spec_decode,
+            is_spec_decode=self.is_spec_decode,
+            runtime_draft_len=getattr(self, "runtime_draft_len", None),
+            new_tensors_shape=_optrt_me_shape(
+                getattr(new_tensors_device, "new_tokens", None)),
+            next_draft_tokens_shape=_optrt_me_shape(
+                getattr(new_tensors_device, "next_draft_tokens", None)),
+            num_accepted_tokens_shape=_optrt_me_shape(
+                num_accepted_tokens_device),
+            batch=_optrt_me_batch_summary(scheduled_requests))
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -4143,6 +4310,18 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
+            _optrt_me_debug(
+                self.dist,
+                "forward_after_maybe_get_cuda_graph",
+                can_run_graph=can_run_graph,
+                key=key,
+                padded_batch=_optrt_me_batch_summary(padded_requests),
+                maybe_attn_metadata=_optrt_me_metadata_summary(
+                    maybe_attn_metadata)
+                if maybe_attn_metadata is not None else None,
+                maybe_spec_metadata=_optrt_me_metadata_summary(
+                    maybe_spec_metadata)
+                if maybe_spec_metadata is not None else None)
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -4167,6 +4346,17 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager, can_run_graph)
+            _optrt_me_debug(
+                self.dist,
+                "forward_after_prepare_inputs",
+                can_run_graph=can_run_graph,
+                gather_ids_len=_optrt_me_len(gather_ids),
+                input_ids_shape=_optrt_me_shape(inputs.get("input_ids")),
+                attn_metadata=_optrt_me_metadata_summary(
+                    inputs.get("attn_metadata")),
+                spec_metadata=_optrt_me_metadata_summary(
+                    inputs.get("spec_metadata"))
+                if inputs.get("spec_metadata") is not None else None)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:

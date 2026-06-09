@@ -177,6 +177,16 @@ data:
       use_cute_dsl_topk: true
       use_cute_dsl_paged_mqa_logits: true
       layersplit_enabled: false
+    speculative_config:
+      decoding_type: SMC
+      speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
+      gamma: 6
+      n_particles: 4
+      resample_threshold: 0.5
+      draft_temperature: 0.7
+      target_temperature: 1.0
+      draft_attention_backend: triton
+      draft_kv_cache_dtype: bfloat16
 ---
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
@@ -504,6 +514,12 @@ spec:
         value: /cache/optrt/tensorrt_llm/llmapi_build
       - name: PYTHONUNBUFFERED
         value: '1'
+      - name: TRTLLM_OPTRT_CG_PADDING_DEBUG
+        value: '0'
+      - name: TRTLLM_OPTRT_SKIP_ATTENTION_DP_CG_TP_ALLGATHER
+        value: '0'
+      - name: TRTLLM_OPTRT_MODEL_ENGINE_ADP_DEBUG
+        value: '0'
       extraPodSpec:
         nodeSelector:
           kubernetes.io/hostname: ${TARGET_NODE}

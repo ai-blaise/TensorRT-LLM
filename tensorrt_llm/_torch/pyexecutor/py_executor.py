@@ -69,7 +69,8 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
-                               ResourceManagerType, request_context)
+                               ResourceManagerType, _optrt_kv_debug,
+                               request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -93,6 +94,12 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
 _IDLE_DISAGG_TRANSFER_POLL_S = float(
     os.getenv("TRTLLM_DISAGG_IDLE_TRANSFER_POLL_S", "0.1"))
+
+
+def _optrt_nixl_transfer_proof(message: str) -> None:
+    if os.environ.get("TRTLLM_OPTRT_NIXL_TRANSFER_PROOF", "0") != "1":
+        return
+    print(f"OPTRT_NIXL_TRANSFER_PROOF {message}", flush=True)
 
 
 class PPCommTag(IntEnum):
@@ -2424,9 +2431,19 @@ class PyExecutor:
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+                _optrt_kv_debug(
+                    "executor_active_request_draft_tokens_before_scheduler_seed",
+                    request,
+                    max_total_draft_tokens=self.max_total_draft_tokens,
+                    use_spec_decode=self.use_spec_decode)
                 request.draft_tokens = [
                     0
                 ] * self.max_total_draft_tokens if self.max_total_draft_tokens > 0 else []
+                _optrt_kv_debug(
+                    "executor_active_request_draft_tokens_after_scheduler_seed",
+                    request,
+                    draft_tokens_len=len(request.draft_tokens),
+                    draft_tokens_head=request.draft_tokens[:8])
 
             # If speculation is off, this function sets py_draft_tokens to []
             # for all active requests. If it's on, we initialize py_draft_tokens
@@ -2712,12 +2729,36 @@ class PyExecutor:
                             self.execution_stream.wait_stream(
                                 torch.cuda.current_stream())
                             with torch.cuda.stream(self.execution_stream):
+                                for request in scheduled_batch.all_requests():
+                                    _optrt_kv_debug(
+                                        "executor_prepare_draft_tokens_before_call",
+                                        request,
+                                        max_total_draft_tokens=self.max_total_draft_tokens,
+                                        use_spec_decode=self.use_spec_decode)
                                 self.drafter.prepare_draft_tokens(
                                     scheduled_batch, self.resource_manager)
+                                for request in scheduled_batch.all_requests():
+                                    _optrt_kv_debug(
+                                        "executor_prepare_draft_tokens_after_call",
+                                        request,
+                                        max_total_draft_tokens=self.max_total_draft_tokens,
+                                        use_spec_decode=self.use_spec_decode)
                                 # Pad draft tokens to the max draft length and extend KV cache
                                 # capacity to match. This is for CUDA graph compatibility.
+                                for request in scheduled_batch.all_requests():
+                                    _optrt_kv_debug(
+                                        "executor_pad_draft_tokens_before_call",
+                                        request,
+                                        max_total_draft_tokens=self.max_total_draft_tokens,
+                                        use_spec_decode=self.use_spec_decode)
                                 self.drafter.pad_draft_tokens_for_cuda_graph(
                                     scheduled_batch, self.resource_manager)
+                                for request in scheduled_batch.all_requests():
+                                    _optrt_kv_debug(
+                                        "executor_pad_draft_tokens_after_call",
+                                        request,
+                                        max_total_draft_tokens=self.max_total_draft_tokens,
+                                        use_spec_decode=self.use_spec_decode)
                             torch.cuda.current_stream().wait_stream(
                                 self.execution_stream)
                         # add_batch must be called again to restore to target requests with updated draft tokens.
@@ -2822,6 +2863,12 @@ class PyExecutor:
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
 
+                _optrt_kv_debug(
+                    "executor_prepare_draft_request_before_reset",
+                    req,
+                    max_total_draft_tokens=self.max_total_draft_tokens,
+                    use_spec_decode=self.use_spec_decode,
+                    py_disable_speculative_decoding=req.py_disable_speculative_decoding)
                 req.py_last_draft_tokens = req.py_draft_tokens
 
                 if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
@@ -2830,6 +2877,10 @@ class PyExecutor:
                 else:
                     req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0
+                _optrt_kv_debug(
+                    "executor_prepare_draft_request_after_reset",
+                    req,
+                    py_draft_pages_allocated=req.py_draft_pages_allocated)
 
         except Exception as e:
             traceback.print_exc()
@@ -2955,8 +3006,24 @@ class PyExecutor:
 
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
+                    _optrt_kv_debug(
+                        "executor_has_draft_batch_decision",
+                        has_draft_batch=has_draft_batch,
+                        previous_batch_present=self.previous_batch is not None,
+                        use_spec_decode=getattr(self, "use_spec_decode", None),
+                        num_context_requests=scheduled_batch.num_context_requests,
+                        scheduled_request_ids=[
+                            req.py_request_id
+                            for req in scheduled_batch.all_requests()
+                        ])
                     # Reset the draft tokens to avoid preparing resources for the draft model.
                     if self.drafter is not None and self.use_spec_decode and not has_draft_batch:
+                        for request in scheduled_batch.all_requests():
+                            _optrt_kv_debug(
+                                "executor_no_draft_batch_before_disable",
+                                request,
+                                has_draft_batch=has_draft_batch,
+                                model_enable_spec_decode=self.model_engine.enable_spec_decode)
                         self.use_spec_decode = False
                         # We are not running the draft model. Remove the draft tokens and turn off spec
                         # decode so that the requests get handled correctly.
@@ -2967,7 +3034,21 @@ class PyExecutor:
                         self.model_engine.enable_spec_decode = scheduled_batch.num_context_requests > 0
                         if not self.model_engine.enable_spec_decode:
                             for request in scheduled_batch.all_requests():
+                                _optrt_kv_debug(
+                                    "executor_no_draft_batch_clear_py_draft_tokens",
+                                    request,
+                                    has_draft_batch=has_draft_batch)
                                 request.py_draft_tokens = []
+                                _optrt_kv_debug(
+                                    "executor_no_draft_batch_after_clear_py_draft_tokens",
+                                    request,
+                                    has_draft_batch=has_draft_batch)
+                        for request in scheduled_batch.all_requests():
+                            _optrt_kv_debug(
+                                "executor_no_draft_batch_after_disable",
+                                request,
+                                use_spec_decode=self.use_spec_decode,
+                                model_enable_spec_decode=self.model_engine.enable_spec_decode)
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
@@ -3849,11 +3930,14 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
+            draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
@@ -3865,6 +3949,22 @@ class PyExecutor:
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
+            resource_order = [
+                resource_type.value for resource_type in
+                self.resource_manager.resource_managers.keys()
+            ]
+            _optrt_kv_debug(
+                "executor_disagg_gen_init_enter",
+                request_ids=[
+                    req.py_request_id for req in fitting_disagg_gen_init_requests
+                ],
+                count=len(fitting_disagg_gen_init_requests),
+                resource_order=resource_order)
+            for req in fitting_disagg_gen_init_requests:
+                _optrt_kv_debug("executor_disagg_gen_init_request",
+                                req,
+                                phase="before_prepare")
+
             disagg_gen_init_to_prepare = ScheduledRequests()
             disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
 
@@ -3873,31 +3973,75 @@ class PyExecutor:
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
                 if (resource_mgr_type in self.resource_manager.resource_managers
-                        and self.resource_manager.
-                        resource_managers[resource_mgr_type] is not None):
-                    self.resource_manager.resource_managers[
-                        resource_mgr_type].prepare_resources(
-                            disagg_gen_init_to_prepare)
+                        and self.resource_manager.resource_managers[
+                            resource_mgr_type] is not None):
+                    _optrt_kv_debug(
+                        "executor_disagg_gen_init_prepare_resource_start",
+                        resource_type=resource_mgr_type.value)
+                    try:
+                        self.resource_manager.resource_managers[
+                            resource_mgr_type].prepare_resources(
+                                disagg_gen_init_to_prepare)
+                    except IndexError:
+                        _optrt_kv_debug(
+                            "executor_disagg_gen_init_prepare_resource_failed",
+                            resource_type=resource_mgr_type.value)
+                        raise
+                    _optrt_kv_debug(
+                        "executor_disagg_gen_init_prepare_resource_done",
+                        resource_type=resource_mgr_type.value)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
+            for req in fitting_disagg_gen_init_requests:
+                _optrt_kv_debug("executor_disagg_gen_init_request",
+                                req,
+                                phase="before_recv")
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            for req in fitting_disagg_gen_init_requests:
+                _optrt_kv_debug("executor_disagg_gen_init_request",
+                                req,
+                                phase="after_recv")
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        _optrt_kv_debug(
+            "executor_disagg_gen_trans_complete_enter",
+            generation=len(scheduled_batch.generation_requests))
         cache_trans_complete_requests = []
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
+                _optrt_kv_debug("executor_disagg_gen_trans_complete_request",
+                                req,
+                                phase="found_complete")
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests_last_chunk = cache_trans_complete_requests
+            _optrt_kv_debug(
+                "executor_disagg_gen_trans_complete_seq_slot_start",
+                request_ids=[
+                    req.py_request_id for req in cache_trans_complete_requests
+                ])
             self.resource_manager.resource_managers[
                 ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
                     requests)
+            _optrt_kv_debug(
+                "executor_disagg_gen_trans_complete_seq_slot_done",
+                request_ids=[
+                    req.py_request_id for req in cache_trans_complete_requests
+                ])
             self._setup_sampler_step(requests)
+            _optrt_kv_debug(
+                "executor_disagg_gen_trans_complete_sampler_setup_done",
+                request_ids=[
+                    req.py_request_id for req in cache_trans_complete_requests
+                ])
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                _optrt_kv_debug("executor_disagg_gen_trans_complete_promote",
+                                req,
+                                phase="before_state_update")
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 if self.kv_cache_transceiver is not None:
@@ -3908,12 +4052,43 @@ class PyExecutor:
                 req.py_kv_transfer_timed_out = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
+                _optrt_kv_debug(
+                    "executor_disagg_gen_trans_complete_draft_source",
+                    req,
+                    ctx_draft_tokens_is_none=ctx_draft_tokens is None,
+                    ctx_draft_tokens=ctx_draft_tokens,
+                    existing_py_draft_tokens=req.py_draft_tokens,
+                    first_gen_tokens=first_gen_tokens)
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+                _optrt_kv_debug(
+                    "executor_disagg_gen_trans_complete_after_draft_restore",
+                    req,
+                    ctx_draft_tokens_is_none=ctx_draft_tokens is None,
+                    first_gen_tokens=first_gen_tokens)
                 beam_width = req.py_beam_width
+                _optrt_kv_debug("executor_disagg_gen_trans_complete_promote",
+                                req,
+                                phase="after_state_update",
+                                first_gen_tokens=first_gen_tokens,
+                                ctx_draft_tokens=ctx_draft_tokens,
+                                beam_width=beam_width)
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
+                    _optrt_kv_debug(
+                        "executor_disagg_gen_trans_complete_add_first_token",
+                        req,
+                        beam=beam,
+                        first_gen_token=first_gen_tokens[beam])
+                _optrt_kv_debug(
+                    "executor_disagg_gen_trans_complete_after_first_tokens",
+                    req,
+                    beam_width=beam_width,
+                    first_gen_tokens=first_gen_tokens)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+                _optrt_kv_debug("executor_disagg_gen_trans_complete_done",
+                                req,
+                                beam_width=beam_width)
 
     def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
         """Prepend logprobs and generation logits for first_gen_tokens
@@ -3956,32 +4131,60 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+        _optrt_kv_debug(
+            "executor_recv_disagg_gen_cache_enter",
+            request_ids=[req.py_request_id for req in new_gen_reqs],
+            count=len(new_gen_reqs),
+            overlap_disabled=os.getenv(
+                "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"),
+            benchmark_gen_only=os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"))
 
         # For gen-only benchmarking, mark new gen request as transmission complete right away
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             for req in new_gen_reqs:
+                _optrt_kv_debug("executor_recv_disagg_gen_cache_benchmark",
+                                req,
+                                phase="before_mark_complete")
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                _optrt_kv_debug("executor_recv_disagg_gen_cache_benchmark",
+                                req,
+                                phase="after_mark_complete")
             return
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
-                print(
-                    "OPTRT_NIXL_TRANSFER_PROOF "
-                    f"phase=gen_recv_start request_id={req.py_request_id} mode=sync",
-                    flush=True)
+                _optrt_kv_debug("executor_recv_disagg_gen_cache_request",
+                                req,
+                                phase="before_sync_recv")
+                _optrt_nixl_transfer_proof(
+                    f"phase=gen_recv_start request_id={req.py_request_id} mode=sync"
+                )
                 self.kv_cache_transceiver.request_and_receive_sync(req)
+                _optrt_kv_debug("executor_recv_disagg_gen_cache_request",
+                                req,
+                                phase="after_sync_recv")
         else:
             for req in new_gen_reqs:
-                print(
-                    "OPTRT_NIXL_TRANSFER_PROOF "
-                    f"phase=gen_recv_start request_id={req.py_request_id} mode=async",
-                    flush=True)
+                _optrt_kv_debug("executor_recv_disagg_gen_cache_request",
+                                req,
+                                phase="before_async_recv")
+                _optrt_nixl_transfer_proof(
+                    f"phase=gen_recv_start request_id={req.py_request_id} mode=async"
+                )
                 self.kv_cache_transceiver.request_and_receive_async(req)
+                _optrt_kv_debug("executor_recv_disagg_gen_cache_request",
+                                req,
+                                phase="after_async_recv")
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
             for req in new_gen_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
+                    _optrt_kv_debug(
+                        "executor_recv_disagg_gen_cache_timeout_tracking",
+                        req,
+                        timeout_ms=timeout_ms)
 
         non_gen_first_active = [
             req for req in self.active_requests
@@ -3991,7 +4194,16 @@ class PyExecutor:
         block_transfer = bool(non_gen_first_active) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_active)
+        _optrt_kv_debug(
+            "executor_recv_disagg_gen_cache_check_status",
+            non_gen_first_active=[
+                req.py_request_id for req in non_gen_first_active
+            ],
+            block_transfer=block_transfer)
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
+        _optrt_kv_debug(
+            "executor_recv_disagg_gen_cache_after_check_status",
+            request_ids=[req.py_request_id for req in new_gen_reqs])
 
         return
 
@@ -4041,11 +4253,9 @@ class PyExecutor:
                     except Exception as e:
                         logger.warning(
                             f"Unable to count KV transfer blocks for request {req.py_request_id}: {e}")
-                    print(
-                        "OPTRT_NIXL_TRANSFER_PROOF "
+                    _optrt_nixl_transfer_proof(
                         f"phase=context_send_start request_id={req.py_request_id} "
-                        f"cache_blocks={transfer_block_count}",
-                        flush=True)
+                        f"cache_blocks={transfer_block_count}")
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
@@ -4093,15 +4303,11 @@ class PyExecutor:
         for request_id in completed_req_ids:
 
             if request_id in finished_requests:
-                print(
-                    "OPTRT_NIXL_TRANSFER_PROOF "
-                    f"phase=context_send_complete request_id={request_id}",
-                    flush=True)
+                _optrt_nixl_transfer_proof(
+                    f"phase=context_send_complete request_id={request_id}")
             if request_id in error_requests:
-                print(
-                    "OPTRT_NIXL_TRANSFER_PROOF "
-                    f"phase=context_send_error request_id={request_id}",
-                    flush=True)
+                _optrt_nixl_transfer_proof(
+                    f"phase=context_send_error request_id={request_id}")
 
             if request_id not in requests_in_transfer:
                 logger.warning(
@@ -4132,28 +4338,38 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        _optrt_kv_debug("executor_check_gen_transfer_status_enter",
+                        at_least_num=atLeastNum)
         result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        _optrt_kv_debug("executor_check_gen_transfer_status_result",
+                        result_type=type(result).__name__,
+                        result_len=len(result) if isinstance(result, tuple) else
+                        "not_tuple")
         if isinstance(result, tuple):
             finished_gen_reqs = result[0] if len(result) > 0 else []
             error_gen_reqs = result[1] if len(result) > 1 else []
             for req in finished_gen_reqs:
                 req_id = req.py_request_id if hasattr(req, 'py_request_id') else req
-                print(
-                    "OPTRT_NIXL_TRANSFER_PROOF "
-                    f"phase=gen_recv_complete request_id={req_id}",
-                    flush=True)
+                if hasattr(req, 'py_request_id'):
+                    _optrt_kv_debug("executor_check_gen_transfer_finished",
+                                    req)
+                _optrt_nixl_transfer_proof(
+                    f"phase=gen_recv_complete request_id={req_id}")
             for req in error_gen_reqs:
                 req_id = req.py_request_id if hasattr(req, 'py_request_id') else req
-                print(
-                    "OPTRT_NIXL_TRANSFER_PROOF "
-                    f"phase=gen_recv_error request_id={req_id}",
-                    flush=True)
+                if hasattr(req, 'py_request_id'):
+                    _optrt_kv_debug("executor_check_gen_transfer_error", req)
+                _optrt_nixl_transfer_proof(
+                    f"phase=gen_recv_error request_id={req_id}")
             _, _, cancelled_reqs = result
             user_canceled_set = set(self.canceled_req_ids)
             for req in cancelled_reqs:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    _optrt_kv_debug(
+                        "executor_check_gen_transfer_cancelled_to_error",
+                        req)
         self._check_cache_transfer_errors("generation requests")
 
     def _forward_step(
@@ -4842,18 +5058,52 @@ class PyExecutor:
                              scheduled_requests=scheduled_batch):
             target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
             assert target_outputs is not None, "target_outputs should not be None"
+            for request in scheduled_batch.all_requests():
+                _optrt_kv_debug(
+                    "executor_spec_decode_before_accept",
+                    request,
+                    previous_tensors_present=previous_tensors is not None,
+                    target_inputs_next_draft_tokens_shape=getattr(
+                        getattr(target_inputs, "next_draft_tokens", None),
+                        "shape", None))
             new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
                 scheduled_batch=scheduled_batch,
                 target_inputs=target_inputs,
                 target_outputs=target_outputs)
+            for request in scheduled_batch.all_requests():
+                _optrt_kv_debug(
+                    "executor_spec_decode_after_accept",
+                    request,
+                    new_target_inputs_present=new_target_inputs is not None,
+                    num_accepted_tokens_device_shape=getattr(
+                        num_accepted_tokens_device, "shape", None),
+                    new_target_inputs_next_draft_tokens_shape=getattr(
+                        getattr(new_target_inputs, "next_draft_tokens", None),
+                        "shape", None))
 
+            for request in scheduled_batch.all_requests():
+                _optrt_kv_debug(
+                    "executor_spec_decode_before_generate_overlap",
+                    request,
+                    previous_tensors_device=previous_tensors.device
+                    if previous_tensors else None)
             self.drafter.generate_draft_tokens_with_overlap(
                 scheduled_batch, self.resource_manager,
                 previous_tensors.device if previous_tensors else None,
                 new_target_inputs, num_accepted_tokens_device)
+            for request in scheduled_batch.all_requests():
+                _optrt_kv_debug(
+                    "executor_spec_decode_after_generate_overlap",
+                    request,
+                    new_target_inputs_next_draft_tokens_shape=getattr(
+                        getattr(new_target_inputs, "next_draft_tokens", None),
+                        "shape", None))
 
             # Pad draft tokens to the max draft length for CUDA graph compatibility
             self.has_previous_draft_tokens = new_target_inputs is not None and new_target_inputs.next_draft_tokens is not None
+            _optrt_kv_debug(
+                "executor_spec_decode_previous_draft_flag",
+                has_previous_draft_tokens=self.has_previous_draft_tokens)
 
         return new_target_inputs, num_accepted_tokens_device
 

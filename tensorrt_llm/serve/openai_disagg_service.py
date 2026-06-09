@@ -50,6 +50,80 @@ _STREAM_CLOSE_DRAIN_GRACE_S = float(
     os.getenv("TRTLLM_DISAGG_STREAM_CLOSE_DRAIN_GRACE_S", "30"))
 
 
+def _optrt_service_debug_format(value: object) -> str:
+    if value is None:
+        return "None"
+    if hasattr(value, "name"):
+        return str(getattr(value, "name"))
+    if isinstance(value, (bool, int, float, str)):
+        return str(value).replace(" ", "_").replace("\n", "\\n")
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+        if len(values) <= 8 and all(
+                item is None or isinstance(item, (bool, int, float, str))
+                for item in values):
+            return str(values).replace(" ", "_")
+        return f"len:{len(values)}"
+    if isinstance(value, dict):
+        return f"keys:{','.join(str(key) for key in value.keys())}"
+    return str(value).replace(" ", "_").replace("\n", "\\n")
+
+
+def _optrt_service_debug_len(value: object) -> str:
+    if value is None:
+        return "None"
+    try:
+        return str(len(value))  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+
+
+def _optrt_service_debug_head(value: object, limit: int = 8) -> str:
+    if value is None:
+        return "None"
+    try:
+        values = list(value)[:limit]  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+    return _optrt_service_debug_format(values)
+
+
+def _optrt_disagg_params_fields(prefix: str,
+                                params: Optional[DisaggregatedParams]) -> list[str]:
+    if params is None:
+        return [f"{prefix}=None"]
+    fields = []
+    for attr in ("request_type", "ctx_request_id", "disagg_request_id",
+                 "ctx_dp_rank", "ctx_info_endpoint", "schedule_style",
+                 "first_gen_tokens", "draft_tokens"):
+        fields.append("%s_%s=%s" %
+                      (prefix, attr,
+                       _optrt_service_debug_format(getattr(params, attr, None))))
+    fields.extend([
+        "%s_first_gen_tokens_len=%s" %
+        (prefix, _optrt_service_debug_len(params.first_gen_tokens)),
+        "%s_first_gen_tokens_head=%s" %
+        (prefix, _optrt_service_debug_head(params.first_gen_tokens)),
+        "%s_draft_tokens_len=%s" %
+        (prefix, _optrt_service_debug_len(params.draft_tokens)),
+        "%s_draft_tokens_head=%s" %
+        (prefix, _optrt_service_debug_head(params.draft_tokens)),
+    ])
+    return fields
+
+
+def _optrt_disagg_service_debug(event: str, **fields: object) -> None:
+    if os.environ.get("TRTLLM_OPTRT_DISAGG_SERVICE_DEBUG", "0") != "1":
+        return
+    parts = ["OPTRT_DISAGG_SERVICE_DEBUG", f"event={event}"]
+    for key, value in fields.items():
+        if isinstance(value, DisaggregatedParams):
+            parts.extend(_optrt_disagg_params_fields(key, value))
+        else:
+            parts.append(f"{key}={_optrt_service_debug_format(value)}")
+    print(" ".join(parts), flush=True)
+
+
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
@@ -309,6 +383,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 "stream_options": None,
             }
         )
+        _optrt_disagg_service_debug(
+            "get_ctx_request",
+            disagg_request_id=disagg_request_id,
+            request_stream=request.stream,
+            ctx_stream=ctx_request.stream,
+            ctx_disaggregated_params=ctx_request.disaggregated_params)
         return ctx_request
 
     def _get_gen_request(
@@ -361,9 +441,21 @@ class OpenAIDisaggregatedService(OpenAIService):
                     )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
+        _optrt_disagg_service_debug(
+            "get_gen_request_before_validate",
+            disagg_request_id=disagg_request_id,
+            ctx_response_present=ctx_response is not None,
+            ctx_server_info_present=ctx_server_info is not None,
+            gen_disaggregated_params=request.disaggregated_params)
         if ctx_response is not None or ctx_server_info is not None:
             self._validate_request_pinning_params(request.disaggregated_params,
                                                  disagg_request_id)
+        _optrt_disagg_service_debug(
+            "get_gen_request_done",
+            disagg_request_id=disagg_request_id,
+            ctx_response_present=ctx_response is not None,
+            ctx_server_info_present=ctx_server_info is not None,
+            gen_disaggregated_params=request.disaggregated_params)
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
@@ -394,6 +486,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 draft_tokens=None,
             )
             request.ignore_eos = True
+            _optrt_disagg_service_debug(
+                "check_gen_only_disagg_benchmark",
+                gen_disaggregated_params=request.disaggregated_params)
             return True
         return False
 

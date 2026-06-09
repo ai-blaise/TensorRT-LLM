@@ -78,6 +78,183 @@ BlocksPerWindow = Dict[int, Tuple[
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
 
 
+def _optrt_debug_is_scalar(value: object) -> bool:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    return hasattr(value, "name")
+
+
+def _optrt_debug_is_small_value(value: object) -> bool:
+    if _optrt_debug_is_scalar(value):
+        return True
+    if isinstance(value, tuple):
+        return all(_optrt_debug_is_small_value(item) for item in value)
+    return False
+
+
+def _optrt_debug_format(value: object) -> str:
+    if value is None:
+        return "None"
+    if hasattr(value, "name"):
+        return str(getattr(value, "name"))
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+        if len(values) <= 8 and all(
+                _optrt_debug_is_small_value(item) for item in values):
+            return str(value).replace(" ", "_")
+        return f"len:{len(value)}"
+    if isinstance(value, dict):
+        return f"keys:{','.join(str(key) for key in value.keys())}"
+    return str(value).replace(" ", "_").replace("\n", "\\n")
+
+
+def _optrt_debug_len(value: object) -> str:
+    if value is None:
+        return "None"
+    try:
+        return str(len(value))  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+
+
+def _optrt_debug_head(value: object, limit: int = 8) -> str:
+    if value is None:
+        return "None"
+    try:
+        values = list(value)[:limit]  # type: ignore[arg-type]
+    except TypeError:
+        return "n/a"
+    return _optrt_debug_format(values)
+
+
+def _optrt_debug_shape(value: object) -> str:
+    if value is None:
+        return "None"
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return "n/a"
+    return _optrt_debug_format(tuple(shape))
+
+
+def _optrt_debug_attr(request: LlmRequest, attr: str) -> str:
+    try:
+        return _optrt_debug_format(getattr(request, attr))
+    except AttributeError:
+        return "missing"
+    except RuntimeError as exc:
+        return f"error:{type(exc).__name__}:{exc}"
+
+
+def _optrt_request_debug_fields(request: LlmRequest) -> List[str]:
+    attrs = (
+        "request_id",
+        "py_request_id",
+        "state",
+        "seq_slot",
+        "py_seq_slot",
+        "prompt_len",
+        "py_prompt_len",
+        "orig_prompt_len",
+        "context_current_position",
+        "context_remaining_length",
+        "max_new_tokens",
+        "py_beam_width",
+        "ctx_iters",
+        "py_decoding_iter",
+        "decoding_iter",
+        "is_first_context_chunk",
+        "is_context_init_state",
+        "is_disagg_generation_init_state",
+        "is_disagg_generation_transmission_in_progress",
+        "is_disagg_generation_transmission_complete",
+        "py_num_accepted_draft_tokens",
+        "py_rewind_len",
+        "py_kv_transfer_start_time",
+        "py_kv_transfer_timed_out",
+    )
+    fields = [f"{attr}={_optrt_debug_attr(request, attr)}" for attr in attrs]
+    try:
+        fields.append(
+            f"draft_token_length={_optrt_debug_format(get_draft_token_length(request))}"
+        )
+    except RuntimeError as exc:
+        fields.append(f"draft_token_length=error:{type(exc).__name__}:{exc}")
+
+    draft_tokens = getattr(request, "py_draft_tokens", None)
+    if draft_tokens is not None:
+        fields.append(f"py_draft_tokens={_optrt_debug_format(draft_tokens)}")
+        fields.append(f"py_draft_tokens_len={_optrt_debug_len(draft_tokens)}")
+        fields.append(f"py_draft_tokens_head={_optrt_debug_head(draft_tokens)}")
+
+    last_draft_tokens = getattr(request, "py_last_draft_tokens", None)
+    if last_draft_tokens is not None:
+        fields.append(
+            f"py_last_draft_tokens={_optrt_debug_format(last_draft_tokens)}")
+        fields.append(
+            f"py_last_draft_tokens_len={_optrt_debug_len(last_draft_tokens)}")
+        fields.append(
+            f"py_last_draft_tokens_head={_optrt_debug_head(last_draft_tokens)}")
+
+    smc_log_probs = getattr(request, "py_smc_draft_token_log_probs", None)
+    if smc_log_probs is not None:
+        fields.append(
+            f"py_smc_draft_token_log_probs_shape={_optrt_debug_shape(smc_log_probs)}"
+        )
+
+    target_probs = getattr(request, "py_target_probs", None)
+    if target_probs is not None:
+        fields.append(f"py_target_probs_shape={_optrt_debug_shape(target_probs)}")
+
+    context_phase_params = getattr(request, "context_phase_params", None)
+    if context_phase_params is not None:
+        for attr in ("req_id", "first_gen_tokens", "draft_tokens",
+                     "ctx_dp_rank", "disagg_info_endpoint"):
+            fields.append("context_phase_%s=%s" %
+                          (attr,
+                           _optrt_debug_format(
+                               getattr(context_phase_params, attr, None))))
+        fields.append("context_phase_draft_tokens_len=%s" % _optrt_debug_len(
+            getattr(context_phase_params, "draft_tokens", None)))
+        fields.append("context_phase_draft_tokens_head=%s" % _optrt_debug_head(
+            getattr(context_phase_params, "draft_tokens", None)))
+        fields.append("context_phase_first_gen_tokens_head=%s" %
+                      _optrt_debug_head(
+                          getattr(context_phase_params, "first_gen_tokens",
+                                  None)))
+
+    disagg_params = getattr(request, "py_disaggregated_params", None)
+    if disagg_params is not None:
+        for attr in ("request_type", "ctx_request_id", "disagg_request_id",
+                     "ctx_dp_rank", "ctx_info_endpoint", "schedule_style",
+                     "first_gen_tokens", "draft_tokens"):
+            fields.append("disagg_%s=%s" %
+                          (attr,
+                           _optrt_debug_format(
+                               getattr(disagg_params, attr, None))))
+        fields.append("disagg_draft_tokens_len=%s" % _optrt_debug_len(
+            getattr(disagg_params, "draft_tokens", None)))
+        fields.append("disagg_draft_tokens_head=%s" % _optrt_debug_head(
+            getattr(disagg_params, "draft_tokens", None)))
+        fields.append("disagg_first_gen_tokens_head=%s" % _optrt_debug_head(
+            getattr(disagg_params, "first_gen_tokens", None)))
+
+    return fields
+
+
+def _optrt_kv_debug(event: str,
+                    request: Optional[LlmRequest] = None,
+                    **fields: object) -> None:
+    if os.environ.get("TRTLLM_OPTRT_KV_DEBUG", "0") != "1":
+        return
+    parts = ["OPTRT_KV_DEBUG", f"event={event}"]
+    if request is not None:
+        parts.extend(_optrt_request_debug_fields(request))
+    parts.extend(
+        f"{key}={_optrt_debug_format(value)}"
+        for key, value in fields.items())
+    print(" ".join(parts), flush=True)
+
+
 @dataclass
 class PoolConfiguration:
     """Configuration of a single KV pool.
@@ -928,6 +1105,18 @@ class KVCacheManager(BaseResourceManager):
             device='cpu')
         self.blocks_per_window = blocks_per_window
 
+    def _debug_role(self) -> str:
+        return "draft" if self.is_draft else "target"
+
+    def _debug_token_count(self, request: LlmRequest) -> str:
+        try:
+            return _optrt_debug_format(
+                self.impl.get_token_count(request.py_request_id))
+        except IndexError as exc:
+            return f"missing:{type(exc).__name__}:{exc}"
+        except RuntimeError as exc:
+            return f"error:{type(exc).__name__}:{exc}"
+
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
         """Probe the KV cache radix tree for prefix match length.
 
@@ -985,8 +1174,26 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
+            _optrt_kv_debug(
+                "kv_prepare_enter",
+                manager=self._debug_role(),
+                rank=self.mapping.rank,
+                tp_rank=self.mapping.tp_rank,
+                tp_size=self.mapping.tp_size,
+                cp_rank=self.mapping.cp_rank,
+                cp_size=self.mapping.cp_size,
+                pp_rank=self.mapping.pp_rank,
+                pp_size=self.mapping.pp_size,
+                context_chunking=len(
+                    scheduled_batch.context_requests_chunking),
+                context_last=len(scheduled_batch.context_requests_last_chunk),
+                generation=len(scheduled_batch.generation_requests),
+                resource_manager=type(self).__name__)
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
+            _optrt_kv_debug(
+                "kv_prepare_after_sync_transfer",
+                manager=self._debug_role())
 
             # Collect first-chunk requests eligible for add_sequence_batch.
             # When block reuse is enabled, addSequenceBatch uses a two-phase
@@ -1014,29 +1221,91 @@ class KVCacheManager(BaseResourceManager):
                         batch_llm_requests.append(req)
                         batch_ctx_requests.append(req)
                 else:
-                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
-                            req):
+                    should_add_sequence = (
+                        self._should_add_sequence_for_context_prepare(req))
+                    if should_add_sequence:
+                        _optrt_kv_debug(
+                            "kv_context_queue_add_sequence",
+                            req,
+                            manager=self._debug_role(),
+                            token_count_before=self._debug_token_count(req))
                         # Batch path: two-phase claim-then-onboard
                         batch_request_infos.append(
                             (req.py_request_id, req.prompt_len, req_beam_width))
                         batch_llm_requests.append(req)
                         batch_ctx_requests.append(req)
+                    else:
+                        _optrt_kv_debug(
+                            "kv_context_skip_add_sequence",
+                            req,
+                            manager=self._debug_role(),
+                            token_count_before=self._debug_token_count(req))
 
             if batch_request_infos:
-                self.impl.add_sequence_batch(batch_request_infos,
-                                             batch_llm_requests)
+                _optrt_kv_debug(
+                    "kv_add_sequence_batch_start",
+                    manager=self._debug_role(),
+                    request_infos=batch_request_infos)
+                try:
+                    self.impl.add_sequence_batch(batch_request_infos,
+                                                 batch_llm_requests)
+                except IndexError:
+                    _optrt_kv_debug(
+                        "kv_add_sequence_batch_failed",
+                        manager=self._debug_role(),
+                        request_infos=batch_request_infos)
+                    raise
+                _optrt_kv_debug(
+                    "kv_add_sequence_batch_done",
+                    manager=self._debug_role(),
+                    request_infos=batch_request_infos)
                 for req in batch_ctx_requests:
+                    _optrt_kv_debug(
+                        "kv_context_after_add_sequence",
+                        req,
+                        manager=self._debug_role(),
+                        token_count_after=self._debug_token_count(req),
+                        num_extra_kv_tokens=self.num_extra_kv_tokens,
+                        draft_token_length=get_draft_token_length(req))
                     for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
+                        try:
+                            self.impl.add_token(req.py_request_id)
+                        except IndexError:
+                            _optrt_kv_debug(
+                                "kv_context_extra_add_token_failed",
+                                req,
+                                manager=self._debug_role(),
+                                token_count_before=self._debug_token_count(req))
+                            raise
                     for _ in range(get_draft_token_length(req)):
-                        self.impl.add_token(req.py_request_id)
+                        try:
+                            self.impl.add_token(req.py_request_id)
+                        except IndexError:
+                            _optrt_kv_debug(
+                                "kv_context_draft_add_token_failed",
+                                req,
+                                manager=self._debug_role(),
+                                token_count_before=self._debug_token_count(req))
+                            raise
 
                     if self.kv_connector_manager is not None:
                         block_ids = self.get_cache_indices(req)
+                        _optrt_kv_debug(
+                            "kv_context_update_connector_after_alloc",
+                            req,
+                            manager=self._debug_role(),
+                            block_ids=block_ids,
+                            token_count_after=self._debug_token_count(req))
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
             for req in scheduled_batch.generation_requests:
+                _optrt_kv_debug(
+                    "kv_generation_prepare_request",
+                    req,
+                    manager=self._debug_role(),
+                    token_count_before=self._debug_token_count(req),
+                    kv_reserve_draft_tokens=self._kv_reserve_draft_tokens)
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -
@@ -1047,21 +1316,68 @@ class KVCacheManager(BaseResourceManager):
                     else:
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
+                        _optrt_kv_debug(
+                            "kv_generation_skip_inactive_helix_rank",
+                            req,
+                            manager=self._debug_role(),
+                            decode_block_id=decode_block_id)
                         continue
                 draft_len = get_draft_token_length(req)
-                self.impl.add_token(req.py_request_id)
-                for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
+                try:
                     self.impl.add_token(req.py_request_id)
+                except IndexError:
+                    _optrt_kv_debug(
+                        "kv_generation_add_token_failed",
+                        req,
+                        manager=self._debug_role(),
+                        draft_len=draft_len,
+                        token_count_before=self._debug_token_count(req))
+                    raise
+                _optrt_kv_debug(
+                    "kv_generation_add_token_done",
+                    req,
+                    manager=self._debug_role(),
+                    draft_len=draft_len,
+                    token_count_after=self._debug_token_count(req))
+                for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
+                    try:
+                        self.impl.add_token(req.py_request_id)
+                    except IndexError:
+                        _optrt_kv_debug(
+                            "kv_generation_reserve_add_token_failed",
+                            req,
+                            manager=self._debug_role(),
+                            draft_len=draft_len,
+                            token_count_before=self._debug_token_count(req))
+                        raise
+                _optrt_kv_debug(
+                    "kv_generation_reserve_done",
+                    req,
+                    manager=self._debug_role(),
+                    draft_len=draft_len,
+                    token_count_after=self._debug_token_count(req))
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
+            _optrt_kv_debug(
+                "kv_prepare_after_refresh_blocks",
+                manager=self._debug_role())
 
         # A request may change from `context_requests_chunking` to
         # `context_requests_last_chunk` in `add_sequence` due to KV cache
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
+        _optrt_kv_debug(
+            "kv_prepare_after_reset_context",
+            manager=self._debug_role(),
+            context_chunking=len(scheduled_batch.context_requests_chunking),
+            context_last=len(scheduled_batch.context_requests_last_chunk),
+            generation=len(scheduled_batch.generation_requests))
 
         if self.kv_connector_manager is not None:
+            _optrt_kv_debug(
+                "kv_prepare_build_scheduler_output",
+                manager=self._debug_role())
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
@@ -1071,6 +1387,20 @@ class KVCacheManager(BaseResourceManager):
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
             request)
+
+    def _should_add_sequence_for_context_prepare(self,
+                                                 request: LlmRequest) -> bool:
+        connector_should_add = self._kv_connector_should_add_sequence(request)
+        add_sequence = (connector_should_add
+                        and (request.is_first_context_chunk
+                             or request.is_disagg_generation_init_state))
+        _optrt_kv_debug(
+            "kv_context_add_sequence_decision",
+            request,
+            manager=self._debug_role(),
+            connector_should_add=connector_should_add,
+            add_sequence=add_sequence)
+        return add_sequence
 
     def add_dummy_requests(
         self,
@@ -3801,9 +4131,34 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        for _, resource_manager in self.resource_managers.items():
+        resource_order = [
+            resource_type.value
+            for resource_type in self.resource_managers.keys()
+        ]
+        _optrt_kv_debug(
+            "resource_manager_prepare_enter",
+            order=resource_order,
+            context_chunking=len(scheduled_batch.context_requests_chunking),
+            context_last=len(scheduled_batch.context_requests_last_chunk),
+            generation=len(scheduled_batch.generation_requests))
+        for resource_type, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
-                resource_manager.prepare_resources(scheduled_batch)
+                _optrt_kv_debug(
+                    "resource_manager_prepare_call_start",
+                    resource_type=resource_type.value,
+                    manager_type=type(resource_manager).__name__)
+                try:
+                    resource_manager.prepare_resources(scheduled_batch)
+                except IndexError:
+                    _optrt_kv_debug(
+                        "resource_manager_prepare_call_failed",
+                        resource_type=resource_type.value,
+                        manager_type=type(resource_manager).__name__)
+                    raise
+                _optrt_kv_debug(
+                    "resource_manager_prepare_call_done",
+                    resource_type=resource_type.value,
+                    manager_type=type(resource_manager).__name__)
 
     @nvtx_range("update_resources")
     def update_resources(

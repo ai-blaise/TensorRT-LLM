@@ -50,6 +50,20 @@ def _smc_probe_check_cuda_range(name: str, tensor: torch.Tensor, low: int,
             f"min={min_value}, max={max_value}, shape={tuple(tensor.shape)}")
 
 
+def _mark_attn_metadata_generation_only(
+        attn_metadata: AttentionMetadata) -> None:
+    old_num_contexts = attn_metadata.num_contexts
+    attn_metadata.host_request_types[:old_num_contexts].fill_(1)
+    attn_metadata.num_contexts = 0
+
+    if (hasattr(attn_metadata, "num_context_blocks")
+            and hasattr(attn_metadata, "num_generation_blocks")):
+        total_blocks = (attn_metadata.num_context_blocks +
+                        attn_metadata.num_generation_blocks)
+        attn_metadata.num_context_blocks = 0
+        attn_metadata.num_generation_blocks = total_blocks
+
+
 class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
 
     @abstractmethod
@@ -809,9 +823,9 @@ class SMCStaticParticleDraftingLoopWrapper(StaticTreeDraftingLoopWrapper):
                                                    1)
         attn_metadata._seq_lens_cuda[:batch_size].fill_(
             self.max_total_draft_tokens + 1)
-        attn_metadata.on_update()
-        attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
-        attn_metadata.num_contexts = 0
+        # Recompute backend-specific decode page-table state with all active
+        # SMC replay requests classified as generation.
+        _mark_attn_metadata_generation_only(attn_metadata)
         attn_metadata.use_spec_decoding = True
         if attn_metadata.spec_decoding_position_offsets is None:
             attn_metadata.spec_decoding_position_offsets = torch.empty(

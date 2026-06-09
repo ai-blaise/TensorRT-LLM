@@ -9,6 +9,9 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _CachingRequestGrouper,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.speculative.drafting_loops import (
+    _mark_attn_metadata_generation_only,
+)
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.smc import (
     build_smc_particle_choices,
@@ -200,6 +203,44 @@ def test_smc_overlap_pack_does_not_require_generic_draft_logits():
     assert "draft_logits" not in packed
 
 
+def test_smc_direct_static_draft_commit_packs_evented_host_tokens():
+    drafter = object.__new__(SMCModelDrafter)
+    drafter.draft_model_engine = object()
+    drafter.use_static_draft_loop = True
+    draft_request = SimpleNamespace(py_request_id=7)
+    draft_batch = SimpleNamespace(all_requests=lambda: [draft_request])
+    outputs = {
+        "new_draft_tokens": torch.tensor([[99]], dtype=torch.int64),
+        "draft_token_log_probs": torch.tensor([[-0.1]]),
+    }
+    sample_state = SimpleNamespace(
+        host=SimpleNamespace(new_tokens=torch.tensor([[11]], dtype=torch.int64)),
+        sampler_event=SimpleNamespace(synchronize=lambda: None),
+    )
+    captured = {}
+    freed = []
+
+    drafter._setup_draft_batch_and_resources = lambda _batch: draft_batch
+    drafter.update_cur_draft_layer_idx = lambda *_args, **_kwargs: None
+    drafter.forward_draft_model = lambda *_args, **_kwargs: outputs
+    drafter._create_static_draft_sample_state = (
+        lambda actual_outputs, actual_batch: sample_state)
+    drafter.process_static_draft_outputs = (
+        lambda actual_outputs, actual_batch: captured.update(
+            outputs=actual_outputs, draft_batch=actual_batch))
+    drafter.draft_seq_slot_manager = SimpleNamespace(
+        free_resources=lambda req: freed.append(req))
+
+    drafter.prepare_draft_tokens(SimpleNamespace(), object())
+
+    assert captured["draft_batch"] is draft_batch
+    assert captured["outputs"]["sample_state"] is sample_state
+    assert captured["outputs"]["draft_token_log_probs"] is outputs[
+        "draft_token_log_probs"]
+    assert "draft_logits" not in captured["outputs"]
+    assert freed == [draft_request]
+
+
 def test_smc_overlap_static_draft_commit_skips_prefill_context():
     drafter = object.__new__(SMCModelDrafter)
     drafter.max_total_draft_tokens = 1
@@ -225,6 +266,44 @@ def test_smc_overlap_static_draft_commit_skips_prefill_context():
     drafter.process_static_draft_outputs(outputs, draft_batch)
 
     assert target_request.py_draft_tokens == ["unchanged"]
+
+
+def test_smc_generation_only_metadata_moves_context_blocks_to_decode():
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        host_request_types=torch.zeros(1, dtype=torch.int32),
+        num_context_blocks=32,
+        num_generation_blocks=0,
+    )
+
+    _mark_attn_metadata_generation_only(metadata)
+
+    assert metadata.num_contexts == 0
+    assert metadata.host_request_types.tolist() == [1]
+    assert metadata.num_context_blocks == 0
+    assert metadata.num_generation_blocks == 32
+
+
+def test_smc_model_drafter_skips_attention_dp_dummy_padding():
+    drafter = object.__new__(SMCModelDrafter)
+    dummy_request = SimpleNamespace(
+        py_request_id=0,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_disable_speculative_decoding=False,
+        is_attention_dp_dummy=True,
+        py_last_draft_tokens=[1] * 24,
+        py_draft_pages_allocated=24,
+    )
+    scheduled_batch = SimpleNamespace(all_requests=lambda: [dummy_request])
+
+    def fail_if_called(_request):
+        raise AssertionError("attention-DP dummy entered draft request setup")
+
+    drafter._create_draft_request_for_request = fail_if_called
+
+    draft_batch = drafter._prepare_draft_batch(scheduled_batch)
+
+    assert draft_batch.batch_size == 0
 
 
 def test_smc_overlap_static_draft_commit_skips_aborted_or_zombie_request():

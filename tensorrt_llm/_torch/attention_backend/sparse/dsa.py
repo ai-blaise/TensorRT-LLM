@@ -4454,15 +4454,17 @@ class DSACacheManager(KVCacheManager):
                 "global_layers=%d, kv_heads_per_layer=%d",
                 len(local_attention_heads), transfer_layers,
                 local_attention_heads[0])
-            print(
-                "OPTRT_DSA_LAYERSPLIT_DEBUG "
-                f"cp_rank={self.layersplit_state.cp_rank} "
-                f"cp_size={self.layersplit_state.cp_size} "
-                f"local_attention_layers={len(local_attention_heads)} "
-                f"global_layers={transfer_layers} "
-                f"local_pool_layers={len(getattr(self, 'num_kv_heads_per_layer', []))} "
-                f"layer_offsets={list(getattr(self, 'layer_offsets', {}).keys())[:8]}...",
-                flush=True)
+            if os.environ.get("TRTLLM_OPTRT_DSA_LAYERSPLIT_DEBUG",
+                              "0") == "1":
+                print(
+                    "OPTRT_DSA_LAYERSPLIT_DEBUG "
+                    f"cp_rank={self.layersplit_state.cp_rank} "
+                    f"cp_size={self.layersplit_state.cp_size} "
+                    f"local_attention_layers={len(local_attention_heads)} "
+                    f"global_layers={transfer_layers} "
+                    f"local_pool_layers={len(getattr(self, 'num_kv_heads_per_layer', []))} "
+                    f"layer_offsets={list(getattr(self, 'layer_offsets', {}).keys())[:8]}...",
+                    flush=True)
         self.num_blocks = self.blocks_in_primary_pool
 
         # KVarN dense-MLA-latent side-pool (parallels the indexer-K pool):

@@ -270,6 +270,92 @@ class ModelDrafter(Drafter):
         else:
             draft_batch.append_context_request(draft_request)
 
+    @staticmethod
+    def _draft_batch_phase(draft_batch: ScheduledRequests) -> int:
+        if draft_batch.num_context_requests > 0:
+            return 2
+        if draft_batch.num_generation_requests > 0:
+            return 1
+        return 0
+
+    def _gather_attention_dp_draft_batch_shape(
+            self, draft_batch: ScheduledRequests) -> tuple[int, int]:
+        """Return the TP-wide draft phase and context token count."""
+        phase = self._draft_batch_phase(draft_batch)
+        context_tokens = sum(
+            request.context_chunk_size
+            for request in draft_batch.context_requests)
+
+        if not getattr(self.draft_model_engine, "enable_attention_dp", False):
+            return phase, context_tokens
+
+        mapping = getattr(self.draft_model_engine, "mapping", None)
+        if mapping is None or getattr(mapping, "tp_size", 1) <= 1:
+            return phase, context_tokens
+
+        dist = getattr(self.draft_model_engine, "dist", None)
+        if dist is None:
+            return phase, context_tokens
+
+        gathered = dist.tp_allgather([phase, context_tokens])
+        global_phase = max(int(item[0]) for item in gathered)
+        global_context_tokens = max(int(item[1]) for item in gathered)
+        return global_phase, global_context_tokens
+
+    @staticmethod
+    def _attention_dp_dummy_request(
+            scheduled_requests: ScheduledRequests) -> Optional[LlmRequest]:
+        for request in scheduled_requests.all_requests():
+            if getattr(request, "is_attention_dp_dummy", False):
+                return request
+        return None
+
+    def _create_attention_dp_dummy_draft_request(
+            self, request: LlmRequest, phase: int,
+            context_tokens: int) -> LlmRequest:
+        if phase == 2:
+            input_tokens = [1] * max(context_tokens, 1)
+        else:
+            input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
+                                                  request,
+                                                  self.disable_overlap_scheduler)
+            if len(input_tokens) == 0:
+                input_tokens = [1]
+
+        draft_request = self._create_draft_request(request, input_tokens)
+        draft_request.is_attention_dp_dummy = True
+        draft_request.is_dummy_request = True
+        draft_request.py_disable_speculative_decoding = (
+            request.py_disable_speculative_decoding)
+        draft_request.py_draft_tokens = []
+        draft_request.py_last_draft_tokens = []
+
+        if phase == 1:
+            draft_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        else:
+            draft_request.state = LlmRequestState.CONTEXT_INIT
+            draft_request.context_current_position = 0
+            draft_request.context_chunk_size = len(input_tokens)
+
+        return draft_request
+
+    def _pad_attention_dp_draft_batch(
+            self, draft_batch: ScheduledRequests,
+            scheduled_requests: ScheduledRequests) -> ScheduledRequests:
+        global_phase, context_tokens = (
+            self._gather_attention_dp_draft_batch_shape(draft_batch))
+        if draft_batch.batch_size > 0 or global_phase == 0:
+            return draft_batch
+
+        dummy_source = self._attention_dp_dummy_request(scheduled_requests)
+        if dummy_source is None:
+            return draft_batch
+
+        draft_request = self._create_attention_dp_dummy_draft_request(
+            dummy_source, global_phase, context_tokens)
+        self._add_to_draft_batch(draft_batch, draft_request, dummy_source)
+        return draft_batch
+
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(
             self, scheduled_requests: ScheduledRequests) -> ScheduledRequests:
@@ -323,6 +409,11 @@ class ModelDrafter(Drafter):
                     # Skip generation complete requests. This could happen when enabling overlap scheduler.
                     continue
 
+                if getattr(request, "is_attention_dp_dummy", False):
+                    # Empty attention-DP ranks add a draft-side dummy after
+                    # gathering the TP-wide draft phase below.
+                    continue
+
                 if request.py_draft_pages_allocated == 0:
                     # No space for draft tokens
                     continue
@@ -342,7 +433,8 @@ class ModelDrafter(Drafter):
                     self._add_to_draft_batch(draft_batch, draft_request,
                                              request)
 
-            return draft_batch
+            return self._pad_attention_dp_draft_batch(draft_batch,
+                                                      scheduled_requests)
 
         except Exception as e:
             logger.error(f"Error in _prepare_draft_batch: {str(e)}")
@@ -797,6 +889,25 @@ class ModelDrafter(Drafter):
     ) -> Any:
         return (outputs["draft_logits"], sample_state)
 
+    def _create_static_draft_sample_state(
+            self, outputs: dict[str, torch.Tensor],
+            draft_batch: ScheduledRequests) -> SampleState:
+        new_tokens = outputs["new_draft_tokens"]
+        new_tokens_host = torch.empty_like(
+            new_tokens,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        new_tokens_host.copy_(new_tokens, non_blocking=True)
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
+
+        return SampleState(requests=draft_batch.all_requests(),
+                           device=SampleStateTensors(new_tokens=new_tokens),
+                           host=SampleStateTensors(
+                               new_tokens=new_tokens_host),
+                           sampler_event=sampler_event)
+
     def cleanup_previous_draft_resources(self) -> None:
         if self.previous_draft_batch is None:
             return
@@ -926,22 +1037,8 @@ class ModelDrafter(Drafter):
                 draft_length=self.max_draft_len,
                 draft_batch=draft_batch)
 
-            new_tokens_host = torch.empty_like(
-                outputs["new_draft_tokens"],
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-            new_tokens_host.copy_(outputs["new_draft_tokens"],
-                                  non_blocking=True)
-            sampler_event = torch.cuda.Event()
-            sampler_event.record()
-
-            sample_state = SampleState(
-                requests=draft_batch.all_requests(),
-                device=SampleStateTensors(
-                    new_tokens=outputs["new_draft_tokens"]),
-                host=SampleStateTensors(new_tokens=new_tokens_host),
-                sampler_event=sampler_event)
+            sample_state = self._create_static_draft_sample_state(
+                outputs, draft_batch)
 
             # Store current batch for processing in next iteration
             self.previous_draft_batch = draft_batch
@@ -1024,7 +1121,11 @@ class ModelDrafter(Drafter):
                                                is_first_draft_token=True)
 
             if self.use_static_draft_loop:
-                self.process_static_draft_outputs(outputs, draft_batch)
+                sample_state = self._create_static_draft_sample_state(
+                    outputs, draft_batch)
+                self.process_static_draft_outputs(
+                    self._pack_static_draft_outputs_for_overlap(
+                        outputs, sample_state), draft_batch)
                 # Clean up draft_seq_slot_manager resources
                 for req in draft_batch.all_requests():
                     self.draft_seq_slot_manager.free_resources(req)

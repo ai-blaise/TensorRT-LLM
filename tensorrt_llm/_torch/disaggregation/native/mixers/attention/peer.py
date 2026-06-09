@@ -8,6 +8,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import PoolRole
 from tensorrt_llm._utils import nvtx_range
 
@@ -335,18 +336,50 @@ class AttentionPolicy:
             local != peer, f"{field} mismatch", field=field, local=local, peer=peer
         )
 
+    @staticmethod
+    def _attention_global_layer_ids(ri: RankInfo) -> set[int]:
+        page_table = ri.page_table
+        if page_table is None:
+            return set()
+        global_layer_ids = set()
+        for layer_group in page_table.layer_groups:
+            if isinstance(layer_group, AttentionLayerGroup):
+                global_layer_ids.update(
+                    layer.global_layer_id for layer in layer_group.local_layers
+                )
+        return global_layer_ids
+
+    def has_attention_layer_overlap(self, peer_ri: RankInfo) -> bool:
+        return bool(
+            self._attention_global_layer_ids(self._ri)
+            & self._attention_global_layer_ids(peer_ri)
+        )
+
+    def _cp_compatible(self, peer_ri: RankInfo) -> bool:
+        if self._ri.cp_size == 1 and peer_ri.cp_size == 1:
+            return True
+        if self.has_attention_layer_overlap(peer_ri):
+            logger.info(
+                "AttentionPolicy allowing CP transfer with page-table layer overlap; "
+                "local_cp=%s, peer_cp=%s",
+                self._ri.cp_size,
+                peer_ri.cp_size,
+            )
+            return True
+        return not self._fail_if(
+            True,
+            "cp_size must be 1 for both ranks unless page tables overlap",
+            local=self._ri.cp_size,
+            peer=peer_ri.cp_size,
+        )
+
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention
         b = peer_ri.attention
 
         return not (
             self._mismatch("is_mla", a.is_mla, b.is_mla)
-            or self._fail_if(
-                self._ri.cp_size != 1 or peer_ri.cp_size != 1,
-                "cp_size must be 1 for both ranks",
-                local=self._ri.cp_size,
-                peer=peer_ri.cp_size,
-            )
+            or not self._cp_compatible(peer_ri)
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
             or self._mismatch("tokens_per_block", a.tokens_per_block, b.tokens_per_block)
             or self._mismatch("dims_per_head", a.dims_per_head, b.dims_per_head)
