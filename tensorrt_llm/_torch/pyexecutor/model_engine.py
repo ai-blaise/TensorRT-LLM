@@ -78,6 +78,12 @@ def _optrt_me_debug_enabled() -> bool:
     return os.environ.get("TRTLLM_OPTRT_MODEL_ENGINE_ADP_DEBUG", "0") == "1"
 
 
+# Cached at import: the debug helpers sit on the per-step forward path, and
+# their kwargs (request/metadata summaries) evaluate eagerly at the call
+# sites, so the enabled check must cost nothing when the env gate is off.
+_OPTRT_ME_DEBUG_ENABLED = _optrt_me_debug_enabled()
+
+
 def _optrt_me_shape(value: object) -> object:
     if value is None:
         return None
@@ -131,6 +137,8 @@ def _optrt_me_request_summary(request: LlmRequest) -> tuple:
 
 
 def _optrt_me_batch_summary(batch: ScheduledRequests) -> str:
+    if not _OPTRT_ME_DEBUG_ENABLED:
+        return ""
     return (
         f"batch_size={batch.batch_size} "
         f"context={[_optrt_me_request_summary(req) for req in batch.context_requests]} "
@@ -139,6 +147,8 @@ def _optrt_me_batch_summary(batch: ScheduledRequests) -> str:
 
 
 def _optrt_me_metadata_summary(metadata: object) -> tuple:
+    if not _OPTRT_ME_DEBUG_ENABLED:
+        return ()
     return (
         type(metadata).__name__,
         getattr(metadata, "num_tokens", None),
@@ -153,7 +163,7 @@ def _optrt_me_metadata_summary(metadata: object) -> tuple:
 
 
 def _optrt_me_debug(dist: Distributed, event: str, **kwargs) -> None:
-    if not _optrt_me_debug_enabled():
+    if not _OPTRT_ME_DEBUG_ENABLED:
         return
     parts = [
         "OPTRT_ME_ADP_DEBUG",
@@ -685,6 +695,23 @@ class PyTorchModelEngine(ModelEngine):
         mgr = getattr(attn_metadata, "kv_cache_manager", None)
         if mgr is None or not getattr(mgr, "kvarn_enabled", False):
             return
+        # Host-only step gate. On the decode worker the KVarN pools' valid /
+        # commit_gen sets change only when the scheduled row composition
+        # changes (request onboard/free) or a sequence crosses a block
+        # boundary; in-between replay steps the per-layer restore scan is a
+        # no-op whose masked-select + unique device syncs (3-4 per layer,
+        # 61 layers) dominate the step's host time. The gate key is O(B)
+        # host integers; any missing attribute falls through to the scan.
+        tpb = getattr(mgr, "tokens_per_block", None)
+        kv_lens = getattr(attn_metadata, "kv_lens_runtime", None)
+        req_ids = getattr(attn_metadata, "request_ids", None)
+        if tpb and kv_lens is not None and req_ids is not None:
+            ids = tuple(req_ids)
+            key = (ids,
+                   tuple(int(kv_lens[i]) // tpb for i in range(len(ids))))
+            if key == getattr(self, "_kvarn_restore_step_key", None):
+                return
+            self._kvarn_restore_step_key = key
         if self._kvarn_restore_modules is None:
             modules = getattr(self.model, "modules", None)
             if not callable(modules):
