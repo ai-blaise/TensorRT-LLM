@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -359,6 +360,398 @@ def _as_rank_tuple(ranks: Any) -> Optional[Tuple[int, ...]]:
         return None
 
 
+# C9: CP=2 IPC/P2P broadcast primitive. The directive-7 bench
+# (tests/unittest/_torch/layersplit_broadcast_primitive_bench.py) measured
+# the owner->peer cross-device copy at ~21-23 us for every per-layer payload
+# on B200 NVLink vs ~25-30 us + jitter for NCCL dist.broadcast on the CP
+# subgroup; at CP>=3 the serial fan-out saturates owner egress and NCCL wins.
+# The IPC path therefore engages only at cp_size == 2 and dist.broadcast
+# stays as the cp_size>2 / capture / oversize / setup-failure path.
+_IPC_BROADCAST_ENV = "TRTLLM_LAYERSPLIT_IPC_BROADCAST"
+_IPC_SLOT_MB_ENV = "TRTLLM_LAYERSPLIT_IPC_SLOT_MB"
+_IPC_RING_DEPTH_ENV = "TRTLLM_LAYERSPLIT_IPC_RING_DEPTH"
+# Default slot covers the dense long-context prefill read set (10-64 MB /
+# layer at 128k); two slots x two directions = 256 MB / rank, ~0.15% of a
+# B200. Payloads above the slot fall back to NCCL per call.
+_IPC_SLOT_MB_DEFAULT = 64
+_IPC_RING_DEPTH_DEFAULT = 2
+# cuda.h literals for the two stream-memop flags in use. Hardcoded so the
+# wrapper is independent of enum-namespace moves across cuda-python 12/13
+# (both bindings coerce plain ints).
+_CU_STREAM_WRITE_VALUE_DEFAULT = 0x0
+_CU_STREAM_WAIT_VALUE_GEQ = 0x1
+
+
+def _cuda_driver() -> Optional[Any]:
+    """cuda-python driver bindings, or None when unavailable.
+
+    Tries the cuda-python >= 12.x ``cuda.bindings.driver`` layout first and
+    the legacy ``cuda.cuda`` module second; both expose the cuStream* memop
+    entry points with the same ``(CUresult, ...)`` tuple-return convention.
+    """
+    try:
+        from cuda.bindings import driver
+        return driver
+    except ImportError:
+        try:
+            from cuda import cuda as driver
+            return driver
+        except ImportError:
+            return None
+
+
+def _cu_check(what: str, ret: Any) -> None:
+    """Raise on a non-success CUresult from a cuda-python driver call."""
+    err = ret[0] if isinstance(ret, tuple) else ret
+    if int(err) != 0:
+        raise RuntimeError(f"LayerSplit IPC broadcast: {what} failed with "
+                           f"CUresult {err}")
+
+
+def _cu_stream_write64(driver: Any, ptr: int, value: int) -> None:
+    """Enqueue a fenced 64-bit value write on the current stream.
+
+    ``CU_STREAM_WRITE_VALUE_DEFAULT`` precedes the write with a system-scope
+    memory fence, so every byte the stream wrote before this op (including
+    cross-device NVLink writes) is globally visible before ``value`` lands.
+    """
+    _cu_check(
+        "cuStreamWriteValue64",
+        driver.cuStreamWriteValue64(torch.cuda.current_stream().cuda_stream,
+                                    ptr, value,
+                                    _CU_STREAM_WRITE_VALUE_DEFAULT))
+
+
+def _cu_stream_wait64_geq(driver: Any, ptr: int, value: int) -> None:
+    """Enqueue a wait on the current stream until ``*ptr >= value``.
+
+    The wait is evaluated by the GPU front end (no SM occupancy, no host
+    round trip) against a monotonically increasing sequence number, so it is
+    immune to host-thread skew between the CP ranks — unlike
+    ``cudaStreamWaitEvent``, which snapshots the event state at host call
+    time and degrades to a no-op when the waiter's host runs ahead of the
+    recorder's host.
+    """
+    _cu_check(
+        "cuStreamWaitValue64",
+        driver.cuStreamWaitValue64(torch.cuda.current_stream().cuda_stream,
+                                   ptr, value, _CU_STREAM_WAIT_VALUE_GEQ))
+
+
+def _cu_memcpy_async(driver: Any, dst_ptr: int, src_ptr: int,
+                     nbytes: int) -> None:
+    """Enqueue a plain async copy on the current stream.
+
+    Used for the mailbox publishes instead of ``cuStreamWriteValue64``:
+    stream memops reject CUDA-IPC-imported addresses
+    (``CUDA_ERROR_INVALID_VALUE``, observed on B200), while ordinary copies
+    route through the same peer mapping the ring payload uses. A
+    torch-level ``copy_`` is not equivalent here — its host-to-device path
+    enqueues on the DESTINATION device's current stream, which would break
+    ordering against the payload copy on the caller's stream.
+    """
+    _cu_check(
+        "cuMemcpyAsync",
+        driver.cuMemcpyAsync(dst_ptr, src_ptr, nbytes,
+                             torch.cuda.current_stream().cuda_stream))
+
+
+class _LayerSplitIpcBroadcast:
+    """CP=2 owner-push broadcast channel over CUDA IPC staging rings (C9).
+
+    Topology: exactly one peer. Each rank owns one ``[depth, slot_bytes]``
+    uint8 RX staging ring plus an int64[2] mailbox (``mail[0]`` = data
+    sequence, ``mail[1]`` = consume credit), both exported once through
+    ``torch.multiprocessing.reductions.reduce_tensor`` and rebuilt by the
+    peer at setup, so the steady state issues zero process-group traffic.
+
+    Per broadcast call, all ops on the caller's current stream:
+
+    - Producer (the layer's owner): wait until the peer has consumed
+      sequence ``s - (depth - 1)`` (ring-slot reuse credit), gather the
+      active rows, one contiguous cross-device ``copy_`` into the peer's
+      ring slot ``s % depth`` — the exact primitive the directive-7 bench
+      measured — then an 8-byte ``cuMemcpyAsync`` of ``s`` from pinned
+      host into the peer's data mailbox (the NVSHMEM put-with-signal
+      shape; stream memops reject IPC-imported addresses, and memcpy
+      completion semantics make the payload destination-visible before
+      the mailbox value lands).
+    - Consumer: ``cuStreamWaitValue64(GEQ, s)`` on its local data mailbox,
+      scatter ring slot ``s % depth`` into its own pool slot, then write
+      the consume credit ``s`` into the producer's mailbox.
+
+    Sequence mailboxes are used instead of cross-process CUDA IPC events
+    because ``cudaStreamWaitEvent`` snapshots the event at host CALL time:
+    a consumer host thread that enqueues its wait before the producer host
+    thread enqueued the matching record waits on the PREVIOUS iteration's
+    (already complete) state and reads stale bytes. No ring of events fixes
+    that host race; a GEQ wait on a value in consumer-local memory is
+    host-skew-immune by construction and trivially reusable across
+    iterations (the sequence only grows).
+
+    Both CP ranks must keep issuing the same broadcast call sequence — the
+    property the NCCL collective path already requires — so the host-side
+    ``out_seq`` / ``in_seq`` counters agree across ranks without any
+    exchange.
+    """
+
+    def __init__(self, driver: Any, ring: Any, mail: Any, peer_ring: Any,
+                 peer_mail: Any, pin: Any, depth: int,
+                 slot_bytes: int) -> None:
+        self._driver = driver
+        self._ring = ring
+        self._mail = mail
+        self._peer_ring = peer_ring
+        self._peer_mail = peer_mail
+        # Pinned-host staging for the outgoing mailbox values: pin[0] feeds
+        # the data-sequence publish, pin[1] the consume-credit publish.
+        # Reusing one slot per direction across iterations is benign: a
+        # publish copy that reads a NEWER (monotonic) value than enqueued
+        # only satisfies the peer's GEQ wait early when the matching
+        # payload copies are already stream-prior, and ring-slot reuse
+        # stays gated by the consume credit either way.
+        self._pin = pin
+        self.depth = int(depth)
+        self.slot_bytes = int(slot_bytes)
+        # mail[0] = data sequence (written remotely by the peer producer),
+        # mail[1] = consume credit (written remotely by the peer consumer).
+        self._mail_data_ptr = int(mail.data_ptr())
+        self._mail_credit_ptr = int(mail.data_ptr()) + 8
+        self._peer_mail_data_ptr = int(peer_mail.data_ptr())
+        self._peer_mail_credit_ptr = int(peer_mail.data_ptr()) + 8
+        self._pin_data_ptr = int(pin.data_ptr())
+        self._pin_credit_ptr = int(pin.data_ptr()) + 8
+        # Host-side sequence counters. Monotonic, never reset; int64
+        # mailboxes cannot wrap in any realistic deployment lifetime.
+        self.out_seq = 0
+        self.in_seq = 0
+
+    def producer_acquire_slot(self, nbytes: int) -> Any:
+        """Advance the producer sequence and return the peer ring slot view.
+
+        Blocks the current stream (not the host) until the peer's consume
+        credit covers sequence ``out_seq - (depth - 1)``, which is exactly
+        the condition under which slot ``out_seq % depth`` is free: the
+        peer scattered its previous contents into its pool before writing
+        that credit, in stream program order.
+        """
+        self.out_seq += 1
+        floor = self.out_seq - (self.depth - 1)
+        if floor >= 1:
+            _cu_stream_wait64_geq(self._driver, self._mail_credit_ptr, floor)
+        return self._peer_ring[self.out_seq % self.depth, :nbytes]
+
+    def producer_publish(self) -> None:
+        """Publish ``out_seq`` to the peer's data mailbox.
+
+        An 8-byte pinned-host -> peer-device ``cuMemcpyAsync`` on the
+        caller's stream. Stream order supplies the fence: the payload copy
+        enqueued before this one completes destination-visible before the
+        mailbox value lands (memcpy completion semantics), so the peer's
+        GEQ wait observing ``out_seq`` implies the slot bytes are visible.
+        """
+        self._pin[0] = self.out_seq
+        _cu_memcpy_async(self._driver, self._peer_mail_data_ptr,
+                         self._pin_data_ptr, 8)
+
+    def consumer_acquire(self, nbytes: int) -> Any:
+        """Advance the consumer sequence and return the local ring slot view.
+
+        Blocks the current stream until the producer's fenced sequence
+        write lands, which (by the producer-side write fence) implies the
+        slot's payload bytes are visible to this device.
+        """
+        self.in_seq += 1
+        _cu_stream_wait64_geq(self._driver, self._mail_data_ptr, self.in_seq)
+        return self._ring[self.in_seq % self.depth, :nbytes]
+
+    def consumer_release(self) -> None:
+        """Write the consume credit for ``in_seq`` into the producer's
+        mailbox. Enqueued after the scatter on the same stream, so stream
+        program order guarantees the scatter's reads of the ring slot
+        completed before the producer can observe the credit and overwrite
+        the slot."""
+        self._pin[1] = self.in_seq
+        _cu_memcpy_async(self._driver, self._peer_mail_credit_ptr,
+                         self._pin_credit_ptr, 8)
+
+    def verify_roundtrip(self, group_rank: int) -> bool:
+        """One full push in each direction through the real protocol.
+
+        Run collectively at setup: every rank produces sequence 1 to its
+        peer and consumes the peer's sequence 1, then waits for its own
+        credit so both mailboxes settle at 1 before steady state begins
+        (counters continue from 1; nothing is reset, so there is no
+        zeroing race against in-flight remote writes).
+        """
+        device = self._ring.device
+        pattern = torch.full((64, ),
+                             0xA0 ^ int(group_rank),
+                             dtype=torch.uint8,
+                             device=device)
+        expected = 0xA0 ^ (1 - int(group_rank))
+        dst = self.producer_acquire_slot(64)
+        dst.copy_(pattern, non_blocking=True)
+        self.producer_publish()
+        recv = self.consumer_acquire(64)
+        got = recv.clone()
+        self.consumer_release()
+        _cu_stream_wait64_geq(self._driver, self._mail_credit_ptr, 1)
+        torch.cuda.synchronize()
+        return bool((got.cpu() == expected).all().item())
+
+
+def _setup_ipc_broadcast(cp_group: Any) -> Optional["_LayerSplitIpcBroadcast"]:
+    """Collectively stand up the C9 CP=2 IPC push channel on ``cp_group``.
+
+    Must be reached by every rank of the CP group at the same call point
+    (it runs three object collectives). The handshake is gated so routing
+    can never diverge across ranks:
+
+    1. Local phase (no collectives): cuda-python import, ring + mailbox
+       allocation, a loopback stream-memop probe (an unsupported platform
+       errors here instead of corrupting steady state), and the
+       ``reduce_tensor`` IPC export. Any failure flips a local flag.
+    2. ``all_gather_object`` of (flag, device info, IPC handles). Each rank
+       then validates compatibility — identical ring config, peer device
+       visible with a matching UUID (guards against CUDA enumeration skew
+       across the MPI ranks), P2P access in both directions — and rebuilds
+       the peer's tensors.
+    3. ``all_gather_object`` agreement vote; any rank's failure downgrades
+       the whole group to the NCCL path.
+    4. A functional roundtrip through the real protocol, then a final
+       unanimous vote.
+
+    Returns the channel on unanimous success, else None. Never raises.
+    """
+    import torch.distributed as dist
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    depth = max(
+        1, int(os.environ.get(_IPC_RING_DEPTH_ENV, _IPC_RING_DEPTH_DEFAULT)))
+    slot_mb = float(os.environ.get(_IPC_SLOT_MB_ENV, _IPC_SLOT_MB_DEFAULT))
+    slot_bytes = (int(slot_mb * 1024 * 1024) + 15) // 16 * 16
+
+    driver = _cuda_driver()
+    device = int(torch.cuda.current_device())
+    ring = mail = None
+    info = None
+    handles = None
+    local_ok = False
+    try:
+        if driver is None:
+            raise RuntimeError("cuda-python driver bindings unavailable")
+        ring = torch.zeros((depth, slot_bytes),
+                           dtype=torch.uint8,
+                           device=device)
+        mail = torch.zeros(2, dtype=torch.int64, device=device)
+        # Loopback probe: write-then-wait on the local mailbox surfaces any
+        # platform restriction on stream memops at setup time.
+        _cu_stream_write64(driver, int(mail.data_ptr()), 7)
+        _cu_stream_wait64_geq(driver, int(mail.data_ptr()), 7)
+        torch.cuda.synchronize()
+        mail.zero_()
+        torch.cuda.synchronize()
+        handles = (reduce_tensor(ring), reduce_tensor(mail))
+        info = {
+            "device": device,
+            "uuid": str(torch.cuda.get_device_properties(device).uuid),
+            "depth": depth,
+            "slot_bytes": slot_bytes,
+        }
+        local_ok = True
+    except Exception as exc:  # noqa: BLE001 - every rank must reach phase 2
+        logger.warning(
+            "LayerSplit IPC broadcast: local setup failed (%s); the CP "
+            "group stays on the NCCL broadcast path.", exc)
+        info, handles = None, None
+
+    group_size = dist.get_world_size(group=cp_group)
+    group_rank = dist.get_rank(group=cp_group)
+    gathered = [None] * group_size
+    dist.all_gather_object(gathered, (local_ok, info, handles),
+                           group=cp_group)
+
+    peer_ring = peer_mail = None
+    peer_entry = gathered[1 - group_rank]
+    ok = bool(local_ok and group_size == 2 and peer_entry is not None
+              and peer_entry[0])
+    if ok:
+        try:
+            _, peer_info, peer_handles = peer_entry
+            if (int(peer_info["depth"]) != depth
+                    or int(peer_info["slot_bytes"]) != slot_bytes):
+                raise RuntimeError(
+                    f"ring config mismatch: local (depth={depth}, "
+                    f"slot_bytes={slot_bytes}) vs peer "
+                    f"(depth={peer_info['depth']}, "
+                    f"slot_bytes={peer_info['slot_bytes']})")
+            peer_dev = int(peer_info["device"])
+            if peer_dev >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"peer device ordinal {peer_dev} is not visible locally")
+            local_uuid_at_peer_ordinal = str(
+                torch.cuda.get_device_properties(peer_dev).uuid)
+            if local_uuid_at_peer_ordinal != peer_info["uuid"]:
+                raise RuntimeError(
+                    f"device enumeration differs across CP ranks: ordinal "
+                    f"{peer_dev} is {local_uuid_at_peer_ordinal} locally but "
+                    f"{peer_info['uuid']} on the peer")
+            if peer_dev != device and not (
+                    torch.cuda.can_device_access_peer(device, peer_dev)
+                    and torch.cuda.can_device_access_peer(peer_dev, device)):
+                raise RuntimeError(f"no P2P access between cuda:{device} "
+                                   f"and cuda:{peer_dev}")
+            ring_fn, ring_args = peer_handles[0]
+            mail_fn, mail_args = peer_handles[1]
+            peer_ring = ring_fn(*ring_args)
+            peer_mail = mail_fn(*mail_args)
+        except Exception as exc:  # noqa: BLE001 - must reach the vote below
+            logger.warning(
+                "LayerSplit IPC broadcast: peer handle rebuild failed (%s); "
+                "the CP group stays on the NCCL broadcast path.", exc)
+            peer_ring = peer_mail = None
+            ok = False
+
+    votes = [None] * group_size
+    dist.all_gather_object(votes, bool(ok and peer_ring is not None),
+                           group=cp_group)
+    if not all(votes):
+        return None
+
+    pin = torch.zeros(2, dtype=torch.int64, pin_memory=True)
+    channel = _LayerSplitIpcBroadcast(driver=driver,
+                                      ring=ring,
+                                      mail=mail,
+                                      peer_ring=peer_ring,
+                                      peer_mail=peer_mail,
+                                      pin=pin,
+                                      depth=depth,
+                                      slot_bytes=slot_bytes)
+    verified = False
+    try:
+        verified = channel.verify_roundtrip(group_rank)
+        if not verified:
+            logger.warning(
+                "LayerSplit IPC broadcast: handshake roundtrip returned "
+                "mismatched bytes; the CP group stays on the NCCL path.")
+    except Exception as exc:  # noqa: BLE001 - must reach the vote below
+        logger.warning(
+            "LayerSplit IPC broadcast: handshake roundtrip failed (%s); the "
+            "CP group stays on the NCCL broadcast path.", exc)
+    votes = [None] * group_size
+    dist.all_gather_object(votes, bool(verified), group=cp_group)
+    if not all(votes):
+        return None
+
+    logger.info(
+        "LayerSplit IPC broadcast ENABLED at CP=2: owner-push staging ring "
+        "depth=%d, slot=%d MiB, peer device cuda:%d (NCCL dist.broadcast "
+        "retained for capture/oversize fallback).", depth,
+        slot_bytes // (1024 * 1024), int(peer_mail.device.index))
+    return channel
+
+
 @dataclass
 class LayerSplitRuntimeState:
     """All LayerSplit state the DSA runtime needs for one model load.
@@ -451,6 +844,12 @@ class LayerSplitRuntimeState:
     # (layer_idx, channel).
     _prefetched_events: Dict[Tuple[int, str], Any] = field(
         default_factory=dict, repr=False, init=False)
+    # C9: the CP=2 owner-push IPC broadcast channel. None whenever any
+    # setup gate failed (cp_size != 2, kill switch, no cuda-python, no P2P,
+    # IPC export failure, ...), in which case maybe_broadcast_active_blocks
+    # keeps the NCCL dist.broadcast path unchanged.
+    _ipc_broadcast: Optional[Any] = field(default=None, repr=False,
+                                          init=False)
 
     def bind_cp_group(self,
                       cp_group: Any,
@@ -466,13 +865,54 @@ class LayerSplitRuntimeState:
         self.cp_group = cp_group
         if cp_group_ranks is not None:
             self.cp_group_ranks = tuple(int(rank) for rank in cp_group_ranks)
+        else:
+            try:
+                import torch.distributed as dist
+                self.cp_group_ranks = tuple(
+                    int(rank)
+                    for rank in dist.get_process_group_ranks(cp_group))
+            except Exception:
+                self.cp_group_ranks = None
+        self._maybe_setup_ipc_broadcast()
+
+    def _maybe_setup_ipc_broadcast(self) -> None:
+        """Stand up the C9 CP=2 IPC push channel when every gate passes.
+
+        Called from ``bind_cp_group``, which every CP rank reaches
+        collectively from ``DSACacheManager.__init__`` (the same guarantee
+        ``ensure_cp_process_group`` relies on for ``new_group``), so the
+        setup handshake's object collectives pair up across the group.
+
+        Gates (all leave ``_ipc_broadcast`` as None and the NCCL path
+        intact): LayerSplit off, ``cp_size != 2`` (the directive-7 bench
+        showed NCCL wins the serial fan-out at CP>=3), the
+        ``TRTLLM_LAYERSPLIT_IPC_BROADCAST=0`` kill switch, no CUDA, no
+        ``torch.distributed``, or any rank of the group failing the
+        collective handshake inside ``_setup_ipc_broadcast``.
+        """
+        if self._ipc_broadcast is not None:
+            return
+        if not self.enabled or self.ownership is None or self.cp_size != 2:
+            return
+        if self.cp_group is None:
+            return
+        if os.environ.get(_IPC_BROADCAST_ENV, "1") == "0":
+            return
+        if torch is None or not torch.cuda.is_available():
             return
         try:
             import torch.distributed as dist
-            self.cp_group_ranks = tuple(
-                int(rank) for rank in dist.get_process_group_ranks(cp_group))
-        except Exception:
-            self.cp_group_ranks = None
+        except ImportError:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        try:
+            self._ipc_broadcast = _setup_ipc_broadcast(self.cp_group)
+        except Exception as exc:  # noqa: BLE001 - setup must never crash load
+            logger.warning(
+                "LayerSplit IPC broadcast: setup failed (%s); staying on "
+                "the NCCL broadcast path.", exc)
+            self._ipc_broadcast = None
 
     def broadcast_src_rank(self, layer_idx: int) -> int:
         """Return the global distributed rank that owns ``layer_idx``.
@@ -691,6 +1131,14 @@ class LayerSplitRuntimeState:
         Returns True iff the broadcast was issued. No-ops on the disabled
         / cp_size=1 / no-group / no-CUDA / dist-not-initialized / None-args
         branches so this is safe to drop in unconditionally.
+
+        Primitive selection (C9): when the CP=2 IPC push channel is bound,
+        eager (non-capturing) calls whose payload fits the staging ring go
+        through ``_ipc_broadcast_active_blocks`` instead of NCCL. Every
+        routing input is identical on both CP ranks (channel setup is
+        unanimously voted, capture state is lockstep across the warmup,
+        and the payload size derives from the shared metadata), so the
+        ranks always pick the same primitive per call.
         """
         if not self.enabled or self.ownership is None:
             return False
@@ -709,6 +1157,12 @@ class LayerSplitRuntimeState:
         if active_block_ids.numel() == 0:
             return False
 
+        if (self._ipc_broadcast is not None
+                and not torch.cuda.is_current_stream_capturing()
+                and self._ipc_broadcast_active_blocks(layer_idx, cache_slot,
+                                                      active_block_ids)):
+            return True
+
         src_rank = self.broadcast_src_rank(layer_idx)
         # index_select / index_copy_ have no CUDA kernel for float8 cache dtypes
         # (the fp8 dense MLA KV pool and the NVFP4 E4M3 block-scale pool), but
@@ -721,6 +1175,56 @@ class LayerSplitRuntimeState:
                        group=cp_group,
                        async_op=False)
         work.index_copy_(0, active_block_ids, send_buffer)
+        return True
+
+    def _ipc_broadcast_active_blocks(self, layer_idx: int, cache_slot: Any,
+                                     active_block_ids: Any) -> bool:
+        """C9 CP=2 owner-push transfer of the active blocks of one slot.
+
+        Owner side, all enqueued on the current stream so the same
+        stream-ordered contract as the NCCL path holds:
+        - ``index_select`` the active rows out of the (byte-aliased) pool
+          slot. The gather follows this step's KV write in stream program
+          order and precedes the owner's next write the same way, so the
+          owner-next-write-after-peer-read hazard never crosses the
+          process boundary — the peer only ever reads the private staging
+          ring, never the owner's pool.
+        - One contiguous cross-device ``copy_`` of the gathered bytes into
+          the peer's ring slot (ATen enqueues the copy on the source
+          device's current stream and fences it against the destination
+          device internally), then the fenced sequence publish.
+
+        Peer side: stream-wait on the sequence mailbox, view the ring slot
+        with the local slot's dtype/row geometry, ``index_copy_`` into the
+        local pool slot (write-through via the float8 byte alias exactly as
+        the NCCL path), then the consume-credit write.
+
+        Returns False — symmetrically on both ranks, because the byte count
+        derives from the shared ``active_block_ids`` and the mirrored slot
+        geometry — when the payload exceeds the staging slot, handing the
+        call back to NCCL. Driver errors raise: silently diverging from the
+        peer's routing decision would hang the CP group.
+        """
+        ipc = self._ipc_broadcast
+        work = self._f8_byte_alias(cache_slot)
+        num_active = int(active_block_ids.numel())
+        row_bytes = (work.numel() // work.shape[0]) * work.element_size()
+        nbytes = num_active * row_bytes
+        if nbytes > ipc.slot_bytes:
+            return False
+
+        if self.ownership.owner_of(layer_idx) == self.cp_rank:
+            rows = work.index_select(0, active_block_ids).contiguous()
+            src_bytes = rows.view(-1).view(torch.uint8)
+            dst = ipc.producer_acquire_slot(nbytes)
+            dst.copy_(src_bytes, non_blocking=True)
+            ipc.producer_publish()
+        else:
+            recv = ipc.consumer_acquire(nbytes)
+            rows = recv.view(work.dtype).view((num_active, ) +
+                                              tuple(work.shape[1:]))
+            work.index_copy_(0, active_block_ids, rows)
+            ipc.consumer_release()
         return True
 
     @staticmethod
