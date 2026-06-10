@@ -1748,6 +1748,11 @@ def _should_use_packed_scale_triton_swap_ab_odd_m(
     return _is_non_8_aligned_sm100_packed_scale(input, weight_scale)
 
 
+def _force_packed_scale_triton_swap_ab_odd_m() -> bool:
+    """Escape hatch to the pre-pad8 Triton route for odd-M packed scales."""
+    return os.environ.get("TRTLLM_FP8_SWAPAB_ODD_M_TRITON", "0") == "1"
+
+
 def _should_use_triton_fp8_quant_for_swap_ab(input: torch.Tensor) -> bool:
     # The CUDA quantizer can illegal-access on odd SMC draft batches on SM100,
     # while the Triton quantizer handles the same shapes correctly.
@@ -2013,15 +2018,39 @@ def fp8_swap_ab_gemm(
         return _fp8_swap_ab_triton_block_matmul(input, weight, weight_scale,
                                                 output_dtype)
 
+    orig_m_before_pad: Optional[int] = None
     if _should_use_packed_scale_triton_swap_ab_odd_m(input, weight_scale):
+        if _force_packed_scale_triton_swap_ab_odd_m():
+            logger.warning_once(
+                "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 packed-scale "
+                f"M={input.size(0)} to Triton packed-scale block-FP8 matmul "
+                "(TRTLLM_FP8_SWAPAB_ODD_M_TRITON=1).",
+                key=("fp8_swap_ab_gemm",
+                     "direct_packed_scale_triton_non_8_aligned_sm100"),
+            )
+            return _fp8_swap_ab_packed_scale_triton_matmul(
+                input, weight, weight_scale, output_dtype)
+        # Pad to the next 8-aligned M and fall through to the normal
+        # autotuned quant + DeepGEMM SwapAB path, slicing the pad rows off
+        # the output. Measured on B200 (fusionproof image, CUDA-event
+        # medians, SMC draft K=7168): vs the Triton fallback this is 1.50x
+        # at M=25/N=18432, 1.17-1.19x at M=50/100/N=4096, 0.96x at
+        # M=25/N=4096; numerics equal (cos 0.9993 both vs BF16 ref). The
+        # historical "padded DeepGEMM faults at M=25" no longer reproduces
+        # on this build — the fault chain was the odd-M CUDA quantizer,
+        # which the pad now runs at an aligned M. F.pad + slice are
+        # CUDA-graph-capture safe. Set TRTLLM_FP8_SWAPAB_ODD_M_TRITON=1 to
+        # restore the old route.
         logger.warning_once(
-            "[fp8_swap_ab_gemm] Routing non-8-aligned SM100 packed-scale "
-            f"M={input.size(0)} to Triton packed-scale block-FP8 matmul.",
-            key=("fp8_swap_ab_gemm",
-                 "direct_packed_scale_triton_non_8_aligned_sm100"),
+            "[fp8_swap_ab_gemm] Padding non-8-aligned SM100 packed-scale "
+            f"M={input.size(0)} to the next 8-aligned M for the autotuned "
+            "DeepGEMM SwapAB path.",
+            key=("fp8_swap_ab_gemm", "pad8_deepgemm_non_8_aligned_sm100"),
         )
-        return _fp8_swap_ab_packed_scale_triton_matmul(
-            input, weight, weight_scale, output_dtype)
+        orig_m_before_pad = input.size(0)
+        padded_m = (orig_m_before_pad + 7) // 8 * 8
+        input = torch.nn.functional.pad(
+            input, (0, 0, 0, padded_m - orig_m_before_pad))
 
     if _should_use_dequantized_swap_ab_odd_m(input, weight_scale):
         logger.warning_once(
@@ -2076,10 +2105,11 @@ def fp8_swap_ab_gemm(
             "runtime path.",
             key=("fp8_swap_ab_gemm", "skip_non_8_aligned_sm100_tuning"),
         )
-        return gemm_runner(
+        out = gemm_runner(
             inputs=[input, weight, weight_scale],
             tactic=0,
         )
+        return out[:orig_m_before_pad] if orig_m_before_pad is not None else out
 
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
@@ -2087,10 +2117,11 @@ def fp8_swap_ab_gemm(
         fp8SwapABGemmRunner.tuning_config,
         [input, weight, weight_scale],
     )
-    return gemm_runner(
+    out = gemm_runner(
         inputs=[input, weight, weight_scale],
         tactic=best_tactic,
     )
+    return out[:orig_m_before_pad] if orig_m_before_pad is not None else out
 
 
 @fp8_swap_ab_gemm.register_fake
