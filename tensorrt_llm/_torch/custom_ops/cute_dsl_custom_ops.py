@@ -1292,11 +1292,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a, b, a_sf, b_sf, alpha, global_sf = inputs
             m, k, n = a.shape[0], a.shape[1] * 2, b.shape[0]
 
-            # The fp4out kernel's SFC epilogue does not properly predicate
-            # writes when m < CTA tile height, causing OOB memory access.
-            # Require m >= 128 (minimum MMA tile M dimension).
-            if m < 128:
-                return []
+            # All m are supported, including m < 128 (decode). The SFC
+            # epilogue stores full 128-row scale-factor blocks without
+            # predication, but forward() sizes C to pad_up(m, cta_m) rows
+            # and SFC to pad_up(padded_m, 128) rows, which covers every
+            # full-tile and cluster-spill write. Partial tiles at small m
+            # are the same code path as the last partial tile of any
+            # m % cta_m != 0 prefill shape.
 
             sf_vec_size = 16
             # MMA tiler N restricted to 128/256 for SwiGLU

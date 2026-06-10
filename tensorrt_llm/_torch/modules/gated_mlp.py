@@ -248,11 +248,6 @@ class GatedMLP(nn.Module):
 
         return output
 
-    # Minimum M dimension for the fp4out CuTe DSL kernel.
-    # Below this, the kernel's SFC epilogue may write out-of-bounds
-    # because the CTA tile height exceeds the output allocation.
-    _FP4OUT_MIN_M = 128
-
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -266,14 +261,7 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self._can_fuse_gate_up_swiglu_fp4out():
-            # Get token count for minimum-M check
-            if isinstance(x, (tuple, Fp4QuantizedTensor)):
-                m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
-            else:
-                m = x.reshape(
-                    -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
-            h2 = self._fused_gate_up_swiglu(x,
-                                            fp4_out=m >= GatedMLP._FP4OUT_MIN_M)
+            h2 = self._fused_gate_up_swiglu(x, fp4_out=True)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
         else:
