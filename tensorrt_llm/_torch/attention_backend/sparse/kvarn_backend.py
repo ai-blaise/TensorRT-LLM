@@ -289,6 +289,36 @@ class KVarNLatentPool:
         ids = np.asarray(block_ids, dtype=np.int64)
         self.restored_gen_host[ids] = self.commit_gen_host[ids]
 
+    def invalidate_blocks(self, block_ids, dev_ids=None) -> None:
+        """Drop the committed records for ``block_ids`` (host ints): the
+        free/recycle hook. The cache manager calls this when paged block ids
+        return to the allocator (request free / kv rewind). The packed record
+        describes the dying owner's content, so the next owner of a recycled
+        id must neither skip its own commit (commit idempotence is keyed on
+        ``valid``) nor have the stale record restored over its fresh fp16
+        block. ``commit_gen`` is left monotonic -- never reset -- so module
+        restore epochs (``_kvarn_restored_gen`` / ``restored_gen_host``)
+        cannot alias a re-committed id at an old epoch value.
+
+        ``dev_ids`` optionally carries the ids as a device long tensor so a
+        caller invalidating across many layer pools materializes it once."""
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.size == 0:
+            return
+        live = ids[self.valid_host[ids]]
+        if live.size:
+            self.valid_host[live] = False
+            self.restored_gen_host[live] = -1
+        if dev_ids is None:
+            if live.size == 0:
+                return
+            dev_ids = torch.as_tensor(live, dtype=torch.long,
+                                      device=self.device)
+        # A superset id write is fine (False over False); sharing one device
+        # tensor across all layer pools keeps the per-layer cost to a single
+        # small index_put launch.
+        self.valid[dev_ids] = False
+
     # -- read --------------------------------------------------------------
 
     def _deserialize(self, block_id: int) -> dict:

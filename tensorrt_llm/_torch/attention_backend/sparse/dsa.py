@@ -5928,6 +5928,71 @@ class DSACacheManager(KVCacheManager):
                                             self.tokens_per_block,
                                             num_attention_layers)
 
+    # -- KVarN side-pool lifecycle (block free / recycle) -------------------
+
+    def _kvarn_invalidate_on_free(self) -> bool:
+        """Correctness gate (default ON): clear the KVarN side-pool records
+        of paged blocks the allocator reclaims. Without it a recycled block
+        id keeps the dying owner's ``valid=True`` record: the new owner's
+        commit is skipped (idempotence keys on ``valid``) and the full-scan
+        restore rewrites the stale record over the new owner's fresh fp16
+        latent -- a silent cross-request KV clobber. Set
+        TRTLLM_KVARN_INVALIDATE_ON_FREE=0 to restore the old behavior."""
+        return (self.kvarn_enabled and os.environ.get(
+            "TRTLLM_KVARN_INVALIDATE_ON_FREE", "1") != "0")
+
+    def _kvarn_invalidate_block_ids(self, block_ids) -> None:
+        """Clear committed side-pool records for ``block_ids`` (host ints)
+        on every local layer pool. Block ids equal primary-pool slot indices
+        in the KVarN posture (no host offload; see _get_pool_block_indices --
+        with an empty secondary pool the encoded offset decode is the
+        identity on cache-block ids)."""
+        if getattr(self, "blocks_in_secondary_pool", 0):
+            # Host-offload posture: cache-block ids are not pool slots and a
+            # free-time decode is unavailable. KVarN does not support
+            # offload; leave the pools untouched rather than guess.
+            return
+        ids = [b for b in block_ids if 0 <= b < self.num_blocks]
+        if not ids:
+            return
+        pools = self.kvarn_latent_pool_per_layer
+        dev_ids = torch.as_tensor(ids, dtype=torch.long,
+                                  device=pools[0].device)
+        for pool in pools:
+            pool.invalidate_blocks(ids, dev_ids)
+
+    def free_resources(self, request, pin_on_release: bool = False):
+        """Release a request's blocks; drop their KVarN records first.
+
+        The ids are fetched while the request still owns its sequence.
+        Invalidating before the C++ free also covers the pinned-release
+        path: pinned blocks stay unreclaimable until unpinned, and the
+        later unpin-time free has no Python hook."""
+        if self._kvarn_invalidate_on_free():
+            try:
+                ids = self.get_cache_indices(request)
+            except (IndexError, RuntimeError):
+                # No sequence for this request id (double-free / freed before
+                # resource prepare). removeSequence no-ops on the same input,
+                # so degrade to the pre-hook behavior instead of raising.
+                ids = []
+            self._kvarn_invalidate_block_ids(ids)
+        return super().free_resources(request, pin_on_release)
+
+    def rewind_kv_cache(self, request, rewind_len: int):
+        """Rewind (spec-decode reject) is the other path returning blocks to
+        the allocator without ``free_resources``. Invalidate the records of
+        every block the rewind freed plus the new tail block: a block that
+        committed when it filled and then shrank back to partial re-fills
+        with different tokens, so its record is stale for the SAME owner."""
+        if not (rewind_len > 0 and self._kvarn_invalidate_on_free()):
+            return super().rewind_kv_cache(request, rewind_len)
+        pre = self.get_cache_indices(request)
+        ret = super().rewind_kv_cache(request, rewind_len)
+        post_n = len(self.get_cache_indices(request))
+        self._kvarn_invalidate_block_ids(pre[max(post_n - 1, 0):])
+        return ret
+
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer K cache buffer for a layer.
 
