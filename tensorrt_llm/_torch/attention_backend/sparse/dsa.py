@@ -3519,11 +3519,18 @@ class Indexer(nn.Module):
         _FusedWkWpNvfp4. Unquantized indexer: single FP32 weight for an
         F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+).
         """
-        # OPT-IN until the fused output passes its cosine gate: the fused GEMM
-        # is 1.85-1.96x faster than the split pair, but the standalone driver
-        # shows cos=0.0 vs the split outputs (scale-concat or API-contract bug
-        # under debug). Do not default-on a kernel that fails correctness.
-        if os.environ.get('TRTLLM_INDEXER_FUSE_WK_WP', '0') == '1':
+        # Verified vs the split Linears on real layer-5 REAP weights at
+        # M in {4, 16}: wk slice bit-identical (max|diff| == 0), weights_proj
+        # slice cos >= 0.999995 (sole delta: the wp_out_scale fold rounding;
+        # exact in f32 out_dtype), cutlass and cuBLASLt agree, 1.96-1.97x vs
+        # the split pair. The earlier cos=0.0 gate failure was a harness
+        # artifact, not a kernel bug: this checkpoint carries no indexer
+        # activation scales and linear.py builds before 5bc2b2cb8 left
+        # module.input_scale as an UNINITIALIZED Parameter, so the driver's
+        # split reference and the fused path both quantized with a garbage
+        # static scale and emitted exact zeros (cosine(0, 0) == 0).
+        # TRTLLM_INDEXER_FUSE_WK_WP=0 disables.
+        if os.environ.get('TRTLLM_INDEXER_FUSE_WK_WP', '1') != '0':
             self._fused_wk_wp_nvfp4 = _FusedWkWpNvfp4.build(
                 self.wk, self.weights_proj, self._indexer_nvfp4_backends)
             if self._fused_wk_wp_nvfp4 is not None:

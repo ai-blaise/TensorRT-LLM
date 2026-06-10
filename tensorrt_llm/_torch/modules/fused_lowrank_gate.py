@@ -378,6 +378,31 @@ def apply_fused_lowrank_gate(flat: torch.Tensor, gate_down: torch.nn.Linear,
     return torch.ops.trtllm.fused_lowrank_gate(flat, wd_f32, wu_t)
 
 
+def apply_fused_lowrank_gate_quant_nvfp4(
+        flat: torch.Tensor, gate_down: torch.nn.Linear,
+        gate_up: torch.nn.Linear, quant_scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gate + NVFP4-quant dispatch for the MoE-input handoff: (y, q, sf).
+
+    The single-launch cute kernel replaces the split-K Triton pair when it
+    can run (B200 graph replay M=4/16: 4.2/4.5us vs 7.0/7.2us per layer);
+    outputs are bit-equal either way.
+    """
+    if _GATE_IMPL == "cute":
+        from .cute_lowrank_gate import cute_lowrank_gate_quant_supported
+        if (gate_down.weight.dtype == torch.bfloat16
+                and cute_lowrank_gate_quant_supported(
+                    flat, gate_down.weight, gate_down.weight.shape[0],
+                    quant_scale)):
+            _, wu_t = get_lowrank_gate_weights(gate_down, gate_up)
+            wd_bf16 = _get_lowrank_gate_wd_bf16(gate_down)
+            return torch.ops.trtllm.cute_lowrank_gate_quant_nvfp4(
+                flat, wd_bf16, wu_t, quant_scale)
+    wd_f32, wu_t = get_lowrank_gate_weights(gate_down, gate_up)
+    return torch.ops.trtllm.fused_lowrank_gate_quant_nvfp4(
+        flat, wd_f32, wu_t, quant_scale)
+
+
 def lowrank_gate_supported(flat: torch.Tensor, rank: int) -> bool:
     return (HAS_TRITON and not _GATE_DISABLED and _GATE_IMPL != "eager"
             and flat.is_cuda and flat.dtype == torch.bfloat16

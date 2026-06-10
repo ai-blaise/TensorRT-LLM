@@ -64,6 +64,7 @@ from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
 from ..modules.fused_lowrank_gate import (apply_fused_lowrank_gate,
+                                          apply_fused_lowrank_gate_quant_nvfp4,
                                           get_lowrank_gate_weights,
                                           lowrank_gate_quant_nvfp4_supported,
                                           lowrank_gate_supported)
@@ -1648,9 +1649,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         quant_scale = self._resolve_premoe_quant_scale()
         if (quant_scale is not None
                 and lowrank_gate_quant_nvfp4_supported(flat, rank)):
-            wd_f32, wu_t = get_lowrank_gate_weights(gate_down, gate_up)
-            y, y_fp4, y_sf = torch.ops.trtllm.fused_lowrank_gate_quant_nvfp4(
-                flat, wd_f32, wu_t, quant_scale)
+            y, y_fp4, y_sf = apply_fused_lowrank_gate_quant_nvfp4(
+                flat, gate_down, gate_up, quant_scale)
             return (y.reshape(hidden_states.shape),
                     Fp4QuantizedTensor(y_fp4, y_sf, is_sf_swizzled=False))
         return self._maybe_apply_gated_norm(hidden_states, gate_down,
