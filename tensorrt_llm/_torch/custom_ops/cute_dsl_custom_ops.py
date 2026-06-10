@@ -2004,7 +2004,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # is_valid_mma_tiler_and_cluster_shape must also accept N=160 under
             # the same gate (see _FC2_VALID_MMA_TILER_N) or can_implement drops
             # the tactic.
-            if os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "1") == "1":
+            if os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "0") == "1":
                 mma_tiler_mn_candidates = [(self.tile_size, 160)]
                 cluster_shape_mn_candidates = [(self.tile_size // 128, 1)]
             else:

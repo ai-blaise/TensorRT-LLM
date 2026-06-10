@@ -58,7 +58,7 @@ from .utils import (
 # -14.1% FC2 win (37.94us vs 44.18us prod, cos=0.99961). N=7168 is not a
 # multiple of 160 (45 N-tiles, final tile 128 cols); the standard predicated
 # epilogue masks the partial tile, so no host-side N padding is required.
-_FC2_NTILE_160_ENABLED = os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "1") == "1"
+_FC2_NTILE_160_ENABLED = os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "0") == "1"
 _FC2_VALID_MMA_TILER_N = ((64, 128, 160, 192, 256)
                           if _FC2_NTILE_160_ENABLED else (64, 128, 192, 256))
 
