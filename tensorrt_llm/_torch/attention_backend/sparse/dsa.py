@@ -2786,18 +2786,24 @@ class Indexer(nn.Module):
         if not q_values.is_cuda:
             return None
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing:
-            # Candidate budget must track live kv, not the static block-table
-            # width (block_table.shape[1] * k_cache.shape[1] is the absolute KV
-            # allocation = 132096, which froze candidate_len at 33024 and broke
-            # HISA scaling). metadata.max_gen_kv_len is the capture-frozen,
-            # sync-free per-graph kv ceiling already used by _indexer_logits_width
-            # and the hoisted candidate schedule. block_topk is monotonic in
-            # max_blocks, so the live value only shrinks the band (never OOB).
-            if metadata is not None and metadata.max_gen_kv_len > 0:
-                max_kv_len = metadata.max_gen_kv_len
-            else:
-                max_kv_len = block_table.shape[1] * k_cache.shape[1]
+        # Candidate budget must track live kv, not the static block-table width
+        # (block_table.shape[1] * k_cache.shape[1] is the absolute KV allocation
+        # = 132096, which froze candidate_len at 33024 and broke HISA scaling).
+        # metadata.max_gen_kv_len is the capture-frozen, sync-free per-graph kv
+        # ceiling — it is `int(kv_lens[gen].max())` computed once in prepare()
+        # from the host kv_lens, so it is identical to the live device max here
+        # whenever no overlap/spec-dec runtime correction split them (the prod
+        # decode path). Reuse it in BOTH the captured and eager branches so the
+        # eager (warmup / non-bucketed-batch) decode step no longer pays a D2H
+        # `kv_lens.max().item()` sync. block_topk is monotonic in max_blocks, so
+        # using the frozen ceiling only ever shrinks the candidate band (never
+        # OOB). Fall back to the original live device read only when the host
+        # int is unavailable (metadata None / not yet populated), which keeps
+        # the eager corner bit-identical to the pre-hoist behavior.
+        if metadata is not None and metadata.max_gen_kv_len > 0:
+            max_kv_len = metadata.max_gen_kv_len
+        elif capturing:
+            max_kv_len = block_table.shape[1] * k_cache.shape[1]
         else:
             max_kv_len = int(kv_lens.max().item())
         if not self._should_use_hisa_pre_indexer(max_kv_len):
@@ -2823,8 +2829,23 @@ class Indexer(nn.Module):
         row_offset = self._hisa_arange(num_rows, q_values.device) % next_n
         prefix_lens = (kv_lens[row_to_batch] - next_n + row_offset + 1).to(
             torch.int32)
-        if not capturing and int(prefix_lens.min().item()) < self.index_topk:
-            return None
+        # Eager-only guard: bail out of HISA when the shortest row's causal
+        # prefix is below index_topk (the candidate band could not fill a full
+        # selection). Under the uniform-decode invariant asserted in prepare()
+        # (all gen requests share one kv length, dsa.py:1732) every row's prefix
+        # equals `max_gen_kv_len - next_n + row_offset + 1`, whose minimum over
+        # row_offset >= 0 is `max_gen_kv_len - next_n + 1`. Derive it from the
+        # capture-frozen host int so the eager (warmup / non-bucketed-batch)
+        # decode step no longer pays a `prefix_lens.min().item()` D2H sync. Fall
+        # back to the exact device reduction only when the host ceiling is
+        # absent, keeping the non-uniform corner bit-identical to before.
+        if not capturing:
+            if metadata is not None and metadata.max_gen_kv_len > 0:
+                min_prefix = metadata.max_gen_kv_len - next_n + 1
+            else:
+                min_prefix = int(prefix_lens.min().item())
+            if min_prefix < self.index_topk:
+                return None
 
         top_blocks = None
         quantized_reps = None
@@ -4051,11 +4072,19 @@ class Indexer(nn.Module):
                     # slow-path C++ kernel. Narrow scoring widths (< 12288) with
                     # short kv still fall through to the faster C++ insertion
                     # path below.
+                    # Enable the fused single-pass multi-CTA cluster radix top-k:
+                    # ~1.3-1.6x faster than the default 2-pass+merge at the prod
+                    # logits width 132096 with a bit-identical selected set
+                    # (IoU=1.0, same radix, same lower-index tie-break). The op
+                    # falls back to single-CTA/distributed internally when a shape
+                    # rejects the cluster launch, so it is safe in this branch.
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens, :], self.index_topk,
-                        next_n)
+                        next_n,
+                        single_pass_multi_cta=True,
+                        single_pass_multi_cta_cluster=True)
                 else:
                     torch.ops.trtllm.indexer_topk_decode(
                         logits_decode,
