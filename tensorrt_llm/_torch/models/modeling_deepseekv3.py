@@ -63,6 +63,11 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
+from ..modules.fused_lowrank_gate import (apply_fused_lowrank_gate,
+                                          apply_fused_lowrank_gate_quant_nvfp4,
+                                          get_lowrank_gate_weights,
+                                          lowrank_gate_quant_nvfp4_supported,
+                                          lowrank_gate_supported)
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
@@ -792,6 +797,20 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
+def _dsv3_mlp_nvfp4_backends() -> Optional[List[str]]:
+    """NVFP4 backend override for the DSv3 dense-MLP / shared-expert GEMMs.
+
+    The NVFP4 GEMM AutoTuner picks the cutlass backend for these
+    hidden/intermediate shapes at decode token counts, where cuBLASLt is
+    bit-identical (max|diff| == 0 on real REAP weights at M in {4,16}) and
+    1.5-2.1x faster, for both full and TP-sharded weights. Mirrors the MLA
+    proj override (TRTLLM_MLA_PROJ_NVFP4_BACKENDS). Comma-separated to
+    override, empty to restore auto-selection.
+    """
+    val = os.environ.get('TRTLLM_DSV3_MLP_NVFP4_BACKENDS', 'cublaslt')
+    return [b.strip() for b in val.split(',') if b.strip()] or None
+
+
 class DeepseekV3Linear(Linear):
     """
     A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
@@ -813,6 +832,7 @@ class DeepseekV3Linear(Linear):
         use_custom_cublas_mm: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
+        nvfp4_allowed_backends: Optional[List[str]] = None,
     ):
         super().__init__(
             in_features,
@@ -829,6 +849,7 @@ class DeepseekV3Linear(Linear):
             use_custom_cublas_mm,
             lora,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
 
     def apply_linear(self,
@@ -892,6 +913,7 @@ class DeepseekV3Attention(MLA):
             use_custom_cublas_mm=True,
             use_cute_dsl_blockscaling_mm=model_config.
             use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=self._mla_proj_nvfp4_backends,
         )
 
 
@@ -933,6 +955,10 @@ class DeepseekV32Attention(MLA):
 
         self.indexer = self.mqa.indexer
 
+        # This re-creation of kv_a_proj_with_mqa previously dropped the MLA
+        # proj NVFP4 backend override, silently restoring the AutoTuner's
+        # cutlass mispick (2.1x slower than cuBLASLt at decode M) for the
+        # fused_a GEMM. Keep it in sync with MLA.__init__.
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
@@ -941,7 +967,8 @@ class DeepseekV32Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
 
 
 class DeepseekV3Gate(nn.Module):
@@ -1128,6 +1155,7 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=_dsv3_mlp_nvfp4_backends(),
         )
         self.shared_experts_use_fp4 = (
             shared_quant_config is not None
@@ -1263,9 +1291,12 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
+            # Linear layers assume swizzled scale factors; a LINEAR-sf fp4
+            # (pre-quantized MoE input) must not reach the shared experts.
             shared_input = (hidden_states_fp4 if
                             (hidden_states_fp4 is not None
-                             and self.shared_experts_use_fp4) else
+                             and self.shared_experts_use_fp4
+                             and hidden_states_fp4.is_sf_swizzled) else
                             hidden_states)
             shared_output = self.shared_experts(shared_input)
             if self.shared_output_scale is not None:
@@ -1448,21 +1479,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=has_mlp_tp,
                 use_cute_dsl_blockscaling_mm=model_config.
                 use_cute_dsl_blockscaling_mm,
+                nvfp4_allowed_backends=_dsv3_mlp_nvfp4_backends(),
             )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
-
-        # When enable_attention_dp is True, we normally skip attention all-reduce since each
-        # DP rank works on different batch elements. However, with CP > 1, attention is split
-        # across CP ranks for the SAME batch element, so all-reduce is still needed.
-        has_cp = mapping_with_cp is not None and mapping_with_cp.cp_size > 1
-        can_skip_for_attention_dp = self.enable_attention_dp and not has_cp
-        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                       or self.fusion_config.PRE_MLP_FUSION
-                                       or self.mapping.tp_size == 1
-                                       or can_skip_for_attention_dp)
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
@@ -1482,13 +1504,39 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 config.hidden_size, rank, bias=False, dtype=config.torch_dtype)
             self.post_attention_gated_norm_up = nn.Linear(
                 rank, config.hidden_size, bias=False, dtype=config.torch_dtype)
-            self.fusion_config.PRE_MOE_FUSION = False
-            self.fusion_config.PRE_MLP_FUSION = False
+            # The fused AR+add+RMSNorm boundary stays exact under the gated
+            # norm: the gate consumes the bf16 norm output, which the
+            # RESIDUAL_RMS_NORM fusion still produces (forward_MoE), and the
+            # PRE_MLP fusion downgrades its op to RESIDUAL_RMS_NORM for gated
+            # layers (forward_mlp) so the gate never sees fp4. Kill-switch
+            # restores the old unfused-everything behavior.
+            if os.environ.get("TRTLLM_OPTRT_GATED_NORM_FUSION", "1") != "1":
+                self.fusion_config.PRE_MOE_FUSION = False
+                self.fusion_config.PRE_MLP_FUSION = False
         else:
             self.input_gated_norm_down = None
             self.input_gated_norm_up = None
             self.post_attention_gated_norm_down = None
             self.post_attention_gated_norm_up = None
+        # Quantized-MoE-input handoff (gate kernel emits NVFP4 alongside the
+        # gated bf16). Resolved lazily at first forward; tri-state None=probe.
+        self._premoe_gate_quant_enabled = (
+            self.has_gated_norm and os.environ.get(
+                "TRTLLM_OPTRT_GATED_PREMOE_QUANT", "1") == "1")
+        self._premoe_quant_scale = None
+
+        # When enable_attention_dp is True, we normally skip attention all-reduce since each
+        # DP rank works on different batch elements. However, with CP > 1, attention is split
+        # across CP ranks for the SAME batch element, so all-reduce is still needed.
+        # NOTE: must be computed AFTER all fusion_config decisions (incl. the
+        # gated-norm kill-switch above); computing it from intermediate flag
+        # values desyncs the attention all-reduce from the fused boundary.
+        has_cp = mapping_with_cp is not None and mapping_with_cp.cp_size > 1
+        can_skip_for_attention_dp = self.enable_attention_dp and not has_cp
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.fusion_config.PRE_MLP_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or can_skip_for_attention_dp)
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -1549,12 +1597,64 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if gate_down is None or gate_up is None:
             return hidden_states
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rank = gate_down.weight.shape[0]
+        if lowrank_gate_supported(flat, rank) and flat.stride(-1) == 1:
+            return apply_fused_lowrank_gate(
+                flat, gate_down, gate_up).reshape(hidden_states.shape)
         hidden_dtype = flat.dtype
-        gate = torch.matmul(flat.float(), gate_down.weight.float().t())
+        wd_f32, _ = get_lowrank_gate_weights(gate_down, gate_up)
+        gate = torch.matmul(flat.float(), wd_f32.t())
         gate = torch.nn.functional.silu(gate).to(gate_up.weight.dtype)
         gate = torch.matmul(gate, gate_up.weight.t())
         gate = torch.sigmoid(gate).to(hidden_dtype)
         return (flat * gate).reshape(hidden_states.shape)
+
+    def _resolve_premoe_quant_scale(self) -> Optional[torch.Tensor]:
+        """fc31_input_scale of the routed experts, or None if the MoE input
+        cannot take a pre-quantized linear-sf NVFP4 tensor. Probed once."""
+        if self._premoe_quant_scale is None:
+            scale = None
+            if self._premoe_gate_quant_enabled and isinstance(
+                    self.mlp, Deepseekv3MoE):
+                experts = self.mlp.experts
+                backend = getattr(experts, "backend", experts)
+                from ..modules.fused_moe.fused_moe_cute_dsl import \
+                    CuteDslFusedMoE
+                if (isinstance(backend, CuteDslFusedMoE)
+                        and getattr(experts, "has_nvfp4", False)
+                        and not getattr(experts, "use_dp", True)
+                        and not getattr(experts, "enable_alltoall", True)
+                        and getattr(backend, "fc31_input_scale", None)
+                        is not None):
+                    scale = backend.fc31_input_scale
+            self._premoe_quant_scale = (scale, ) if scale is not None else ()
+        return self._premoe_quant_scale[0] if self._premoe_quant_scale else None
+
+    def _apply_post_attention_gated_norm_quant(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor]]:
+        """Post-attention gated norm with an optional NVFP4 handoff.
+
+        Returns (gated bf16 hidden states, Fp4QuantizedTensor of the same
+        values quantized with the routed experts' input scale in LINEAR sf
+        layout, or None). The fp4 tensor must only feed consumers that accept
+        unswizzled scales (the MoE token-permute path), never Linear layers.
+        """
+        gate_down = self.post_attention_gated_norm_down
+        gate_up = self.post_attention_gated_norm_up
+        if gate_down is None or gate_up is None:
+            return hidden_states, None
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rank = gate_down.weight.shape[0]
+        quant_scale = self._resolve_premoe_quant_scale()
+        if (quant_scale is not None
+                and lowrank_gate_quant_nvfp4_supported(flat, rank)):
+            y, y_fp4, y_sf = apply_fused_lowrank_gate_quant_nvfp4(
+                flat, gate_down, gate_up, quant_scale)
+            return (y.reshape(hidden_states.shape),
+                    Fp4QuantizedTensor(y_fp4, y_sf, is_sf_swizzled=False))
+        return self._maybe_apply_gated_norm(hidden_states, gate_down,
+                                            gate_up), None
 
     def forward(
         self,
@@ -1644,9 +1744,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        hidden_states = self._maybe_apply_gated_norm(
-            hidden_states, self.post_attention_gated_norm_down,
-            self.post_attention_gated_norm_up)
+        hidden_states, hidden_states_fp4 = (
+            self._apply_post_attention_gated_norm_quant(hidden_states))
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1656,7 +1755,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
         hidden_states = _run_MoE(hidden_states,
-                                 hidden_states_fp4=None,
+                                 hidden_states_fp4=hidden_states_fp4,
                                  do_finalize=do_finalize)
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -1709,17 +1808,32 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
-            act_fp4, act_sf, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.mlp.gate_up_proj.input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ),
-            )
-            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            if self.has_gated_norm:
+                # The gated norm consumes the bf16 norm output, so the quant
+                # cannot ride the allreduce; keep AR+add+norm fused and let
+                # the MLP quantize the gated activations as usual.
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
+            else:
+                act_fp4, act_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        scale=self.mlp.gate_up_proj.input_scale,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic

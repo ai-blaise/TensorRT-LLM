@@ -143,6 +143,26 @@ should scale with **churn, not working-set**.
   (zero extra round-trip, the paper's s2 fold); LayerSplit (the KVarN pool is a
   cache pool that LayerSplit can own/broadcast per CP rank).
 
+## Decode-regime restore cost: host-gate (shipped) + delta-restore (pending)
+
+Two follow-ups on the amortized-restore path, tracked in
+[optimization_candidates.md](optimization_candidates.md) as C1/C2:
+
+- **C1 — pre-replay host-gate (shipped `a1b13ea78`):** the pre-replay restore
+  scan walked all 61 layer modules before every CUDA-graph replay, paying 3–4
+  implicit device syncs per layer before the empty-set early-exit could fire.
+  An O(B) host step key `(request_ids, kv_len//tokens_per_block)` proves the
+  restore set empty when unchanged and skips the scan entirely.
+- **C2 — delta-restore (implemented opt-in; verification pending):** when the
+  step key *does* change, the scan still re-derives far more than the delta.
+  At **TP bs=16** (pure-TP attention, every rank sees the full batch) the
+  pre-replay scan is **~4 ms/step amortized — the single biggest TP-regime
+  cost** (the DP4/bs=4 regime is much cheaper, which is why C1 sufficed
+  there). Delta-restore restores only the changed rows/blocks. **Not default**
+  until the 5-scenario equivalence verification passes (delta vs full restore:
+  onboard, free, block-boundary crossing, recycle/re-commit, mixed) — the gate
+  is bit-equality of the restored pool.
+
 ## Enabling KVarN
 
 ```python

@@ -6,8 +6,8 @@ This is the ``warpdecode_mega_driver`` artifact promoted to a reusable builder:
 ONE ``@cute.jit`` function emits BOTH device-kernel launches (FC1 SwiGLU -> FC2
 finalize) into a single compiled artifact on ONE stream, with FC1's FP4 output
 ``(c, sfc)`` wired directly as FC2's input ``(a, sfa)`` (a true data dependency)
-and PDL on. The FC2 N-tile defaults to 160 (the swept decode optimum:
--14.1% vs the 256 tile on the prod decode shape, cos 0.99961).
+and PDL on. The FC2 N-tile defaults to 256 (a validated tile; see
+``_resolve_default_fc2_n``).
 
 Why this is a *device* fusion and not a residency fusion: FC1 still TMA-stores
 ``(c, sfc)`` to GMEM and FC2 still TMA-loads ``(a, sfa)`` from GMEM. On SM90+ the
@@ -16,8 +16,15 @@ kernels' bodies into one ``@cute.kernel`` (unified SharedStorage + TMEM
 time-share + matched A-SMEM layout) -- the TMA-descriptor surgery the CuTe-DSL
 skill flags as prohibitively complex. The fusion win here is host-gap removal:
 there is NO Python/host work between the two launches, so the two grid ramps
-collapse toward a single combined ramp (the mega-driver measured fusion-alone as
-ties-PDL; the real shippable lever is the N=160 tile, carried here).
+collapse toward a single combined ramp. NOTE: the device fusion itself is
+timing-neutral on the prod decode shape (PDL already overlaps the FC1->FC2
+boundary, so the mega-driver measured fusion-alone as ties-PDL). The earlier
+"-14% FC2 win at N=160" that this path advertised was a mis-measurement: N=160
+is numerically broken (cosine ~0.79 vs a true f32 reference; see
+``_resolve_default_fc2_n``), and the win came from the validator comparing the
+fused artifact to a sequential run that shared the same broken FC2 kernel. With
+the correct N=256 tile this artifact carries no measured decode advantage over
+the standard two-kernel op path, so it remains opt-in (``TRTLLM_OPTRT_MOE_MEGAKERNEL=jit``).
 
 The compiled artifact is cached on (shape, dtype, tile) so a steady-state call
 never recompiles (CuTe-DSL skill rule: pre-compile once, call the compiled
@@ -44,8 +51,56 @@ import torch
 
 _RUNNER_DIR = None  # resolved at build time
 
-# Default prod decode-MoE shape (REAP DeepSeek-V3.2, TP4 EP). N=160 FC2 tile.
-_DEFAULT_FC2_N = int(os.environ.get("TRTLLM_OPTRT_MOE_MEGAKERNEL_FC2_N", "160"))
+# FC2 N-tile widths the blockscaled SFB (weight scale-factor) TMEM/GMEM pipeline
+# of Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel supports
+# correctly. cta_tile_n=160 is intentionally NOT a member (see below).
+_FC2_VALID_N = (64, 128, 192, 256)
+
+
+def _resolve_default_fc2_n() -> int:
+    """Resolve the FC2 N-tile for the JIT device-fusion artifact.
+
+    Default 256 (the smallest validated tile that divides cleanly into the SFB
+    layout for the H=7168 down-projection). ``TRTLLM_OPTRT_MOE_MEGAKERNEL_FC2_N``
+    may override to any width in ``_FC2_VALID_N``.
+
+    N=160 is rejected. It was previously the default to chase a "-14% FC2 win
+    (cos=0.99961)", but that number came from the megakernel's self-blind
+    validator (it compares the fused artifact to a 2-kernel sequential run that
+    uses the SAME FC2 kernel at the SAME N, so both legs share the bug and
+    agree). Measured against a TRUE f32 reference at the prod decode shape
+    (H=7168, I=2048, 128 experts/top-8), FC2 N=160 yields cosine ~0.79 vs ~0.9998
+    for {128,192,256}. Root cause: the SFB GMEM is tiled by round_up(N,128)=256
+    and consumed from TMEM with a per-tile slice_n; only the {192,64} cases carry
+    the compensating odd-tile TMEM shift in the MMA warp (see
+    blockscaled_contiguous_grouped_gemm_finalize_fusion.py). N=160 has no such
+    compensation, so every N-tile reads the wrong 32-col SFB sub-block -> a broad,
+    M-independent MMA miscompute. N=7168 is also not a multiple of 160, so the
+    final 160-tile overruns the output by 32 cols. A correct N=160 needs an SFB
+    layout that tiles at 160 granularity (a CUTLASS-internal change), not a tile
+    swap. Until then N=160 is unreachable here.
+    """
+    raw = os.environ.get("TRTLLM_OPTRT_MOE_MEGAKERNEL_FC2_N")
+    if raw is None:
+        return 256
+    val = int(raw)
+    if val not in _FC2_VALID_N:
+        import warnings
+
+        warnings.warn(
+            f"TRTLLM_OPTRT_MOE_MEGAKERNEL_FC2_N={val} is not a valid FC2 N-tile "
+            f"(must be one of {_FC2_VALID_N}; N=160 in particular is numerically "
+            f"incorrect, cosine ~0.79 vs f32 at the prod decode shape). Falling "
+            f"back to 256.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 256
+    return val
+
+
+# Default prod decode-MoE shape (REAP DeepSeek-V3.2, TP4 EP). FC2 N-tile=256.
+_DEFAULT_FC2_N = _resolve_default_fc2_n()
 _DEFAULT_TILE_M = 128
 _DEFAULT_FC1_N = 256
 
@@ -108,6 +163,13 @@ def build_fused_moe_megakernel_jit(
 
     Cached on the full shape/tile key.
     """
+    if fc2_n not in _FC2_VALID_N:
+        raise ValueError(
+            f"fc2_n={fc2_n} is not a valid FC2 N-tile (must be one of "
+            f"{_FC2_VALID_N}). In particular N=160 is numerically incorrect "
+            f"(cosine ~0.79 vs a true f32 reference at the prod decode shape) "
+            f"because the blockscaled SFB scale-factor layout has no "
+            f"cta_tile_n=160 support; see _resolve_default_fc2_n.")
     key = (hidden, inter, hot, ntok, top_k, tile_m, fc1_n, fc2_n, vectorized_f32)
     if key in _COMPILE_CACHE:
         return _COMPILE_CACHE[key]

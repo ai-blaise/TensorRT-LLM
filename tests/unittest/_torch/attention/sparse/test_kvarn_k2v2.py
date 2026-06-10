@@ -136,11 +136,17 @@ class _FakeLocalKVarNPool:
         self.ckv = torch.arange(64 * 2, dtype=torch.float16).reshape(1, 64, 2)
         self.kpe = torch.arange(64, dtype=torch.float16).reshape(1, 64, 1)
         self.loaded_ids = None
+        self.restored_marked = None
 
     def load_blocks(self, block_ids):
         self.loaded_ids = block_ids.clone()
         assert block_ids.tolist() == [1]
         return self.ckv, self.kpe
+
+    def mark_restored_host(self, block_ids):
+        # Real pools mirror the restore epoch on host for the pre-replay
+        # delta walk; record the call so the test can assert it fired.
+        self.restored_marked = [int(b) for b in block_ids]
 
 
 class _FakeLocalKVarNManager:
@@ -186,3 +192,106 @@ def test_kvarn_restore_writes_local_layer_main_pool(monkeypatch):
     assert torch.equal(mgr.pool.loaded_ids, torch.tensor([1], dtype=torch.long))
     assert torch.equal(mgr.buf[1, 0, :, 0, :2], mgr.pool.ckv[0])
     assert torch.equal(mgr.buf[1, 0, :, 0, 2:], mgr.pool.kpe[0])
+    assert mgr.pool.restored_marked == [1]
+
+
+def _smooth_latent(group: int, cfg, seed: int):
+    torch.manual_seed(seed)
+    ckv = torch.randn(group, cfg.kv_lora_rank, dtype=torch.float16) * 0.35
+    k_pe = torch.randn(group, cfg.qk_rope_head_dim, dtype=torch.float16) * 0.20
+    return ckv, k_pe
+
+
+def test_kvarn_latent_pool_free_reuse_commit_restore_cpu():
+    """Block-id recycle contract: free -> reuse -> commit -> restore.
+
+    ``invalidate_blocks`` (the DSACacheManager free/rewind hook) must clear
+    ``valid`` + host mirror and reset the restore epoch so that (1) the
+    commit walk's idempotence check (keyed on ``valid``) re-commits the new
+    owner -- ``commit_gen`` bumps then, the documented recycle contract --
+    and (2) no restore path (full-scan keep mask ``pool.valid[cand]``, the
+    amortized epoch compare, or the host delta filter) can write the dying
+    owner's record over the new owner's fresh fp16 latent.
+    """
+    group = 64
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNLatentPool(
+        num_blocks=4, group=group, cfg=cfg, device=torch.device("cpu")
+    )
+    old_ckv, old_kpe = _smooth_latent(group, cfg, seed=20260610)
+
+    # Owner A commits block 2 and the decode walk restores it.
+    pool.store_block(2, old_ckv, old_kpe)
+    assert pool.stale_committed_host([2]) == [2]
+    pool.mark_restored_host([2])
+    assert pool.stale_committed_host([2]) == []
+    old_rt, _ = pool.load_block(2)
+
+    # Block 2 returns to the allocator and is recycled to owner B.
+    pool.invalidate_blocks([2])
+    assert not bool(pool.valid[2])  # full-scan keep mask skips it
+    assert not bool(pool.valid_host[2])  # commit walk re-commits it
+    assert int(pool.restored_gen_host[2]) == -1
+    assert int(pool.commit_gen[2]) == 1  # monotonic: never reset
+    assert int(pool.commit_gen_host[2]) == 1
+    assert pool.stale_committed_host([2]) == []  # delta walk: no stale fire
+    # Idempotent on double-free and a no-op on empty / never-committed ids.
+    pool.invalidate_blocks([2])
+    pool.invalidate_blocks([])
+    pool.invalidate_blocks([0, 3])
+    assert not pool.valid_host.any()
+
+    # Owner B fills the recycled id and the commit walk re-commits it: the
+    # content epoch advances past every recorded restore epoch.
+    new_ckv, new_kpe = _smooth_latent(group, cfg, seed=20260611)
+    pool.store_block(2, new_ckv, new_kpe)
+    assert bool(pool.valid[2]) and bool(pool.valid_host[2])
+    assert int(pool.commit_gen[2]) == 2
+    assert int(pool.commit_gen_host[2]) == 2
+    assert pool.stale_committed_host([2]) == [2]
+    pool.mark_restored_host([2])
+    assert pool.stale_committed_host([2]) == []
+
+    # The restore dequantizes B's record; A's content is gone.
+    new_rt, _ = pool.load_block(2)
+    assert _cosine(new_rt, new_ckv) > 0.80
+    assert _cosine(new_rt, old_rt) < 0.5
+    assert _cosine(new_rt, old_ckv) < 0.5
+
+
+def test_dsa_cache_manager_invalidate_fans_out_all_layer_pools():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    group = 64
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pools = [
+        KVarNLatentPool(
+            num_blocks=4, group=group, cfg=cfg, device=torch.device("cpu")
+        )
+        for _ in range(2)
+    ]
+    ckv, k_pe = _smooth_latent(group, cfg, seed=20260612)
+    for p in pools:
+        p.store_block(1, ckv, k_pe)
+        p.store_block(3, ckv, k_pe)
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = pools
+    mgr.blocks_in_secondary_pool = 0
+    mgr.num_blocks = 4
+
+    # Out-of-range ids (stale tables / padding) are filtered, never raised.
+    DSACacheManager._kvarn_invalidate_block_ids(mgr, [1, -1, 99])
+    for p in pools:
+        assert not bool(p.valid[1]) and not bool(p.valid_host[1])
+        assert bool(p.valid[3]) and bool(p.valid_host[3])  # untouched
+
+    # Host-offload posture: block ids are not pool slots; must not touch.
+    mgr.blocks_in_secondary_pool = 8
+    DSACacheManager._kvarn_invalidate_block_ids(mgr, [3])
+    for p in pools:
+        assert bool(p.valid[3]) and bool(p.valid_host[3])

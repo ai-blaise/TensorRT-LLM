@@ -1628,6 +1628,14 @@ class NVFP4LinearMethod(LinearMethodBase):
             copy_weight(module.input_scale, input_scale)
             E2M1_MAX = 6.0
             module.inv_input_scale.data = module.input_scale / E2M1_MAX
+        else:
+            # Checkpoint carries no activation scale (compressed-tensors
+            # dynamic activation quantization). Drop the never-initialized
+            # placeholder Parameters so _input_prepare takes the dynamic
+            # branch instead of quantizing with uninitialized memory.
+            # Mirrors FP8QDQLinearMethod.process_weights_after_loading_vanilla.
+            module.input_scale = None
+            module.inv_input_scale = None
         if alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()

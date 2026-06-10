@@ -96,6 +96,38 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 _IDLE_DISAGG_TRANSFER_POLL_S = float(
     os.getenv("TRTLLM_DISAGG_IDLE_TRANSFER_POLL_S", "0.1"))
 
+# Per-iteration stats decimation (S5). Full IterationStats / per-request perf
+# metrics / CUDA timing-event work runs only on iterations where
+# iter_counter % TRTLLM_OPTRT_STATS_DECIMATE == 0. The cheap per-loop
+# host/device step times captured by profile_step are kept on every
+# iteration. Set to 1 to restore per-iteration stats.
+_STATS_DECIMATE_ENV_VAR_NAME = "TRTLLM_OPTRT_STATS_DECIMATE"
+_STATS_DECIMATE_DEFAULT = 16
+
+
+def _parse_stats_decimate() -> int:
+    """Parse the stats decimation interval from the environment.
+
+    Returns an int >= 1. Invalid values fall back to the default so a typo
+    cannot desync rank behavior (all ranks read the same environment from
+    the launcher, and the fallback is deterministic).
+    """
+    raw = os.environ.get(_STATS_DECIMATE_ENV_VAR_NAME,
+                         str(_STATS_DECIMATE_DEFAULT))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            f"Invalid {_STATS_DECIMATE_ENV_VAR_NAME}={raw!r}; using default "
+            f"{_STATS_DECIMATE_DEFAULT}")
+        return _STATS_DECIMATE_DEFAULT
+    if value < 1:
+        logger.warning(
+            f"{_STATS_DECIMATE_ENV_VAR_NAME}={value} below 1; clamping to 1 "
+            "(stats every iteration)")
+        return 1
+    return value
+
 
 def _optrt_nixl_transfer_proof(message: str) -> None:
     if os.environ.get("TRTLLM_OPTRT_NIXL_TRANSFER_PROOF", "0") != "1":
@@ -371,8 +403,13 @@ class PyExecutor:
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.stream_interval = self.llm_args.stream_interval
+        # S5: stats decimation interval. The sampled/unsampled decision is
+        # derived from iter_counter only (see _stats_iter_sampled), so every
+        # rank — whose loops run in lockstep — makes the same decision.
+        self._stats_decimate = _parse_stats_decimate()
         self.perf_manager = PerfMetricsManager(
-            enabled=getattr(self.llm_args, 'return_perf_metrics', False))
+            enabled=getattr(self.llm_args, 'return_perf_metrics', False),
+            decimate=self._stats_decimate)
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -1236,6 +1273,42 @@ class PyExecutor:
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
 
+    def _stats_iter_sampled(self) -> bool:
+        """True when the current loop iteration carries full stats (S5).
+
+        SYMMETRY-CRITICAL. IterationStats payloads ride rank-synchronous
+        collectives: under Attention-DP the per-rank payload piggybacks on
+        the rank-state allgather (_fetch_new_requests ->
+        adp_router.gather_all_rank_states), and under TLLM_METRICS_ALL_RANKS
+        the full stats dict is itself tp_allgather'ed (_append_iter_stats).
+        Every rank must therefore make the same sampled/unsampled decision
+        for the same loop iteration. This decision derives ONLY from
+        ``self.iter_counter`` and the launch-time env value — never from
+        request data, timing, or rank-local state:
+
+        - ``iter_counter`` starts at 0 on every rank (__init__) and is
+          incremented exactly once per executor-loop iteration on every rank
+          (_executor_loop / _executor_loop_overlap / _executor_loop_pp tail).
+          Ranks cannot skip loop iterations relative to each other: each
+          iteration contains unconditional collectives (request broadcast in
+          _fetch_and_enqueue_requests; rank-state allgather under ADP), so
+          the counters advance in lockstep.
+        - ``_stats_decimate`` is parsed once at construction from the
+          launcher-provided environment, identical across ranks (invalid
+          values fall back deterministically).
+
+        The decision is made once, at IterationStats construction time
+        (_prepare_and_schedule_batch / _executor_loop_pp). Downstream
+        consumption is data-driven — BatchState.iter_stats is None on
+        unsampled iterations and _process_iter_stats returns early — so the
+        overlap/PP delay between construction and consumption cannot split
+        the decision across different counter values. The ADP allgather
+        payload itself is a fixed-width int list (RankIterStatsPayload with
+        has_iter_stats=0/1), so unsampled iterations keep byte-identical
+        collective shapes on all ranks.
+        """
+        return self.iter_counter % self._stats_decimate == 0
+
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
         stats = IterationStats()
@@ -1885,7 +1958,10 @@ class PyExecutor:
                     self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_disagg_gen_transfer_status()
 
-                if self.enable_iter_perf_stats:
+                iter_stats = None
+                # S5 decimation: see _stats_iter_sampled for the cross-rank
+                # symmetry argument.
+                if self.enable_iter_perf_stats and self._stats_iter_sampled():
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
                         self._get_new_active_requests_queue_latency())
@@ -2041,7 +2117,7 @@ class PyExecutor:
                                 self._update_generation_requests_that_will_complete_next_iteration(
                                     scheduled_batch.generation_requests)
 
-                    if self.enable_iter_perf_stats:
+                    if self.enable_iter_perf_stats and iter_stats is not None:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
                     batch_state = BatchStatePP(
@@ -2410,7 +2486,11 @@ class PyExecutor:
             self._check_kv_transfer_timeout()
 
         iter_stats = None
-        if self.enable_iter_perf_stats:
+        # S5 decimation: build full IterationStats only on sampled
+        # iterations. The decision keys on iter_counter alone so all ranks
+        # agree (see _stats_iter_sampled); downstream consumers treat
+        # iter_stats=None as "no stats this iteration".
+        if self.enable_iter_perf_stats and self._stats_iter_sampled():
             iter_stats = self._get_init_iter_stats(
                 len(new_requests),
                 self._get_new_active_requests_queue_latency())
@@ -2807,7 +2887,7 @@ class PyExecutor:
 
                     # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
-                    )
+                        self.iter_counter)
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
@@ -2880,7 +2960,8 @@ class PyExecutor:
 
                 self._kv_connector_terminate_requests()
 
-                if self.enable_iter_perf_stats and sample_state is not None:
+                if (self.enable_iter_perf_stats and sample_state is not None
+                        and iter_stats is not None):
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
                     self._process_iter_stats(
@@ -3166,7 +3247,7 @@ class PyExecutor:
 
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
-                    )
+                        self.iter_counter)
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
@@ -3246,7 +3327,7 @@ class PyExecutor:
                         gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
                         fwd_timing.end_time, sample_timing.start_time,
                         sample_timing.end_time)
-                    if self.enable_iter_perf_stats:
+                    if self.enable_iter_perf_stats and iter_stats is not None:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
 
@@ -4910,6 +4991,13 @@ class PyExecutor:
         )
 
         batch_token_time = self.perf_manager.get_timestamp()
+        # S5 decimation: per-request C++ perf-metric refreshes run on sampled
+        # iterations plus the correctness-critical boundaries — the first
+        # call for a request (C++ sets firstTokenTime exactly once) and the
+        # finishing iteration (C++ sets lastTokenTime for E2E latency).
+        # Between samples only the mPerfMetrics.iter refresh on streaming
+        # intermediates is skipped. Rank-local; no collective on this path.
+        perf_iter_sampled = self._stats_iter_sampled()
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -4951,8 +5039,14 @@ class PyExecutor:
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
             # This is critical for E2E latency computation in tracing/Prometheus.
+            # Under S5 decimation the refresh is sampled, but the first call
+            # per request and the finishing call always run so firstTokenTime
+            # and lastTokenTime keep their exact semantics.
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
-                request.update_perf_metrics(self.iter_counter)
+                if (perf_iter_sampled or request.is_finished or not getattr(
+                        request, 'py_perf_metrics_started', False)):
+                    request.py_perf_metrics_started = True
+                    request.update_perf_metrics(self.iter_counter)
 
             request_done = False
             should_emit = (request.py_decoding_iter == 1 or request.is_finished

@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +34,7 @@ class GatedMLP(nn.Module):
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
+        nvfp4_allowed_backends: Optional[List[str]] = None,
     ):
 
         super().__init__()
@@ -94,6 +95,7 @@ class GatedMLP(nn.Module):
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
 
         if is_shared_expert:
@@ -123,6 +125,7 @@ class GatedMLP(nn.Module):
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
@@ -245,11 +248,6 @@ class GatedMLP(nn.Module):
 
         return output
 
-    # Minimum M dimension for the fp4out CuTe DSL kernel.
-    # Below this, the kernel's SFC epilogue may write out-of-bounds
-    # because the CTA tile height exceeds the output allocation.
-    _FP4OUT_MIN_M = 128
-
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -263,14 +261,7 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self._can_fuse_gate_up_swiglu_fp4out():
-            # Get token count for minimum-M check
-            if isinstance(x, (tuple, Fp4QuantizedTensor)):
-                m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
-            else:
-                m = x.reshape(
-                    -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
-            h2 = self._fused_gate_up_swiglu(x,
-                                            fp4_out=m >= GatedMLP._FP4OUT_MIN_M)
+            h2 = self._fused_gate_up_swiglu(x, fp4_out=True)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
         else:

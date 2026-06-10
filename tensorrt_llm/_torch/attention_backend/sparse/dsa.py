@@ -142,6 +142,63 @@ def _layersplit_compute_read_block_ids(metadata):
     return torch.unique(selected)
 
 
+def _layersplit_readset_hoist_enabled() -> bool:
+    """L2 gate: memoize the LayerSplit indexer-K READ set once per step
+    instead of recomputing it inside every layer's Indexer.forward (61x at
+    DSV3.2). Default on; set TRTLLM_OPTRT_LAYERSPLIT_READSET_HOIST=0 to
+    recompute per layer (pre-hoist behavior, identical sets either way)."""
+    return os.environ.get("TRTLLM_OPTRT_LAYERSPLIT_READSET_HOIST",
+                          "1") != "0"
+
+
+def _layersplit_read_block_ids_step(metadata):
+    """Per-step memo of :func:`_layersplit_compute_read_block_ids` (L2).
+
+    The read set is a pure function of step-level metadata — host kv_lens
+    values, block_table, num_seqs, tokens_per_block — none of which vary
+    across the indexer layers of one forward step, yet every layer's
+    Indexer.forward re-ran the full computation (H2D kv_lens copy, range
+    mask, padding filter, torch.unique — the last two host-sync on their
+    data-dependent output shapes). The first indexer layer of a step
+    computes the set; the remaining layers reuse the tensor. The broadcast
+    consumer only reads it (index_select / index_copy_ index argument), so
+    cross-layer aliasing is safe.
+
+    Correctness across steps rests on the same two legs as
+    ``_hisa_step_invariants``: prepare() / on_update_kv_lens() /
+    update_for_spec_dec() clear the slot every step, and the memo key
+    revalidates. The key here is strictly stronger than the HISA one: it
+    carries the host kv_lens VALUES, so chunked-prefill steps of the same
+    request (same buffers and num_seqs, advanced kv progress — the read
+    set legitimately grows chunk to chunk) and prefix-cache-hit admissions
+    can never alias even if a clear were missed. The capture flag mirrors
+    the template; in practice this path is always eager — batches with
+    context requests never run under CUDA graphs, and the unique() output
+    shape is data-dependent.
+
+    Falls back to the plain per-layer compute when the gate is off, the
+    metadata is unusable for keying, or kv_lens is not host-resident
+    (fingerprinting a device tensor would itself sync).
+    """
+    if metadata is None or not _layersplit_readset_hoist_enabled():
+        return _layersplit_compute_read_block_ids(metadata)
+    kv_lens = getattr(metadata, "kv_lens", None)
+    block_table = getattr(metadata, "block_table", None)
+    num_seqs = getattr(metadata, "num_seqs", 0)
+    if (kv_lens is None or block_table is None or num_seqs <= 0
+            or kv_lens.device.type != "cpu"):
+        return _layersplit_compute_read_block_ids(metadata)
+    key = (kv_lens.data_ptr(), block_table.data_ptr(), int(num_seqs),
+           tuple(kv_lens[:num_seqs].tolist()),
+           torch.cuda.is_current_stream_capturing())
+    cached = getattr(metadata, "_layersplit_step_read_set", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    read_set = _layersplit_compute_read_block_ids(metadata)
+    metadata._layersplit_step_read_set = (key, read_set)
+    return read_set
+
+
 def _layersplit_topk_global_block_ids(topk_indices_global, stride_factor):
     """Map global-token TopK indices -> the unique global BLOCK ids they hit.
 
@@ -213,13 +270,16 @@ except ImportError:
 # (device_index, top_k, hint_size, num_cols). Prevents repeated allocations
 # and synchronizations when multiple Indexer modules invoke the warmup with
 # the same parameters during model construction.
-_HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int]] = set()
+_HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int,
+                                       torch.dtype]] = set()
 _HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
 
 
 def warmup_heuristic_topk_decode(top_k: int = 2048,
                                  hint_size: int = 2048,
-                                 num_cols: int = 4096) -> None:
+                                 num_cols: int = 4096,
+                                 logits_dtype: torch.dtype = torch.float32
+                                 ) -> None:
     """Pre-initialize cached hardware attributes in the C++ Scheme X dispatcher.
 
     The dispatcher inside ``invokeIndexerTopKDecode`` lazily queries
@@ -235,22 +295,27 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
     ``enable_heuristic_topk`` is true.
 
     Repeated invocations with the same ``(device, top_k, hint_size,
-    num_cols)`` key are short-circuited so that constructing many Indexer
-    modules in the same process does not re-allocate scratch tensors or
-    issue redundant synchronizations.
+    num_cols, logits_dtype)`` key are short-circuited so that constructing
+    many Indexer modules in the same process does not re-allocate scratch
+    tensors or issue redundant synchronizations.
+
+    ``logits_dtype`` must match the dtype the decode pipeline feeds the
+    C++ Top-K (see ``resolve_indexer_logits_dtype``); the kernel requires
+    its heuristic scratch dtype to equal its logits dtype.
     """
-    key = (torch.cuda.current_device(), top_k, hint_size, num_cols)
+    key = (torch.cuda.current_device(), top_k, hint_size, num_cols,
+           logits_dtype)
     with _HEURISTIC_TOPK_WARMUP_LOCK:
         if key in _HEURISTIC_TOPK_WARMUP_DONE:
             return
         _HEURISTIC_TOPK_WARMUP_DONE.add(key)
 
     device = torch.device("cuda")
-    logits = torch.zeros((1, num_cols), dtype=torch.float32, device=device)
+    logits = torch.zeros((1, num_cols), dtype=logits_dtype, device=device)
     seq_lens = torch.tensor([num_cols], dtype=torch.int32, device=device)
     indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
     pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
-    scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
+    scratch = torch.empty((top_k, ), dtype=logits_dtype, device=device)
     torch.ops.trtllm.indexer_topk_decode(logits,
                                          seq_lens,
                                          indices,
@@ -323,6 +388,14 @@ def _hisa_perrow_cand() -> bool:
     *allocations* stay graph-stable; only the per-row length arguments shrink.
     Default off (0) = the uniform `full(candidate_len)` behavior, byte-identical."""
     return os.environ.get("TRTLLM_OPTRT_HISA_PERROW_CAND", "0") == "1"
+
+
+def _hisa_step_memo_enabled() -> bool:
+    """Gate for the per-step memo of layer-invariant HISA decode index math
+    (row_to_batch / prefix_lens / block_counts / row spans). Default on; set
+    TRTLLM_OPTRT_HISA_STEP_MEMO=0 to recompute per layer (pre-memo behavior,
+    byte-identical math either way)."""
+    return os.environ.get("TRTLLM_OPTRT_HISA_STEP_MEMO", "1") != "0"
 
 
 @functools.lru_cache(maxsize=1)
@@ -424,28 +497,25 @@ def _build_hisa_candidate_schedule(sparse_attention_config, kv_lens_gen: torch.T
     return schedule, (num_rows, next_n, candidate_len)
 
 
-# Decode top-k kernel crossover on max KV length (B200, index_topk=1024, fp32
-# logits, microbenchmarked across batch 1..256). The CuTe DSL kernel runs a
-# kv-parallel select whose latency is ~flat in kv_len, while the C++ Scheme X
-# kernel walks a per-row histogram whose latency grows ~linearly in kv_len.
-# Measured: C++ wins by 3.7x at kv_len=4608 and 1.6x at 16384; the paths are
-# even near 32768; DSL wins by ~1.3-1.4x at 65536-131072. Both produce
-# identical selected sets (Jaccard=1.0). Below this threshold prefer C++.
-_DSL_TOPK_MIN_KV_LEN = 32768
+# Decode top-k kernel crossover on LIVE KV length (B200, index_topk=1024,
+# CUDA-graph replay, 3-seed, prod width 132096). The C++ indexer_topk_decode
+# walks only [0, live_kv) per row (cpp/.../indexerTopK.cu topKPerRowJob), so its
+# latency is ~independent of the padded logits width and grows ~linearly in live
+# kv. The CuTe DSL kernel runs a kv-parallel select whose cost scales with the
+# padded WIDTH. Measured at prod width 132096: C++ is ~1.7x FASTER at live kv
+# ~4608 (~11us vs ~19us); the paths cross at ~12-16K live kv; the (cluster) DSL
+# kernel wins by ~1.3-1.4x only at long live kv (>= ~16K up to 131072). Both
+# produce identical selected sets (recall 1.0). Below this threshold prefer C++.
+_DSL_TOPK_MIN_KV_LEN = 16384
 
-# Decode Top-K kernel selection by LOGITS WIDTH (= the paged-MQA-logits output
-# column count = kv_cache max_seq_len, NOT the live kv_len). The C++
-# indexer_topk_decode takes a fast per-row insertion path only for
-# numColumns < 12288; at/above that it falls to a ~2x-slower path (B200 sweep,
-# B=8 topk=1024, graphed: C++ 8.2us at width<=8192 jumps to 16.4us at
-# width>=12288 and stays flat, while cute_dsl_indexer_topk_decode is ~10-12us
-# flat across width and selects a bit-identical Top-K set). Production decode
-# runs the logits at max_seq_len=132096 (sdt_gen.yaml) regardless of the short
-# ~4.6K live prefix, so the width is always >=12288 and the DSL kernel wins by
-# ~4us/recompute-F layer. Gate the DSL path on this width crossover so the
-# scoring-width regime (not just the >=32K long-context kv regime) takes the
-# faster kernel. DSL scratch is O(num_gen_tokens * live_kv_len) (bounded by the
-# 256-token cap below), independent of the padded width, so it stays cheap.
+# _DSL_TOPK_MIN_COLS is a logits-WIDTH bucket used ONLY by the width-correction
+# helper below (DSL-scratch sizing / logits-buffer bucketing for the long-kv DSL
+# path). It is NO LONGER a top-k dispatch gate: the earlier width-based override
+# (route to DSL whenever the logits width >= this) was REMOVED because it forced
+# the SLOWER DSL kernel at prod (width 132096 >> 12288) on the false premise that
+# the C++ kernel slows at width >= 12288. Direct measurement shows C++ is
+# ~width-independent (~11us flat), so the top-k dispatch is now gated on live kv
+# only (_DSL_TOPK_MIN_KV_LEN above).
 _DSL_TOPK_MIN_COLS = 12288
 
 
@@ -492,6 +562,40 @@ def _indexer_logits_width(max_gen_kv_len: int, hard_cap: int) -> int:
     while bucket < max_gen_kv_len:
         bucket <<= 1
     return bucket if bucket < hard_cap else hard_cap
+
+
+_INDEXER_LOGITS_DTYPE_MAP = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+
+def resolve_indexer_logits_dtype(sparse_attention_config) -> torch.dtype:
+    """Decode-logits element type for the DSL score -> Top-K pipeline.
+
+    The indexer scoring inputs are already fp8/fp4 quantized (see
+    ``indexer_k_dtype``), so fp32 logits carry far more precision than the
+    scores contain. 16-bit logits halve the logits store/load traffic and
+    cut the radix Top-K from 4 rounds (fp32) to 2; the scoring kernels keep
+    fp32 accumulation and only convert at the epilogue store. ``auto``
+    resolves to fp16: 3 extra mantissa bits over bf16 give measurably
+    better top-1024 selection fidelity, and the score magnitudes (weighted
+    ReLU sums over 64 heads) sit orders of magnitude below the fp16 range.
+
+    Only the CuTe DSL paged-MQA-logits kernels can emit 16-bit logits; the
+    DeepGEMM fallback emits fp32 only, so everything resolves to fp32 when
+    that path is active. This keeps the heuristic-topk scratch dtype (which
+    the C++ Top-K requires to match its logits input) consistent with the
+    logits actually produced.
+    """
+    if not (getattr(sparse_attention_config, "use_cute_dsl_paged_mqa_logits",
+                    False) and IS_CUTLASS_DSL_AVAILABLE):
+        return torch.float32
+    choice = getattr(sparse_attention_config, "indexer_logits_dtype", "auto")
+    if choice == "auto":
+        return torch.float16
+    return _INDEXER_LOGITS_DTYPE_MAP[choice]
 
 
 def _pick_dsl_expand(
@@ -1095,6 +1199,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._sparse_mla_meta_valid = False
         self._sparse_mla_meta_num_sm_parts = 0
         self._sparse_mla_meta_sig = None
+        # Per-step memo slots for layer-invariant HISA decode index math
+        # (row_to_batch / prefix_lens / block_counts / row spans). Cleared in
+        # prepare() and on kv-len updates; rebuilt by the first indexer layer.
+        self._hisa_step_invariants = None
+        self._hisa_step_rowspan = None
+        # Per-step memo for the LayerSplit indexer-K read set (candidate L2);
+        # same lifecycle as the HISA slots above.
+        self._layersplit_step_read_set = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
@@ -1355,13 +1467,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Pre-allocated with stable address for CUDA Graph compatibility
             # (replaces cudaMallocAsync/cudaFreeAsync inside the kernel launcher).
             # Shape: [max_gen_tokens, topK] where max_gen_tokens = max_batch * (1 + max_draft).
+            # The C++ Top-K requires scratch dtype == logits dtype, so this
+            # follows the resolved decode-logits dtype.
             max_gen_tokens = self.max_num_sequences * (1 +
                                                        self.max_draft_tokens)
             self.heuristic_scratch_values = self.get_empty(
                 self.cuda_graph_buffers,
                 (max_gen_tokens, self.num_sparse_topk),
                 cache_name="heuristic_scratch_values",
-                dtype=torch.float32,
+                dtype=resolve_indexer_logits_dtype(
+                    self.sparse_attention_config),
                 capture_graph=capture_graph,
             )
 
@@ -1472,7 +1587,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     self.cuda_graph_buffers,
                     (max_gen_tokens, self.num_sparse_topk),
                     cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
+                    dtype=resolve_indexer_logits_dtype(
+                        self.sparse_attention_config),
                     capture_graph=capture_graph,
                 )
 
@@ -1611,9 +1727,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
-        # Per-step LayerSplit read-set cache (computed lazily by the first
-        # broadcasting layer, reused by the rest — see Indexer.forward).
-        self._layersplit_read_block_ids_step = None
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -1692,6 +1805,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Copy to GPU
             self.block_table[:self.num_seqs, :max_blocks_used].copy_(
                 host_block_table, non_blocking=True)
+            # Host-side view for the KVarN pre-replay delta restore: the
+            # delta walk derives newly-full block ids from request metadata
+            # without reading the device block table back.
+            self.kvarn_host_block_table = host_block_table
 
         # For mla_rope_append_paged_kv_assign_q
         if self.num_contexts > 0:
@@ -1904,6 +2021,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def on_update_kv_lens(self):
         """Refresh indexer slot mappings after KV lengths change at runtime."""
+        self._hisa_step_invariants = None
+        self._hisa_step_rowspan = None
+        self._layersplit_step_read_set = None
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -2046,11 +2166,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # signature guard is sufficient; the eager prepare() runs before any
             # CUDA-graph replay, keeping the buffer addresses stable.
             self._sparse_mla_meta_valid = False
+        self._hisa_step_invariants = None
+        self._hisa_step_rowspan = None
+        self._layersplit_step_read_set = None
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
         """Reset context/generation counters and refresh slot mappings for speculative decoding."""
         super().update_for_spec_dec()
+        self._hisa_step_invariants = None
+        self._hisa_step_rowspan = None
+        self._layersplit_step_read_set = None
         # host
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
@@ -2089,6 +2215,151 @@ def _tf32_matmul_enabled():
         yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
+
+
+class _FusedWkWpNvfp4:
+    """Single NVFP4 GEMM for the Indexer's wk + weights_proj projections.
+
+    wk [head_dim <- hidden] and weights_proj [n_heads <- hidden] consume the
+    SAME hidden-state tensor, so the unfused pair quantizes the activation
+    twice and streams the [M, hidden] activation through two skinny GEMMs.
+    This runs one [head_dim + n_heads <- hidden] GEMM instead: the packed FP4
+    weights and the swizzled block scales are concatenated along N at load
+    time and the output is split back into the two projections.
+
+    Scale handling: the activation quantization (and therefore the FP4 codes
+    and per-block activation scales) is shared, which is exact because both
+    parts see the same input. The GEMM's scalar dequant alpha uses wk's
+    per-tensor weight scale; the weights_proj part is corrected by
+    weight_scale_2_wp / weight_scale_2_wk on its f32 output slice. That fold
+    is a per-element f32 multiply (1 ulp), NOT an e4m3 block-scale
+    requantization, so no quantization error is introduced.
+
+    Block-scale layout: trtllm swizzled scales order 128-row blocks
+    outermost (block_scale_interleave pads each part's N to a multiple of
+    128), so concatenating the two flat swizzled tensors is the swizzled
+    layout of the [head_dim + n_heads, hidden] weight iff head_dim is a
+    multiple of 128. The trailing pad rows of the weights_proj block only
+    back output columns >= head_dim + n_heads, which are never computed
+    (GEMM N = head_dim + n_heads).
+    """
+
+    # Mirrors NVFP4LinearMethod._input_prepare quantization constants.
+    _FP8_MAX = 448.0
+    _E2M1_MAX = 6.0
+
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor,
+                 wk_out: int, wp_out: int, out_dtype: torch.dtype,
+                 weight_scale_2_wk: torch.Tensor, wp_out_scale: float,
+                 input_scale: Optional[torch.Tensor],
+                 alpha: Optional[torch.Tensor], allowed_backends: str):
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.wk_out = wk_out
+        self.wp_out = wp_out
+        self.out_dtype = out_dtype
+        self.weight_scale_2_wk = weight_scale_2_wk
+        self.wp_out_scale = wp_out_scale
+        # Static activation quantization when the checkpoint carries an
+        # activation scale; dynamic (per-call amax) otherwise.
+        self.input_scale = input_scale
+        self.alpha = alpha
+        self.allowed_backends = allowed_backends
+
+    @classmethod
+    def build(cls, wk: Linear, wp: Linear,
+              allowed_backends: Optional[List[str]]
+              ) -> Optional["_FusedWkWpNvfp4"]:
+        """Build from two loaded NVFP4 Linears; None when fusion is unsafe."""
+
+        def _is_nvfp4(m: Linear) -> bool:
+            w = getattr(m, "weight", None)
+            ws = getattr(m, "weight_scale", None)
+            ws2 = getattr(m, "weight_scale_2", None)
+            return (w is not None and w.dtype == torch.uint8 and w.dim() == 2
+                    and ws is not None and ws.dim() == 1 and ws2 is not None
+                    and m.bias is None
+                    and getattr(m, "pre_quant_scale", None) is None)
+
+        if not (_is_nvfp4(wk) and _is_nvfp4(wp)):
+            return None
+        if wk.weight.shape[1] != wp.weight.shape[1]:
+            return None
+        if wk.dtype != wp.dtype:
+            return None
+        # Swizzled scales order 128-row blocks outermost; the concat is only
+        # the fused layout when wk's rows fill whole blocks.
+        if wk.out_features % 128 != 0:
+            return None
+        k_blocks = (wk.weight.shape[1] * 2) // 16
+        k_blocks_padded = (k_blocks + 3) // 4 * 4
+        for m in (wk, wp):
+            n_padded = (m.out_features + 127) // 128 * 128
+            if m.weight.shape[0] != m.out_features:
+                return None
+            if m.weight_scale.numel() != n_padded * k_blocks_padded:
+                return None
+
+        wk_static = getattr(wk, "input_scale", None) is not None
+        wp_static = getattr(wp, "input_scale", None) is not None
+        if wk_static != wp_static:
+            return None
+        if wk_static:
+            # Both parts must quantize the shared activation identically for
+            # the fused GEMM to reproduce the unfused outputs.
+            if not torch.allclose(wk.input_scale, wp.input_scale):
+                logger.warning(
+                    "DSA indexer wk/weights_proj input_scale mismatch; "
+                    "keeping the projections unfused.")
+                return None
+
+        weight = torch.cat([wk.weight.data, wp.weight.data], dim=0)
+        weight_scale = torch.cat(
+            [wk.weight_scale.data, wp.weight_scale.data], dim=0)
+        wp_out_scale = float(
+            (wp.weight_scale_2.float() / wk.weight_scale_2.float()).item())
+        return cls(
+            weight=weight,
+            weight_scale=weight_scale,
+            wk_out=wk.out_features,
+            wp_out=wp.out_features,
+            out_dtype=wk.dtype,
+            weight_scale_2_wk=wk.weight_scale_2.data,
+            wp_out_scale=wp_out_scale,
+            input_scale=wk.input_scale if wk_static else None,
+            alpha=wk.alpha if wk_static else None,
+            allowed_backends=','.join(allowed_backends or
+                                      ['cutlass', 'cublaslt', 'cuda_core']))
+
+    def __call__(
+            self,
+            hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the fused GEMM; returns (wk_out, weights_proj_out) slices."""
+        if self.input_scale is not None:
+            input_scale = self.input_scale
+            alpha = self.alpha
+        else:
+            # Dynamic activation quantization, computed ONCE for both parts
+            # (the unfused pair pays the amax reduction + quantize twice).
+            global_max = self._FP8_MAX * self._E2M1_MAX
+            amax = torch.amax(torch.abs(hidden_states)).float()
+            input_scale = global_max / amax
+            alpha = (amax / global_max) * self.weight_scale_2_wk
+        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+            hidden_states, input_scale, 16, False)
+        out = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4,
+            self.weight,
+            act_sf,
+            self.weight_scale,
+            alpha,
+            self.out_dtype,
+            allowed_backends=self.allowed_backends)
+        indexer_k = out[..., :self.wk_out]
+        weights = out[..., self.wk_out:self.wk_out + self.wp_out]
+        if self.wp_out_scale != 1.0:
+            weights = weights * self.wp_out_scale
+        return indexer_k, weights
 
 
 class Indexer(nn.Module):
@@ -2167,6 +2438,19 @@ class Indexer(nn.Module):
                                    Dict[str, torch.Tensor]] = {}
         self.skip_topk = self._should_reuse_previous_topk()
 
+        # NVFP4 backend override for the indexer projection GEMMs. With an
+        # NVFP4-quantized indexer (e.g. the REAP indexer overlay) the GEMM
+        # AutoTuner picks the cutlass backend for wq_b/wk/weights_proj at
+        # decode token counts; cuBLASLt is bit-identical (max|diff| == 0 on
+        # real weights at M in {4,16}) and 1.16-1.30x faster. Ignored when the
+        # indexer is unquantized. Comma-separated to override, empty to
+        # restore auto-selection.
+        _idx_backends_env = os.environ.get('TRTLLM_INDEXER_NVFP4_BACKENDS',
+                                           'cublaslt')
+        self._indexer_nvfp4_backends = ([
+            b.strip() for b in _idx_backends_env.split(',') if b.strip()
+        ] or None)
+
         self.wq_b = Linear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -2174,7 +2458,8 @@ class Indexer(nn.Module):
             dtype=dtype,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            nvfp4_allowed_backends=self._indexer_nvfp4_backends)
         self.wk = Linear(
             self.hidden_size,
             self.head_dim,
@@ -2182,7 +2467,8 @@ class Indexer(nn.Module):
             dtype=torch.float32,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            nvfp4_allowed_backends=self._indexer_nvfp4_backends)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
         self.weights_proj = Linear(
             self.hidden_size,
@@ -2191,11 +2477,17 @@ class Indexer(nn.Module):
             dtype=torch.float32,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            nvfp4_allowed_backends=self._indexer_nvfp4_backends)
 
         # Fused wk + weights_proj weight for single F.linear FP32 GEMM under allow_tf32.
         # Maps to TF32 tensor cores on Ampere+.
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+        # NVFP4 counterpart (quantized indexer): one [head_dim + n_heads <-
+        # hidden] NVFP4 GEMM with a single activation quantize, built from
+        # the loaded wk/weights_proj tensors in post_load_weights.
+        # TRTLLM_INDEXER_FUSE_WK_WP=0 disables.
+        self._fused_wk_wp_nvfp4: Optional[_FusedWkWpNvfp4] = None
 
         indexer_rope_interleave = getattr(sparse_attention_config,
                                           'indexer_rope_interleave', False)
@@ -2232,6 +2524,11 @@ class Indexer(nn.Module):
         self.use_cute_dsl_paged_mqa_logits = (
             sparse_attention_config.use_cute_dsl_paged_mqa_logits
             and IS_CUTLASS_DSL_AVAILABLE)
+        # Decode-logits dtype for the DSL score -> Top-K pipeline. fp16 at
+        # prod (config-matched: scoring inputs are fp8/fp4 quantized);
+        # fp32 whenever the DeepGEMM scoring fallback is active.
+        self.logits_dtype = resolve_indexer_logits_dtype(
+            sparse_attention_config)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (
@@ -2243,16 +2540,15 @@ class Indexer(nn.Module):
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
             if self.use_cute_dsl_topk:
-                # the dtype of topk input tensor, which is float32 now.
-                # Note, need to update it if the dtype of topk input tensor is changed.
                 cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
-                    dtype=torch.float32, top_k=self.index_topk)
+                    dtype=self.logits_dtype, top_k=self.index_topk)
 
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
             # Scheme X dispatcher before any CUDA Graph capture so the host
             # attribute queries do not end up frozen into a captured graph.
-            warmup_heuristic_topk_decode(top_k=self.index_topk)
+            warmup_heuristic_topk_decode(top_k=self.index_topk,
+                                         logits_dtype=self.logits_dtype)
 
     def _should_reuse_previous_topk(self) -> bool:
         if self.indexer_mode not in ("indexcache", "indexcache-hisa"):
@@ -2407,6 +2703,50 @@ class Indexer(nn.Module):
                                device=device)
             self._hisa_full_cache[key] = value
         return value
+
+    def _hisa_step_invariants(
+        self, metadata: Optional["DSAtrtllmAttentionMetadata"],
+        kv_lens: torch.Tensor, num_rows: int, next_n: int,
+        device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        """Layer-invariant HISA decode index math, memoized per step.
+
+        row_to_batch / prefix_lens / block_counts depend only on the step's
+        kv_lens and shapes, never on the layer; eagerly they re-ran as ~7
+        small int kernels in every layer's indexer. The first indexer layer
+        of a step computes them; the rest reuse the tensors. metadata
+        prepare()/kv-len updates clear the slot, and under CUDA graphs the
+        layer-0 kernels are captured once and replay against the live
+        kv_lens buffer, so every step still sees fresh values.
+        """
+        # The capture flag in the key forces the first captured layer to
+        # rebuild inside the graph instead of hitting tensors memoized by the
+        # eager warmup pass (which the replayed graph would never refresh).
+        use_memo = metadata is not None and _hisa_step_memo_enabled()
+        key = (kv_lens.data_ptr(), num_rows, next_n, self.hisa_block_size,
+               torch.cuda.is_current_stream_capturing())
+        cached = getattr(metadata, "_hisa_step_invariants",
+                         None) if use_memo else None
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        rows = self._hisa_arange(num_rows, device)
+        row_to_batch = torch.div(rows, next_n, rounding_mode="floor")
+        row_offset = rows % next_n
+        prefix_lens = (kv_lens[row_to_batch] - next_n + row_offset + 1).to(
+            torch.int32)
+        block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
+                                 self.hisa_block_size,
+                                 rounding_mode="floor")
+        vals = (row_to_batch, prefix_lens, block_counts,
+                row_to_batch.to(torch.int32), kv_lens.to(torch.int64))
+        if use_memo:
+            metadata._hisa_step_invariants = (key, vals)
+            # The rowspan memo keys off id(block_counts); drop it together
+            # with the invariants so a rebuilt block_counts can never collide
+            # with a stale entry through CPython address reuse.
+            metadata._hisa_step_rowspan = None
+        return vals
 
     def _should_use_hisa(self, max_kv_len: int) -> bool:
         if not self.enable_nvfp4_hisa:
@@ -2662,20 +3002,24 @@ class Indexer(nn.Module):
         prefix_lens: torch.Tensor,
         block_topk: int,
         next_n: int,
+        block_counts: Optional[torch.Tensor] = None,
+        row_to_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q_dequant = self._dequantize_indexer_nvfp4(q_flat, q_scale_flat)
-        row_to_batch = torch.div(
-            self._hisa_arange(q_flat.shape[0], q_flat.device),
-            next_n,
-            rounding_mode="floor")
+        if row_to_batch is None:
+            row_to_batch = torch.div(
+                self._hisa_arange(q_flat.shape[0], q_flat.device),
+                next_n,
+                rounding_mode="floor")
         reps_rows = reps.index_select(0, row_to_batch.long())
         with _tf32_matmul_enabled():
             dots = torch.bmm(q_dequant, reps_rows.transpose(1, 2))
         block_scores = (dots.clamp_min_(0.0) *
                         weights_flat.unsqueeze(-1)).sum(dim=1)
-        block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
-                                 self.hisa_block_size,
-                                 rounding_mode="floor")
+        if block_counts is None:
+            block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
+                                     self.hisa_block_size,
+                                     rounding_mode="floor")
         block_ids = self._hisa_arange(reps.shape[1], q_flat.device).view(1, -1)
         block_scores = block_scores.masked_fill(
             block_ids >= block_counts.view(-1, 1), float("-inf"))
@@ -2697,6 +3041,9 @@ class Indexer(nn.Module):
         next_n: int,
         quantized_reps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         max_blocks: Optional[int] = None,
+        block_counts: Optional[torch.Tensor] = None,
+        row_to_batch_i32: Optional[torch.Tensor] = None,
+        metadata: Optional["DSAtrtllmAttentionMetadata"] = None,
     ) -> Optional[torch.Tensor]:
         if quantized_reps is None:
             if not hasattr(torch.ops.trtllm,
@@ -2710,24 +3057,42 @@ class Indexer(nn.Module):
         else:
             block_rep_values, block_rep_scales = quantized_reps
             assert max_blocks is not None
-        block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
-                                 self.hisa_block_size,
-                                 rounding_mode="floor")
-        row_to_batch = torch.div(
-            self._hisa_arange(q_flat.shape[0], q_flat.device),
-            next_n,
-            rounding_mode="floor").to(torch.int32)
-        row_starts = row_to_batch * max_blocks
-        row_ends = row_starts + block_counts
+        if block_counts is None:
+            block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
+                                     self.hisa_block_size,
+                                     rounding_mode="floor")
+        if row_to_batch_i32 is None:
+            row_to_batch_i32 = torch.div(
+                self._hisa_arange(q_flat.shape[0], q_flat.device),
+                next_n,
+                rounding_mode="floor").to(torch.int32)
+        # Layer-invariant row spans (and the width-correction gather index),
+        # memoized per step alongside _hisa_step_invariants.
+        use_rowspan_memo = metadata is not None and _hisa_step_memo_enabled()
+        rowspan_key = (id(block_counts), int(max_blocks), q_flat.shape[0])
+        rowspan = getattr(metadata, "_hisa_step_rowspan",
+                          None) if use_rowspan_memo else None
+        if rowspan is not None and rowspan[0] == rowspan_key:
+            row_starts, row_ends, gather_idx = rowspan[1]
+        else:
+            row_starts = row_to_batch_i32 * max_blocks
+            row_ends = row_starts + block_counts
+            gather_idx = None
         block_scores = fp8_fp4_mqa_logits(
             (q_flat.contiguous().view(torch.int8), q_scale_flat.contiguous()),
             (block_rep_values.reshape(-1, self.head_dim // 2),
              block_rep_scales.reshape(-1)),
             weights_flat.contiguous(), row_starts, row_ends, False, max_blocks)
         if block_scores.shape[1] != max_blocks:
-            block_ids = self._hisa_arange(max_blocks, q_flat.device).view(1, -1)
-            block_scores = block_scores.gather(
-                1, (row_starts.to(torch.int64).view(-1, 1) + block_ids))
+            if gather_idx is None:
+                block_ids = self._hisa_arange(max_blocks,
+                                              q_flat.device).view(1, -1)
+                gather_idx = row_starts.to(torch.int64).view(-1,
+                                                             1) + block_ids
+            block_scores = block_scores.gather(1, gather_idx)
+        if use_rowspan_memo:
+            metadata._hisa_step_rowspan = (rowspan_key,
+                                           (row_starts, row_ends, gather_idx))
         top_blocks = torch.empty((q_flat.shape[0], block_topk),
                                  dtype=torch.int32,
                                  device=q_flat.device)
@@ -2744,11 +3109,23 @@ class Indexer(nn.Module):
         prefix_lens: torch.Tensor,
         block_topk: int,
         next_n: int,
+        block_counts: Optional[torch.Tensor] = None,
+        row_to_batch: Optional[torch.Tensor] = None,
+        row_to_batch_i32: Optional[torch.Tensor] = None,
+        metadata: Optional["DSAtrtllmAttentionMetadata"] = None,
     ) -> torch.Tensor:
         if q_flat.is_cuda and reps.shape[1] > _HISA_FUSED_BLOCK_SCORE_MAX_BLOCKS:
             top_blocks = self._hisa_select_blocks_deepgemm_fp4(
-                q_flat, q_scale_flat, weights_flat, reps, prefix_lens,
-                block_topk, next_n)
+                q_flat,
+                q_scale_flat,
+                weights_flat,
+                reps,
+                prefix_lens,
+                block_topk,
+                next_n,
+                block_counts=block_counts,
+                row_to_batch_i32=row_to_batch_i32,
+                metadata=metadata)
             if top_blocks is not None:
                 return top_blocks
 
@@ -2761,9 +3138,11 @@ class Indexer(nn.Module):
                 q_flat.contiguous(), q_scale_flat.contiguous(),
                 weights_flat.contiguous(), reps.contiguous(), prefix_lens,
                 block_topk, next_n, self.hisa_block_size)
-            block_counts = torch.div(prefix_lens + self.hisa_block_size - 1,
-                                     self.hisa_block_size,
-                                     rounding_mode="floor")
+            if block_counts is None:
+                block_counts = torch.div(prefix_lens + self.hisa_block_size -
+                                         1,
+                                         self.hisa_block_size,
+                                         rounding_mode="floor")
             top_blocks = torch.empty((q_flat.shape[0], block_topk),
                                      dtype=torch.int32,
                                      device=q_flat.device)
@@ -2771,10 +3150,15 @@ class Indexer(nn.Module):
                                                  top_blocks, 1, block_topk)
             return top_blocks
 
-        return self._hisa_select_blocks_tensor_ops(q_flat, q_scale_flat,
-                                                   weights_flat, reps,
-                                                   prefix_lens, block_topk,
-                                                   next_n)
+        return self._hisa_select_blocks_tensor_ops(q_flat,
+                                                   q_scale_flat,
+                                                   weights_flat,
+                                                   reps,
+                                                   prefix_lens,
+                                                   block_topk,
+                                                   next_n,
+                                                   block_counts=block_counts,
+                                                   row_to_batch=row_to_batch)
 
     def _hisa_topk_from_nvfp4_cache(
         self, q_values: torch.Tensor, q_scales: torch.Tensor,
@@ -2826,12 +3210,10 @@ class Indexer(nn.Module):
         q_flat = q_values.reshape(num_rows, self.n_heads, self.head_dim // 2)
         q_scale_flat = q_scales.reshape(num_rows, self.n_heads)
         weights_flat = weights.reshape(num_rows, self.n_heads)
-        row_to_batch = torch.div(self._hisa_arange(num_rows, q_values.device),
-                                 next_n,
-                                 rounding_mode="floor")
-        row_offset = self._hisa_arange(num_rows, q_values.device) % next_n
-        prefix_lens = (kv_lens[row_to_batch] - next_n + row_offset + 1).to(
-            torch.int32)
+        (row_to_batch, prefix_lens, block_counts, row_to_batch_i32,
+         kv_lens_i64) = self._hisa_step_invariants(metadata, kv_lens,
+                                                   num_rows, next_n,
+                                                   q_values.device)
         # Eager-only guard: bail out of HISA when the shortest row's causal
         # prefix is below index_topk (the candidate band could not fill a full
         # selection). Under the uniform-decode invariant asserted in prepare()
@@ -2858,17 +3240,35 @@ class Indexer(nn.Module):
                 k_cache.shape[1])
         if quantized_reps is not None:
             top_blocks = self._hisa_select_blocks_deepgemm_fp4(
-                q_flat, q_scale_flat, weights_flat, None, prefix_lens,
-                block_topk, next_n, quantized_reps, max_blocks)
+                q_flat,
+                q_scale_flat,
+                weights_flat,
+                None,
+                prefix_lens,
+                block_topk,
+                next_n,
+                quantized_reps,
+                max_blocks,
+                block_counts=block_counts,
+                row_to_batch_i32=row_to_batch_i32,
+                metadata=metadata)
         if top_blocks is None:
             reps = self._hisa_cached_block_reps(k_cache, block_table,
-                                                kv_lens.to(torch.int64),
-                                                max_blocks, request_ids,
-                                                page_reps, page_counts)
-            top_blocks = self._hisa_select_blocks(q_flat, q_scale_flat,
-                                                  weights_flat, reps,
-                                                  prefix_lens, block_topk,
-                                                  next_n)
+                                                kv_lens_i64, max_blocks,
+                                                request_ids, page_reps,
+                                                page_counts)
+            top_blocks = self._hisa_select_blocks(
+                q_flat,
+                q_scale_flat,
+                weights_flat,
+                reps,
+                prefix_lens,
+                block_topk,
+                next_n,
+                block_counts=block_counts,
+                row_to_batch=row_to_batch,
+                row_to_batch_i32=row_to_batch_i32,
+                metadata=metadata)
         # H3b: per-row live candidate count (TRTLLM_OPTRT_HISA_PERROW_CAND). Bound to
         # None here so it is defined across every execution-mode branch; populated lazily
         # at the first per-row use below.
@@ -2899,10 +3299,7 @@ class Indexer(nn.Module):
             # already masked downstream). `cand_count` is pure device arithmetic on
             # `prefix_lens` (no host sync) so it is recomputed correctly each graph replay.
             if _hisa_perrow_cand():
-                block_counts_row = torch.div(prefix_lens + self.hisa_block_size -
-                                             1,
-                                             self.hisa_block_size,
-                                             rounding_mode="floor")
+                block_counts_row = block_counts
                 cand_count = (block_counts_row.clamp_max(block_topk) *
                               self.hisa_block_size).to(torch.int32)
                 candidate_context_lens = cand_count.view(num_rows, 1)
@@ -3005,11 +3402,7 @@ class Indexer(nn.Module):
         # the in-scope `prefix_lens` (pure device arithmetic, graph-safe, no host sync).
         if _hisa_perrow_cand():
             if cand_count is None:
-                block_counts_row = torch.div(prefix_lens + self.hisa_block_size -
-                                             1,
-                                             self.hisa_block_size,
-                                             rounding_mode="floor")
-                cand_count = (block_counts_row.clamp_max(block_topk) *
+                cand_count = (block_counts.clamp_max(block_topk) *
                               self.hisa_block_size).to(torch.int32)
             selected_lengths = cand_count
         else:
@@ -3128,7 +3521,30 @@ class Indexer(nn.Module):
         return result
 
     def post_load_weights(self):
-        """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
+        """Fuse wk + weights_proj into a single GEMM over their shared input.
+
+        NVFP4-quantized indexer: one [head_dim + n_heads <- hidden] NVFP4
+        GEMM (single activation quantize + single weight stream); see
+        _FusedWkWpNvfp4. Unquantized indexer: single FP32 weight for an
+        F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+).
+        """
+        # Verified vs the split Linears on real layer-5 REAP weights at
+        # M in {4, 16}: wk slice bit-identical (max|diff| == 0), weights_proj
+        # slice cos >= 0.999995 (sole delta: the wp_out_scale fold rounding;
+        # exact in f32 out_dtype), cutlass and cuBLASLt agree, 1.96-1.97x vs
+        # the split pair. The earlier cos=0.0 gate failure was a harness
+        # artifact, not a kernel bug: this checkpoint carries no indexer
+        # activation scales and linear.py builds before 5bc2b2cb8 left
+        # module.input_scale as an UNINITIALIZED Parameter, so the driver's
+        # split reference and the fused path both quantized with a garbage
+        # static scale and emitted exact zeros (cosine(0, 0) == 0).
+        # TRTLLM_INDEXER_FUSE_WK_WP=0 disables.
+        if os.environ.get('TRTLLM_INDEXER_FUSE_WK_WP', '1') != '0':
+            self._fused_wk_wp_nvfp4 = _FusedWkWpNvfp4.build(
+                self.wk, self.weights_proj, self._indexer_nvfp4_backends)
+            if self._fused_wk_wp_nvfp4 is not None:
+                self._fused_wk_wp_weight = None
+                return
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
         wk_weight = self.wk.weight.data
@@ -3713,15 +4129,10 @@ class Indexer(nn.Module):
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
         if layersplit_state is not None and layersplit_state.enabled:
-            # Per-step cache (invalidated in prepare()): the read set is
-            # identical for every layer within a step, and computing it
-            # per layer paid kv_lens/seq_lens H2D copies + arange/mask/
-            # unique kernels each time.
-            read_block_ids = getattr(metadata,
-                                     "_layersplit_read_block_ids_step", None)
-            if read_block_ids is None:
-                read_block_ids = _layersplit_compute_read_block_ids(metadata)
-                metadata._layersplit_read_block_ids_step = read_block_ids
+            # L2 per-step read-set memo: the set is layer-invariant within a
+            # step; the memo key carries the host kv_lens values so it
+            # revalidates across steps / chunked-prefill growth on its own.
+            read_block_ids = _layersplit_read_block_ids_step(metadata)
 
             indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
@@ -4048,7 +4459,8 @@ class Indexer(nn.Module):
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q, decode_q_scale, k_cache, weights_decode,
                         dsl_context_lens, dsl_block_table, dsl_schedule_meta,
-                        logits_width)
+                        logits_width,
+                        output_dtype=self.logits_dtype)
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
                     # Atom-split benefits small-batch / low-ntask configs by
@@ -4070,7 +4482,8 @@ class Indexer(nn.Module):
                             metadata.scheduler_metadata_buffer_expanded)
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q, k_cache, weights_decode, fp8_ctx_lens,
-                        fp8_block_table, fp8_schedule_meta, logits_width)
+                        fp8_block_table, fp8_schedule_meta, logits_width,
+                        output_dtype=self.logits_dtype)
             elif pre_hisa_topk is None:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
@@ -4149,19 +4562,20 @@ class Indexer(nn.Module):
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
                 elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
-                      and (metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN
-                           or logits_decode.shape[1] >= _DSL_TOPK_MIN_COLS)):
+                      and metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN):
                     # DSL allocates O(num_gen_tokens * live_kv_len) scratch, so
-                    # it is capped at 256 tokens. It beats the C++ kernel in two
-                    # regimes: (a) long live kv (>= _DSL_TOPK_MIN_KV_LEN), and
-                    # (b) wide scoring logits (>= _DSL_TOPK_MIN_COLS columns =
-                    # max_seq_len), where the C++ kernel leaves its fast
-                    # insertion path. Production hits (b) every step (logits
-                    # width = max_seq_len = 132096 >> 12288), so the short-prefix
-                    # decode now takes the faster DSL Top-K instead of the
-                    # slow-path C++ kernel. Narrow scoring widths (< 12288) with
-                    # short kv still fall through to the faster C++ insertion
-                    # path below.
+                    # it is capped at 256 tokens. It beats the C++ kernel only at
+                    # long live kv (>= _DSL_TOPK_MIN_KV_LEN); below that the C++
+                    # kernel wins -- it walks only [0, live_kv) per row, while the
+                    # DSL kernel's cost scales with the padded logits WIDTH. The
+                    # earlier width-based override (route to DSL whenever logits
+                    # width >= _DSL_TOPK_MIN_COLS) was REMOVED: it forced DSL at
+                    # prod (width 132096, live kv ~4.6k) on the false premise that
+                    # the C++ kernel slows at width >= 12288. Direct B200
+                    # measurement (3-seed, CUDA-graph replay) shows C++ is
+                    # ~width-independent (~11us flat) and ~1.7x FASTER than DSL at
+                    # the prod short-kv regime, with a bit-identical selected set
+                    # (recall 1.0). So prod now routes to the C++ kernel below.
                     # Enable the fused single-pass multi-CTA cluster radix top-k:
                     # ~1.3-1.6x faster than the default 2-pass+merge at the prod
                     # logits width 132096 with a bit-identical selected set
@@ -4367,7 +4781,10 @@ class Indexer(nn.Module):
                                               dtype=torch.float32)
             return q_fp8, k_fp8, k_scale, weights, q_scale
 
-        if self._fused_wk_wp_weight is not None:
+        if (self._fused_wk_wp_nvfp4 is not None
+                and isinstance(hidden_states, torch.Tensor)):
+            indexer_k, weights = self._fused_wk_wp_nvfp4(hidden_states)
+        elif self._fused_wk_wp_weight is not None:
             hidden_float = _to_float(hidden_states)
             with _tf32_matmul_enabled():
                 # F.linear computes input @ weight.T internally; no explicit .t() needed.
@@ -4454,7 +4871,8 @@ class Indexer(nn.Module):
         # past the indexcache / cross-step-reuse early returns and
         # immediately before the paths that actually READ the full
         # per-request indexer-K prefix, so BOTH entry points get it and
-        # reuse layers/steps skip it for free.
+        # reuse layers/steps skip it for free. It uses the L2 per-step
+        # read-set memo (_layersplit_read_block_ids_step).
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
 
@@ -4742,6 +5160,47 @@ class DSATrtllmAttention(TrtllmAttention):
         buf[ids, 0, :, 0, Dckv:] = kpe_d.to(buf.dtype)
         if amortize:
             self._kvarn_restored_gen[block_ids] = pool.commit_gen[block_ids]
+        # Mirror the restore epoch on host for the pre-replay delta walk.
+        # This path already pays masked-select syncs, so the small ids d2h
+        # is noise here; without it the delta walk would re-restore these
+        # blocks on their owner's next boundary crossing -- idempotent for
+        # live blocks but wrong for a recycled id whose stale committed
+        # record the amortized path would correctly leave alone.
+        pool.mark_restored_host(block_ids.cpu().numpy())
+
+    def kvarn_restore_block_ids(self, metadata, block_ids) -> None:
+        """Reconstruct a host-precomputed set of committed blocks into this
+        layer's fp16 main-pool slots.
+
+        Sync-free counterpart of ``kvarn_restore_for_decode`` for the
+        pre-replay delta walk (``model_engine._restore_kvarn_before_cuda_
+        graph_replay``): the caller derived the stale-block set from host
+        request metadata plus the pool's host mirrors, so this body is one
+        batched dequant and two scatters -- no masked-select / ``unique``
+        readbacks, no device->host syncs. Every id must be committed
+        (``pool.valid``) and stale; restoring an already-restored committed
+        block is an idempotent rewrite of identical bytes.
+        """
+        mgr = self._kvarn_mgr(metadata)
+        if mgr is None:
+            return
+        pool = mgr.get_kvarn_latent_pool(self.layer_idx)
+        if pool is None:
+            return
+        ids = torch.as_tensor(block_ids, dtype=torch.long, device=pool.device)
+        if ids.numel() == 0:
+            return
+        ckv_d, kpe_d = pool.load_blocks(ids)  # [N,G,Dckv] / [N,G,Dpe]
+        buf = mgr.get_buffers(self.layer_idx, kv_layout="NHD")  # [P,1,tpb,1,D]
+        Dckv = mgr.kvarn_cfg.kv_lora_rank
+        ids = ids.to(buf.device)
+        buf[ids, 0, :, 0, :Dckv] = ckv_d.to(buf.dtype)
+        buf[ids, 0, :, 0, Dckv:] = kpe_d.to(buf.dtype)
+        # Keep the eager amortized path's epoch view coherent so a later
+        # eager step does not redo this work (device-to-device, no sync).
+        rg = self._kvarn_restored_gen
+        if torch.is_tensor(rg) and rg.numel() == pool.num_blocks:
+            rg[ids] = pool.commit_gen[ids]
 
     def mla_rope_generation(
         self,
@@ -5530,6 +5989,71 @@ class DSACacheManager(KVCacheManager):
         return kvarn_latent_bytes_per_token(self.kvarn_cfg,
                                             self.tokens_per_block,
                                             num_attention_layers)
+
+    # -- KVarN side-pool lifecycle (block free / recycle) -------------------
+
+    def _kvarn_invalidate_on_free(self) -> bool:
+        """Correctness gate (default ON): clear the KVarN side-pool records
+        of paged blocks the allocator reclaims. Without it a recycled block
+        id keeps the dying owner's ``valid=True`` record: the new owner's
+        commit is skipped (idempotence keys on ``valid``) and the full-scan
+        restore rewrites the stale record over the new owner's fresh fp16
+        latent -- a silent cross-request KV clobber. Set
+        TRTLLM_KVARN_INVALIDATE_ON_FREE=0 to restore the old behavior."""
+        return (self.kvarn_enabled and os.environ.get(
+            "TRTLLM_KVARN_INVALIDATE_ON_FREE", "1") != "0")
+
+    def _kvarn_invalidate_block_ids(self, block_ids) -> None:
+        """Clear committed side-pool records for ``block_ids`` (host ints)
+        on every local layer pool. Block ids equal primary-pool slot indices
+        in the KVarN posture (no host offload; see _get_pool_block_indices --
+        with an empty secondary pool the encoded offset decode is the
+        identity on cache-block ids)."""
+        if getattr(self, "blocks_in_secondary_pool", 0):
+            # Host-offload posture: cache-block ids are not pool slots and a
+            # free-time decode is unavailable. KVarN does not support
+            # offload; leave the pools untouched rather than guess.
+            return
+        ids = [b for b in block_ids if 0 <= b < self.num_blocks]
+        if not ids:
+            return
+        pools = self.kvarn_latent_pool_per_layer
+        dev_ids = torch.as_tensor(ids, dtype=torch.long,
+                                  device=pools[0].device)
+        for pool in pools:
+            pool.invalidate_blocks(ids, dev_ids)
+
+    def free_resources(self, request, pin_on_release: bool = False):
+        """Release a request's blocks; drop their KVarN records first.
+
+        The ids are fetched while the request still owns its sequence.
+        Invalidating before the C++ free also covers the pinned-release
+        path: pinned blocks stay unreclaimable until unpinned, and the
+        later unpin-time free has no Python hook."""
+        if self._kvarn_invalidate_on_free():
+            try:
+                ids = self.get_cache_indices(request)
+            except (IndexError, RuntimeError):
+                # No sequence for this request id (double-free / freed before
+                # resource prepare). removeSequence no-ops on the same input,
+                # so degrade to the pre-hook behavior instead of raising.
+                ids = []
+            self._kvarn_invalidate_block_ids(ids)
+        return super().free_resources(request, pin_on_release)
+
+    def rewind_kv_cache(self, request, rewind_len: int):
+        """Rewind (spec-decode reject) is the other path returning blocks to
+        the allocator without ``free_resources``. Invalidate the records of
+        every block the rewind freed plus the new tail block: a block that
+        committed when it filled and then shrank back to partial re-fills
+        with different tokens, so its record is stale for the SAME owner."""
+        if not (rewind_len > 0 and self._kvarn_invalidate_on_free()):
+            return super().rewind_kv_cache(request, rewind_len)
+        pre = self.get_cache_indices(request)
+        ret = super().rewind_kv_cache(request, rewind_len)
+        post_n = len(self.get_cache_indices(request))
+        self._kvarn_invalidate_block_ids(pre[max(post_n - 1, 0):])
+        return ret
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer K cache buffer for a layer.

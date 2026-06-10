@@ -1292,11 +1292,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a, b, a_sf, b_sf, alpha, global_sf = inputs
             m, k, n = a.shape[0], a.shape[1] * 2, b.shape[0]
 
-            # The fp4out kernel's SFC epilogue does not properly predicate
-            # writes when m < CTA tile height, causing OOB memory access.
-            # Require m >= 128 (minimum MMA tile M dimension).
-            if m < 128:
-                return []
+            # All m are supported, including m < 128 (decode). The SFC
+            # epilogue stores full 128-row scale-factor blocks without
+            # predication, but forward() sizes C to pad_up(m, cta_m) rows
+            # and SFC to pad_up(padded_m, 128) rows, which covers every
+            # full-tile and cluster-spill write. Partial tiles at small m
+            # are the same code path as the last partial tile of any
+            # m % cta_m != 0 prefill shape.
 
             sf_vec_size = 16
             # MMA tiler N restricted to 128/256 for SwiGLU
@@ -1993,21 +1995,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l = sum(bi.size(0) for bi in b_list)
             n = b_list[0].size(1)
 
-            # op-trt FC2 (MoE down-proj finalize) N-tile retune. Default OFF =
-            # the validated [128, 256] N sweep (byte-identical). When
-            # TRTLLM_OPTRT_FC2_NTILE_160=1 (default), ADD N=160 to the sweep —
-            # the AutoTuner lands on the driver-measured FC2 optimum (-14.1%,
-            # cos=0.99961 at the REAP decode shape H=7168, I=2048) for that
-            # shape while keeping 128/256 reachable for any other M/N/K
-            # (other models, EP layouts, skewed expert loads) where 160 could
-            # lose. N=160 is only correct with a single N-CTA cluster (the
-            # odd-tile TMEM shift is a 192-only special case); can_implement
-            # does NOT reject the 160-with-cluster_n=2 combination, so the
-            # sweep loop below skips it explicitly.
+            # op-trt FC2 (MoE down-proj finalize) N-tile sweep. The validated
+            # [128, 256] N candidates. N=160 is intentionally excluded: it is
+            # numerically incorrect (cosine ~0.79 vs f32 ref at all M — the SFB
+            # scale-factor layout has no cta_tile_n=160 support) and overruns the
+            # output on the final partial N-tile (hard illegal-memory-access at
+            # prefill M=1024). See the long note on _FC2_VALID_MMA_TILER_N in
+            # blockscaled_contiguous_grouped_gemm_finalize_fusion.py. The
+            # TRTLLM_OPTRT_FC2_NTILE_160 env var is accepted for backward compat
+            # but no longer injects N=160 (the kernel emits a RuntimeWarning).
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
-            if os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "1") == "1":
-                mma_tiler_mn_candidates.insert(0, (self.tile_size, 160))
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
             # raster_along_m=False should be theoretically more performant than raster_along_m=True.

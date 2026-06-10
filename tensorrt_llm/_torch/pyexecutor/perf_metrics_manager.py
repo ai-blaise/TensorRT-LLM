@@ -23,18 +23,35 @@ class PerfMetricsManager:
     Args:
         enabled: Whether performance metrics collection is turned on
             (mirrors ``LlmArgs.return_perf_metrics``).
+        decimate: Stats decimation interval (S5,
+            ``TRTLLM_OPTRT_STATS_DECIMATE``). GPU timing events are created
+            and recorded, and per-request timings saved, only on iterations
+            where ``iter_counter % decimate == 0``. ``1`` keeps the original
+            every-iteration behavior. All state here is rank-local (no
+            collectives), so decimation cannot desync ranks.
     """
 
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool, decimate: int = 1):
         self.enabled = enabled
+        self._decimate = max(1, decimate)
+        # Sampling phase of the iteration most recently passed to
+        # create_timing_events. record_perf_events / save_timing_to_requests
+        # run after create_timing_events within the same loop iteration, so
+        # this single flag is sufficient.
+        self._iter_sampled = True
         self._perf_events = None
         self._perf_event_idx = 0
+
+    @property
+    def _active(self) -> bool:
+        """Metrics enabled and the current iteration is sampled."""
+        return self.enabled and self._iter_sampled
 
     # ------------------------------------------------------------------
     # GPU event helpers
     # ------------------------------------------------------------------
 
-    def create_timing_events(self):
+    def create_timing_events(self, iter_counter: int = 0):
         """Get GPU timing events for performance measurement.
 
         Uses ping-pong pattern (two sets of events, alternating per
@@ -43,12 +60,18 @@ class PerfMetricsManager:
         because :meth:`compute_batch_gpu_times` reads the previous
         iteration's events before they are reused.
 
+        Args:
+            iter_counter: Executor loop iteration counter; sets the S5
+                sampling phase for this iteration (events are returned only
+                on sampled iterations).
+
         Returns:
             Tuple of ``(gpu_forward_start, gpu_forward_end,
             gpu_sample_end)`` or ``(None, None, None)`` if metrics are
-            disabled.
+            disabled or the iteration is unsampled.
         """
-        if not self.enabled:
+        self._iter_sampled = (iter_counter % self._decimate == 0)
+        if not self._active:
             return None, None, None
         if self._perf_events is None:
             self._perf_events = [
@@ -84,9 +107,11 @@ class PerfMetricsManager:
         timing = SimpleNamespace(start_time=None, end_time=None)
 
         # --- Pre-execution: record start ---
+        # _active (not enabled) so unsampled iterations skip the clock reads
+        # along with the event records (events are None on those iterations).
         if start_event is not None:
             start_event.record()
-        if self.enabled:
+        if self._active:
             timing.start_time = get_steady_clock_now_in_seconds()
 
         yield timing
@@ -94,7 +119,7 @@ class PerfMetricsManager:
         # --- Post-execution: record end ---
         if end_event is not None:
             end_event.record()
-        if self.enabled:
+        if self._active:
             timing.end_time = get_steady_clock_now_in_seconds()
 
     # ------------------------------------------------------------------
@@ -105,8 +130,8 @@ class PerfMetricsManager:
         """Return a CPU timestamp if metrics are enabled, else ``None``."""
         return get_steady_clock_now_in_seconds() if self.enabled else None
 
-    @staticmethod
     def save_timing_to_requests(
+        self,
         requests,
         gpu_forward_start,
         gpu_forward_end,
@@ -116,7 +141,16 @@ class PerfMetricsManager:
         sample_start_time,
         sample_end_time,
     ):
-        """Save current iteration's timing info to all requests in the batch."""
+        """Save current iteration's timing info to all requests in the batch.
+
+        On unsampled iterations (S5 decimation) this is a no-op: each
+        request keeps the timings from its last sampled iteration, and
+        :meth:`append_step_metrics` deduplicates on the unchanged
+        ``forward_start_time``, so no metric entry is appended between
+        samples.
+        """
+        if not self._active:
+            return
         for req in requests:
             # Lazily create PerfTimingInfo only when perf metrics are enabled
             if req.py_perf_timing is None:

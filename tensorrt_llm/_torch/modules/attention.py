@@ -32,6 +32,7 @@ from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, maybe_compiled_cat,
                      maybe_compiled_copy_)
+from .fused_lowrank_gate import sigmoid_mul_supported
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -948,8 +949,11 @@ class Attention(nn.Module):
                                         has_lora=bool(lora_params))
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if sigmoid_mul_supported(attn_output, gate):
+                attn_output = torch.ops.trtllm.fused_sigmoid_mul(
+                    attn_output, gate)
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
@@ -1309,6 +1313,23 @@ class MLA(nn.Module):
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
+        # NVFP4 backend override for the dense MLA projection GEMMs
+        # (kv_a_proj_with_mqa, q_b_proj/q_proj, o_proj). At the small token
+        # counts of decode these are GEMV-bound, and the NVFP4 GEMM AutoTuner
+        # systematically selects the cutlass backend, which is 1.3-2.1x slower
+        # than cuBLASLt across every measured M (1..1024) for these
+        # hidden_size/lora shapes -- the AutoTuner never picks cuBLASLt and
+        # falls back to cutlass under CUDA-graph capture. cuBLASLt is
+        # bit-identical to cutlass here (verified max|diff| == 0 vs a true-f32
+        # reference at M in {1,4,512}), so forcing it is a free win. Override
+        # via TRTLLM_MLA_PROJ_NVFP4_BACKENDS (comma-separated) or empty to
+        # restore the default auto-selection.
+        _mla_proj_backends_env = os.environ.get(
+            'TRTLLM_MLA_PROJ_NVFP4_BACKENDS', 'cublaslt')
+        self._mla_proj_nvfp4_backends = (
+            [b.strip() for b in _mla_proj_backends_env.split(',') if b.strip()]
+            or None)
+
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -1320,7 +1341,8 @@ class MLA(nn.Module):
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -1338,7 +1360,8 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -1350,7 +1373,8 @@ class MLA(nn.Module):
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -1364,7 +1388,8 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -1419,7 +1444,8 @@ class MLA(nn.Module):
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
 
         self.gate_proj = None
         if getattr(config.pretrained_config, "attention_output_gate", False):
@@ -3172,7 +3198,11 @@ class MLA(nn.Module):
 
         if self.gate_proj is not None:
             gate = self.gate_proj(hidden_states)
-            attn_output = attn_output * torch.sigmoid(gate)
+            if sigmoid_mul_supported(attn_output, gate):
+                attn_output = torch.ops.trtllm.fused_sigmoid_mul(
+                    attn_output, gate)
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

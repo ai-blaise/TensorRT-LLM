@@ -47,6 +47,7 @@ import math
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 try:
@@ -202,6 +203,17 @@ class KVarNLatentPool:
         # Python loop (the loop dominates at batch>=8, see bench_amort_e2e).
         self.commit_gen = torch.zeros((num_blocks,), dtype=torch.int64,
                                       device=device)
+        # Host mirrors of valid / commit_gen plus the restore epoch consumed
+        # by the pre-replay delta restore. ``store_block`` is the only writer
+        # of the device flags and takes a host block id, so the mirrors stay
+        # exact with zero device readback. ``restored_gen_host`` records the
+        # commit epoch most recently reconstructed into the fp16 main-pool
+        # slot by the delta walk; committed blocks are immutable until their
+        # id is recycled and re-committed, so ``restored == commit`` means the
+        # fp16 slot already holds the block's dequantized content.
+        self.valid_host = np.zeros((num_blocks,), dtype=bool)
+        self.commit_gen_host = np.zeros((num_blocks,), dtype=np.int64)
+        self.restored_gen_host = np.full((num_blocks,), -1, dtype=np.int64)
         # Hadamard matrices cached once per layer (shared across all blocks).
         self.H_ckv = hadamard_matrix(cfg.kv_lora_rank, device, torch.float32)
         self.H_pe = hadamard_matrix(cfg.qk_rope_head_dim, device, torch.float32)
@@ -264,6 +276,55 @@ class KVarNLatentPool:
         self._serialize_into(block_id, rec)
         self.valid[block_id] = True
         self.commit_gen[block_id] += 1  # bump content epoch (device tensor)
+        bid = int(block_id)
+        self.valid_host[bid] = True
+        self.commit_gen_host[bid] += 1
+
+    def stale_committed_host(self, block_ids) -> list:
+        """Filter ``block_ids`` (host ints) down to committed blocks whose
+        fp16 main-pool slot lags their commit epoch. Pure host; no syncs."""
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.size == 0:
+            return []
+        keep = self.valid_host[ids] & (self.restored_gen_host[ids] !=
+                                       self.commit_gen_host[ids])
+        return ids[keep].tolist()
+
+    def mark_restored_host(self, block_ids) -> None:
+        """Record that ``block_ids`` were reconstructed at their current
+        commit epoch (call after the restore kernels were launched)."""
+        ids = np.asarray(block_ids, dtype=np.int64)
+        self.restored_gen_host[ids] = self.commit_gen_host[ids]
+
+    def invalidate_blocks(self, block_ids, dev_ids=None) -> None:
+        """Drop the committed records for ``block_ids`` (host ints): the
+        free/recycle hook. The cache manager calls this when paged block ids
+        return to the allocator (request free / kv rewind). The packed record
+        describes the dying owner's content, so the next owner of a recycled
+        id must neither skip its own commit (commit idempotence is keyed on
+        ``valid``) nor have the stale record restored over its fresh fp16
+        block. ``commit_gen`` is left monotonic -- never reset -- so module
+        restore epochs (``_kvarn_restored_gen`` / ``restored_gen_host``)
+        cannot alias a re-committed id at an old epoch value.
+
+        ``dev_ids`` optionally carries the ids as a device long tensor so a
+        caller invalidating across many layer pools materializes it once."""
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.size == 0:
+            return
+        live = ids[self.valid_host[ids]]
+        if live.size:
+            self.valid_host[live] = False
+            self.restored_gen_host[live] = -1
+        if dev_ids is None:
+            if live.size == 0:
+                return
+            dev_ids = torch.as_tensor(live, dtype=torch.long,
+                                      device=self.device)
+        # A superset id write is fine (False over False); sharing one device
+        # tensor across all layer pools keeps the per-layer cost to a single
+        # small index_put launch.
+        self.valid[dev_ids] = False
 
     # -- read --------------------------------------------------------------
 

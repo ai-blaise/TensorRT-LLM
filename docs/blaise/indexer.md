@@ -3,8 +3,13 @@
 The **DSA Indexer** is the lightning-attention pre-filter that selects, per
 decode token, which KV positions the sparse-MLA attention will actually attend
 to (the top-`index_topk` by indexer logit). On the DeepSeek-V3.2 NVFP4 decode
-path the Indexer is **~50–74 % of TPOT** — by far the biggest single lever — so
-this is where the campaign spent the most effort.
+path the Indexer **was ~50–74 % of TPOT at campaign start** — by far the
+biggest single lever — so this is where the campaign spent the most effort.
+That premise is now **spent**: after the wins below (plus fp16 logits and the
+C++ prod top-k routing), the fresh eager c16 GPU profile measures the Indexer
+at **≈ 4 % of the decode step (HISA ≈ 0.7 %)** — see
+[optimization_candidates.md](optimization_candidates.md) for where the open
+levers moved (MoE/EP comm, proj GEMMs, glue).
 
 The Indexer runs once per "F" (full-compute) layer. Its decode step is:
 
@@ -16,7 +21,7 @@ pre_indexer_proj (q/k proj + RoPE)                 -> indexer q,k
         → sparse_mla_decode reads only topk slots
 ```
 
-Six composable wins attack this path. They all live in
+Seven composable wins attack this path. They all live in
 `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (the Python driver) plus
 dedicated C++/CuTe kernels. All are validated by **top-k SET match** against a
 torch reference (the Indexer's only externally-visible contract is *which*
@@ -29,7 +34,8 @@ positions it selects), not by end-to-end text.
 | 3 | Fused cross-step recency-patch op | `indexerXstepRecencyPatch.cu` | 20× (~104→~5 µs) | on when reuse engaged |
 | 4 | Cross-step IndexCache reuse | `dsa.py` | −39/60/68 % @ stride 2/4/8 | opt-in `index_topk_freq` |
 | 5 | In-graph metadata / sync-free decode | `dsa.py` | −48 % TPOT (consolidated) | on |
-| 6 | Native C++ / CuTe-DSL top-k dispatch | `dsa.py`, `indexerTopK.cu`, `*_paged_mqa_logits.py` | net-win ≤ b32 | auto by kv_len |
+| 6 | Native C++ / CuTe-DSL top-k dispatch | `dsa.py`, `indexerTopK.cu`, `*_paged_mqa_logits.py` | C++ ~1.7× @ prod live-kv; DSL at kv ≥ 16k | auto by live kv_len |
+| 7 | fp16 indexer logits | `dsa.py`, `llm_args.py` (`indexer_logits_dtype`) | top-k −15…−22 % @ kv ≥ 33k; buffer halved | on (`auto` → fp16 on the DSL path) |
 
 ---
 
@@ -61,8 +67,9 @@ short-circuited.
   declared width changes; the histogram scan was already length-bounded.
 - **Composes with:** the adaptive final-sort (next section) — width-correct
   cuts the *scan* domain, adaptive-sort cuts the *tie-break* domain; they stack.
-  Pairs with `_DSL_TOPK_MIN_COLS` (the CuTe-DSL top-k floor) which gates which
-  rows take the DSL path.
+  `_DSL_TOPK_MIN_COLS` is now ONLY this helper's buffer-bucketing constant —
+  it is no longer a top-k dispatch gate (the width-override was removed in
+  `841f9874a`; dispatch is live-kv-only, see #6).
 
 ## Adaptive per-row final-sort
 
@@ -186,11 +193,18 @@ floor" set:
 - **Win:** **decode TPOT ≈ −48 %** consolidated (R2); the dead-HISA-gate alone
   is **−67 % eager** on its sub-path.
 - **Enable:** on. The guards are the production defaults
-  (`_should_use_hisa_logits` → `False`; HISA gated by
-  `hisa_min_seq_len = 65536`, i.e. off at prod context lengths).
+  (`_should_use_hisa_logits` → `False` — that *logits* path was dead). Note the
+  HISA candidate gate itself is a different thing and is **not** off at prod:
+  it now tracks live kv via `metadata.max_gen_kv_len` (`8db5cd77f`, which also
+  fixed wrong selection at kv > 33k) and HISA wins whenever the Indexer is
+  active — see optimization_candidates.md cycle 4.
 - **Correctness:** the metadata is the same values, computed on device instead
   of host — top-k SET unchanged. The gated HISA-logits path was dead (its
   outputs were never consumed on the decode path).
+- **Extension (`3e03d665d`):** the **HISA per-step invariant memo** —
+  row_to_batch / prefix_lens / block-counts / gather indices are per-*step*
+  invariants but were recomputed per *layer* (61×); now computed once per step
+  under a capture-aware key. Part of the G1 glue lane.
 - **Composes with:** cross-step reuse (#4, consumes the on-device `curKvLens` /
   `refreshEnd`), CUDA-graph capture (in-graph metadata is what *allows* the
   Indexer decode step to be captured — host scalars would break replay).
@@ -202,30 +216,69 @@ kernel to use as a function of `kv_len`, and (b) which paged-MQA-logits scoring
 kernel (native fp8/fp4 vs CuTe-DSL).
 
 **Fix.**
-- **Top-k:** route decode top-k to the **C++ `indexerTopK` kernel below 32 K
-  `kv_len`** (where it beats the alternatives) and let longer contexts take the
-  split-work / DSL path. The `use_cute_dsl_topk` config selects the CuTe-DSL
-  top-k for `num_gen_tokens ≤ 256` when enabled; the campaign measured the DSL
-  top-k as a **net loss at ≤ b32** (`use_cute_dsl_topk` net-negative on small
-  batch), so the C++ path is the production default below b32.
+- **Top-k (updated `841f9874a`):** route decode top-k by **live `kv_len` only**
+  — C++ `indexerTopK` below `_DSL_TOPK_MIN_KV_LEN` (now **16384**, lowered from
+  32768 by the fp16-logits win #7), the split-work / DSL path above it. The
+  dispatch previously OR'd in a *width* gate (force DSL whenever the padded
+  logits width ≥ `_DSL_TOPK_MIN_COLS`=12288), which at the prod width 132096
+  fired unconditionally and overrode the kv gate. That width gate's premise
+  was **measured false** (3-seed, CUDA-graph replay, true head-to-head): the
+  C++ kernel is **~width-independent (~11 µs flat)** — it walks only
+  `[0, live_kv)` per row — so at prod (live kv ~4.6k) **C++ is ~1.7× faster
+  with a bit-identical selected set** (top-1024 recall 1.0); ~29–33 % off the
+  top-k pipeline. The fused single-pass cluster DSL top-k (`81cfeb88c`,
+  1.28–1.59× over the 2-pass DSL form, IoU 1.0000) now serves only genuinely
+  long live kv. Separately, `use_cute_dsl_topk` remains opt-in and
+  net-negative at small batch — measured a **net loss at ≤ b32**.
 - **Scoring:** the native **fp8_fp4 candidate-score** kernel is already ahead of
   the SGLang WMMA path. `cute_dsl_fp4_paged_mqa_logits` was validated as a
   **proven floor** (a correctness/perf lower bound, not a kernel win), so the
   native path stays default.
 
 - **Files:** `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (dispatch:
-  `use_cute_dsl_topk`, the `< 32K` route), `cpp/tensorrt_llm/kernels/indexerTopK.cu`,
+  `_DSL_TOPK_MIN_KV_LEN`, `use_cute_dsl_topk`), `cpp/tensorrt_llm/kernels/indexerTopK.cu`,
   `tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/{fp4,fp8,bf16}_paged_mqa_logits.py`.
-- **Win:** native C++ top-k is the **net-win path ≤ b32**; the DSL floor is
-  proven (closes the question rather than adding a kernel win).
-- **Enable:** automatic — selected by `kv_len` and `num_gen_tokens`.
-  `use_cute_dsl_topk` is opt-in and intentionally *not* default (net-loss at
-  small batch).
-- **Correctness:** all paths validated by top-k SET match; the DSL path is a
-  proven floor with FP4 logits re-verified at B ≥ 64.
+- **Win:** C++ is the prod path (**~1.7× at the prod operating point**, width
+  132096 / live kv ~4.6k); the DSL floor is proven and owns long live kv.
+- **Enable:** automatic — selected by **live** `kv_len`
+  (`metadata.max_gen_kv_len`), no width clause. `use_cute_dsl_topk` is opt-in
+  and intentionally *not* default (net-loss at small batch).
+- **Correctness:** all paths validated by top-k SET match (the `841f9874a`
+  re-route is bit-identical, recall 1.0); the DSL path is a proven floor with
+  FP4 logits re-verified at B ≥ 64.
 - **Composes with:** adaptive final-sort (#2, the C++ kernel this dispatch
   selects), width-correct logits (#1, the width the selected kernel runs at),
-  the AB-swapped scoring kernel (sparse_mla.md #9, the tcgen05 scoring path).
+  fp16 logits (#7, which shifts the crossover), the AB-swapped scoring kernel
+  (sparse_mla.md #9, the tcgen05 scoring path).
+
+## fp16 indexer logits
+
+**Problem.** The model is bf16 with 4-bit indexer keys, yet the decode indexer
+logits were stored fp32 — the only fp32 element in the scoring→top-k pipeline.
+The fp8/fp4-quantized scoring inputs carry far less information than 32 bits,
+and the fp32 store costs the DSL top-k **2 extra radix rounds** plus double the
+logits HBM traffic.
+
+**Fix (`3e03d665d`).** New `DeepSeekSparseAttentionConfig.indexer_logits_dtype`
+(`auto | fp32 | fp16 | bf16`): `auto` resolves to **fp16 on the CuTe-DSL path**
+and stays fp32 on the DeepGEMM fallback. Config-matched precision — the logits
+dtype now matches what the quantized scores actually carry.
+
+- **Files:** `tensorrt_llm/_torch/attention_backend/sparse/dsa.py`,
+  `tensorrt_llm/llmapi/llm_args.py` (`indexer_logits_dtype`).
+- **Win:** **top-k −15…−22 % at kv ≥ 33k** (e.g. B16/33k 27.9 → 21.7 µs), zero
+  short-kv regression, logits buffer halved. Also lowered the C++→DSL
+  crossover `_DSL_TOPK_MIN_KV_LEN` 32768 → 16384 (#6).
+- **Enable:** on (`auto`). Set `indexer_logits_dtype=fp32` to restore the old
+  behavior.
+- **Correctness:** top-1024 recall vs a **TRUE-f32-scored reference** equals
+  the pre-existing fp8-scoring noise floor (|Δ| ≤ 0.0005 — fp16 adds nothing
+  above the noise already inherent in fp8 scoring); downstream attention
+  cosine 1.000000; max|logit| ~360 vs the 65504 fp16 ceiling (no overflow
+  margin concern).
+- **Composes with:** the top-k dispatch (#6 — the DSL top-k reads these
+  logits; the crossover shift is this win propagating), width-correct logits
+  (#1, orthogonal: width vs dtype).
 
 ---
 
@@ -237,13 +290,15 @@ sparse_attention_config = {
     "indexer_mode": "indexcache-hisa",
     "indexer_k_dtype": "fp4",            # FP4 indexer-K (smaller cache, native score path)
     "index_topk_freq": 4,                # #4 cross-step reuse (−60% @ stride 4); 1 = off
+    # "indexer_logits_dtype": "auto",    # #7 fp16 logits on the DSL path (default)
     # "seq_len_threshold": <int>,        # #1 width-correct logits (opt-in)
-    # "use_cute_dsl_topk": False,        # #6 keep C++ top-k below b32 (net-loss if True)
+    # "use_cute_dsl_topk": False,        # #6 keep C++ top-k at short live kv (net-loss if True)
 }
 ```
 
 Defaults that are **on** without configuration: adaptive final-sort (#2),
-in-graph / sync-free metadata (#5), native top-k+scoring dispatch (#6), and the
+in-graph / sync-free metadata (#5), native top-k+scoring dispatch (#6, live-kv
+gated — prod routes to C++), fp16 logits (#7, `auto`), and the
 fused recency-patch op (#3, whenever reuse is engaged). The two opt-ins worth
 flipping per deployment are `index_topk_freq` (the single biggest Indexer lever)
 and `seq_len_threshold` (width-correct logits).
@@ -257,7 +312,8 @@ and `seq_len_threshold` (width-correct logits).
 | Fused recency-patch | exact-equal vs PyTorch ref | Jaccard = 1.0, bit-identical |
 | IndexCache reuse | top-k SET within recency window | matches fresh top-k on recency cols |
 | In-graph metadata | top-k SET vs host-scalar path | identical set |
-| Native top-k/scoring dispatch | top-k SET + FP4 logits floor | identical set; floor proven |
+| Native top-k/scoring dispatch | top-k SET + FP4 logits floor | identical set (`841f9874a` re-route recall 1.0); floor proven |
+| fp16 logits | top-1024 recall vs TRUE-f32-scored ref + downstream cosine | recall at the fp8 noise floor (\|Δ\| ≤ 0.0005); attention cos 1.000000 |
 
 ## Composition with the rest of the campaign
 
