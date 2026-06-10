@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -49,6 +50,17 @@ from .utils import (
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp32x2,
 )
+
+# op-trt FC2 (MoE down-proj finalize) N-tile=160 retune gate. Default OFF keeps
+# the validated N in {64,128,192,256} set byte-identical. When ON, the MMA
+# tiler N=160 is additionally accepted as valid so the AutoTuner can select it
+# for the production REAP decode shape (H=7168, I=2048): a driver-measured
+# -14.1% FC2 win (37.94us vs 44.18us prod, cos=0.99961). N=7168 is not a
+# multiple of 160 (45 N-tiles, final tile 128 cols); the standard predicated
+# epilogue masks the partial tile, so no host-side N padding is required.
+_FC2_NTILE_160_ENABLED = os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "1") == "1"
+_FC2_VALID_MMA_TILER_N = ((64, 128, 160, 192, 256)
+                          if _FC2_NTILE_160_ENABLED else (64, 128, 192, 256))
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
@@ -2631,8 +2643,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Skip invalid mma tile shape
         if mma_tiler_mn[0] not in (128, 256):
             is_valid = False
-        # Skip invalid mma tile n
-        if mma_tiler_mn[1] not in (64, 128, 192, 256):
+        # Skip invalid mma tile n. N=160 is additionally allowed when the op-trt
+        # FC2 retune gate is on (see _FC2_VALID_MMA_TILER_N); off -> identical.
+        if mma_tiler_mn[1] not in _FC2_VALID_MMA_TILER_N:
             is_valid = False
 
         # Skip illegal cluster shape

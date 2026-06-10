@@ -3,6 +3,7 @@
 
 import itertools
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -1992,10 +1993,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l = sum(bi.size(0) for bi in b_list)
             n = b_list[0].size(1)
 
-            mma_tiler_mn_candidates = [(self.tile_size, 128),
-                                       (self.tile_size, 256)]
-            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
-                                           (self.tile_size // 128, 2)]
+            # op-trt FC2 (MoE down-proj finalize) N-tile retune. Default OFF =
+            # the validated [128, 256] N sweep (byte-identical). When
+            # TRTLLM_OPTRT_FC2_NTILE_160=1, pin N=160 as the sole MMA tiler N so
+            # the AutoTuner deterministically lands on the driver-measured FC2
+            # optimum (-14.1%, cos=0.99961 at the REAP decode shape H=7168,
+            # I=2048). N=160 is only correct with a single N-CTA cluster (the
+            # odd-tile TMEM shift is a 192-only special case), so the cluster
+            # sweep is restricted to cluster_n=1 in that mode. The kernel's
+            # is_valid_mma_tiler_and_cluster_shape must also accept N=160 under
+            # the same gate (see _FC2_VALID_MMA_TILER_N) or can_implement drops
+            # the tactic.
+            if os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "1") == "1":
+                mma_tiler_mn_candidates = [(self.tile_size, 160)]
+                cluster_shape_mn_candidates = [(self.tile_size // 128, 1)]
+            else:
+                mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                           (self.tile_size, 256)]
+                cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                               (self.tile_size // 128, 2)]
             # raster_along_m=False should be theoretically more performant than raster_along_m=True.
             # TODO: Add raster_along_m=True if we find it more performant in some cases.
             raster_along_m_candidates = [False]

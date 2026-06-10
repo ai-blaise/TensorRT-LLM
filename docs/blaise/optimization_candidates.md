@@ -113,9 +113,9 @@ Deep HISA optimization (track H) is the top hill-climb priority.
 | I2 | `index_topk_freq` 4→8 | indexer | indexer-cost −68% on S-steps (~) | planned (recall gate) |
 | M1 | MoE A2A two-sided → one-sided + workspace combine | comm | 0.3–0.9 ms/step | planned |
 | K1 | PDL coverage completion | kernel | +1–3% | planned |
-| K2 | FC2 N-tile 256→160 | kernel | ~+1.5–2% e2e (−14.1% on the MoE pair) | planned |
+| K2 | FC2 N-tile 256→160 | kernel | −27% standalone FC2 / −11.1% in-pipeline, cos 0.99956 | **SHIPPED default-on** (driver cosine+timing verified) |
 | L1 | z.ai dense-broadcast overlap | prefill | TTFT (exposed indexer-K broadcast) | planned |
-| P1 | Persistent decode-layer megakernel | kernel | +5–10% near-term, multi-× ceiling | strategic |
+| P1 | Persistent decode-layer megakernel | kernel | −13.9% vs prod 2-kernel (but −4.75µs is K2's N=160; fusion itself delta=−0.01µs), cos 0.99956 | **code shipped, opt-in** (`MOE_MEGAKERNEL`); incremental win over K2 is host-glue, exposure-unconfirmed |
 | MO1 | MORI-style generation-first / write-mode handoff | transport | TTFT (overlaps RDMA with prefill) | needs router build |
 
 ---

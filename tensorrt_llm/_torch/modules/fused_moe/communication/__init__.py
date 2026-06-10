@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +31,7 @@ Factory:
 
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
-from .communication_factory import CommunicationFactory
+from .communication_factory import CommunicationFactory, onesided_a2a_enabled
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nvlink_one_sided import NVLinkOneSided
@@ -48,4 +48,5 @@ __all__ = [
     "DeepEPLowLatency",
     # Factory
     "CommunicationFactory",
+    "onesided_a2a_enabled",
 ]

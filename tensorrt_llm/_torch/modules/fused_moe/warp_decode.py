@@ -43,6 +43,41 @@ if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
 
 
+def _maybe_register_megakernel_cursor_op() -> None:
+    """Optionally register the Phase-1 persistent decode-MoE megakernel op.
+
+    Env-gated by ``TRTLLM_OPTRT_MOE_MEGAKERNEL`` (default off): when set, registers
+    ``trtllm::warp_decode_nvfp4_cursor_moe`` -- the typed landing contract that
+    ``_get_nvfp4_cursor_op`` below probes for. This is additive and side-effect
+    free when the gate is unset (the function returns immediately) and import-safe
+    on hosts without a cute_dsl build (registration failures are swallowed so the
+    overlay falls back to the existing trtllm_gen / native paths). See
+    ``cute_dsl_kernels/blackwell/moe_as_dense_gemm/fused_moe_megakernel.py``.
+    """
+    if os.environ.get("TRTLLM_OPTRT_MOE_MEGAKERNEL", "0").strip().lower() in (
+            "", "0", "off", "false", "no"):
+        return
+    try:
+        from ...cute_dsl_kernels.blackwell.moe_as_dense_gemm.fused_moe_megakernel import (
+            maybe_register_cursor_op,
+        )
+
+        if maybe_register_cursor_op():
+            logger.info_once(
+                "WarpDecode megakernel: registered "
+                "trtllm::warp_decode_nvfp4_cursor_moe "
+                "(TRTLLM_OPTRT_MOE_MEGAKERNEL set).",
+                key="warp_decode_megakernel_registered")
+    except Exception as exc:  # noqa: BLE001 - registration must never break import
+        logger.warning_once(
+            "WarpDecode megakernel registration skipped (%s); falling back to "
+            "the existing NVFP4 overlay paths." % type(exc).__name__,
+            key="warp_decode_megakernel_register_failed")
+
+
+_maybe_register_megakernel_cursor_op()
+
+
 class WarpDecodeStatus(str, Enum):
     DISABLED = "disabled"
     FALLBACK = "fallback"

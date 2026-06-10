@@ -668,6 +668,53 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
 
+        # Phase-1 persistent decode-MoE megakernel hook (additive, env-gated,
+        # default OFF via TRTLLM_OPTRT_MOE_MEGAKERNEL). When enabled, collapse the
+        # moe_sort -> FC1(gather+SwiGLU+quant) -> FC2(finalize) chain into the
+        # single registered op trtllm::warp_decode_nvfp4_cursor_moe, threading the
+        # CORRECT cute_dsl scale family (fc1_global_scale / fc2_input_scale /
+        # fc2_global_scale) -- which the trtllm_gen overlay call site does not
+        # carry. Numerically identical to the explicit path below (same kernels);
+        # the win is eliminated host glue + single dispatch + decode_1cta tile.
+        # Gated to the fused-finalize decode shape so the op's in-place finalize
+        # contract holds.
+        if self.use_fused_finalize:
+            try:
+                from ...cute_dsl_kernels.blackwell.moe_as_dense_gemm.fused_moe_megakernel import (
+                    megakernel_enabled,
+                    run_fused_moe_megakernel_op,
+                )
+                _megakernel_on = megakernel_enabled()
+            except Exception:  # noqa: BLE001 - never break the production path
+                _megakernel_on = False
+            if _megakernel_on:
+                logger.info_once(
+                    "CuteDslFusedMoE: Phase-1 decode-MoE megakernel ENABLED "
+                    "(trtllm::warp_decode_nvfp4_cursor_moe).",
+                    key="cute_dsl_moe_megakernel_on")
+                megakernel_out = run_fused_moe_megakernel_op(
+                    x=x.view(torch.float4_e2m1fn_x2),
+                    x_sf=x_sf.view(torch.uint8),
+                    w13=weight_view.w3_w1_weight[0].view(torch.float4_e2m1fn_x2),
+                    w13_scale=weight_view.fc1_weight_scale[0].view(torch.uint8),
+                    w2=weight_view.w2_weight[0].view(torch.float4_e2m1fn_x2),
+                    w2_scale=weight_view.fc2_weight_scale[0].view(torch.uint8),
+                    output1_scale=None,
+                    output1_gate_scale=weight_view.fc1_global_scale[0],
+                    output2_scale=weight_view.fc2_global_scale[0],
+                    topk_ids=token_selected_experts,
+                    topk_weights=token_final_scales,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=weight_view.w2_weight[0].size(-1) * 2,
+                    num_experts=self.num_slots,
+                    local_expert_offset=slot_start,
+                    local_num_experts=esp,
+                    scaling_vector_size=16,
+                    fc2_input_global_sf=self.fc2_input_scale,
+                )
+                moe_output.copy_(megakernel_out)
+                return moe_output
+
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,

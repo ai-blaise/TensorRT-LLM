@@ -42,7 +42,8 @@ from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTens
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
+from .communication import (AllGatherReduceScatter, Communication,
+                            CommunicationFactory, onesided_a2a_enabled)
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
@@ -515,13 +516,24 @@ class ConfigurableMoE(MoE):
         """
         if self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM:
             return None
+        # Seed the NVLinkOneSided combine to expect the MoE output already in the
+        # A2A workspace when the op-trt one-sided path is opted in
+        # (TRTLLM_OPTRT_MOE_ONESIDED_A2A=1). This only sets the constructor seed;
+        # MoEScheduler._get_nvlink_onesided_moe_output sets comm.payload_in_workspace
+        # per-forward based on the backend's
+        # supports_moe_output_in_alltoall_workspace() capability and whether a
+        # workspace output tensor was actually allocated, so an unsupported backend
+        # still falls back to a separate-buffer combine. Default off keeps the seed
+        # False, byte-identical to prior behavior. The seed is consumed only by
+        # NVLinkOneSided; NVLinkTwoSided / AllGatherReduceScatter ignore it.
+        payload_in_workspace = onesided_a2a_enabled()
         return CommunicationFactory.create_strategy(
             model_config=self.model_config,
             num_experts=self.num_experts,
             num_slots=self.num_slots,
             top_k=self.routing_method.experts_per_token,
             expert_size_per_partition=self.expert_size_per_partition,
-            payload_in_workspace=False,  # ConfigurableMoE does not use workspace output for now
+            payload_in_workspace=payload_in_workspace,
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,

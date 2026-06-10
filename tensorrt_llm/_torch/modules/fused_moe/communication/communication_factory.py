@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,26 @@ from .deep_ep_low_latency import DeepEPLowLatency
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
+
+# op-trt M1: opt-in switch for one-sided NVLink A2A + combine-into-workspace.
+#
+# Default "0" reproduces the upstream/deploy behavior byte-for-byte: the deploy's
+# explicit TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED is honored verbatim, and the
+# combine writes to a separate buffer that is then copied into the A2A workspace.
+#
+# Set to "1" to select NVLinkOneSided and let the MoE kernel write its output
+# directly into the A2A combine workspace (one fewer payload copy per MoE layer,
+# and the two-sided FIFO dispatch handshake is dropped). The runtime
+# workspace-combine path is already wired in MoEScheduler
+# (_get_nvlink_onesided_moe_output) and self-gates on the backend's
+# supports_moe_output_in_alltoall_workspace() capability, so enabling this only
+# changes the transport, not the MoE math.
+_ONESIDED_A2A_ENV = "TRTLLM_OPTRT_MOE_ONESIDED_A2A"
+
+
+def onesided_a2a_enabled() -> bool:
+    """Whether the op-trt one-sided + workspace-combine A2A path is opted in."""
+    return os.environ.get(_ONESIDED_A2A_ENV, "0").strip().lower() in ("1", "true", "on")
 
 
 class CommunicationFactory:
@@ -113,6 +133,26 @@ class CommunicationFactory:
 
         # Check if forced method is specified via environment variable
         force_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
+
+        # op-trt M1 (env-gated, default off): when the operator opts in via
+        # TRTLLM_OPTRT_MOE_ONESIDED_A2A=1, promote the deploy's default
+        # NVLINK_TWO_SIDED force to NVLINK_ONE_SIDED so the existing manifest's
+        # TRTLLM_FORCE_COMM_METHOD line can stay unchanged and the A/B is a single
+        # env flip. The redirect is intentionally narrow: only an explicit
+        # two-sided force is promoted; any other explicit force (DeepEP, AllGather,
+        # or an already one-sided force) is left untouched, and the auto path below
+        # is unaffected (it already prefers NVLinkOneSided).
+        if (
+            force_method is not None
+            and force_method.strip().upper() == "NVLINK_TWO_SIDED"
+            and onesided_a2a_enabled()
+        ):
+            logger.info(
+                "%s=1: promoting forced comm method NVLINK_TWO_SIDED -> "
+                "NVLINK_ONE_SIDED (one-sided A2A + combine-into-workspace).",
+                _ONESIDED_A2A_ENV,
+            )
+            force_method = "NVLINK_ONE_SIDED"
 
         if force_method is not None:
             return CommunicationFactory._create_forced_method(
