@@ -80,8 +80,9 @@ def time_graph(fn, iters=300, warmup=50):
         g.replay()
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - t0) * 1e6)
-    samples.sort()
-    samples = samples[: int(len(samples) * 0.8)]
+    # Untrimmed median. (A previous version sorted and dropped the slowest
+    # 20% before the median — i.e. reported ~P40, optimistically biased;
+    # flagged as PERF_AUDIT F-40.)
     return st.median(samples)
 
 

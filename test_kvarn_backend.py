@@ -43,9 +43,9 @@ def main():
     assert cfg.name == "kvarn_k4v2"
     assert cfg.latent_dim == 576
     import os
-    os.environ["TRTLLM_KV_CACHE_QUANT"] = "kvarn_k2v2"
+    os.environ["TRTLLM_MLA_LATENT_KV_DTYPE"] = "kvarn_k2v2"
     assert B.resolve_kvarn_config().ckv_bits == 2
-    del os.environ["TRTLLM_KV_CACHE_QUANT"]
+    del os.environ["TRTLLM_MLA_LATENT_KV_DTYPE"]
     assert B.resolve_kvarn_config() is None
     assert B.resolve_kvarn_config("fp8") is None
     print("[1] dtype parse + env resolve OK")

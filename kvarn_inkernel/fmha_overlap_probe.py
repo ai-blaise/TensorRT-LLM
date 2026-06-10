@@ -15,4 +15,8 @@ torch.cuda.synchronize(); t0=time.time()
 for _ in range(50): qk()
 torch.cuda.synchronize(); dt=(time.time()-t0)/50*1e6
 print(f"FMHA-equivalent (QK+softmax+PV) over T={T} tok, Hq={Hq}: {dt:.1f} us/step")
-print(f"  -> the FUSED KVarN dequant (489us at N=1024) would OVERLAP this attention compute")
+dequant_us = 489.0  # fullFUSED re-dequant at N=1024 (kvarn_inkernel_bench)
+print(f"  -> attention compute can hide at most {dt:.1f} of the {dequant_us:.0f} us "
+      f"fused KVarN dequant ({100*min(dt/dequant_us,1):.0f}%); the remaining "
+      f"{max(dequant_us-dt,0):.0f} us is EXPOSED unless amortized "
+      f"(steadyAvg path) — overlap alone does NOT cover the fullFUSED cost")
