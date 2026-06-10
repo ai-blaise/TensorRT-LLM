@@ -3750,6 +3750,12 @@ class Indexer(nn.Module):
                 if q_split_eligible:
                     tp_rank = metadata.mapping.tp_rank
                     tp_size = metadata.mapping.tp_size
+                # (token_start, chunk_num_token) of every chunk that ran with
+                # the q-split; their TopK slices are assembled with ONE
+                # allgather after the loop instead of one collective per
+                # chunk (chunk results are independent — nothing reads
+                # topk_indices_buffer between chunks). [audit F-5]
+                q_split_chunks = []
 
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                     self.layer_idx)
@@ -3819,16 +3825,39 @@ class Indexer(nn.Module):
                             shape[-1]] = topk_indices.to(dtype=torch.int32)
 
                     if apply_q_split:
-                        q_sizes = [(r + 1) * chunk_num_token // tp_size -
-                                   r * chunk_num_token // tp_size
-                                   for r in range(tp_size)]
-                        topk_indices_buffer[
-                            chunk.token_start:chunk.token_end, :] = allgather(
+                        q_split_chunks.append(
+                            (chunk.token_start, chunk_num_token))
+
+                if q_split_chunks:
+                    # Single deferred allgather for all q-split chunks. Each
+                    # rank sends the concatenation of its per-chunk q-slices;
+                    # the gathered layout is [rank0 chunks..., rank1
+                    # chunks..., ...], scattered back to the per-chunk,
+                    # per-rank offsets the in-loop gathers used to write.
+                    local_parts = [
+                        topk_indices_buffer[ts + cn * tp_rank // tp_size:ts +
+                                            cn * (tp_rank + 1) // tp_size, :]
+                        for ts, cn in q_split_chunks
+                    ]
+                    rank_sizes = [
+                        sum(cn * (r + 1) // tp_size - cn * r // tp_size
+                            for _, cn in q_split_chunks)
+                        for r in range(tp_size)
+                    ]
+                    gathered = allgather(torch.cat(local_parts, dim=0),
+                                         metadata.mapping,
+                                         dim=0,
+                                         sizes=rank_sizes)
+                    offset = 0
+                    for r in range(tp_size):
+                        for ts, cn in q_split_chunks:
+                            r_start = cn * r // tp_size
+                            r_len = cn * (r + 1) // tp_size - r_start
+                            if r != tp_rank:
                                 topk_indices_buffer[
-                                    global_q_start:global_q_end, :],
-                                metadata.mapping,
-                                dim=0,
-                                sizes=q_sizes)
+                                    ts + r_start:ts + r_start + r_len, :] = \
+                                    gathered[offset:offset + r_len]
+                            offset += r_len
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
