@@ -25,12 +25,36 @@ native MoE backend when its runtime guards do not match.
   pattern/bucket).
 - **NVFP4 FC1→SwiGLU→FC2 megakernel** build + bench (CuTeDSL tensor-core,
   2-CTA `cta_group::2` → FC1 1.27× / 24.3 µs); CZS index-contract proofs per
-  config round.
+  config round. **Correctness fix `e105fd7a1`:** the megakernel JIT default
+  `TRTLLM_OPTRT_MOE_MEGAKERNEL_FC2_N` was 160, which a TRUE-f32 reference
+  shows is **numerically broken** (SFB weight-scale-factor miscompute —
+  cosine 0.790 vs f32 at the REAP shape, vs 0.99984 at N=256); default is now
+  **256**, an explicit 160 raises, and `validate_fused_moe_megakernel.py` was
+  de-blinded to compare against a true f32 einsum (it previously compared the
+  fused kernel against a sequential run of the SAME FC2 kernel —
+  fusion-equivalence only, blind to the SFB bug). The fusion itself is
+  timing-neutral under PDL; the megakernel's case is structural (persistent
+  kernel), not the tile.
+- **DeepEP low-latency unblocked under WarpDecode (`51918fba2`):** the LL
+  adapter's padded top-1/sentinel recv layout made the trtllm_gen overlay
+  RAISE under policy=force — now detected and skip-reasoned (the canonical
+  CuteDslFusedMoE backend consumes it natively; moe_sort drops sentinel rows
+  without inflating tiles — tiles_equal at EP2, xlayout cosine 0.99999). Plus
+  the ConfigurableMoE oversize **park/restore** fix: an oversize forward (the
+  max_num_tokens warmup) used to destroy the comm strategy and pin the
+  AllGather fallback for the process lifetime, silently evicting LL. Sizing
+  caveat for any LL deploy: per-layer roundtrip **45 µs at token_limit=16 vs
+  115 µs two-sided — but 225 µs at limit=64**; `TRTLLM_DEEP_EP_TOKEN_LIMIT`
+  must be per-rank concurrency, not max_batch_size (see
+  optimization_candidates.md M3).
 - **Honest rejected paths recorded** (do-not-redo): generic CuTeDSL grouped-GEMM
   (~0.34–0.50 ms, rejected), small-tile grouped-MoE (tiles < 128 fail the guard;
   tile-128 ~0.32–0.49 ms, rejected), CUTLASS FP4 GEMV floor (already slower than
   the bridge), BF16 output-owned down-proj bridge (0.106–0.630 ms, rejected),
-  dynamic route-locality selector (selector overhead erased the win).
+  dynamic route-locality selector (selector overhead erased the win),
+  **FC2 N-tile 160 in any form** (SFB miscompute cos 0.790 + prefill M=1024
+  OOB since 7168 % 160 ≠ 0; killed `29f492b49`→`d01737397` — a correct 160
+  needs a CUTLASS-internal SFB layout tiled at 160, not an epilogue tweak).
 
 ## Files
 
