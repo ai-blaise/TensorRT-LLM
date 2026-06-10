@@ -51,16 +51,38 @@ from .utils import (
     vectorized_atomic_add_fp32x2,
 )
 
-# op-trt FC2 (MoE down-proj finalize) N-tile=160 retune gate. Default OFF keeps
-# the validated N in {64,128,192,256} set byte-identical. When ON, the MMA
-# tiler N=160 is additionally accepted as valid so the AutoTuner can select it
-# for the production REAP decode shape (H=7168, I=2048): a driver-measured
-# -14.1% FC2 win (37.94us vs 44.18us prod, cos=0.99961). N=7168 is not a
-# multiple of 160 (45 N-tiles, final tile 128 cols); the standard predicated
-# epilogue masks the partial tile, so no host-side N padding is required.
-_FC2_NTILE_160_ENABLED = os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "0") == "1"
-_FC2_VALID_MMA_TILER_N = ((64, 128, 160, 192, 256)
-                          if _FC2_NTILE_160_ENABLED else (64, 128, 192, 256))
+# op-trt FC2 (MoE down-proj finalize) N-tile gate. The valid MMA tiler N set is
+# {64,128,192,256} — the only widths the blockscaled SFB (weight scale-factor)
+# TMEM/GMEM pipeline supports correctly. cta_tile_n=160 is intentionally NOT a
+# member.
+#
+# History/why N=160 is rejected (do not re-add without an SFB fix):
+#   TRTLLM_OPTRT_FC2_NTILE_160=1 used to append N=160 to chase a "-14% FC2 win
+#   (cos=0.99961)". That measurement was wrong. The SFB GMEM is tiled by
+#   round_up(N,128)=256 and consumed from TMEM with a per-tile slice_n; only the
+#   {192,64} cases carry the compensating odd-tile TMEM shift (see the
+#   cta_tile_shape_mnk[1] in {192,64} branches in the MMA warp). N=160 has no
+#   such compensation, so for every N-tile>0 the kernel reads the wrong 32-col
+#   SFB sub-block -> a broad, M-independent MMA miscompute. Measured against a
+#   true f32 reference at the REAP shape (H=7168,I=2048,128 experts/top-8),
+#   N=160 yields cosine ~0.790 at BOTH decode and prefill (vs ~0.9999 for
+#   {128,192,256}); N=7168 is also not a multiple of 160, so the final 160-tile
+#   additionally overruns the output by 32 cols (a hard illegal-memory-access at
+#   M=1024 once the output is exactly [num_tokens,7168]). A correct N=160 needs
+#   an SFB layout that tiles at 160 granularity (a CUTLASS-internal change), not
+#   an epilogue tweak. Until then the env var is accepted but does nothing.
+if os.environ.get("TRTLLM_OPTRT_FC2_NTILE_160", "0") == "1":
+    import warnings as _warnings
+
+    _warnings.warn(
+        "TRTLLM_OPTRT_FC2_NTILE_160=1 is ignored: FC2 N-tile=160 is numerically "
+        "incorrect (SFB scale-factor layout unsupported for cta_tile_n=160; "
+        "cosine ~0.79 vs f32 ref at all M) and overruns the output at the final "
+        "partial N-tile. Using the validated N set {64,128,192,256}.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+_FC2_VALID_MMA_TILER_N = (64, 128, 192, 256)
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
