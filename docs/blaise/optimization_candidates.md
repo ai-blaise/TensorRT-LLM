@@ -432,4 +432,22 @@ but lower priority for this metric.
 - **Cycle 2** (in progress): H1 (HISA band-aware) is the headline — probing the
   cost with the zero-code decode `enable_nvfp4_hisa=false` A/B against the 39.98
   tight baseline, then the band-aware code fix keeps HISA enabled and optimal.
-- **Queued**: C9 GPU re-validation → push; then S2, N1, I2, M1, K1/K2.
+- **Cycle 3** (shipped `2833bb0c5`): K2 FC2 N=160 default-on (driver cos+timing
+  verified, −27% standalone FC2); P1 megakernel op shipped opt-in.
+- **Cycle 4** (HISA-scale, shipped this cycle): fixed the CUDA-graph capture-gate
+  root cause in `dsa.py` — `max_kv_len` was the static block-table width (132096),
+  freezing `candidate_len` at 33024 and **selecting wrong tokens at kv>33k**
+  (cos 0.707 vs eager at 66k). Now reads `metadata.max_gen_kv_len` (capture-frozen
+  live ceiling). B200-verified on the real `indexer_topk_decode`: cos 1.00000 at
+  all lengths, HISA-on never slower than off, **1.87× at 66k / 2.09× at 132k**;
+  forced-on proves "always wins when Indexer on" (up to 2.56× at 33k). This is the
+  HISA-scaling directive realized + a latent correctness fix. Default-on.
+- **NVFP4 index-scoring (rejected, not a vacuum win)**: the FP4 path already exists
+  (`FP4MQALogitsKernel`, dsa.py:3925, gated `use_fp4 and use_cute_dsl_paged_mqa_logits`).
+  Head-to-head at REAP B≈4 decode: only 1.0–1.02× faster (memory-bound 1.6× win
+  needs B≈16, which REAP decode never reaches) **and degrades top-k selection**
+  (IoU 0.69–0.83 vs FP8's 0.92–0.95) on random inputs. Do NOT default-on without an
+  e2e accuracy eval on real indexer activations. Bench:
+  `tests/scripts/cute_dsl_kernels/paged_mqa_logits/bench_fp4_vs_fp8_decode.py`.
+- **Queued**: Indexer d2h-sync elimination (29 `.item()` calls); fresh-image e2e +
+  nsys exposure check for SM1/SM3/HISA-scale; then N1, I2, K1 PDL. Held: S2 (hang).

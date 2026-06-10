@@ -2787,7 +2787,17 @@ class Indexer(nn.Module):
             return None
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing:
-            max_kv_len = block_table.shape[1] * k_cache.shape[1]
+            # Candidate budget must track live kv, not the static block-table
+            # width (block_table.shape[1] * k_cache.shape[1] is the absolute KV
+            # allocation = 132096, which froze candidate_len at 33024 and broke
+            # HISA scaling). metadata.max_gen_kv_len is the capture-frozen,
+            # sync-free per-graph kv ceiling already used by _indexer_logits_width
+            # and the hoisted candidate schedule. block_topk is monotonic in
+            # max_blocks, so the live value only shrinks the band (never OOB).
+            if metadata is not None and metadata.max_gen_kv_len > 0:
+                max_kv_len = metadata.max_gen_kv_len
+            else:
+                max_kv_len = block_table.shape[1] * k_cache.shape[1]
         else:
             max_kv_len = int(kv_lens.max().item())
         if not self._should_use_hisa_pre_indexer(max_kv_len):
