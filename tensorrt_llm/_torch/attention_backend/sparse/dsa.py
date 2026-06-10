@@ -1611,6 +1611,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
+        # Per-step LayerSplit read-set cache (computed lazily by the first
+        # broadcasting layer, reused by the rest — see Indexer.forward).
+        self._layersplit_read_block_ids_step = None
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -3042,6 +3045,15 @@ class Indexer(nn.Module):
             row_starts_are_zero: bool = False) -> Optional[torch.Tensor]:
         if logits.numel() == 0:
             return None
+        # Probe the gate with the logits WIDTH (a static upper bound on any
+        # row's kv span) BEFORE deriving the true max_kv_len: the eager
+        # branch's max_kv_len read is a D2H sync (.item()), and both prefill
+        # call sites invoke this function unconditionally per chunk per
+        # layer. The gate is monotone in kv_len (and currently statically
+        # False), so a width-level reject implies the true max_kv_len would
+        # reject too — the sync is only paid when the width probe passes.
+        if not self._should_use_hisa_logits(logits.shape[1]):
+            return None
         if logits.is_cuda and torch.cuda.is_current_stream_capturing():
             max_kv_len = logits.shape[1]
         else:
@@ -3325,10 +3337,16 @@ class Indexer(nn.Module):
 
             if has_mla_chunked_prefill:
                 # MLA chunked prefill is active - use single-chunk pattern for
-                # indexer prefill chunks.
-                chunk_specs = [(i, 0, host_seq_lens[i].item(),
-                                host_seq_lens[:i].sum().item() if i > 0 else 0)
-                               for i in range(num_contexts)]
+                # indexer prefill chunks. One .tolist() + a running prefix sum
+                # instead of per-request tensor indexing: the old
+                # host_seq_lens[:i].sum().item() form was O(B^2) tensor-slice
+                # sums plus 2B .item() calls per prefill step.
+                ctx_seq_lens = host_seq_lens[:num_contexts].tolist()
+                chunk_specs = []
+                seq_start = 0
+                for i, ctx_len in enumerate(ctx_seq_lens):
+                    chunk_specs.append((i, 0, ctx_len, seq_start))
+                    seq_start += ctx_len
                 metadata.indexer_prefill_chunks = [
                     Indexer.prepare_one_prefill_chunk(
                         metadata,
@@ -4374,8 +4392,22 @@ class Indexer(nn.Module):
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
-        if layersplit_state is not None and layersplit_state.enabled:
-            read_block_ids = _layersplit_compute_read_block_ids(metadata)
+        # skip_topk gate: a reuse ("S") layer never computes logits — its
+        # indexer-K cache is never READ — so peers don't need its prefix.
+        # Only owning ("F") layers broadcast (saves up to 43/58 of the
+        # indexer-channel bytes at the FSSS prod split).
+        if (layersplit_state is not None and layersplit_state.enabled
+                and not self.skip_topk):
+            # The read set ([0, kv_len) per request) is identical for every
+            # layer within a step — compute it once per step and cache it on
+            # the metadata (invalidated in prepare()). This also collapses
+            # the per-layer kv_lens/seq_lens H2D copies inside the compute
+            # to one per step.
+            read_block_ids = getattr(metadata,
+                                     "_layersplit_read_block_ids_step", None)
+            if read_block_ids is None:
+                read_block_ids = _layersplit_compute_read_block_ids(metadata)
+                metadata._layersplit_read_block_ids_step = read_block_ids
 
             indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
