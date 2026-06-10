@@ -22,7 +22,8 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
+    DSAtrtllmAttentionMetadata, _hoist_sparse_mla_meta_enabled,
+    transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -2582,19 +2583,93 @@ class MLA(nn.Module):
         # [num_tokens, topk] -> [batch, s_q, topk]
         indices = topk_indices_pool.view(num_seqs, s_q, -1).contiguous()
 
-        out = torch.ops.trtllm.sparse_mla_decode_nvfp4(
-            q_concat,
-            kv,
-            kv_scales,
-            indices,
-            d_v=self.kv_lora_rank,
-            sm_scale=self.softmax_scale,
-        )[0]
+        out = self._run_sparse_mla_decode_nvfp4_op(
+            q_concat, kv, kv_scales, indices, attn_metadata, num_seqs, s_q)
         # out: [batch, s_q, 128, kv_lora_rank] -> drop head padding.
         out = out.view([num_tokens, padding, self.kv_lora_rank])
         out = out[:, :self.num_heads_tp_cp, :]
         return out.reshape(
             [num_tokens, self.num_heads_tp_cp * self.kv_lora_rank])
+
+    def _run_sparse_mla_decode_nvfp4_op(
+        self,
+        q_concat: torch.Tensor,
+        kv: torch.Tensor,
+        kv_scales: torch.Tensor,
+        indices: torch.Tensor,
+        attn_metadata: "DSAtrtllmAttentionMetadata",
+        num_seqs: int,
+        s_q: int,
+    ) -> torch.Tensor:
+        """Run ``sparse_mla_decode_nvfp4``, optionally hoisting tile-scheduler
+        metadata across the per-step F-layers (candidate SM1).
+
+        The op recomputes its tile-scheduler metadata on every call (16/step)
+        unless ``tile_scheduler_metadata`` / ``num_splits`` are supplied. With
+        prod topk and ``topk_length=None`` the metadata is data-independent — a
+        pure function of ``(num_seqs, s_q, topk)`` — so it is bit-identical
+        across all 16 F-layers and every step at a fixed batch bucket. When the
+        ``TRTLLM_OPTRT_HOIST_SPARSE_MLA_META`` gate is on, the step's first
+        F-layer lets the op compute the metadata, we copy it into the
+        pre-allocated graph-stable buffers on ``attn_metadata``, and subsequent
+        layers feed those buffers back in so the op skips its serial metadata
+        kernel (``computeSchedulerMetadata=false``). The gate defaults off, in
+        which case every layer passes ``None`` exactly as before (byte-identical).
+        """
+        if not _hoist_sparse_mla_meta_enabled():
+            return torch.ops.trtllm.sparse_mla_decode_nvfp4(
+                q_concat,
+                kv,
+                kv_scales,
+                indices,
+                d_v=self.kv_lora_rank,
+                sm_scale=self.softmax_scale,
+            )[0]
+
+        # The hoisted metadata is keyed on the batch bucket only (the kernel
+        # derives `cur_s_k = topk` independent of the real KV lengths). A change
+        # in the signature forces this step's first F-layer to recompute even if
+        # the once-per-step `prepare()` reset has not run for this metadata yet.
+        topk = indices.shape[-1]
+        meta_sig = (num_seqs, s_q, topk)
+        if (attn_metadata._sparse_mla_meta_valid
+                and attn_metadata._sparse_mla_meta_sig == meta_sig):
+            num_sm_parts = attn_metadata._sparse_mla_meta_num_sm_parts
+            return torch.ops.trtllm.sparse_mla_decode_nvfp4(
+                q_concat,
+                kv,
+                kv_scales,
+                indices,
+                tile_scheduler_metadata=attn_metadata.
+                sparse_mla_tile_scheduler_metadata[:num_sm_parts],
+                num_splits=attn_metadata.sparse_mla_num_splits[:num_seqs + 1],
+                d_v=self.kv_lora_rank,
+                sm_scale=self.softmax_scale,
+            )[0]
+
+        # First F-layer of the step (or a new batch bucket): let the op compute
+        # the metadata, then cache it for the remaining layers. The op returns
+        # `(out, lse, tile_scheduler_metadata, num_splits)`.
+        out, _, tile_scheduler_metadata, num_splits = (
+            torch.ops.trtllm.sparse_mla_decode_nvfp4(
+                q_concat,
+                kv,
+                kv_scales,
+                indices,
+                d_v=self.kv_lora_rank,
+                sm_scale=self.softmax_scale,
+            ))
+        num_sm_parts = tile_scheduler_metadata.shape[0]
+        # Copy into the pre-allocated graph-stable buffers (sliced to the actual
+        # num_sm_parts / batch+1) so subsequent layers read a stable address.
+        attn_metadata.sparse_mla_tile_scheduler_metadata[:num_sm_parts].copy_(
+            tile_scheduler_metadata, non_blocking=True)
+        attn_metadata.sparse_mla_num_splits[:num_seqs + 1].copy_(
+            num_splits, non_blocking=True)
+        attn_metadata._sparse_mla_meta_num_sm_parts = num_sm_parts
+        attn_metadata._sparse_mla_meta_sig = meta_sig
+        attn_metadata._sparse_mla_meta_valid = True
+        return out
 
     def forward_absorption_generation(
         self,
