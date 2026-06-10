@@ -273,6 +273,24 @@ def _is_cuda_graph(moe: "ConfigurableMoE") -> bool:
     return bool(getattr(moe, "warp_decode_is_cuda_graph", False))
 
 
+def _is_deepep_ll_layout(moe: "ConfigurableMoE") -> bool:
+    """Whether the active comm strategy hands the MoE an expert-major recv.
+
+    DeepEPLowLatency._modify_output_to_adapt_fused_moe flattens the padded
+    [num_local_experts, ep*token_limit, H] recv into top-1 rows with a
+    num_slots sentinel on masked rows. The overlay's trtllm_gen runner
+    requires token-major top-k routing, so it can never serve this layout;
+    the canonical WARPDECODE CuteDslFusedMoE backend consumes it natively
+    (moe_sort drops the sentinel rows without inflating tiles).
+    """
+    comm = getattr(moe, "comm", None)
+    if comm is None:
+        return False
+    from .communication.deep_ep_low_latency import DeepEPLowLatency
+
+    return isinstance(comm, DeepEPLowLatency)
+
+
 def _tensor_data(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if isinstance(tensor, torch.nn.Parameter):
         return tensor.data
@@ -872,6 +890,8 @@ def get_warp_decode_guard_failure(
         return "policy_fallback_only"
     if not _is_pure_decode(moe):
         return "not_decode_only"
+    if _is_deepep_ll_layout(moe):
+        return "deepep_ll_expert_major_layout"
     if _is_cuda_graph(moe) and not getattr(moe, "has_nvfp4", False):
         return "cuda_graph_not_supported"
     if not do_finalize:
@@ -995,7 +1015,7 @@ def try_run_warp_decode(
         all_rank_num_tokens=all_rank_num_tokens,
     )
     if reason is not None:
-        if reason == "not_decode_only":
+        if reason in ("not_decode_only", "deepep_ll_expert_major_layout"):
             _record(moe, WarpDecodeStatus.NOT_APPLICABLE, reason)
             return None
         _guard_failure(moe, config, reason)

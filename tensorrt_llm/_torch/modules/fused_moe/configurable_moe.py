@@ -43,7 +43,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import (AllGatherReduceScatter, Communication,
-                            CommunicationFactory, onesided_a2a_enabled)
+                            CommunicationFactory, DeepEPLowLatency,
+                            onesided_a2a_enabled)
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
@@ -193,6 +194,11 @@ class ConfigurableMoE(MoE):
 
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
+        # Reversible-fallback bookkeeping for oversize forwards (see
+        # determine_communication_method). DeepEPLowLatency is parked, not
+        # destroyed, while an oversize forward is served by AllGather.
+        self._comm_primary: Optional[Communication] = None
+        self._comm_oversize_fallback: Optional[AllGatherReduceScatter] = None
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
@@ -463,6 +469,12 @@ class ConfigurableMoE(MoE):
 
         """
 
+        # Restore a parked primary strategy before validation so a prior
+        # oversize forward (e.g. the max_num_tokens warmup pass) does not pin
+        # the AllGather fallback for the rest of the process.
+        if self._comm_primary is not None and self.comm is not self._comm_primary:
+            self.comm = self._comm_primary
+
         # Early return if nothing to validate:
         # - None: Atten is TP or single rank, no communication needed
         # - AllGather: Already using fallback strategy, no validation needed
@@ -480,8 +492,19 @@ class ConfigurableMoE(MoE):
                 f"Falling back to AllGatherReduceScatter."
             )
 
-            self.comm.destroy()
-            self.comm = AllGatherReduceScatter(mapping=self.mapping)
+            if isinstance(self.comm, DeepEPLowLatency):
+                # Park the strategy instead of destroying it: the NVSHMEM
+                # buffer is expensive to rebuild and oversize forwards are
+                # transient (warmup max-shape passes, oversize mixed batches).
+                # The restore branch above re-arms it on the next forward
+                # within the token limit.
+                self._comm_primary = self.comm
+                if self._comm_oversize_fallback is None:
+                    self._comm_oversize_fallback = AllGatherReduceScatter(mapping=self.mapping)
+                self.comm = self._comm_oversize_fallback
+            else:
+                self.comm.destroy()
+                self.comm = AllGatherReduceScatter(mapping=self.mapping)
 
     def destroy(self):
         """Release communication resources.
@@ -497,6 +520,8 @@ class ConfigurableMoE(MoE):
         """
         if self.comm is not None:
             self.comm.destroy()
+        if self._comm_primary is not None and self._comm_primary is not self.comm:
+            self._comm_primary.destroy()
 
     def __enter__(self):
         return self
