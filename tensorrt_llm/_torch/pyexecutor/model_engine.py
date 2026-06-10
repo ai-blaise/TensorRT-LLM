@@ -84,6 +84,44 @@ def _optrt_me_debug_enabled() -> bool:
 _OPTRT_ME_DEBUG_ENABLED = _optrt_me_debug_enabled()
 
 
+def _optrt_fuse_adp_collectives_enabled() -> bool:
+    """Whether to fuse the per-step ADP num_tokens + num_ctx_requests gathers.
+
+    OFF (default) preserves the original two separate ``tp_allgather`` calls
+    verbatim. ON combines them into a single ``tp_allgather`` of a 2-element
+    list, removing one host MPI collective pair (Allgather + Allgatherv) from
+    every forward step under attention-DP. Only the provably-symmetric,
+    data-independent pair is fused; see ``_get_padding_params`` and the
+    ``_prepare_tp_inputs*`` call sites.
+    """
+    return os.environ.get("TRTLLM_OPTRT_FUSE_ADP_COLLECTIVES", "0") == "1"
+
+
+# Cached at import: same per-step hot-path rationale as _OPTRT_ME_DEBUG_ENABLED.
+_OPTRT_FUSE_ADP_COLLECTIVES = _optrt_fuse_adp_collectives_enabled()
+
+# Sentinel for _get_padding_params(all_rank_ctx_requests=...): distinguishes
+# "caller did not gather ctx_requests" (method gathers it itself) from the
+# legitimate None returned when attention-DP is disabled.
+_UNSET_CTX_REQUESTS = object()
+
+
+def _optrt_kvarn_delta_restore_enabled() -> bool:
+    """Whether the pre-replay KVarN restore walk uses the per-request delta.
+
+    ON (default): when the step key changes, restore exactly the blocks that
+    newly became full (block-boundary crossings) or belong to newly onboarded
+    requests, derived from host metadata and the side-pools' host mirrors --
+    no per-layer masked-select scan, no device readbacks. OFF: the original
+    full per-layer scan walk on every key change.
+    """
+    return os.environ.get("TRTLLM_OPTRT_KVARN_DELTA_RESTORE", "1") == "1"
+
+
+# Cached at import: per-step hot path, same rationale as _OPTRT_ME_DEBUG_ENABLED.
+_OPTRT_KVARN_DELTA_RESTORE = _optrt_kvarn_delta_restore_enabled()
+
+
 def _optrt_me_shape(value: object) -> object:
     if value is None:
         return None
@@ -406,6 +444,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = False
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         self._kvarn_restore_modules: Optional[List[Any]] = None
+        self._kvarn_delta_capable: bool = False
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -705,13 +744,13 @@ class PyTorchModelEngine(ModelEngine):
         tpb = getattr(mgr, "tokens_per_block", None)
         kv_lens = getattr(attn_metadata, "kv_lens_runtime", None)
         req_ids = getattr(attn_metadata, "request_ids", None)
+        key = None
         if tpb and kv_lens is not None and req_ids is not None:
             ids = tuple(req_ids)
             key = (ids,
                    tuple(int(kv_lens[i]) // tpb for i in range(len(ids))))
             if key == getattr(self, "_kvarn_restore_step_key", None):
                 return
-            self._kvarn_restore_step_key = key
         if self._kvarn_restore_modules is None:
             modules = getattr(self.model, "modules", None)
             if not callable(modules):
@@ -722,8 +761,105 @@ class PyTorchModelEngine(ModelEngine):
                     if callable(getattr(module, "kvarn_restore_for_decode",
                                         None))
                 ]
+            self._kvarn_delta_capable = all(
+                callable(getattr(m, "kvarn_restore_block_ids", None))
+                and getattr(m, "layer_idx", None) is not None
+                for m in self._kvarn_restore_modules)
+        # Per-request incremental fire: on a key change, only requests whose
+        # full-block count grew (or that newly joined the batch) can hold
+        # committed-but-unrestored blocks; restore exactly those instead of
+        # rescanning all requests x all layers. Falls back to the full walk
+        # whenever the delta cannot be derived safely.
+        if (_OPTRT_KVARN_DELTA_RESTORE and key is not None
+                and getattr(self, "_kvarn_delta_capable", False)
+                and self._kvarn_delta_restore(attn_metadata, mgr, key)):
+            self._kvarn_restore_step_key = key
+            return
+        if key is not None:
+            self._kvarn_restore_step_key = key
         for module in self._kvarn_restore_modules:
             module.kvarn_restore_for_decode(attn_metadata)
+
+    def _kvarn_delta_restore(self, attn_metadata: AttentionMetadata, mgr: Any,
+                             key: Tuple[Tuple, Tuple]) -> bool:
+        """Per-request incremental KVarN restore for the pre-replay walk.
+
+        Between two fires of the step gate, the side-pools' committed
+        content for a surviving generation request can change only where its
+        full-block count grew: the previous fire already reconstructed every
+        older committed block, committed blocks are immutable until their id
+        is recycled (re-committed by the new owner, which lands in that
+        owner's delta), and the in-progress tail block stays fp16. The delta
+        is therefore (a) blocks ``[prev_n_full, n_full)`` of requests whose
+        count grew and (b) blocks ``[0, n_full)`` of requests not present in
+        the previous key (onboard / kv shrink), filtered through the pools'
+        host mirrors of valid/commit_gen. Everything is host integers --
+        previous/current step keys, the host block table stashed by DSA
+        ``prepare()``, and the numpy mirrors -- so the common fire (a
+        boundary crossing whose fresh block is not committed on this worker)
+        costs O(batch) host work and zero launches, instead of the
+        per-layer masked-select scans (3 device syncs x num_layers).
+
+        Returns True when the fire was handled (possibly with zero restore
+        work). Returns False -- without having mutated any pool or buffer
+        state -- to make the caller run the full per-layer scan walk.
+        """
+        prev = getattr(self, "_kvarn_restore_step_key", None)
+        if prev is None:
+            return False
+        hbt = getattr(attn_metadata, "kvarn_host_block_table", None)
+        if hbt is None or hbt.dim() != 2 or hbt.is_cuda:
+            return False
+        if int(getattr(attn_metadata, "num_contexts", 0)) != 0:
+            # Replay batches are generation-only; a context row here means
+            # the walk is running outside its contract -- take the safe path.
+            return False
+        pools = getattr(mgr, "kvarn_latent_pool_per_layer", None)
+        if (not pools or not callable(
+                getattr(mgr, "get_kvarn_latent_pool", None))
+                or not hasattr(pools[0], "stale_committed_host")):
+            return False
+        ids_new, nfull_new = key
+        num_rows = len(ids_new)
+        if hbt.shape[0] < num_rows:
+            return False
+        prev_nfull = dict(zip(prev[0], prev[1]))
+        table = hbt.numpy()
+        cand: List[int] = []
+        for row in range(num_rows):
+            n1 = nfull_new[row]
+            n0 = prev_nfull.get(ids_new[row], 0)
+            if n1 < n0:
+                # Shrunk kv (rewind / recycled request id): redo the range.
+                n0 = 0
+            if n1 <= n0:
+                continue
+            if n1 > table.shape[1]:
+                return False
+            seg = table[row, n0:n1]
+            if (seg < 0).any():
+                return False
+            cand.extend(seg.tolist())
+        if not cand:
+            return True
+        cand = sorted(set(cand))
+        ids_dev_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
+        for module in self._kvarn_restore_modules:
+            pool = mgr.get_kvarn_latent_pool(module.layer_idx)
+            if pool is None:
+                continue
+            todo = pool.stale_committed_host(cand)
+            if not todo:
+                continue
+            tkey = tuple(todo)
+            ids_dev = ids_dev_cache.get(tkey)
+            if ids_dev is None:
+                ids_dev = torch.tensor(todo, dtype=torch.long,
+                                       device=pool.device)
+                ids_dev_cache[tkey] = ids_dev
+            module.kvarn_restore_block_ids(attn_metadata, ids_dev)
+            pool.mark_restored_host(todo)
+        return True
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
@@ -2045,12 +2181,123 @@ class PyTorchModelEngine(ModelEngine):
             return all_rank_ctx_requests
         return None
 
+    def _optrt_adp_fuse_is_safe(self) -> bool:
+        """Whether fusing the ADP num_tokens + num_ctx_requests gathers is
+        collective-symmetric across all TP ranks for *every* step.
+
+        The fused gather is issued only on the ``_prepare_tp_inputs``
+        non-incremental path (and its ``_prepare_tp_inputs_no_cache`` analog).
+        ``_prepare_tp_inputs`` has a data-dependent early return
+        (``_can_use_incremental_update`` -> ``_apply_incremental_update``,
+        L2715) that bypasses the fused gather and instead runs the original
+        per-step collective sequence (a scalar ``tp_allgather(num_tokens)`` plus
+        a spec ``tp_cp_allgather``, with no ctx-requests gather).
+
+        Under attention-DP each TP rank schedules its own batch (no schedule
+        ``tp_broadcast`` under ADP), so ``_can_use_incremental_update`` — which
+        depends on per-rank ``scheduled_requests.num_context_requests`` and
+        per-rank ``previous_request_ids`` — can be True on some ranks and False
+        on others in the same iteration. If the fused (shortened) normal path
+        and the unfused incremental path co-occur across ranks, their
+        ``tp_allgather`` / ``tp_cp_allgather`` calls desynchronize on the shared
+        TP communicator and the ranks deadlock.
+
+        The incremental path is reachable iff ALL of the rank-invariant
+        preconditions in ``_can_use_incremental_update`` hold (it returns False
+        unconditionally otherwise). We therefore allow the fusion only when the
+        incremental path can NEVER be taken on any rank, which makes the
+        fused-vs-unfused choice a rank-invariant config decision rather than a
+        per-rank per-step one. This preserves cross-rank collective symmetry
+        under graphed, eager, warmup, onboarding, and first-token steps.
+
+        Note ``self.enable_spec_decode`` is mutated during warmup, so it is
+        intentionally NOT consulted here; only stable ``__init__``-time config
+        is used (``spec_config``, ``is_draft_model``, ``model_is_wrapped``,
+        ``cuda_graph_runner.enabled``, ``use_mrope``, overlap scheduler).
+        """
+        spec_config = self.spec_config
+        # No draft-model speculative decoding -> _can_use_incremental_update
+        # short-circuits to False on every rank (L2212/L2216), so the fused
+        # branch is always reached in lockstep.
+        if spec_config is None or not spec_config.spec_dec_mode.has_draft_model(
+        ):
+            return True
+        # The incremental path additionally requires CUDA graphs, no mrope, and
+        # the overlap scheduler (new_tokens_device is None without it, L2226).
+        # If any is off, the incremental early return is unreachable.
+        if not self.cuda_graph_runner.enabled:
+            return True
+        if self.use_mrope:
+            return True
+        if self._disable_overlap_scheduler:
+            return True
+        # Incremental path is reachable on a per-rank, data-dependent basis ->
+        # fusing the normal path would break collective symmetry. Keep the
+        # original two unconditional gathers.
+        return False
+
+    def _get_all_rank_num_tokens_and_ctx_requests(
+            self, attn_metadata: AttentionMetadata, num_ctx_requests: int
+    ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+        """Fused ADP gather of per-rank num_tokens and num_ctx_requests.
+
+        Replaces the two separate ``tp_allgather`` calls in
+        ``_get_all_rank_num_tokens`` (non-helix branch) and
+        ``_get_all_rank_ctx_requests`` with a single ``tp_allgather`` of a
+        2-element list, removing one host MPI collective pair per forward step.
+
+        Safe to fuse because both gathers are unconditional under attention-DP
+        (one ``if self.enable_attention_dp`` guard each, on a rank-invariant
+        config), their inputs (``attn_metadata.num_tokens`` and
+        ``num_ctx_requests``) are host ints known at the same program point with
+        no cross-dependency, and both target the same TP communicator. The
+        caller guarantees ``self.enable_attention_dp and not
+        self.mapping.has_cp_helix()`` before invoking this, so only the non-helix
+        ``tp_allgather`` path is taken (helix reroutes num_tokens to a different
+        ``tp_cp_allgather`` group and is excluded).
+
+        The same four ``_optrt_me_debug`` events emitted by the two original
+        helpers are preserved so debug telemetry is identical to the unfused
+        path.
+        """
+        num_tokens = attn_metadata.num_tokens
+        _optrt_me_debug(self.dist,
+                        "attn_num_tokens_tp_allgather_before",
+                        num_tokens=num_tokens,
+                        metadata=_optrt_me_metadata_summary(attn_metadata))
+        _optrt_me_debug(self.dist,
+                        "ctx_requests_tp_allgather_before",
+                        num_ctx_requests=num_ctx_requests)
+        gathered = list(
+            self.dist.tp_allgather([num_tokens, num_ctx_requests]))
+        all_rank_num_tokens = [item[0] for item in gathered]
+        all_rank_ctx_requests = [item[1] for item in gathered]
+        _optrt_me_debug(self.dist,
+                        "attn_num_tokens_tp_allgather_after",
+                        gathered=all_rank_num_tokens)
+        _optrt_me_debug(self.dist,
+                        "ctx_requests_tp_allgather_after",
+                        gathered=all_rank_ctx_requests)
+        return all_rank_num_tokens, all_rank_ctx_requests
+
     def _get_padding_params(
-        self, total_num_tokens: int, num_ctx_requests: int,
-        attn_all_rank_num_tokens: Optional[List[int]]
+        self,
+        total_num_tokens: int,
+        num_ctx_requests: int,
+        attn_all_rank_num_tokens: Optional[List[int]],
+        all_rank_ctx_requests: Optional[List[int]] = _UNSET_CTX_REQUESTS,
     ) -> Tuple[int, bool, Optional[List[int]]]:
         """
         Get the padding parameters for tensor padding.
+
+        Args:
+            all_rank_ctx_requests: per-rank num_ctx_requests, when already
+                gathered by the caller (fused ADP path). Left at the
+                ``_UNSET_CTX_REQUESTS`` sentinel by callers that have not gathered
+                it, in which case this method issues the gather itself via
+                ``_get_all_rank_ctx_requests`` (original behavior). The sentinel
+                distinguishes "not provided" from the legitimate ``None`` result
+                returned when attention-DP is disabled.
         Return:
             padded_num_tokens: the padded number of tokens
             can_run_piecewise_cuda_graph: whether the piecewise cuda graph can be run
@@ -2058,8 +2305,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         padded_num_tokens = total_num_tokens
 
-        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
-            num_ctx_requests)
+        if all_rank_ctx_requests is _UNSET_CTX_REQUESTS:
+            all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+                num_ctx_requests)
 
         def get_padded_piecewise_tokens(tokens):
             captured_num_tokens = self._torch_compile_backend.capture_num_tokens
@@ -3440,9 +3688,21 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
 
-        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
-        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
-            total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
+        if (_OPTRT_FUSE_ADP_COLLECTIVES and self.enable_attention_dp
+                and not self.mapping.has_cp_helix()
+                and self._optrt_adp_fuse_is_safe()):
+            # Fuse the num_tokens + num_ctx_requests gathers into one collective.
+            attn_all_rank_num_tokens, all_rank_ctx_requests = (
+                self._get_all_rank_num_tokens_and_ctx_requests(
+                    attn_metadata, num_ctx_requests))
+            padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+                total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens,
+                all_rank_ctx_requests)
+        else:
+            attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
+                attn_metadata)
+            padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+                total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
         set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != total_num_tokens else None
 
@@ -3620,9 +3880,22 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
 
-        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
-        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
-            num_tokens, attn_metadata.num_contexts, attn_all_rank_num_tokens)
+        if (_OPTRT_FUSE_ADP_COLLECTIVES and self.enable_attention_dp
+                and not self.mapping.has_cp_helix()
+                and self._optrt_adp_fuse_is_safe()):
+            # Fuse the num_tokens + num_ctx_requests gathers into one collective.
+            attn_all_rank_num_tokens, all_rank_ctx_requests = (
+                self._get_all_rank_num_tokens_and_ctx_requests(
+                    attn_metadata, attn_metadata.num_contexts))
+            padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+                num_tokens, attn_metadata.num_contexts,
+                attn_all_rank_num_tokens, all_rank_ctx_requests)
+        else:
+            attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
+                attn_metadata)
+            padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+                num_tokens, attn_metadata.num_contexts,
+                attn_all_rank_num_tokens)
         set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
