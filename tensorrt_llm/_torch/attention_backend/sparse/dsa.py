@@ -3691,6 +3691,47 @@ class Indexer(nn.Module):
                 self._maybe_store_indexcache_topk(metadata, reused)
                 return reused
 
+        # LayerSplit indexer-K READ-SET broadcast: the owner CP rank for
+        # layer L publishes the cache blocks the logits/prefill-gather
+        # kernels READ this step — the FULL per-request KV prefix
+        # [0, kv_len), not just the write set. z.ai "Scaling Pain" §4:
+        # under chunked prefill / prefix reuse a write-set-only broadcast
+        # leaves the non-owner's indexer-K scratch STALE for the cached
+        # prefix on chunk >= 2 → wrong logits, wrong TopK.
+        #
+        # Placement: past the indexcache early-return (S layers never read
+        # this cache) and the cross-step-reuse return (no logits read on
+        # those steps), immediately before the paths that DO read — so the
+        # broadcast runs exactly when needed, on both the module-forward
+        # and the mla_dsa custom-op entry paths. _update_k_cache above is
+        # order-safe: every CP rank writes identical current-step K
+        # (replicated compute), so the owner's scatter delivers the same
+        # bytes. The dense-KV/NVFP4-scale broadcasts stay in
+        # sparse_attn_predict (their read set is TopK-dependent). All
+        # branches no-op when LayerSplit is off / cp_size==1.
+        kv_cache_manager = metadata.kv_cache_manager
+        layersplit_state = getattr(kv_cache_manager, "layersplit_state",
+                                   None) if kv_cache_manager is not None else None
+        if layersplit_state is not None and layersplit_state.enabled:
+            # Per-step cache (invalidated in prepare()): the read set is
+            # identical for every layer within a step, and computing it
+            # per layer paid kv_lens/seq_lens H2D copies + arange/mask/
+            # unique kernels each time.
+            read_block_ids = getattr(metadata,
+                                     "_layersplit_read_block_ids_step", None)
+            if read_block_ids is None:
+                read_block_ids = _layersplit_compute_read_block_ids(metadata)
+                metadata._layersplit_read_block_ids_step = read_block_ids
+
+            indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
+                self.layer_idx)
+            layersplit_state.maybe_broadcast_active_blocks(
+                layer_idx=self.layer_idx,
+                cache_slot=indexer_slot,
+                active_block_ids=read_block_ids,
+                cp_group=layersplit_state.cp_group,
+            )
+
         topk_indices_buffer = torch.empty(
             (hidden_states.shape[0], self.index_topk),
             dtype=torch.int32,
@@ -4116,7 +4157,18 @@ class Indexer(nn.Module):
                         pre_idx=pre_idx,
                         heuristic_scratch=heuristic_scratch)
             else:
-                # padded
+                # padded fallback: dense full-width masked top-k. This is
+                # O(B*N x logits_width) memory-bound (132096-wide at prod) —
+                # roughly 10x the DSL/C++ top-k cost — and only engages when
+                # the custom top-k paths reject a shape. Log once so a
+                # kernel-gating regression can't silently eat the indexer
+                # budget.
+                logger.warning_once(
+                    "[dsa] decode top-k taking the padded full-width masked "
+                    f"fallback (width={logits_decode.shape[-1]}, "
+                    f"num_gen_tokens={num_gen_tokens}, next_n={next_n}); "
+                    "expected only on shapes the DSL/C++ top-k reject.",
+                    key="dsa_decode_topk_padded_fallback")
                 positions = torch.arange(
                     logits_decode.shape[-1],
                     device=q_decode.device).unsqueeze(0).expand(
@@ -4365,59 +4417,15 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        # LayerSplit indexer-K READ-SET broadcast: the owner CP rank for
-        # layer L publishes the cache blocks the indexer KERNEL READS this
-        # step — the FULL per-request KV prefix [0, kv_len) — not just the
-        # write set (the new-token blocks). z.ai "Scaling Pain" §4: the
-        # indexer scores every query token causally against the whole
-        # prefix, so under chunked prefill / prefix reuse a write-set-only
-        # broadcast (the old M5e) leaves the non-owner's indexer-K scratch
-        # STALE for the cached prefix on chunk >= 2, yielding wrong logits
-        # and wrong TopK. The read set is ~1/8 of total KV (z.ai's exposed
-        # broadcast cost) and is REQUIRED for correctness.
-        #
-        # The dense-KV + NVFP4-scale broadcasts are NOT here: the dense
-        # read set is the TopK-selected blocks, which are only known AFTER
-        # the indexer runs. They are issued in
-        # DSATrtllmAttention.sparse_attn_predict, after topk_indices_global
-        # is computed and before the sparse-MLA dense read consumes it.
-        #
-        # All ranks see the same metadata, so they compute identical read
-        # sets — required for the NCCL broadcast to agree on buffer shape.
-        # All paths are no-ops on the LayerSplit-off / cp_size=1 / no
-        # process-group / no-CUDA branches so this is safe to drop in
-        # unconditionally — and it ONLY engages for DSA models because this
-        # file is the DSA attention backend (LayerSplit's only home;
-        # non-DSA models never construct a DSACacheManager).
-        kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
-        layersplit_state = getattr(kv_cache_manager, "layersplit_state",
-                                   None) if kv_cache_manager is not None else None
-        # skip_topk gate: a reuse ("S") layer never computes logits — its
-        # indexer-K cache is never READ — so peers don't need its prefix.
-        # Only owning ("F") layers broadcast (saves up to 43/58 of the
-        # indexer-channel bytes at the FSSS prod split).
-        if (layersplit_state is not None and layersplit_state.enabled
-                and not self.skip_topk):
-            # The read set ([0, kv_len) per request) is identical for every
-            # layer within a step — compute it once per step and cache it on
-            # the metadata (invalidated in prepare()). This also collapses
-            # the per-layer kv_lens/seq_lens H2D copies inside the compute
-            # to one per step.
-            read_block_ids = getattr(metadata,
-                                     "_layersplit_read_block_ids_step", None)
-            if read_block_ids is None:
-                read_block_ids = _layersplit_compute_read_block_ids(metadata)
-                metadata._layersplit_read_block_ids_step = read_block_ids
-
-            indexer_slot = kv_cache_manager.get_indexer_k_cache_buffers(
-                self.layer_idx)
-            layersplit_state.maybe_broadcast_active_blocks(
-                layer_idx=self.layer_idx,
-                cache_slot=indexer_slot,
-                active_block_ids=read_block_ids,
-                cp_group=layersplit_state.cp_group,
-            )
-
+        # NOTE: the LayerSplit indexer-K read-set broadcast used to live
+        # here, but this forward() is bypassed by the live custom-op path
+        # (modules/attention.py runs pre_indexer_proj via mla_dsa_proj and
+        # then calls sparse_attn_indexer directly) — so a broadcast here
+        # never ran in production. It now lives inside sparse_attn_indexer,
+        # past the indexcache / cross-step-reuse early returns and
+        # immediately before the paths that actually READ the full
+        # per-request indexer-K prefix, so BOTH entry points get it and
+        # reuse layers/steps skip it for free.
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
 

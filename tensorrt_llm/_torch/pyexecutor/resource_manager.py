@@ -1180,21 +1180,26 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            _optrt_kv_debug(
-                "kv_prepare_enter",
-                manager=self._debug_role(),
-                rank=self.mapping.rank,
-                tp_rank=self.mapping.tp_rank,
-                tp_size=self.mapping.tp_size,
-                cp_rank=self.mapping.cp_rank,
-                cp_size=self.mapping.cp_size,
-                pp_rank=self.mapping.pp_rank,
-                pp_size=self.mapping.pp_size,
-                context_chunking=len(
-                    scheduled_batch.context_requests_chunking),
-                context_last=len(scheduled_batch.context_requests_last_chunk),
-                generation=len(scheduled_batch.generation_requests),
-                resource_manager=type(self).__name__)
+            # Gate at the call site: the kwargs below (and especially the
+            # per-request _debug_token_count() C++ calls further down) are
+            # evaluated BEFORE the callee's internal gate can reject them.
+            if _OPTRT_KV_DEBUG_ENABLED:
+                _optrt_kv_debug(
+                    "kv_prepare_enter",
+                    manager=self._debug_role(),
+                    rank=self.mapping.rank,
+                    tp_rank=self.mapping.tp_rank,
+                    tp_size=self.mapping.tp_size,
+                    cp_rank=self.mapping.cp_rank,
+                    cp_size=self.mapping.cp_size,
+                    pp_rank=self.mapping.pp_rank,
+                    pp_size=self.mapping.pp_size,
+                    context_chunking=len(
+                        scheduled_batch.context_requests_chunking),
+                    context_last=len(
+                        scheduled_batch.context_requests_last_chunk),
+                    generation=len(scheduled_batch.generation_requests),
+                    resource_manager=type(self).__name__)
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
             _optrt_kv_debug(
@@ -1230,17 +1235,21 @@ class KVCacheManager(BaseResourceManager):
                     should_add_sequence = (
                         self._should_add_sequence_for_context_prepare(req))
                     if should_add_sequence:
-                        _optrt_kv_debug(
-                            "kv_context_queue_add_sequence",
-                            req,
-                            manager=self._debug_role(),
-                            token_count_before=self._debug_token_count(req))
+                        if _OPTRT_KV_DEBUG_ENABLED:
+                            # _debug_token_count is a per-request C++
+                            # get_token_count call — never pay it gated-off.
+                            _optrt_kv_debug(
+                                "kv_context_queue_add_sequence",
+                                req,
+                                manager=self._debug_role(),
+                                token_count_before=self._debug_token_count(
+                                    req))
                         # Batch path: two-phase claim-then-onboard
                         batch_request_infos.append(
                             (req.py_request_id, req.prompt_len, req_beam_width))
                         batch_llm_requests.append(req)
                         batch_ctx_requests.append(req)
-                    else:
+                    elif _OPTRT_KV_DEBUG_ENABLED:
                         _optrt_kv_debug(
                             "kv_context_skip_add_sequence",
                             req,
@@ -1266,13 +1275,14 @@ class KVCacheManager(BaseResourceManager):
                     manager=self._debug_role(),
                     request_infos=batch_request_infos)
                 for req in batch_ctx_requests:
-                    _optrt_kv_debug(
-                        "kv_context_after_add_sequence",
-                        req,
-                        manager=self._debug_role(),
-                        token_count_after=self._debug_token_count(req),
-                        num_extra_kv_tokens=self.num_extra_kv_tokens,
-                        draft_token_length=get_draft_token_length(req))
+                    if _OPTRT_KV_DEBUG_ENABLED:
+                        _optrt_kv_debug(
+                            "kv_context_after_add_sequence",
+                            req,
+                            manager=self._debug_role(),
+                            token_count_after=self._debug_token_count(req),
+                            num_extra_kv_tokens=self.num_extra_kv_tokens,
+                            draft_token_length=get_draft_token_length(req))
                     for _ in range(self.num_extra_kv_tokens):
                         try:
                             self.impl.add_token(req.py_request_id)

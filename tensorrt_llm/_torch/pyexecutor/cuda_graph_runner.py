@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import functools
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
@@ -30,7 +31,11 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 KeyType: TypeAlias = Tuple[int, int, bool, bool]
 
 
+@functools.lru_cache(maxsize=None)
 def _optrt_cg_debug_enabled(env_var: str) -> bool:
+    # Read-once-per-process debug gate (same pattern as the cached env
+    # gates in model_engine): these are checked on the per-batch padding
+    # path, several times per step.
     return os.environ.get(env_var, "0") == "1"
 
 
