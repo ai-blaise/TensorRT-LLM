@@ -42,6 +42,7 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
 from ..distributed import Distributed
+from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
 from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -1911,8 +1912,25 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                        if not all_gen_first:
+                    # [disagg-ctx-deadlock-fix] Mirror of the OR-gated entry in
+                    # _executor_loop: ensure every TP rank either calls
+                    # _check_disagg_ctx_cache_transfer_status together or skips
+                    # it together, so the internal allgather in
+                    # CacheTransceiver::checkContextTransferStatus always has
+                    # full quorum. The C++ syncComm inside that helper is at
+                    # most TP-wide (mGroupTensorParaComm; mGroupTPInDPComm
+                    # with attention_dp), so a TP-scoped OR vote is sufficient.
+                    # Using WORLD allreduce here serialized the disagg prefill
+                    # host loop on every iter (nvbug/6280060).
+                    local_need_check = (num_fitting_reqs == 0 and
+                                        not fitting_disagg_gen_init_requests)
+                    if self.dist.tp_size > 1:
+                        any_need_check = self.dist.tp_allreduce(
+                            int(local_need_check), op=ReduceOp.MAX)
+                    else:
+                        any_need_check = int(local_need_check)
+                    if any_need_check > 0:
+                        if local_need_check and not all_gen_first:
                             logger.warning(
                                 "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                             )
@@ -2466,8 +2484,28 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                if not all_gen_first:
+            # [disagg-ctx-deadlock-fix] _check_disagg_ctx_cache_transfer_status
+            # internally invokes a TP-scoped allgather inside
+            # CacheTransceiver::checkContextTransferStatus. Gating the call on
+            # rank-local `num_fitting_reqs` (which can drift between ranks by
+            # one block due to per-rank UCX/CUDA-event-sync timing variance)
+            # lets some ranks enter the allgather while others skip ahead to
+            # model_forward / kv_connector → cross-rank collective-mismatch
+            # deadlock. OR the decision across TP ranks: if ANY rank wants the
+            # call, ALL ranks call it. Ranks that don't locally need it use the
+            # non-blocking variant so the collective stays in sync without
+            # holding any individual rank. Use TP-scoped allreduce (matches
+            # the C++ syncComm scope) instead of WORLD to avoid serializing
+            # the disagg prefill host loop on every iter (nvbug/6280060).
+            local_need_check = (num_fitting_reqs == 0
+                                and not fitting_disagg_gen_init_requests)
+            if self.dist.tp_size > 1:
+                any_need_check = self.dist.tp_allreduce(int(local_need_check),
+                                                        op=ReduceOp.MAX)
+            else:
+                any_need_check = int(local_need_check)
+            if any_need_check > 0:
+                if local_need_check and not all_gen_first:
                     logger.warning(
                         "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                     )
