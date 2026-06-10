@@ -63,6 +63,8 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
+from ..modules.fused_lowrank_gate import (get_lowrank_gate_weights,
+                                          lowrank_gate_supported)
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
@@ -792,6 +794,20 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
+def _dsv3_mlp_nvfp4_backends() -> Optional[List[str]]:
+    """NVFP4 backend override for the DSv3 dense-MLP / shared-expert GEMMs.
+
+    The NVFP4 GEMM AutoTuner picks the cutlass backend for these
+    hidden/intermediate shapes at decode token counts, where cuBLASLt is
+    bit-identical (max|diff| == 0 on real REAP weights at M in {4,16}) and
+    1.5-2.1x faster, for both full and TP-sharded weights. Mirrors the MLA
+    proj override (TRTLLM_MLA_PROJ_NVFP4_BACKENDS). Comma-separated to
+    override, empty to restore auto-selection.
+    """
+    val = os.environ.get('TRTLLM_DSV3_MLP_NVFP4_BACKENDS', 'cublaslt')
+    return [b.strip() for b in val.split(',') if b.strip()] or None
+
+
 class DeepseekV3Linear(Linear):
     """
     A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
@@ -813,6 +829,7 @@ class DeepseekV3Linear(Linear):
         use_custom_cublas_mm: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
+        nvfp4_allowed_backends: Optional[List[str]] = None,
     ):
         super().__init__(
             in_features,
@@ -829,6 +846,7 @@ class DeepseekV3Linear(Linear):
             use_custom_cublas_mm,
             lora,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
 
     def apply_linear(self,
@@ -892,6 +910,7 @@ class DeepseekV3Attention(MLA):
             use_custom_cublas_mm=True,
             use_cute_dsl_blockscaling_mm=model_config.
             use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=self._mla_proj_nvfp4_backends,
         )
 
 
@@ -933,6 +952,10 @@ class DeepseekV32Attention(MLA):
 
         self.indexer = self.mqa.indexer
 
+        # This re-creation of kv_a_proj_with_mqa previously dropped the MLA
+        # proj NVFP4 backend override, silently restoring the AutoTuner's
+        # cutlass mispick (2.1x slower than cuBLASLt at decode M) for the
+        # fused_a GEMM. Keep it in sync with MLA.__init__.
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
@@ -941,7 +964,8 @@ class DeepseekV32Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
 
 
 class DeepseekV3Gate(nn.Module):
@@ -1128,6 +1152,7 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            nvfp4_allowed_backends=_dsv3_mlp_nvfp4_backends(),
         )
         self.shared_experts_use_fp4 = (
             shared_quant_config is not None
@@ -1448,6 +1473,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=has_mlp_tp,
                 use_cute_dsl_blockscaling_mm=model_config.
                 use_cute_dsl_blockscaling_mm,
+                nvfp4_allowed_backends=_dsv3_mlp_nvfp4_backends(),
             )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -1549,8 +1575,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if gate_down is None or gate_up is None:
             return hidden_states
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rank = gate_down.weight.shape[0]
+        if lowrank_gate_supported(flat, rank) and flat.stride(-1) == 1:
+            wd_f32, wu_t = get_lowrank_gate_weights(gate_down, gate_up)
+            return torch.ops.trtllm.fused_lowrank_gate(
+                flat, wd_f32, wu_t).reshape(hidden_states.shape)
         hidden_dtype = flat.dtype
-        gate = torch.matmul(flat.float(), gate_down.weight.float().t())
+        wd_f32, _ = get_lowrank_gate_weights(gate_down, gate_up)
+        gate = torch.matmul(flat.float(), wd_f32.t())
         gate = torch.nn.functional.silu(gate).to(gate_up.weight.dtype)
         gate = torch.matmul(gate, gate_up.weight.t())
         gate = torch.sigmoid(gate).to(hidden_dtype)

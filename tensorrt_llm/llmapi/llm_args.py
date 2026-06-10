@@ -388,6 +388,20 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "index_head_dim=128, and can halve the indexer K cache per-token "
         "footprint from 132 B to 68 B.",
     )
+    indexer_logits_dtype: Literal["auto", "fp32", "fp16", "bf16"] = Field(
+        default="auto",
+        description=
+        "Element type of the decode indexer logits emitted by the CuTe DSL "
+        "paged-MQA-logits kernels and consumed by the decode Top-K. The "
+        "scoring inputs are fp8/fp4 quantized, so 16-bit logits already "
+        "exceed the information the scores carry; they halve the logits "
+        "store/load traffic and cut the radix Top-K from 4 rounds (fp32) "
+        "to 2. Scoring accumulation stays fp32 regardless. `auto` resolves "
+        "to fp16 (better top-1024 selection fidelity than bf16) on the DSL "
+        "scoring path and to fp32 on the DeepGEMM fallback, which only "
+        "emits fp32; non-fp32 choices are likewise honored only on the DSL "
+        "path.",
+    )
     mla_latent_kv_dtype: str = Field(
         default="auto",
         description=

@@ -32,6 +32,7 @@ from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, maybe_compiled_cat,
                      maybe_compiled_copy_)
+from .fused_lowrank_gate import sigmoid_mul_supported
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -948,8 +949,11 @@ class Attention(nn.Module):
                                         has_lora=bool(lora_params))
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if sigmoid_mul_supported(attn_output, gate):
+                attn_output = torch.ops.trtllm.fused_sigmoid_mul(
+                    attn_output, gate)
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
@@ -3194,7 +3198,11 @@ class MLA(nn.Module):
 
         if self.gate_proj is not None:
             gate = self.gate_proj(hidden_states)
-            attn_output = attn_output * torch.sigmoid(gate)
+            if sigmoid_mul_supported(attn_output, gate):
+                attn_output = torch.ops.trtllm.fused_sigmoid_mul(
+                    attn_output, gate)
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

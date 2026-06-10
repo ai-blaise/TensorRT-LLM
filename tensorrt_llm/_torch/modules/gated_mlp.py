@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +34,7 @@ class GatedMLP(nn.Module):
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
+        nvfp4_allowed_backends: Optional[List[str]] = None,
     ):
 
         super().__init__()
@@ -94,6 +95,7 @@ class GatedMLP(nn.Module):
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
 
         if is_shared_expert:
@@ -123,6 +125,7 @@ class GatedMLP(nn.Module):
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
