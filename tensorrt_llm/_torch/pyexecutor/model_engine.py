@@ -707,8 +707,10 @@ class PyTorchModelEngine(ModelEngine):
         req_ids = getattr(attn_metadata, "request_ids", None)
         if tpb and kv_lens is not None and req_ids is not None:
             ids = tuple(req_ids)
+            # kv_lens_runtime is a host tensor; one .tolist() beats O(B)
+            # per-element tensor __getitem__ + int() conversions.
             key = (ids,
-                   tuple(int(kv_lens[i]) // tpb for i in range(len(ids))))
+                   tuple(v // tpb for v in kv_lens[:len(ids)].tolist()))
             if key == getattr(self, "_kvarn_restore_step_key", None):
                 return
             self._kvarn_restore_step_key = key
