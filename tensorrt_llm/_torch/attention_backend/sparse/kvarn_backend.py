@@ -86,7 +86,14 @@ class KVarNConfig:
 
     ckv_bits: int = 4
     pe_bits: int = 2
-    iters: int = 16
+    # Sinkhorn variance-norm iterations for the software-cache store path.
+    # kvarn_core's own docstring says "~4 in practice"; measured on B200
+    # (256x[64,512] MLA-shaped latents, k4, 8 seeds): iters=16 -> cos
+    # 0.99351 @ 21.3ms/256blk vs iters=4 -> cos 0.99369 @ 1.85ms — quality
+    # is flat-to-slightly-better at 4 and store cost drops ~11x (the
+    # best-imbalance state tracking keeps the strongest normalization
+    # seen). Override via parse_kvarn_dtype(..., iters=N) if needed.
+    iters: int = 4
     sink_tokens: int = 128
     kv_lora_rank: int = 512
     qk_rope_head_dim: int = 64
