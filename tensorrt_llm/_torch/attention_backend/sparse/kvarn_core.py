@@ -82,19 +82,26 @@ def variance_normalize_batched(
     log_s_col = torch.zeros(N, 1, C, device=dev)
     log_s_row = torch.zeros(N, R, 1, device=dev)
 
-    cur = m / log_s_col.exp() / log_s_row.exp()
+    # exp(0) == 1 exactly and x/1.0 == x bit-exactly in IEEE, so the initial
+    # state is m itself and the best-state scale factors are ones — skip the
+    # two full-tensor divisions and the exp().clone()s the literal form pays.
+    cur = m
     imb_best = _imbalance(cur)
-    sc_best = log_s_col.exp().clone()
-    sr_best = log_s_row.exp().clone()
+    sc_best = torch.ones(N, 1, C, device=dev)
+    sr_best = torch.ones(N, R, 1, device=dev)
 
     for _ in range(iterations):
         col_std = cur.std(dim=1, keepdim=True).clamp(_CLIP_STD_MIN, _CLIP_STD_MAX)
         log_s_col = (log_s_col + col_std.log()).clip(_LOG_S_MIN, _LOG_S_MAX)
-        cur = m / log_s_col.exp() / log_s_row.exp()
+        # Keep the col-divided intermediate: the row half-step below changes
+        # only the row factor, so `m / col.exp()` need not be recomputed.
+        # (m / a) / b is bit-identical to the literal m / a / b chain.
+        m_col = m / log_s_col.exp()
+        cur = m_col / log_s_row.exp()
 
         row_std = cur.std(dim=2, keepdim=True).clamp(_CLIP_STD_MIN, _CLIP_STD_MAX)
         log_s_row = (log_s_row + row_std.log()).clip(_LOG_S_MIN, _LOG_S_MAX)
-        cur = m / log_s_col.exp() / log_s_row.exp()
+        cur = m_col / log_s_row.exp()
 
         imb = _imbalance(cur)
         better = imb <= imb_best
