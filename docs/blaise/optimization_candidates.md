@@ -99,11 +99,12 @@ Deep HISA optimization (track H) is the top hill-climb priority.
 
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
-| **H (track)** | **Deep HISA optimization — TOP hill-climb priority (after LayerSplit)** | indexer | **decode HISA is launch/latency-bound → attack overhead, not width** | **H3 is the lead lever** |
-| **H3** | **HISA 8-kernel-pipeline fusion + PDL** (mask→score, remap→topk, block-score→block-topk) | indexer | cut ~128 HISA launches/step (16 F-layers × 8) | **lead — probing (P2-HISA)** |
-| ~~H1~~ | ~~HISA candidate-width band-scaling~~ | indexer | **REGRESSED −6% (40.28→37.82)** — decode is not width-bound | **discarded (measured)** |
-| ~~H2~~ | ~~per-row continuous candidate scaling~~ | indexer | same latency-bound reasoning as H1 | deprioritized pending H3 |
-| H4 | HISA knob tuning (`compression_ratio`/`block_topk`/`block_size`), recall-gated | indexer | fewer candidates only helps if throughput-bound | probing (P2-HISA) |
+| **H (track)** | **Deep HISA optimization — TOP hill-climb priority (after LayerSplit)** | indexer | **launch-overhead first, then per-row long-band walk** | **P2-HISA done + source-verified** |
+| **H3a** | **PDL-chain the 5 HISA glue kernels** (candidate_pages/mask/remap/block_reps/block_scores; indexerHisaNvfp4.cu has 0 PDL, indexerTopK.cu has 9) | indexer | ~0.11–0.17 ms/step (7 boundaries × ~1–1.5µs × 16F) | **lead (lowest risk, launch-bound-aligned)** |
+| H3b | Per-row live-length candidate scaling (caller-only: per-row `candidate_context_lens`/`selected_lengths` from `prefix_lens`; kernels already walk `[0,num_kv)` — verified fp4_paged_mqa_logits.py:1422 / indexerTopK.cu:663) | indexer | long-band topk radix→insertion 14→6.9µs (real); GEMM 7.2× (latency-bound caveat) | **measure in mixed/long-band regime** |
+| H3c | Incremental block-rep quantize (only the boundary block changes/step; indexerHisaNvfp4.cu:279 rebuilds all) | indexer | ~0.08–0.11 ms/step | candidate |
+| H4 | HISA `compression_ratio` sweep {4,6,8,12}, recall-gated (`hisa_block_topk=64` is dead config when ratio>0) | indexer | ckpt-specific; config-only | candidate |
+| ~~H1~~ | ~~short-band candidate-width allocation shrink~~ | indexer | **REGRESSED −6% (40.28→37.82)** — short kv is latency-bound | **discarded (measured)** |
 | C1 | KVarN pre-replay restore host-gate | scheduler | ~0.75–2 ms host (within harness noise) | **shipped** `a1b13ea78` |
 | C3 | Cache debug env-gates / no eager kwargs | scheduler | ~0.1 ms/step | **shipped** `0adc87009` |
 | C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl, GPU re-validating |
