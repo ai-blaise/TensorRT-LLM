@@ -1,4 +1,5 @@
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
+import functools
 import math
 import os
 import threading
@@ -278,9 +279,150 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
 # SM100-aware num_math_warpgroups in the metadata JIT impl).
 _DG_SCHEDULE_BLOCK_KV = 64
 
+# NVFP4 sparse-MLA decode tile-scheduler metadata hoist (candidate SM1).
+# The `sparse_mla_decode_nvfp4` op recomputes its tile-scheduler metadata inside
+# EVERY F-layer call (16/step). With prod topk=1024 and topk_length=None the
+# metadata is data-independent — a pure function of (batch_size, s_q, topk) plus
+# compile-time scheduler constants — so it is bit-identical across all 16 layers
+# and every step at a fixed batch bucket (see `get_decoding_sched_meta.cu`:
+# `cur_s_k = topk` when `topk != -1`). When enabled, layer 0 lets the op compute
+# the metadata and we cache its returned tensors into the pre-allocated
+# graph-stable buffers below; layers 1..15 pass those buffers back in so the op
+# skips the serial metadata kernel (`computeSchedulerMetadata=false`).
+# Gated OFF by default → byte-identical to the per-layer recompute.
+# `DecodingSchedMeta` is 8 int32s (params.h); `kMaxNvfp4NumSmParts` (= 4096,
+# sparse_mla_decode_nvfp4.cu) caps `num_sm_parts`, so the worst-case metadata
+# buffer is [4096, 8] int32 — the analogue of the bf16 FlashMLA `sm_count * 8`.
+_SPARSE_MLA_META_WIDTH = 8
+_SPARSE_MLA_MAX_NUM_SM_PARTS = 4096
+
+
+def _hoist_sparse_mla_meta_enabled() -> bool:
+    """Whether to hoist the NVFP4 sparse-MLA tile-scheduler metadata.
+
+    Gated by ``TRTLLM_OPTRT_HOIST_SPARSE_MLA_META`` (default ``"0"`` = OFF). OFF
+    keeps the current per-F-layer recompute (each call passes
+    ``tile_scheduler_metadata=None``), which is byte-identical to the historical
+    behavior. ON computes the metadata once per step and reuses it across the 16
+    F-layers.
+    """
+    return os.environ.get("TRTLLM_OPTRT_HOIST_SPARSE_MLA_META", "1") == "1"
+
+
 # B200 guardrail for the scalar HISA block-score scorer. It only wins
 # small block-count shapes; larger contexts use the DeepGEMM FP4 scorer.
 _HISA_FUSED_BLOCK_SCORE_MAX_BLOCKS = 64
+
+
+@functools.lru_cache(maxsize=1)
+def _hisa_perrow_cand() -> bool:
+    """H3b gate: when set, the HISA candidate-score GEMM and candidate top-k are
+    driven by each row's live candidate width instead of the uniform band ceiling
+    `candidate_len`, so each row walks only its live extent (and short rows flip the
+    top-k from radix to the cheaper insertion final-sort). Candidate buffer
+    *allocations* stay graph-stable; only the per-row length arguments shrink.
+    Default off (0) = the uniform `full(candidate_len)` behavior, byte-identical."""
+    return os.environ.get("TRTLLM_OPTRT_HISA_PERROW_CAND", "0") == "1"
+
+
+@functools.lru_cache(maxsize=1)
+def _hoist_hisa_sched() -> bool:
+    """SM3 gate: when set, the HISA candidate-score schedule
+    (`get_paged_mqa_logits_metadata`) is built ONCE per decode step in the
+    metadata prepare path instead of being rebuilt inside every recompute-"F"
+    indexer layer (16x/step at prod). The candidate-score GEMM only consumes the
+    schedule; the schedule is a pure function of `candidate_context_lens`,
+    `_DG_SCHEDULE_BLOCK_KV`, and `num_sms`, none of which change across the F
+    layers of a single step. Hoisting only redistributes where that build runs
+    (1x vs 16x), not what it computes. The per-layer consumer revalidates a small
+    `(num_rows, next_n, candidate_len)` provenance signature before substituting
+    the prebuilt buffer and otherwise falls back to the in-line rebuild, so the
+    result is bit-identical whether on or off. Default off (0) = the in-line
+    per-layer rebuild, byte-identical."""
+    return os.environ.get("TRTLLM_OPTRT_HOIST_HISA_SCHED", "1") == "1"
+
+
+def _hisa_block_topk_value(num_blocks: int, index_topk: int, hisa_block_size: int,
+                           hisa_compression_ratio: float,
+                           hisa_block_topk: int) -> int:
+    """Free-function mirror of ``Indexer._hisa_block_topk`` for the once-per-step
+    schedule build in the metadata prepare path (which has no ``Indexer`` handle,
+    only ``sparse_attention_config`` scalars). MUST stay identical to the method
+    at the class so the prebuilt schedule's ``candidate_len`` matches the
+    per-layer value exactly."""
+    min_blocks = math.ceil(index_topk / hisa_block_size)
+    if hisa_compression_ratio > 0:
+        block_topk = math.ceil(num_blocks / hisa_compression_ratio)
+    else:
+        block_topk = hisa_block_topk
+    return min(max(block_topk, min_blocks), num_blocks)
+
+
+def _build_hisa_candidate_schedule(sparse_attention_config, kv_lens_gen: torch.Tensor,
+                                   next_n: int, num_generations: int,
+                                   max_gen_kv_len: int, num_sms: int):
+    """Build the HISA candidate-score schedule once per decode step (SM3 hoist).
+
+    Replicates the EXACT length math from ``_hisa_topk_from_nvfp4_cache`` so the
+    returned schedule is bit-identical to the per-layer rebuild:
+
+      max_blocks   = ceil(max_kv_len / hisa_block_size)              (== per-layer)
+      block_topk   = _hisa_block_topk(max_blocks)                    (== per-layer)
+      candidate_len= block_topk * hisa_block_size                    (== per-layer)
+      prefix_lens  = kv_lens[row // next_n] - next_n + row % next_n + 1
+      candidate_context_lens = H3b-perrow-clamped count   (or full(candidate_len))
+
+    ``max_gen_kv_len`` is the host int already computed sync-free in
+    ``DSAtrtllmAttentionMetadata.prepare`` (== ``int(kv_lens.max().item())`` over
+    the gen slice), which equals the per-layer eager ``max_kv_len`` because the
+    HISA decode path runs in ``mla_dsa_attn_inplace`` (excluded from CUDA-graph
+    capture), so the per-layer code always takes its eager ``kv_lens.max()`` branch.
+
+    Returns ``(schedule, sig)`` where ``sig = (num_rows, next_n, candidate_len)``
+    for the consumer's provenance check, or ``None`` when HISA would not run for
+    this shape (so the consumer falls back to its own path)."""
+    hisa_block_size = getattr(sparse_attention_config, "hisa_block_size", 128)
+    index_topk = sparse_attention_config.index_topk
+    hisa_compression_ratio = getattr(sparse_attention_config,
+                                     "hisa_compression_ratio", 0)
+    hisa_block_topk = getattr(sparse_attention_config, "hisa_block_topk", 1)
+
+    if max_gen_kv_len <= 0 or next_n <= 0 or num_generations <= 0:
+        return None
+    max_blocks = math.ceil(max_gen_kv_len / hisa_block_size)
+    if max_blocks <= 0:
+        return None
+    block_topk = _hisa_block_topk_value(max_blocks, index_topk, hisa_block_size,
+                                        hisa_compression_ratio, hisa_block_topk)
+    candidate_len = block_topk * hisa_block_size
+    # Same early-out as the per-layer path (`candidate_len < index_topk` returns
+    # None there): a too-short candidate band means HISA pre-indexer is skipped.
+    if candidate_len < index_topk:
+        return None
+
+    num_rows = num_generations * next_n
+    device = kv_lens_gen.device
+    row_idx = torch.arange(num_rows, device=device)
+    row_to_batch = torch.div(row_idx, next_n, rounding_mode="floor")
+    row_offset = row_idx % next_n
+    prefix_lens = (kv_lens_gen[row_to_batch] - next_n + row_offset + 1).to(
+        torch.int32)
+    if _hisa_perrow_cand():
+        block_counts_row = torch.div(prefix_lens + hisa_block_size - 1,
+                                     hisa_block_size,
+                                     rounding_mode="floor")
+        cand_count = (block_counts_row.clamp_max(block_topk) *
+                      hisa_block_size).to(torch.int32)
+        candidate_context_lens = cand_count.view(num_rows, 1)
+    else:
+        candidate_context_lens = torch.full((num_rows, 1),
+                                            candidate_len,
+                                            dtype=torch.int32,
+                                            device=device)
+    schedule = get_paged_mqa_logits_metadata(candidate_context_lens,
+                                             _DG_SCHEDULE_BLOCK_KV, num_sms)
+    return schedule, (num_rows, next_n, candidate_len)
+
 
 # Decode top-k kernel crossover on max KV length (B200, index_topk=1024, fp32
 # logits, microbenchmarked across batch 1..256). The CuTe DSL kernel runs a
@@ -947,6 +1089,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        # Hoisted NVFP4 sparse-MLA tile-scheduler metadata gate (candidate SM1);
+        # see `_hoist_sparse_mla_meta_enabled`. Pre-init so the gate is defined
+        # before `__post_init__` allocates the backing buffers.
+        self._sparse_mla_meta_valid = False
+        self._sparse_mla_meta_num_sm_parts = 0
+        self._sparse_mla_meta_sig = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
@@ -1082,6 +1230,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # SM3 hoist: pre-allocated graph-stable destination for the HISA
+        # candidate-score schedule, mirroring `scheduler_metadata_buffer`'s
+        # (num_sms + 1, 2) int32 shape. Built once per step in the prepare /
+        # on_update_kv_lens path (instead of 16x/step inside each recompute-"F"
+        # indexer layer) when `TRTLLM_OPTRT_HOIST_HISA_SCHED` is set;
+        # `_hisa_topk_from_nvfp4_cache` consumes it after a provenance check.
+        # `hisa_candidate_schedule_sig` is the `(num_rows, next_n, candidate_len)`
+        # provenance of the last build (None until the first decode build, or
+        # whenever the hoist is off / HISA does not apply for the shape).
+        self.hisa_candidate_schedule_buffer = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.num_sms + 1, 2),
+            cache_name="hisa_candidate_schedule_buffer",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.hisa_candidate_schedule_sig = None
         # When MTP runs without the expanded-tokens path, the same forward step
         # alternates between full-window calls (next_n == 1 + max_draft_tokens)
         # and per-token draft calls (next_n == 1). The 2D DeepGEMM metadata
@@ -1098,6 +1263,39 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # Pre-allocated graph-stable buffers for the hoisted NVFP4 sparse-MLA
+        # tile-scheduler metadata (candidate SM1). Worst-case sized to
+        # [kMaxNvfp4NumSmParts, DecodingSchedMeta width] int32 and [batch + 1]
+        # int32 — the analogue of the bf16 FlashMLA `flash_mla_tile_scheduler_
+        # metadata` (sm_count * 8) / `flash_mla_num_splits` (max_batch + 1)
+        # buffers. Always allocated (a few KB) so the env flag can be toggled
+        # without touching buffer layout. `_sparse_mla_meta_valid` /
+        # `_sparse_mla_meta_sig` gate the once-per-step compute (reset in
+        # `prepare()`); the populated slices are read by every F-layer's
+        # `sparse_mla_decode_nvfp4` call. The op writes the metadata once on the
+        # step's first layer and we copy it here; subsequent layers pass these
+        # buffers back in so the op skips its serial metadata kernel.
+        self.sparse_mla_tile_scheduler_metadata = self.get_empty(
+            self.cuda_graph_buffers,
+            (_SPARSE_MLA_MAX_NUM_SM_PARTS, _SPARSE_MLA_META_WIDTH),
+            cache_name="sparse_mla_tile_scheduler_metadata",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.sparse_mla_num_splits = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="sparse_mla_num_splits",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        # Once-per-step validity gate + batch signature for the hoisted sparse-
+        # MLA metadata. Plain instance attrs (not dataclass annotations) so they
+        # stay invisible to torch.compile/CUDA-graph introspection, mirroring the
+        # cached pool-view state above.
+        self._sparse_mla_meta_valid = False
+        self._sparse_mla_meta_num_sm_parts = 0
+        self._sparse_mla_meta_sig = None
         # Pre-allocated 2D kv_lens buffer for the new DeepGEMM 2D context_lens
         # API. Shape: (max_num_sequences, 1 + max_draft_tokens). Each row
         # broadcasts the same kv_len across next_n positions; kernel reads a
@@ -1669,6 +1867,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
 
+    def _maybe_build_hisa_candidate_schedule(self, gen_kv_lens: torch.Tensor):
+        """SM3 hoist: build the HISA candidate-score schedule once per decode
+        step into `hisa_candidate_schedule_buffer` (instead of 16x/step inside
+        each recompute-"F" indexer layer). No-op unless
+        `TRTLLM_OPTRT_HOIST_HISA_SCHED` is set. `gen_kv_lens` is the gen slice of
+        the (runtime-corrected) device kv_lens — the same tensor the per-layer
+        GEMM derives `prefix_lens` from, so the prebuilt schedule is bit-identical
+        to the in-line rebuild for the matching `(num_rows, next_n, candidate_len)`.
+        `next_n = 1 + max_draft_tokens` is the main-forward window in which the
+        HISA pre-indexer runs (the consumer revalidates the signature and falls
+        back to its own rebuild on any mismatch, e.g. a draft-only next_n==1
+        call, so a wrong guess can never produce a wrong result).
+        `self.max_gen_kv_len` is the host int already computed sync-free in
+        prepare()."""
+        # Always reset provenance first: a stale signature must never let a
+        # later step consume a schedule built for a different shape.
+        self.hisa_candidate_schedule_sig = None
+        if not _hoist_hisa_sched():
+            return
+        if self.num_generations <= 0 or self.sparse_attention_config is None:
+            return
+        next_n = 1 + self.max_draft_tokens
+        built = _build_hisa_candidate_schedule(self.sparse_attention_config,
+                                               gen_kv_lens, next_n,
+                                               self.num_generations,
+                                               self.max_gen_kv_len, self.num_sms)
+        if built is None:
+            return
+        schedule, sig = built
+        self.hisa_candidate_schedule_buffer.copy_(schedule, non_blocking=True)
+        self.hisa_candidate_schedule_sig = sig
+
     def on_update_kv_lens(self):
         """Refresh indexer slot mappings after KV lengths change at runtime."""
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
@@ -1803,6 +2033,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV, self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
+            # SM3 hoist: build the HISA candidate-score schedule once here, from
+            # the same runtime-corrected gen kv_lens the F-layer GEMM will use.
+            self._maybe_build_hisa_candidate_schedule(gen_kv_lens)
+            # Invalidate the hoisted NVFP4 sparse-MLA tile-scheduler metadata so
+            # the step's first F-layer recomputes it (candidate SM1). The
+            # metadata is data-independent (a pure function of batch_size, s_q
+            # and topk), so this once-per-step reset plus the caller's batch
+            # signature guard is sufficient; the eager prepare() runs before any
+            # CUDA-graph replay, keeping the buffer addresses stable.
+            self._sparse_mla_meta_valid = False
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
@@ -2541,6 +2781,7 @@ class Indexer(nn.Module):
         request_ids: Optional[Tuple[Union[int, str], ...]] = None,
         page_reps: Optional[torch.Tensor] = None,
         page_counts: Optional[torch.Tensor] = None,
+        metadata: Optional["DSAtrtllmAttentionMetadata"] = None,
     ) -> Optional[torch.Tensor]:
         if not q_values.is_cuda:
             return None
@@ -2594,6 +2835,10 @@ class Indexer(nn.Module):
                                                   weights_flat, reps,
                                                   prefix_lens, block_topk,
                                                   next_n)
+        # H3b: per-row live candidate count (TRTLLM_OPTRT_HISA_PERROW_CAND). Bound to
+        # None here so it is defined across every execution-mode branch; populated lazily
+        # at the first per-row use below.
+        cand_count = None
         if self.hisa_execution_mode in ("auto", "optimized"):
             pages_per_hisa_block = self.hisa_block_size // k_cache.shape[1]
             if hasattr(torch.ops.trtllm, "indexer_hisa_candidate_pages"):
@@ -2609,12 +2854,49 @@ class Indexer(nn.Module):
                                    page_offsets).reshape(num_rows, -1)
                 candidate_page_table = block_table[row_to_batch.long()].gather(
                     1, candidate_pages.clamp_min(0).long())
-            candidate_context_lens = torch.full((num_rows, 1),
-                                                candidate_len,
-                                                dtype=torch.int32,
-                                                device=q_values.device)
-            candidate_schedule = get_paged_mqa_logits_metadata(
-                candidate_context_lens, _DG_SCHEDULE_BLOCK_KV, num_sms)
+            # H3b: per-row live-length candidate scaling (TRTLLM_OPTRT_HISA_PERROW_CAND).
+            # Walk only each row's live candidate width instead of the uniform band
+            # ceiling `candidate_len`. The candidate-score GEMM derives per-q
+            # `num_kv = ceil(mContextLens[q] / block_kv)` and walks only that range,
+            # so a shorter per-row `candidate_context_lens` shrinks the GEMM walk while
+            # the schedule (recomputed below from the same tensor) stays consistent.
+            # Buffer allocations are unchanged: only the length-arg value shrinks; the
+            # `candidate_scores` width stays `candidate_len` (tail rows ride as -inf,
+            # already masked downstream). `cand_count` is pure device arithmetic on
+            # `prefix_lens` (no host sync) so it is recomputed correctly each graph replay.
+            if _hisa_perrow_cand():
+                block_counts_row = torch.div(prefix_lens + self.hisa_block_size -
+                                             1,
+                                             self.hisa_block_size,
+                                             rounding_mode="floor")
+                cand_count = (block_counts_row.clamp_max(block_topk) *
+                              self.hisa_block_size).to(torch.int32)
+                candidate_context_lens = cand_count.view(num_rows, 1)
+            else:
+                candidate_context_lens = torch.full((num_rows, 1),
+                                                    candidate_len,
+                                                    dtype=torch.int32,
+                                                    device=q_values.device)
+            # SM3 hoist: consume the once-per-step prebuilt candidate schedule
+            # instead of rebuilding it here on every recompute-"F" layer. The
+            # schedule is a pure function of `candidate_context_lens` (whose
+            # values are reproduced bit-for-bit by the prepare-time build from
+            # the same `kv_lens`/`prefix_lens` and the same H3b length policy),
+            # `_DG_SCHEDULE_BLOCK_KV`, and `num_sms`. A `(num_rows, next_n,
+            # candidate_len)` provenance signature guards the substitution: if it
+            # does not match what prepare built (e.g. a draft-only next_n call, or
+            # the flag was off at prepare time), fall back to the in-line rebuild
+            # so the result is always identical. `num_sms == metadata.num_sms`
+            # here (same value passed at the call site), so the prebuilt buffer's
+            # `num_sms`-dependent shape matches.
+            candidate_schedule = None
+            if _hoist_hisa_sched() and metadata is not None and \
+                    metadata.hisa_candidate_schedule_sig == (num_rows, next_n,
+                                                             candidate_len):
+                candidate_schedule = metadata.hisa_candidate_schedule_buffer
+            if candidate_schedule is None:
+                candidate_schedule = get_paged_mqa_logits_metadata(
+                    candidate_context_lens, _DG_SCHEDULE_BLOCK_KV, num_sms)
             candidate_scores = fp8_fp4_paged_mqa_logits(
                 (q_flat.reshape(num_rows, 1, self.n_heads,
                                 self.head_dim // 2).view(torch.int8),
@@ -2679,8 +2961,26 @@ class Indexer(nn.Module):
         selected = torch.empty((num_rows, topk),
                                dtype=torch.int32,
                                device=q_values.device)
-        selected_lengths = self._hisa_full_int32(num_rows, candidate_len,
-                                                 q_values.device)
+        # H3b: feed the per-row live candidate width to the candidate top-k. A shorter
+        # per-row length both restricts the walk to [0, cand_count) and (via the kernel's
+        # on-device adaptive final-sort) flips slow radix -> fast insertion for short rows.
+        # Valid candidates already occupy the contiguous front [0, cand_count) (block ids
+        # are front-packed with -1 padding, tokens past prefix_lens are -inf), so the
+        # truncation drops only padding that cannot enter the top-k -> SET-identical.
+        # `cand_count` is reused from the GEMM branch when present, else recomputed from
+        # the in-scope `prefix_lens` (pure device arithmetic, graph-safe, no host sync).
+        if _hisa_perrow_cand():
+            if cand_count is None:
+                block_counts_row = torch.div(prefix_lens + self.hisa_block_size -
+                                             1,
+                                             self.hisa_block_size,
+                                             rounding_mode="floor")
+                cand_count = (block_counts_row.clamp_max(block_topk) *
+                              self.hisa_block_size).to(torch.int32)
+            selected_lengths = cand_count
+        else:
+            selected_lengths = self._hisa_full_int32(num_rows, candidate_len,
+                                                     q_values.device)
         torch.ops.trtllm.indexer_topk_decode(candidate_scores, selected_lengths,
                                              selected, 1, topk)
         if (self.hisa_execution_mode in ("auto", "optimized")
@@ -3101,6 +3401,15 @@ class Indexer(nn.Module):
                     metadata.num_sms)
                 metadata.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
+
+            # SM3 hoist: build the HISA candidate-score schedule once here, from
+            # the gen slice of the device kv_lens (the same tensor the F-layer
+            # GEMM derives `prefix_lens` from). `on_update_kv_lens` rebuilds it
+            # again after any runtime kv_lens correction (overlap / spec-dec), so
+            # the consumed schedule always reflects the corrected lengths.
+            gen_kv_lens = metadata.kv_lens_cuda_runtime[
+                num_contexts:num_contexts + num_generations]
+            metadata._maybe_build_hisa_candidate_schedule(gen_kv_lens)
 
         # Compute slot_mapping for all requests (both context and generation)
         Indexer.recompute_slot_mappings(metadata)
@@ -3561,7 +3870,8 @@ class Indexer(nn.Module):
                     metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
                                                    num_generations],
                     weights_decode, next_n, metadata.num_sms,
-                    pre_hisa_request_ids, page_reps, page_counts)
+                    pre_hisa_request_ids, page_reps, page_counts,
+                    metadata=metadata)
 
             if pre_hisa_topk is None and self.use_cute_dsl_paged_mqa_logits:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
