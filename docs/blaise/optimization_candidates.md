@@ -99,11 +99,11 @@ Deep HISA optimization (track H) is the top hill-climb priority.
 
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
-| **H (track)** | **Deep HISA optimization — TOP hill-climb priority (after LayerSplit)** | indexer | **HISA must win at every length, scaling with kv** | **H1 in A/B; H2+ deep-probing** |
-| **H1** | **HISA candidate-width band-scaling** (use `metadata.max_gen_kv_len`; gate→`index_topk`) | indexer | short-band candidate 33024→2048 (~2–4% TPOT) | **fix landed, A/B in flight** |
-| H2 | HISA per-row continuous candidate scaling (Tier-2: live-kv-aware candidate GEMM + topk) | indexer | candidate cost → continuous-with-kv (chart) | probing (P2-HISA) |
-| H3 | HISA 8-kernel-pipeline fusion + PDL (mask→score, remap→topk, block-score→block-topk) | indexer | 128 launches/step → fewer | probing (P2-HISA) |
-| H4 | HISA knob tuning (`compression_ratio`/`block_topk`/`block_size`), recall-gated | indexer | faster compression that holds recall | probing (P2-HISA) |
+| **H (track)** | **Deep HISA optimization — TOP hill-climb priority (after LayerSplit)** | indexer | **decode HISA is launch/latency-bound → attack overhead, not width** | **H3 is the lead lever** |
+| **H3** | **HISA 8-kernel-pipeline fusion + PDL** (mask→score, remap→topk, block-score→block-topk) | indexer | cut ~128 HISA launches/step (16 F-layers × 8) | **lead — probing (P2-HISA)** |
+| ~~H1~~ | ~~HISA candidate-width band-scaling~~ | indexer | **REGRESSED −6% (40.28→37.82)** — decode is not width-bound | **discarded (measured)** |
+| ~~H2~~ | ~~per-row continuous candidate scaling~~ | indexer | same latency-bound reasoning as H1 | deprioritized pending H3 |
+| H4 | HISA knob tuning (`compression_ratio`/`block_topk`/`block_size`), recall-gated | indexer | fewer candidates only helps if throughput-bound | probing (P2-HISA) |
 | C1 | KVarN pre-replay restore host-gate | scheduler | ~0.75–2 ms host (within harness noise) | **shipped** `a1b13ea78` |
 | C3 | Cache debug env-gates / no eager kwargs | scheduler | ~0.1 ms/step | **shipped** `0adc87009` |
 | C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl, GPU re-validating |
@@ -119,7 +119,27 @@ Deep HISA optimization (track H) is the top hill-climb priority.
 
 ---
 
-## H1 — HISA candidate-width band-scaling (HEADLINE; fix landed, A/B in flight)
+## H1 — HISA candidate-width band-scaling (MEASURED REGRESSION, discarded)
+
+**Result (tight harness, sd<0.1): −6%.** Production HISA-on (candidate 33024,
+gate 65536) = **40.28 tok/s/user** (TPOT 24.83 ms); HISA-scale (candidate
+band-sized→2048, gate 1024) = **37.82** (TPOT 26.44 ms). Shrinking the candidate
+width made decode *slower*. Why: at the harness kv (~2560) production's
+`candidate_len=33024 ≥ live kv`, so HISA was doing *exact, unfiltered* selection
+— yet faster than the 2048-wide *approximate* (filtered) version. Less work being
+slower ⇒ the decode candidate score+topk are **launch/latency-bound** at b≈4/rank
+(kernel launch + tcgen05 pipeline fill dominate), not width-bound; shrinking the
+width buys ~nothing while the band/gate/filter path adds overhead. The reference
+chart's width-scaling reflects a throughput-bound regime (large batch / long
+context); c16 decode at b≈4 is latency-bound. **Code change discarded; not
+pushed. `hisa_min_seq_len` reverted to 65536; production restored to 40.28.**
+
+**Redirect → H3:** the decode HISA lever is the ~128 kernel launches/step (16
+F-layers × ~8 kernels), not the candidate width. Fuse/PDL-chain the pipeline.
+
+---
+
+## (historical) original H1 framing
 
 **The correct framing (HISA stays ENABLED; the defect is that our HISA doesn't
 scale).** HISA, implemented right, *wins* tok/s/user at every indexed length and
