@@ -4059,19 +4059,20 @@ class Indexer(nn.Module):
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
                 elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
-                      and (metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN
-                           or logits_decode.shape[1] >= _DSL_TOPK_MIN_COLS)):
+                      and metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN):
                     # DSL allocates O(num_gen_tokens * live_kv_len) scratch, so
-                    # it is capped at 256 tokens. It beats the C++ kernel in two
-                    # regimes: (a) long live kv (>= _DSL_TOPK_MIN_KV_LEN), and
-                    # (b) wide scoring logits (>= _DSL_TOPK_MIN_COLS columns =
-                    # max_seq_len), where the C++ kernel leaves its fast
-                    # insertion path. Production hits (b) every step (logits
-                    # width = max_seq_len = 132096 >> 12288), so the short-prefix
-                    # decode now takes the faster DSL Top-K instead of the
-                    # slow-path C++ kernel. Narrow scoring widths (< 12288) with
-                    # short kv still fall through to the faster C++ insertion
-                    # path below.
+                    # it is capped at 256 tokens. It beats the C++ kernel only at
+                    # long live kv (>= _DSL_TOPK_MIN_KV_LEN); below that the C++
+                    # kernel wins -- it walks only [0, live_kv) per row, while the
+                    # DSL kernel's cost scales with the padded logits WIDTH. The
+                    # earlier width-based override (route to DSL whenever logits
+                    # width >= _DSL_TOPK_MIN_COLS) was REMOVED: it forced DSL at
+                    # prod (width 132096, live kv ~4.6k) on the false premise that
+                    # the C++ kernel slows at width >= 12288. Direct B200
+                    # measurement (3-seed, CUDA-graph replay) shows C++ is
+                    # ~width-independent (~11us flat) and ~1.7x FASTER than DSL at
+                    # the prod short-kv regime, with a bit-identical selected set
+                    # (recall 1.0). So prod now routes to the C++ kernel below.
                     # Enable the fused single-pass multi-CTA cluster radix top-k:
                     # ~1.3-1.6x faster than the default 2-pass+merge at the prod
                     # logits width 132096 with a bit-identical selected set
