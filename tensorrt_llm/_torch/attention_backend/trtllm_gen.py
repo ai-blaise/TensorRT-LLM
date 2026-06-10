@@ -427,6 +427,32 @@ def _get_generation_workspace_size(
 
 
 @lru_cache(maxsize=128)
+def _get_multi_ctas_kv_counter_size(
+    num_heads: int,
+    max_num_requests: int,
+    multi_processor_count: Optional[int],
+) -> int:
+    return max(num_heads * max_num_requests, multi_processor_count or 0)
+
+
+def _clear_multi_ctas_kv_counter_workspace(
+    fmha_workspace: torch.Tensor,
+    num_heads: int,
+    max_num_requests: int,
+    multi_processor_count: Optional[int],
+) -> None:
+    # The multi-CTAs KV counters live at the head of the FMHA workspace and
+    # must be zeroed before the MLA decode kernel reads them; stale values
+    # from a prior launch can steer CTAs at out-of-range KV tiles (illegal
+    # memory access). Ported from upstream 3b4672876.
+    counter_size = _get_multi_ctas_kv_counter_size(
+        num_heads,
+        max_num_requests,
+        multi_processor_count,
+    )
+    fmha_workspace.narrow(0, 0, counter_size).zero_()
+
+
 def _get_workspace_size(
     dtype: torch.dtype,
     num_tokens: int,
@@ -1246,10 +1272,19 @@ class FlashInferTrtllmGenAttention:
 
         bmm1_scale = 1.0 / (self._q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
 
+        workspace_buffer = params.workspace.view(-1, 4)
+        # Upstream clears max_num_requests-worth of counters; EnqueueParams
+        # does not carry max_num_requests, so clear for this launch's
+        # batch_beam (the counter slots this kernel launch indexes), still
+        # floored at the SM count by the helper.
+        _clear_multi_ctas_kv_counter_workspace(
+            workspace_buffer, self._num_heads, batch_beam, self._multi_processor_count
+        )
+
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
-            workspace_buffer=params.workspace.view(-1, 4),
+            workspace_buffer=workspace_buffer,
             qk_nope_head_dim=qk_nope_head_dim,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
