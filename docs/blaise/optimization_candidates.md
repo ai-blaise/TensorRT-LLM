@@ -64,22 +64,46 @@ disabling it:
 | WarpDecode (decode) | on, forced `decode_1cta`, fixed tactic | persistent-megakernel is the structural ceiling |
 | dense KVarN `kvarn_k2v2` | on, amortized restore | host-gated pre-replay scan (C1) |
 | Indexer IndexCache + FSSS | on, `index_topk_freq=4` | escalation to 8 under recall gate |
-| **HISA** | **on, `enable_nvfp4_hisa=true`** | **band-aware capture gate (H1) — HISA for ≥`hisa_min_seq_len`, plain exact top-k below** |
+| **HISA** | **on whenever the Indexer is on (kv > `index_topk`=1024); `enable_nvfp4_hisa=true`, gate `hisa_min_seq_len=1024`** | **candidate width scales with kv (H1 landed); deep-optimization track H is the top hill-climb priority** |
 | NVFP4 indexer-K (MX E2M1+UE8M0) | on | score→top-k fusion candidate |
 | NIXL transport + request pinning + Moondream overlap | on | generation-first/write-mode is the open gate |
 
-HISA in particular stays **enabled at the architecture level**; the H1 fix
-below makes it fire only where it wins (long context) and fall to the exact
-plain path where that is both faster and more accurate (short context) — i.e.
-*maximally optimized HISA*, not HISA-off.
+HISA stays **enabled whenever the Indexer is on** (kv > `index_topk` = 1024).
+HISA is a core part of the model's serving path and, implemented correctly,
+*wins* at every indexed length with cost that scales with sequence length. The
+H1 fix below makes our HISA scale (its candidate width was frozen at the
+max-context value); it does **not** gate HISA off anywhere the Indexer runs.
+Deep HISA optimization (track H) is the top hill-climb priority.
 
 ---
+
+## Priority sequence
+
+1. **Finish LayerSplit (Part 1 of the goal):** C9 CP=2 IPC broadcast GPU
+   re-validation → push; then L1 (z.ai dense-broadcast overlap re-measure) and
+   L2 (read-set block-id hoist). LayerSplit must be correct + optimal before the
+   decode hill-climb is the focus.
+2. **THEN — deep HISA optimization is the TOP hill-climb priority (track H).**
+   HISA, implemented correctly, wins tok/s/user at *every* indexed length and
+   its cost *scales* with sequence length (validated empirically + the 4:1
+   compression chart); the Indexer (and thus HISA) is on whenever kv >
+   `index_topk` (1024). Any length where our HISA loses is an implementation
+   defect to fix, not a reason to gate HISA off. H1 (below) is the first fix;
+   H2+ (the continuous-scaling, pipeline-fusion, and knob-tuning tiers) are
+   under active deep investigation (probe P2-HISA) and become the lead Part-2
+   work once LayerSplit lands.
+3. Then the host/MoE/kernel levers (S2, N1, I2, M1, K1/K2), then the structural
+   megakernel (P1).
 
 ## Ranked candidates
 
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
-| **H1** | **HISA capture-gate band-awareness** | indexer | **~0.4–1.1 ms/step (~2–4% TPOT)** | **probing** |
+| **H (track)** | **Deep HISA optimization — TOP hill-climb priority (after LayerSplit)** | indexer | **HISA must win at every length, scaling with kv** | **H1 in A/B; H2+ deep-probing** |
+| **H1** | **HISA candidate-width band-scaling** (use `metadata.max_gen_kv_len`; gate→`index_topk`) | indexer | short-band candidate 33024→2048 (~2–4% TPOT) | **fix landed, A/B in flight** |
+| H2 | HISA per-row continuous candidate scaling (Tier-2: live-kv-aware candidate GEMM + topk) | indexer | candidate cost → continuous-with-kv (chart) | probing (P2-HISA) |
+| H3 | HISA 8-kernel-pipeline fusion + PDL (mask→score, remap→topk, block-score→block-topk) | indexer | 128 launches/step → fewer | probing (P2-HISA) |
+| H4 | HISA knob tuning (`compression_ratio`/`block_topk`/`block_size`), recall-gated | indexer | faster compression that holds recall | probing (P2-HISA) |
 | C1 | KVarN pre-replay restore host-gate | scheduler | ~0.75–2 ms host (within harness noise) | **shipped** `a1b13ea78` |
 | C3 | Cache debug env-gates / no eager kwargs | scheduler | ~0.1 ms/step | **shipped** `0adc87009` |
 | C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl, GPU re-validating |
@@ -95,75 +119,69 @@ plain path where that is both faster and more accurate (short context) — i.e.
 
 ---
 
-## H1 — HISA capture-gate band-awareness (HEADLINE)
+## H1 — HISA candidate-width band-scaling (HEADLINE; fix landed, A/B in flight)
 
-**Problem (triple-confirmed: P2-I2, P2-I3 independently, + direct read).** The
-HISA pre-indexer enable gate keys on the wrong length under CUDA-graph capture.
-`dsa.py:2547-2551`:
+**The correct framing (HISA stays ENABLED; the defect is that our HISA doesn't
+scale).** HISA, implemented right, *wins* tok/s/user at every indexed length and
+its cost *scales* with sequence length (validated on a reference stack + the 4:1
+compression chart: ~0.65 ms @8k → ~2.6 ms @64k, below the plain DSA path at all
+lengths). Our HISA cost was instead **flat at the max-context value** for every
+length — an implementation defect, not a reason to gate HISA off.
 
-```python
-capturing = torch.cuda.is_current_stream_capturing()
-if capturing:
-    max_kv_len = block_table.shape[1] * k_cache.shape[1]   # STATIC = 132096
-else:
-    max_kv_len = int(kv_lens.max().item())                 # live kv (~4.6k prod)
-if not self._should_use_hisa_pre_indexer(max_kv_len):      # >= hisa_min_seq_len (65536)
-    return None
-```
+**Root cause (triple-confirmed: P2-I2, P2-I3 independently, + direct read).**
+`candidate_len`, the width of the HISA candidate score + top-k, is *designed* to
+scale: `candidate_len = _hisa_block_topk(ceil(max_kv_len/block)) * block`
+(`dsa.py:2559-2561`), and `_hisa_block_topk` (`dsa.py:2140-2147`) scales with
+`max_kv_len` via `hisa_compression_ratio`. But under CUDA-graph capture
+`max_kv_len = block_table.shape[1] * k_cache.shape[1]` — the **static pool
+width 132096** (`dsa.py:2549`) — not the per-graph band kv. So `candidate_len`
+froze at `258 × 128 = 33024` for *every* sequence length, and the candidate GEMM
+(`fp8_fp4_paged_mqa_logits`, `dsa.py:2632`) + candidate top-k
+(`indexer_topk_decode`, `dsa.py:2684`) paid 33024-wide cost on a 4.6k context —
+where they should pay ~2k. (Eager warmup used live kv, which is why HISA looked
+"off at prod" in eager measurements.) The Indexer itself is on iff
+kv > `index_topk` (1024) via `skip_indexer_for_gen_reqs` (`dsa.py:1365/1439`);
+HISA should track that exactly.
 
-At capture the gate sees the **static block-table width** (132096 ≥ 65536), so
-`_should_use_hisa` (`dsa.py:2168-2180`) returns True and HISA is baked into
-**every** decode graph. Eager warmup uses the live kv (~4.6k < 65536 → plain
-path), which is why HISA was believed "off at prod" — those were eager-mode
-measurements. The candidate-score GEMM (`fp8_fp4_paged_mqa_logits`,
-`dsa.py:2618`) and candidate top-k (`indexer_topk_decode`, `dsa.py:2684`) then
-run at a **fixed** `candidate_len` (`candidate_context_lens = full(..)`
-`dsa.py:2612`; `selected_lengths = full(candidate_len)` `dsa.py:2682`) —
-regardless of live kv, and `kAdaptiveFinalSort` (which rescues the *plain*
-path's static-width top-k) does **not** rescue HISA because the selected length
-is forced to the full candidate width. So every graphed decode step at prod kv
-(~4.6k, where the plain exact path is cheapest) pays the full HISA pipeline:
-~8 kernels incl. a 33024-wide candidate GEMM + 33024-wide C++ top-k vs the
-plain path's 2 kernels.
+**Cost recovered.** Short-band candidate work 33024 → ~2048 (16×). Per-F-layer
+HISA was ~45–66 µs over the plain path × 16 F-layers ≈ 0.4–1.1 ms/step (~2–4%
+TPOT); scaling the width recovers the bulk of it while keeping HISA on — so
+HISA becomes a net *win* at prod kv (scores ~64 block-reps + ~2048 candidates
+vs the plain path's ~4608), matching the chart.
 
-**Cost.** Per F-layer HISA excess ≈ 45–66 µs (block quant/score/top-k ~19 µs +
-candidate score @33024 ~25–40 µs + candidate top-k @33024 ~16.4 µs + glue −
-plain MQA+top-k ~21–24 µs) × 16 F-layers ≈ **0.75–1.09 ms/step** (P2-I3,
-higher accounting) / **0.4–0.7 ms/step** (P2-I2, lower bound) ≈ **2–4% of
-TPOT, ~5–7% of the attackable 15 ms.** Single largest clean indexer lever.
+**Fix landed (HISA stays ON, made to scale).** The bands already exist —
+`seq_len_threshold` auto-defaults to 8192 (`llm_args.py:564-599`,
+`needs_separate_short_long_cuda_graphs` returns `skip_indexer_for_short_seqs`),
+so short-band graphs warm at ~8192 — but the HISA gate ignored it.
 
-**Fix (HISA stays ENABLED — make it band-correct).** At capture, gate on the
-per-graph warmup kv instead of the static table width. `metadata.max_gen_kv_len`
-is exactly this value (`dsa.py:321-350` docstring; set `dsa.py:1539`) and is
-already used by `_indexer_logits_width` for the identical band-aware purpose.
-Two parts:
+1. **Code** (`dsa.py:2536-2560`, landed): thread `metadata.max_gen_kv_len` (the
+   per-graph band kv, the same value `_indexer_logits_width` uses at
+   `dsa.py:3485/3721`) into `_hisa_topk_from_nvfp4_cache` and use it for
+   `max_kv_len` under capture instead of the static pool width. Falls back to
+   the pool width when unavailable. → `candidate_len` scales per band.
+2. **Config** (landed): `hisa_min_seq_len` 65536 → 1024 (= `index_topk`) so HISA
+   stays **on** for the short band, tracking the Indexer's gate. (Without this,
+   the code fix would have turned HISA *off* on the short band — wrong.)
 
-1. **Code (~5 lines).** Thread the per-graph `max_gen_kv_len` into
-   `_hisa_topk_from_nvfp4_cache` (it is an `Indexer` method that does not
-   currently receive `metadata`; the caller `dsa.py:3558` has it in scope) and
-   use it for `max_kv_len` when `capturing`. Then the short-band graph
-   (warmup kv < 65536) captures the **plain exact** path and the long-band
-   graph (warmup kv ≥ 65536) captures genuine HISA.
-2. **Config.** Set `seq_len_threshold: 65536` (currently unset → default split
-   at 8192) so the graph-band boundary **aligns with** `hisa_min_seq_len`;
-   otherwise the long band [8192, 132096] would still over-fire HISA on its
-   8k–65k portion.
+**Correctness (intel two-stage gate, required before push).** At short kv the
+old `candidate_len ≥ live kv` meant *no* block filtering (accidentally exact);
+the fix restores HISA's *intended* block-prefilter approximation there. Gate:
+top-1024 SET recall of band-scaled HISA vs the exact plain path on synthetic
+kv ∈ {2k, 4.6k, 8k} must be high (HISA preserves the top tokens by design); long
+band (≥8192) unchanged.
 
-**Why this is correctness-safe (and an improvement at prod).** For kv < 33024
-the HISA candidate set (33024 positions) already covers the entire context, so
-HISA selection is *exact* there — switching to the plain path returns the same
-top-k SET, just cheaper. For kv ≥ 65536 HISA is unchanged. The only band where
-behavior changes is where HISA was pure wasted compute.
+**Measurement.** Tight uniform-prompt harness (sd < 0.1): production HISA-on
+baseline 40.28 tok/s/user (TPOT 24.83 ms); HISA-scale image
+(`hisascale`, candidate band-sized + gate 1024) A/B in flight — expect *higher*
+(short-band candidate work drops 16×). Push to op-trt as a verified win once the
+A/B shows the gain and the recall gate passes.
 
-**Correctness gate.** Two-stage: (a) top-k SET Jaccard = 1.0 between HISA-on
-and band-aware (HISA-off-for-short) on synthetic kv ∈ {2k, 8k, 32k} (must
-match: candidate set complete); (b) on a ≥65k synthetic, confirm the long band
-still selects the HISA set (HISA genuinely engaged).
-
-**Measurement.** A zero-code probe (`enable_nvfp4_hisa=false` on the decode
-worker only) quantifies the prod-kv cost end-to-end against the 39.98 tight
-baseline before the code fix lands. The production version keeps
-`enable_nvfp4_hisa=true` + the band-aware gate.
+**Track H continues (deep HISA optimization, top hill-climb priority):** H2
+(per-row continuous candidate scaling — make the candidate GEMM/topk live-kv
+length-aware like the plain path's `kAdaptiveFinalSort`, so cost scales
+*continuously* with kv, not stepwise per band), H3 (8-kernel-pipeline
+fusion + PDL), H4 (compression/block-topk/block-size tuning, recall-gated) are
+under active deep investigation (probe P2-HISA).
 
 **Composability.** Independent of WarpDecode, kvarn, ADP, LayerSplit. Composes
 with I2 (freq) and the seq_len_threshold short-band (which also revives the
