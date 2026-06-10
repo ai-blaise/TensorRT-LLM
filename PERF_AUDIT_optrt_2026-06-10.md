@@ -84,7 +84,9 @@ savings: 0.0073 ms/token across 43 S-layers   (10× less than documented)
 
 The full-remap baseline and the `torch.where` reference (6.150 vs 6.149 µs) reproduce to 3 decimal places, so clocks/environment are NOT the explanation — the affine path specifically lost its advantage. Plausible causes, in order: (a) both kernels are now sitting at a ~3.9–4.1 µs launch/latency floor at these tiny sizes, and the original 2.27 µs was measured on a build where the affine kernel avoided some fixed overhead that has since returned (e.g. AOT op dispatch layering vs raw `load_inline` kernel); (b) the AOT `indexer_affine_reuse` op in the current `.so` is slower than the JIT kernel that was originally measured; (c) a kernel change between measurement and HEAD. **Action:** profile one S-layer call with nsys (kernel name + duration will immediately distinguish dispatch overhead vs kernel regression). Until then, treat `-0.071 ms/tok` (and the R4 aggregate that embeds it) as stale.
 
-**UPDATE (same day, post-optimization validation):** a re-run of `bench_lever2_wiring.py` immediately after a GPU-warming workload measured **F 3.811 / S 2.755 µs (1.38×)** — the win partially reappears under warm clocks. So the honest characterization is not "gone" but **clock-sensitive and smaller than documented**: across three same-day runs the S-path ranged 2.76–4.07 µs against a 3.8–4.1 µs F-path. Lock GPU clocks (`nvidia-smi -lgc`) and run both states before trusting any single number; the documented 0.0712 ms/tok saving remains unsupported (best observed same-day: ~0.045 ms/tok warm, ~0.007 cold).
+**UPDATE (same day, post-optimization validation):** a re-run of `bench_lever2_wiring.py` immediately after a GPU-warming workload measured **F 3.811 / S 2.755 µs (1.38×)** — the win partially reappears under warm clocks. Across three same-day runs the S-path ranged 2.76–4.07 µs against a 3.8–4.1 µs F-path.
+
+**RESOLVED (nsys, same day):** profiling the wiring bench gives the device-time truth: `convertReqIndexToGlobalKernel` (full remap) **1.60 µs median**, `indexerAffineReuseKernel` **1.30 µs median**. Both kernels are healthy — and both are far below every wall measurement, which is launch/graph-replay floor. Conclusions: (a) there was never a kernel regression; (b) the documented 1.78×/0.071 ms-per-token saving compared launch-floor-dominated wall times — the **true device-level saving is ~0.3 µs/layer ≈ 0.013 ms/token across 43 S-layers (~5× smaller than documented)**, and that device delta is what a captured prod graph actually realizes; (c) the run-to-run wall oscillation (1.0×–1.7×) is clock/launch noise, exactly the F-44 methodology gap. The R4 aggregate should be restated with the 0.013 ms/tok figure.
 
 ---
 
@@ -276,7 +278,16 @@ Audit findings fixed and validated:
 - **F-14** (`c0105c924`): step-gate key via one `.tolist()`.
 - **F-31** (`28bee8268`): FC2 160 appended to the sweep instead of replacing it; explicit skip of the invalid (160, cluster_n=2) combo — note `is_valid_mma_tiler_and_cluster_shape` does NOT reject it, contrary to what a hasty reading of the original comment suggests.
 
-Still open from the top-10: lever-2 nsys investigation (see §2.2 update — clock-sensitive), SMC 8-aligned draft batch (F-26), LayerSplit entry-point unification (F-18), bench methodology fixes (F-40/42), megakernel precompile + WarpDecode tactic table (F-32/33), debug-gate wraps (F-36/37).
+**Round 2 (same day, later):**
+- **F-26 FIXED**: odd-M packed-scale SwapAB now pads to 8-aligned M and takes the autotuned DeepGEMM path (the historical fault was the odd-M CUDA quantizer, which padding sidesteps; it no longer reproduces). Measured: 1.35× on the M=25/N=18432 draft GEMM through the op, 1.17–1.19× at M=50/100; `TRTLLM_FP8_SWAPAB_ODD_M_TRITON=1` restores the old route. All `-k odd_m` unit tests pass incl. CUDA-graph replay.
+- **F-18 FIXED**: the indexer read-set broadcast moved from the bypassed `Indexer.forward` into `sparse_attn_indexer` (both entry paths covered; reuse layers/steps skip it via the existing early returns). `test_dsa_indexer` failure set unchanged vs baseline; `test_layersplit_ownership` 81/81.
+- **F-5 FIXED**: one deferred allgather for all q-split prefill chunks (R20 prefill is q_split-eligible: `enable_attention_dp=false`, TP2). Assembly math validated equal to the per-chunk reference across tp×rank×chunk-layout combinations.
+- **F-3 FIXED** (log-once on the padded full-width top-k fallback), **F-37 FIXED** (per-request `get_token_count` C++ calls no longer paid with debug off), **F-38 FIXED** (cg debug gates lru_cached).
+- **F-40/F-46/F-47/F-48 FIXED**: microbench reports untrimmed median; `test_kvarn_backend.py` env-var rename repaired (passes as-committed now); `kvarn_inkernel/results/README.md` indexes the three kernel generations; fmha probe prints honest overlap coverage.
+- **F-41 RESOLVED** via nsys — see §2.2: both kernels healthy; true lever-2 saving ≈ 0.013 ms/token (device-level), 5× below the documented figure.
+- **F-32/F-33 DOWNGRADED**: uncovered WarpDecode buckets resolve their tactic at *capture time* through the warmed autotuner cache, not per-replay — no decode-loop tuning in graph mode. Extending the table to 48/64 needs a `warpdecode_tactic_retune.py` run if such buckets ever ship; megakernel is opt-in experimental, precompile deferred.
+
+Still open: LayerSplit CP=2 e2e revalidation before the next R20 image bake (multiproc NCCL machinery test run in a 2-GPU container; a real TP2xCP2 model A/B is the remaining gate), `topk_scheme_probe.py` reconstruction (its `logits_launch_probe` helper was never committed), F-20 incremental block-version broadcast (substantial design work), F-36 idle-poll wakeup (idle-time only, low value).
 
 ---
 
