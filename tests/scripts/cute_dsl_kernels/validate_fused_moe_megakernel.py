@@ -16,12 +16,21 @@ Two independently-runnable modes (NO e2e serving):
     build (moe_sort + cute_dsl_* ops). By construction this is the same underlying
     kernels, so the gate is cos ~ 1.0; the test guards the wiring/ABI.
 
-GATE: cosine >= 0.9999 (the campaign's two-stage discipline). N=160 is the only
-FC2 tile that may relax to ~0.99961 (known/accepted).
+GATE: cosine >= 0.9999 (the campaign's two-stage discipline).
+
+WARNING: the --mode jit cosine below is a fused-vs-sequential SELF comparison
+(both legs use the SAME FC2 kernel at the SAME N over shared buffers). It guards
+the device-fusion WIRING but is BLIND to a wrong FC2 kernel: if the FC2 tile is
+numerically broken, both legs are broken identically and still agree (cos~1.0).
+This is exactly how FC2 N=160's "cos=0.99961 win" slipped through. The FC2 tile's
+numerical correctness MUST be established separately against a TRUE f32 reference
+(see tests/scripts/cute_dsl_kernels via run_blockscaled_contiguous_grouped_gemm_
+finalize_fusion.verify_reference_result, or /tmp/p1mega_reval_work/mega_fc2_reval.py).
+FC2 N=160 is numerically incorrect (cosine ~0.79 vs f32) and is rejected by the
+builder; the validated tiles are {128,192,256}.
 
 Run (inside the megakernel container, --gpus device=<free>):
-  python validate_fused_moe_megakernel.py --mode jit
-  python validate_fused_moe_megakernel.py --mode jit --fc2-n 256   # baseline tile
+  python validate_fused_moe_megakernel.py --mode jit              # fc2_n=256
   TRTLLM_OPTRT_MOE_MEGAKERNEL=1 python validate_fused_moe_megakernel.py --mode op
 """
 from __future__ import annotations
@@ -37,7 +46,6 @@ import torch.nn.functional as F
 # Number of MoE layers in REAP DeepSeek-V3.2 decode (first ~3 dense, rest MoE).
 _MOE_LAYERS_PER_STEP = 55
 _GATE_COS = 0.9999
-_N160_RELAXED_COS = 0.99955  # N=160 accepted floor (driver reports ~0.99961)
 
 
 def _bench(launch, iters, blocks, warm=40):
@@ -92,7 +100,7 @@ def validate_jit(args) -> int:
     seq_med, seq_min = _bench(seq, args.iters, args.blocks)
     mega_med, mega_min = _bench(mega, args.iters, args.blocks)
 
-    floor = _N160_RELAXED_COS if args.fc2_n == 160 else _GATE_COS
+    floor = _GATE_COS
     passed = cos >= floor
     saving_per_step_us = (seq_med - mega_med) * _MOE_LAYERS_PER_STEP
 
@@ -102,7 +110,9 @@ def validate_jit(args) -> int:
           f"ntok={args.ntok} topk={args.top_k} "
           f"tile_m={args.tile_m} fc1_n={args.fc1_n} fc2_n={args.fc2_n}")
     print(f"[jit] COSINE(mega,seq) = {cos:.6f}  (gate {floor:.5f}) -> "
-          f"{'PASS' if passed else 'FAIL'}")
+          f"{'PASS' if passed else 'FAIL'}  [SELF-comparison: guards fusion "
+          f"wiring only, NOT FC2 numeric correctness -- validate the FC2 tile "
+          f"against a true f32 ref separately]")
     print(f"[jit] mega_med={mega_med:.2f}us mega_min={mega_min:.2f}us | "
           f"seq2k_med={seq_med:.2f}us seq2k_min={seq_min:.2f}us")
     print(f"[jit] delta_fuse(mega-seq)={mega_med - seq_med:+.2f}us/call")
@@ -157,7 +167,7 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=8)
     ap.add_argument("--tile-m", type=int, default=128)
     ap.add_argument("--fc1-n", type=int, default=256)
-    ap.add_argument("--fc2-n", type=int, default=160)
+    ap.add_argument("--fc2-n", type=int, default=256)
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--blocks", type=int, default=8)
     args = ap.parse_args()

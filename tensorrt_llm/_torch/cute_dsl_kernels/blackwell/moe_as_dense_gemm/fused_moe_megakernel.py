@@ -26,11 +26,14 @@ Two device paths are provided, selected by ``TRTLLM_OPTRT_MOE_MEGAKERNEL``:
 * ``"jit"`` (single-``@cute.jit`` device fusion): emit BOTH device-kernel
   launches (FC1 SwiGLU -> FC2 finalize) from a single compiled ``@cute.jit``
   artifact on one stream, FC1's FP4 output ``(c, sfc)`` wired directly as FC2's
-  input ``(a, sfa)``, PDL on, FC2 N-tile = 160. This is the
+  input ``(a, sfa)``, PDL on, FC2 N-tile = 256 (a validated tile). This is the
   ``warpdecode_mega_driver`` artifact promoted to a registered op. It removes the
   Python/host work between the two launches so the two grid ramps collapse toward
   one combined ramp (still two device grids; the FP4 intermediate is still GMEM
-  per the SM90+ TMA-epilogue constraint documented in DESIGN-NOTES).
+  per the SM90+ TMA-epilogue constraint documented in DESIGN-NOTES). The device
+  fusion is timing-neutral vs the op path (PDL already overlaps the FC1->FC2
+  boundary); the earlier "N=160 decode win" was a mis-measurement (N=160 is
+  numerically broken, cosine ~0.79 vs f32 -- see fused_moe_megakernel_jit.py).
 
 The fully SMEM-resident single-``@cute.kernel`` (no GMEM intermediate, no
 ``tma_atom_a`` for the intermediate) is NOT shipped here: it requires merging the
@@ -61,8 +64,10 @@ except Exception:  # pragma: no cover - enum import is environment dependent
 # configuration the production deploy already forces for decode
 # (fused_moe_cute_dsl.py: forced_tile_size for tile_mode="decode_1cta"). This is
 # the tile the megakernel must use; it avoids 2-CTA cluster coordination and keeps
-# the token tile CTA-resident. The FC2 N-tile=160 win lives inside the production
-# finalize Runner's tactic table for this tile_size, picked by the AutoTuner.
+# the token tile CTA-resident. (This is the token-tile M dimension; the FC2
+# N-tile for the op path is chosen by the AutoTuner from the validated {128,256}
+# set -- N=160 is excluded as numerically incorrect, see
+# blockscaled_contiguous_grouped_gemm_finalize_fusion.py.)
 _DECODE_TILE_SIZE = 128
 
 _MEGAKERNEL_ENV = "TRTLLM_OPTRT_MOE_MEGAKERNEL"
