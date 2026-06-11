@@ -372,6 +372,43 @@ class DeepEPLowLatency(Communication):
             and self.quant_config.quant_mode.is_int4_weight_only_per_group()
         )
 
+    def _adapter_cache(self, n_experts: int, n_padded: int,
+                       device: torch.device, final_scales_dtype: torch.dtype):
+        """Constant tensors for `_modify_output_to_adapt_fused_moe`.
+
+        Everything the adapter builds is shape-static for a (local-expert
+        count, padded-token count) bucket except the comparison against
+        `recv_expert_count` -- so the column indices, the per-expert slot
+        ids, the `num_slots` fill, the all-ones final scales, and the two
+        scratch outputs are built once and reused (stable addresses, so the
+        captured graph replays against the same buffers).
+        """
+        key = (n_experts, n_padded, device.index, final_scales_dtype)
+        cache = getattr(self, "_adapter_cache_store", None)
+        if cache is None:
+            cache = {}
+            self._adapter_cache_store = cache
+        ent = cache.get(key)
+        if ent is None:
+            col_idx = torch.arange(n_padded, dtype=torch.int32,
+                                   device=device).expand(n_experts, n_padded)
+            slot_ids = torch.arange(
+                n_experts * self.mapping.moe_ep_rank,
+                n_experts * (self.mapping.moe_ep_rank + 1),
+                dtype=torch.int32, device=device,
+            ).unsqueeze(1).expand(n_experts, n_padded)
+            fill = torch.full((n_experts, n_padded), self.num_slots,
+                              dtype=torch.int32, device=device)
+            ones = torch.ones(n_experts * n_padded, 1,
+                              dtype=final_scales_dtype, device=device)
+            mask_buf = torch.empty(n_experts, n_padded, dtype=torch.bool,
+                                   device=device)
+            slots_buf = torch.empty(n_experts, n_padded, dtype=torch.int32,
+                                    device=device)
+            ent = (col_idx, slot_ids, fill, ones, mask_buf, slots_buf)
+            cache[key] = ent
+        return ent
+
     def _modify_output_to_adapt_fused_moe(
         self,
         hidden_states: torch.Tensor,
@@ -385,22 +422,21 @@ class DeepEPLowLatency(Communication):
         hidden_states shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
         recv_expert_count shape: [#local experts]
 
-        TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
-        """
-        mask = torch.arange(
-            hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
-        ).expand(hidden_states.shape[0], hidden_states.shape[1]) < recv_expert_count.unsqueeze(1)
+        The hot path is 2 launches with zero allocations (lt + where into
+        cached scratch); the constants (column indices, slot ids, fill,
+        all-ones scales) come from `_adapter_cache`. This ran 5 launches +
+        3 allocations per MoE layer per step (~11-14us/layer measured),
+        most of the LL "adapter give-back".
 
-        token_selected_slots = torch.where(
-            mask,
-            torch.arange(
-                hidden_states.shape[0] * self.mapping.moe_ep_rank,
-                hidden_states.shape[0] * (self.mapping.moe_ep_rank + 1),
-                dtype=torch.int32,
-                device=hidden_states.device,
-            ).unsqueeze(1),
-            self.num_slots,
-        )
+        TODO: remove the adapter entirely by teaching moe_sort the padded
+        expert-major recv layout + recv_expert_count (C++ change).
+        """
+        col_idx, slot_ids, fill, ones, mask_buf, slots_buf = self._adapter_cache(
+            hidden_states.shape[0], hidden_states.shape[1],
+            hidden_states.device, final_scales_dtype)
+
+        torch.lt(col_idx, recv_expert_count.unsqueeze(1), out=mask_buf)
+        torch.where(mask_buf, slot_ids, fill, out=slots_buf)
 
         hidden_states = hidden_states.reshape(
             hidden_states.shape[0] * hidden_states.shape[1], hidden_states.shape[2]
@@ -410,7 +446,5 @@ class DeepEPLowLatency(Communication):
                 hidden_states_sf.shape[0] * hidden_states_sf.shape[1], hidden_states_sf.shape[2]
             )
 
-        token_selected_slots = token_selected_slots.view(hidden_states.shape[0], 1)
-        token_final_scales = torch.ones_like(token_selected_slots, dtype=final_scales_dtype)
-
-        return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
+        token_selected_slots = slots_buf.view(hidden_states.shape[0], 1)
+        return hidden_states, hidden_states_sf, token_selected_slots, ones

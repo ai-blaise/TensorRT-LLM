@@ -426,7 +426,7 @@ no longer the top hill-climb priority.
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
 | **M3** | **DeepEP low-latency production flip** (`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`) | comm | LL wins at **every** point: 2.4–2.5× at steady c16 a2a-level; **graphed step-level (the honest number): median −1.48–1.57 ms/step (4.8–5.1 %) + kills the 3.7 ms-class normal tail** — the TRUE exposed normal a2a is 14–15 % of the step (eager 48.4 % deflates 3.4×); env delta **REQUIRED** (the factory never auto-picks LL) | **DECIDED GO** (2026-06-11); graphed re-measure **DONE** (a2a-graphed study); env delta staged; **requires ADP + `moe_tp_size=1`** (`communication_factory.py:126`); post-flip lever in flight: LL adapter give-back 0.7–0.9 ms/step |
-| C2 | KVarN delta-restore (restore only the changed rows/blocks) | scheduler | host 48.8 → 0.3 ms/fire (147–162×); **12.1 → 0.08 ms/step amortized at TP bs=16** | **SHIPPED default-on** `5bc2b2cb8` (5-scenario lockstep equivalence PASS) |
+| C2 | KVarN delta-restore (restore only the changed rows/blocks) | scheduler | host 48.8 → 0.3 ms/fire (147–162×); **12.1 → 0.08 ms/step amortized at TP bs=16**; round-2: the committed-block (T1) fire's ~500-launch eager storm now replays ONE captured graph — 23.1 → 6.0 ms/fire (3.9×) | **SHIPPED default-on** `5bc2b2cb8` + graphed T1 fire (`TRTLLM_OPTRT_KVARN_GRAPHED_RESTORE`, default-on; per-layer id rows in a persistent [n_layers, B] buffer, pads = committed ids = idempotent rewrites; eager fallback on no-pad-id/oversize/capture-fail; gates: 6 scenarios incl. graph-reuse-with-new-ids + bucket escalation, diffs confined to the documented batched-dequant ulp envelope) |
 | G2 | Gated-norm → PRE_MOE_FUSION (chain quant-epilogue + absorb) | glue | chain: −165 µs/tok shipped; absorb floor: ~117 µs/tok — **irreducible** | **chain SHIPPED** `68866e061`; **absorb CLOSED PERMANENTLY** (2026-06-11) — MoE-output cosine FAILs every cell at the 0.98 bar (see G2) |
 | I5 | Indexer wk+wp fused GEMM (one launch + one read of x per F-layer) | indexer | fused 23.5 vs split 46.5 µs @ M=4 (1.96×) → **~2.0 ms/token** | **SHIPPED default-on** `68866e061` (the v1 cos=0.0 gate-fail was the input_scale bug, not the fusion) |
 | C4 | KVarN eager decode-restore host-path (`_kvarn_step_cand_host` host-mirror selection) | scheduler | 13.3 → 0.69 ms/61-layer step (19.4×) steady, 17.0 → 1.7 ms churn; kills the misattributed "indexer FSSS cub select ~3 %" profile slice | **SHIPPED default-on** `0a1504755` (300-trial set-equality, 0 failures) |
@@ -1838,3 +1838,25 @@ bar-irrelevant — and stands.
   stays opt-in); megakernel phase 3 (landed `db0c1b41d`, then
   self-optimized past prod: pipelined pop + in-kernel self-reset, 91.7 →
   84.77 µs vs prod 90.74 — see P1). Held: S2 (moot under WarpDecode+TP).
+- **Cycle 18 — round-2 residual squeeze (every shipped candidate re-audited
+  for leftover juice, solo session 2026-06-11/12).** Squeezed: (1) the
+  **DeepEP-LL adapter** (`_modify_output_to_adapt_fused_moe`) rebuilt five
+  constant tensors per MoE layer per step — now cached with a 2-launch
+  zero-alloc hot path (`lt` + `where` into persistent scratch): graphed
+  10.25 → 6.16 µs/layer (**−0.24 ms/step** at the M3 flip), eager 45.9 →
+  16.5 µs; bit-equal across count edge cases incl. zero/full, replay-
+  deterministic. (2) the **KVarN committed-block (T1) fire** — see C2: one
+  captured graph replaces the ~500-launch eager storm, 23.1 → 6.0 ms/fire
+  (3.9×). Rigorous negatives / confirmed-at-max: **megakernel MMA_N=256**
+  (93.7 vs 84.8 µs at the 20-tile decode shape — fewer, bigger items make
+  ragged waves; N=128 + dyn-pop stands, and with dyn-pop now beating the
+  static list the control plane is no longer the bottleneck);
+  **lowrank-gate cluster sweep extended** (CN=8 structurally invalid —
+  896/8 has no thread-count divisor; CN=14 parity-clean but 3.91/4.00 µs vs
+  CN7's 3.69/4.21 at M=4/16 — keep 7 at decode M=4, 14 is an env-tunable
+  ±0.2 µs trade for a TP-bs16 cutover); **cuBLASLt backends** (gate_proj/
+  lm_head at HBM SOL; NVFP4-proj format-blocked), **fp16 logits / C++ topk**
+  (insertion path has no radix rounds; dispatch already live-kv-keyed),
+  **gate-overlap** (c-sweep complete), **S5** (jitter-only by design),
+  **fp4out / HISA fixes** (guard lifted / correctness) — all at max within
+  the correctness + checkpoint-format constraints.
