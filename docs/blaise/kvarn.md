@@ -18,6 +18,8 @@ never routed through KVarN.
 |---|-------|------|--------|---------|
 | 10 | Variance-normalized latent quant (k2v2/k4v4) | `kvarn_core.py`, `kvarn_mla.py`, `kvarn_backend.py` | k2v2 = 2.36 bits/elem @ group64; k4v4 = 314 B/tok, 3.67×, cos 0.99418 | default `kvarn_k2v2` for production dense MLA |
 | 11 | BDR fold: amortized low-bit dequant-on-read | `mlaKernels.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady (INT4 measured; k2 path same packed helper with qmax=3) | default on with KVarN |
+| 11b | Delta-restore (C2): O(batch) host-integer pre-replay restore | `model_engine.py`, `kvarn_backend.py` | host 48.8 → 0.3 ms/fire; 12.1 → 0.08 ms/step @ TP bs=16 | default on (`5bc2b2cb8`; `TRTLLM_OPTRT_KVARN_DELTA_RESTORE=0` escape) |
+| 11c | Stale-record-on-recycle invalidation | `dsa.py` (`DSACacheManager`), `kvarn_backend.py` (`invalidate_blocks`) | restore bit-equivalent to a never-recycled universe (cos 1.0, all 4 paths) | default on (`34fe7aaec`; `TRTLLM_KVARN_INVALIDATE_ON_FREE=0` escape) |
 
 ---
 
@@ -143,25 +145,51 @@ should scale with **churn, not working-set**.
   (zero extra round-trip, the paper's s2 fold); LayerSplit (the KVarN pool is a
   cache pool that LayerSplit can own/broadcast per CP rank).
 
-## Decode-regime restore cost: host-gate (shipped) + delta-restore (pending)
+## Decode-regime restore cost: host-gate + delta-restore (both shipped)
 
-Two follow-ups on the amortized-restore path, tracked in
-[optimization_candidates.md](optimization_candidates.md) as C1/C2:
+Three follow-ups on the amortized-restore path, tracked in
+[optimization_candidates.md](optimization_candidates.md) as C1/C2/C2b:
 
 - **C1 — pre-replay host-gate (shipped `a1b13ea78`):** the pre-replay restore
   scan walked all 61 layer modules before every CUDA-graph replay, paying 3–4
   implicit device syncs per layer before the empty-set early-exit could fire.
   An O(B) host step key `(request_ids, kv_len//tokens_per_block)` proves the
   restore set empty when unchanged and skips the scan entirely.
-- **C2 — delta-restore (implemented opt-in; verification pending):** when the
-  step key *does* change, the scan still re-derives far more than the delta.
-  At **TP bs=16** (pure-TP attention, every rank sees the full batch) the
-  pre-replay scan is **~4 ms/step amortized — the single biggest TP-regime
-  cost** (the DP4/bs=4 regime is much cheaper, which is why C1 sufficed
-  there). Delta-restore restores only the changed rows/blocks. **Not default**
-  until the 5-scenario equivalence verification passes (delta vs full restore:
-  onboard, free, block-boundary crossing, recycle/re-commit, mixed) — the gate
-  is bit-equality of the restored pool.
+- **C2 — delta-restore (shipped DEFAULT-ON `5bc2b2cb8`,
+  `TRTLLM_OPTRT_KVARN_DELTA_RESTORE=0` escape):** when the step key *does*
+  change, the 61-layer masked-select scan walk re-derived far more than the
+  delta. The delta path restores only blocks newly full + newly onboarded,
+  filtered by the pools' host mirrors; **any uncertainty returns False
+  WITHOUT mutation** → full-scan fallback. Verification: 5-scenario lockstep
+  equivalence vs the full scan (no-op key, boundary crossing, multi-request
+  churn, onboard/free/rewind/recycle, fallback-decline) — **all PASS**
+  (non-buffer state byte-exact; restored buffers reference-exact 0 ulp where
+  the full scan itself wanders 3–9 ulp from batched-dequant
+  nondeterminism). Win: host cost/fire 48.8 → 0.3 ms (162× on the common
+  uncommitted fire); at TP bs=16 the amortized pre-replay cost — the single
+  biggest TP-regime cost — drops **12.1 → 0.08 ms/step**.
+- **C2b — stale-record-on-recycle invalidation (shipped DEFAULT-ON
+  `34fe7aaec`, `TRTLLM_KVARN_INVALIDATE_ON_FREE=0` escape):** the C2
+  adversarial probes exposed a pre-existing bug in the *full-scan* path:
+  `KVarNLatentPool.valid` was never cleared when a paged KV block was freed
+  and recycled, `kvarn_commit_full_blocks` skips valid blocks (so the
+  recycled id was never re-committed), and the full restore
+  (`keep = pool.valid[cand]`, no epoch check) dequantized the OLD owner's
+  record over the NEW owner's fresh fp16 latent — stale-KV poisoning on every
+  restore fire for that block (scenario d3: cos −0.02 vs the new owner's
+  data). The delta path was immune via its host-mirror epoch filter. Fix:
+  `KVarNLatentPool.invalidate_blocks()` clears `valid`/`valid_host` and
+  resets `restored_gen_host`; `DSACacheManager.free_resources` (ids
+  snapshotted before the C++ free) and `rewind_kv_cache` (freed blocks + the
+  new tail block) fan out to all local layer pools with one shared device-id
+  tensor — restoring the documented "re-committed when block-id is recycled"
+  contract. Gates (B200): d3 fixed — gate-ON restore bit-equivalent to a
+  never-recycled universe (cos 1.0) on all 4 restore paths; the full a–e
+  scenario suite passes on BOTH delta and full-scan paths (worst cos 0.99964
+  = the k2v2 quant floor); 7/7 unit tests
+  (`test_kvarn_k2v2.py`: free→reuse→commit→restore + fan-out). Cost: decode
+  walk byte-identical; 1.46 ms once per request-free at the full 61-pool
+  fan-out.
 
 ## Enabling KVarN
 
@@ -228,6 +256,8 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/python/bench_kvarn_k2v2_micro.py \
 |-------|--------|--------|
 | Variance-normalized quant | cos vs fp16 GT, same latent | 0.99418 (cos_ckv 0.99390, cos_kpe 0.99582), 314 B/tok |
 | Amortized / in-kernel restore | amortize vs full-restore | cos ≥ 1.0; per-step loads 36 → 8; recycle correct |
+| Delta-restore (C2) | 5-scenario lockstep equivalence vs full scan | all PASS; non-buffer state byte-exact; buffers 0 ulp vs reference |
+| Recycle invalidation (C2b) | restore vs never-recycled universe | bit-equivalent (cos 1.0) on all 4 restore paths; a–e suite worst cos 0.99964 (k2v2 floor) |
 
 ## Composition with the rest of the campaign
 

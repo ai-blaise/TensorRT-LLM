@@ -17,6 +17,75 @@ batch, not aggregate throughput.
 
 ---
 
+## CRITICAL — the uninitialized-`input_scale` production hazard (2026-06-10)
+
+**Mechanism (runtime-proven).** Before `5bc2b2cb8`,
+`NVFP4LinearMethod.create_weights` allocated `input_scale` as
+`Parameter(torch.empty([1]))` and `process_weights_after_loading_vanilla`
+never nulled it when the checkpoint carries **no activation scales** for the
+module — so `_input_prepare` took the **STATIC quant branch with
+uninitialized memory**. Every FP4 activation code quantizes to 0 and the GEMM
+**silently outputs EXACT ZEROS** (no error, no NaN — probe-observed garbage
+scales 1.4e-45…1.76e+22, output amax 0.0). `5bc2b2cb8` fixes it: no
+in-checkpoint act scale ⇒ `input_scale = None` ⇒ the dynamic-quant branch.
+
+**Exposed set on this checkpoint** (from `model.safetensors.index.json` —
+decisive): `indexer.{wk, wq_b, weights_proj}` × 61 layers = 183 modules — the
+**only** NVFP4 modules without `input_global_scale`. Every other NVFP4 module
+(routed/shared experts, dense MLP, q_a/q_b/kv_a/kv_b/o_proj) carries
+in-checkpoint act scales and is NOT exposed.
+
+**The LIVE 002 r20 deploy is CONFIRMED EXPOSED.** Image
+`optrt-0be07d6df64e-smcquietadpfix-20260608203818` (both P/D workers):
+`/proc/<pid>/root` in-mount-namespace code check shows the pre-fix linear.py;
+no `.py` overlay mounts in the pods; **no `force_dynamic_quantization` escape
+hatch** anywhere (0 hits in worker env and served yamls); indexer NVFP4 is
+active (`indexer_k_dtype: fp4`, `indexer_mode: indexcache-hisa`). GPU probe on
+byte-identical linear.py (wave2 image, md5-equal): all three layer-5 indexer
+projections output exact zeros (0/2048, 0/1024, 0/131072 nonzero) on
+real-magnitude input; the same image with the 8-line fix overlaid outputs
+dense nonzero. **Production DSA top-k therefore runs on all-zero index scores
+for every request past `seq_len_threshold = 8192`** (degenerate selection);
+sub-8192 traffic never engages the sparse path and is unaffected.
+
+**Remediation** (runbook `/tmp/livehazard_work/REMEDIATION.md`, staged not
+deployed): hot-patch overlay `linear_wave2_fixed.py` (hostPath-mount over the
+venv linear.py — the deploys already use this .py-overlay pattern) **or**
+rebuild from a tree ≥ `5bc2b2cb8`. The live tag exists in **no registry**
+(only 002's containerd store), so the overlay is the fast path. Rollout
+timing is the owner's call (active workload). **ALL 001-resident images and
+the 001 host trees predate the fix** — any future build must include
+≥ `5bc2b2cb8` or it re-introduces the hazard.
+
+**Invalidated claims** (zero-vs-zero comparisons are vacuously "equal"):
+
+- `3e03d665d`'s indexer-proj backend claim "bit-identical (max|diff| == 0 at
+  M ∈ {4,16})" is **VACUOUS for the indexer triple** — both sides were
+  all-zero. The 1.18–1.30× timing stands (kernel time is value-independent).
+  Post-fix re-proof under HEAD dynamic-quant semantics (`wkwp_driver2`):
+  **wk and weights_proj re-proven** (cutlass↔cuBLASLt cos 1.000000 /
+  0.999996); **wq_b re-proven PASS** (close-out B, 2026-06-10: bit-identical
+  with liveness asserted — cos 1.000000, max|diff| 0 at M ∈ {4,16} × layers
+  {5,30}; cuBLASLt 1.18–1.21×, stays the pick). The full indexer triple is
+  re-proven. See B1.
+- The `5bc2b2cb8` commit-message note "wkwp fused GEMM fails the cosine gate
+  (cos = 0.000000), do not enable" — both sides were all-zero; cos(0,0) = 0.
+  Root-caused and superseded by `68866e061` (default-on after the driver2
+  PASS). Do not cite that commit-message claim.
+- **Any output-quality / long-context-correctness observation through pre-fix
+  images on this checkpoint is void** (every serve since the Graft checkpoint
+  landed ran degenerate selection past 8192 tokens). Pure TPOT/throughput
+  numbers stand mechanically (`index_topk` is fixed, so kernel work is
+  value-independent) — the topology-sweep tok/s rankings survive as
+  PERFORMANCE data but must not be cited as long-context correctness
+  evidence. The planned A/B campaign runs on fixed code only.
+
+**Lesson (extends the K2 lesson):** an equality gate is only as good as the
+liveness of both sides — assert the outputs are nonzero/dense before
+celebrating `max|diff| == 0`.
+
+---
+
 ## Measurement methodology (read first)
 
 Two harnesses, both client-side streaming timestamps from inside the frontend
@@ -71,13 +140,33 @@ entirely (which is what moots S2 below). Per-lever microbenches are therefore
 taken at **bs=4 AND bs=16**; TP-regime-specific costs (e.g. the KVarN
 pre-replay scan, C2) are called out explicitly.
 
-### Correctness gating (untrained checkpoint)
+### Correctness gating (untrained checkpoint; the 0.98 functional bar)
 
 The graft checkpoint emits garbage-class text and MoE routing is run-to-run
 non-deterministic, so **end-to-end text parity is meaningless**. Every
-correctness-affecting change is gated **kernel-level, two-stage**: (1) top-k
-SET match (Jaccard / recall@`index_topk`) against the reference path, and (2)
-bit-exact cache-slice / cosine ≥ 0.9999 on the dense read where applicable.
+correctness-affecting change is gated **kernel-level against a TRUE
+reference** — never the candidate's own fused-vs-sequential output (the K2
+lesson), and never an equality whose two sides could both be degenerate (the
+input_scale lesson above).
+
+**The bar (owner directive 2026-06-10): downstream functional correctness,
+cosine ≥ 0.98. Bit-identical is never required.** This supersedes the earlier
+"cosine ≥ 0.9999" preamble for functional gates. Two qualifications:
+
+- **Format mandate:** quantization precision/formats are pinned to the
+  checkpoint (`NVFP4-W4A4KV4-IndexerK4` + `HISA4to1`); FP/BF16 logits are
+  acceptable. A lever that changes a checkpoint-pinned format is dead
+  regardless of its cosine (see H4 in the killed list).
+- **State-machine / cache-content gates are NOT cosine gates** and are
+  unaffected: KVarN restore correctness is still judged by equivalence of the
+  restored pool vs the reference universe (a cosine there would mask restore
+  bugs).
+
+Top-k selection changes are judged by their **downstream effect** (attention-
+output cosine of the candidate-selected set vs the reference-selected set):
+boundary swaps among near-tied tail tokens carry ~zero softmax mass, so set
+IoU systematically understates functional agreement. See the 0.98-bar
+re-screen section for what this revived and what stays dead.
 
 ---
 
@@ -91,13 +180,14 @@ disabling it:
 |-------|-------|-------------------|
 | LayerSplit (prefill) | on, CP2×TP2, owner-local, read-set broadcast | + CP=2 IPC push primitive (C9) |
 | WarpDecode (decode) | on, forced `decode_1cta`, fixed tactic | persistent-megakernel is the structural ceiling; megakernel FC2 N-tile default is now 256 (160 numerically broken, cycle 5) |
-| dense KVarN `kvarn_k2v2` | on, amortized restore | host-gated pre-replay scan (C1); delta-restore (C2) is the TP-regime follow-up |
+| dense KVarN `kvarn_k2v2` | on, amortized + **delta** restore (C2 default-on `5bc2b2cb8`) | C1 host-gate retained as the no-change fast path; stale-record-on-recycle invalidation default-on (`34fe7aaec`) |
 | Indexer IndexCache + FSSS | on, `index_topk_freq=4` | escalation to 8 under recall gate |
 | **HISA** | **on whenever the Indexer is on; capture gate + candidate width track live kv via `metadata.max_gen_kv_len` (cycle 4); engages at kv ≥ `hisa_min_seq_len` (default 32768)** | **never slower than off, wins whenever active (forced-on gate=1024 proven never-slower, up to 2.56× at 33k); per-step invariant memo shipped `3e03d665d`** |
 | NVFP4 indexer-K (MX E2M1+UE8M0) | on | score→top-k fusion measured net-zero under graphs — killed |
 | Indexer decode top-k | on — prod live-kv routes to vanilla C++ (`841f9874a`), DSL only at kv ≥ 16k | fp16 logits (`indexer_logits_dtype=auto`→fp16 on the DSL path, `3e03d665d`) |
-| MLA / MLP / indexer proj GEMM backend | on — cuBLASLt forced for the NVFP4 proj Linears (`TRTLLM_MLA_PROJ_NVFP4_BACKENDS` + `TRTLLM_DSV3_MLP_NVFP4_BACKENDS` + `TRTLLM_INDEXER_NVFP4_BACKENDS`, default `cublaslt`) | bit-identical, 1.2–2.1× per GEMM (B1, `4220bf4bd`+`3e03d665d`) |
-| Gated-norm / glue | on — `fused_lowrank_gate` with the CuTe DSL kernel as default impl (`TRTLLM_OPTRT_LOWRANK_GATE_IMPL=cute`, `33e801fd1`) + fused sigmoid·mul at both attention gate sites | −91.6 % on the gated-norm chain (G1); PRE_MOE_FUSION absorb is the follow-up (G2) |
+| MLA / MLP / indexer proj GEMM backend | on — cuBLASLt forced for the NVFP4 proj Linears (`TRTLLM_MLA_PROJ_NVFP4_BACKENDS` + `TRTLLM_DSV3_MLP_NVFP4_BACKENDS` + `TRTLLM_INDEXER_NVFP4_BACKENDS`, default `cublaslt`) | 1.2–2.1× per GEMM (B1, `4220bf4bd`+`3e03d665d`); bit-identical on the MLA/MLP set — the indexer-triple equality was vacuous pre-input_scale-fix; full triple re-proven post-fix (wk/wp `wkwp_driver2`, wq_b close-out B; CRITICAL section) |
+| Indexer wk+weights_proj fused GEMM | on (`68866e061`, `TRTLLM_INDEXER_FUSE_WK_WP=1` default) | 1.96–1.97× → **~2.0 ms/token**; also halves the dynamic amax+quantize work (I5) |
+| Gated-norm / glue | on — `fused_lowrank_gate` with the CuTe DSL kernel as default impl (`TRTLLM_OPTRT_LOWRANK_GATE_IMPL=cute`, `33e801fd1`) + fused sigmoid·mul at both attention gate sites + **single-launch gate+NVFP4-quant on the MoE input** (`68866e061`) | −91.6 % on the gated-norm chain (G1); the quant epilogue takes the chain 7.04 → 4.19 µs/layer (−165 µs/tok, G2 chain); absorb rejected-as-measured, 0.98-bar re-screen in flight |
 | Shared-expert swiglu+FP4-out fusion | on at decode M — `_FP4OUT_MIN_M=128` guard lifted (`fd705a6f5`) | exact vs TRUE-f32 (cos 1.0, max_abs 0.0) at every m |
 | MoE EP comm | NVLINK_TWO_SIDED today; DeepEP low-latency enablement shipped (`51918fba2`), production flip is M3 | LL needs `TRTLLM_DEEP_EP_TOKEN_LIMIT` = per-rank concurrency (16), NOT max_batch_size |
 | NIXL transport + request pinning + Moondream overlap | on | generation-first/write-mode is the open gate |
@@ -116,31 +206,31 @@ no longer the top hill-climb priority.
 
 ## Priority sequence
 
-1. **Finish LayerSplit (Part 1 of the goal):** C9 CP=2 IPC broadcast GPU
-   re-validation → push; then L1 (z.ai dense-broadcast overlap re-measure) and
-   L2 (read-set block-id hoist). LayerSplit must be correct + optimal before the
-   decode hill-climb is the focus.
+1. **Remediate the live input_scale hazard** (CRITICAL section above):
+   overlay `linear_wave2_fixed.py` on the 002 r20 deploy or rebuild from a
+   tree ≥ `5bc2b2cb8`; rollout timing is the owner's call (active workload).
+   Every future image build must carry the fix.
 2. **MoE / EP comm is the top open hill-climb lever (per the eager c16
    profile: MoE ≈ 60 % of the step, EP comm ≈ 40 %).** M3 — the DeepEP
    low-latency production flip (enablement shipped `51918fba2`; the open item
    is the `TRTLLM_DEEP_EP_TOKEN_LIMIT` c16-vs-max_batch sizing decision).
-3. **The TP-regime cost: C2 KVarN delta-restore** (the bs=16 pre-replay scan
-   is ~4 ms/step amortized at TP — the single biggest TP-regime cost), then
-   **G2 gated-norm → PRE_MOE_FUSION** (~1–1.5 ms/step) and **I5 indexer wk+wp
-   fused GEMM** (verification in progress).
-4. Track H (HISA) — re-scoped small by the profile (HISA ≈ 0.7 % of step);
-   H3a/H3b remain valid low-risk candidates, no longer the lead. Then the
-   remaining host/kernel levers (N1, I2, M1, K1), then the structural
-   megakernel (P1). S2 is moot under the WarpDecode+TP production plan (held).
+3. **The 0.98-bar re-screen experiments** (see the re-screen section):
+   G2-absorb (MoE-output-cosine gate), I2 freq 4→8 (GATE-B; real-activation
+   dump blocked on a fixed image), H3b long-band A/B. The FP4MQA formal
+   close-out and the wq_b backend re-gate both **PASSED 2026-06-10** — done.
+4. C9 CP=2 IPC GPU re-validation → push; then the remaining host/kernel
+   levers (N1, M1, K1 PDL, H3a/H3c), then the structural megakernel (P1).
+   **Shipped this round: C2, I5, G2-chain, L2, S5** (`5bc2b2cb8` +
+   `68866e061` + `34fe7aaec`). S2 stays moot under WarpDecode+TP (held).
 
 ## Ranked candidates
 
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
 | **M3** | **DeepEP low-latency production flip** (`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + `TRTLLM_DEEP_EP_TOKEN_LIMIT=16`) | comm | LL roundtrip 45 vs 115 µs/layer @ limit 16 (~2.5×) — **INVERTS at limit 64** | **enablement SHIPPED** `51918fba2`; flip pending the c16-vs-max_batch sizing decision |
-| **C2** | **KVarN delta-restore** (restore only the changed rows/blocks) | scheduler | bs=16 pre-replay scan ~4 ms/step amortized at TP — the biggest TP-regime cost | impl, opt-in; **5-scenario equivalence verification pending** |
-| G2 | Gated-norm → PRE_MOE_FUSION absorb/fold (gate measured 0.500 ± 0.0025) | glue | ~1–1.5 ms/step | design (absorb-or-fold) |
-| I5 | Indexer wk+wp fused GEMM (one launch + one read of x per F-layer) | indexer | small per-F-layer | impl; **verification in progress** (`build()` gating vs the production loader under investigation) |
+| C2 | KVarN delta-restore (restore only the changed rows/blocks) | scheduler | host 48.8 → 0.3 ms/fire (147–162×); **12.1 → 0.08 ms/step amortized at TP bs=16** | **SHIPPED default-on** `5bc2b2cb8` (5-scenario lockstep equivalence PASS) |
+| G2 | Gated-norm → PRE_MOE_FUSION (chain quant-epilogue + absorb) | glue | chain: −165 µs/tok shipped; absorb floor: ~117 µs/tok more | **chain SHIPPED** `68866e061`; **absorb REJECTED on routing** as measured — 0.98-bar MoE-output-cosine re-screen in flight |
+| I5 | Indexer wk+wp fused GEMM (one launch + one read of x per F-layer) | indexer | fused 23.5 vs split 46.5 µs @ M=4 (1.96×) → **~2.0 ms/token** | **SHIPPED default-on** `68866e061` (the v1 cos=0.0 gate-fail was the input_scale bug, not the fusion) |
 | C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl, GPU re-validating |
 | B1 | cuBLASLt NVFP4 backend force: MLA proj + shared/dense MLP + indexer proj | GEMM | ~1.62 ms/tok (`4220bf4bd`) + 1.62 ms/tok incremental (`3e03d665d`, TP4); bit-identical | **SHIPPED** `4220bf4bd`+`3e03d665d` |
 | G1 | Gated-norm + glue fusions (`fused_lowrank_gate` −91.6 %, fused sigmoid·mul, HISA invariant memo) + CuTe DSL port (−36 % vs Triton, default impl) | glue | −6.27 (bs4) / −9.38 (bs16) ms/step eager GPU | **SHIPPED** `3e03d665d`+`33e801fd1` |
@@ -150,13 +240,13 @@ no longer the top hill-climb priority.
 | C1 | KVarN pre-replay restore host-gate | scheduler | ~0.75–2 ms host (within harness noise) | **shipped** `a1b13ea78` |
 | C3 | Cache debug env-gates / no eager kwargs | scheduler | ~0.1 ms/step | **shipped** `0adc87009` |
 | H3a | PDL-chain the 5 HISA glue kernels (candidate_pages/mask/remap/block_reps/block_scores; indexerHisaNvfp4.cu has 0 PDL, indexerTopK.cu has 9) | indexer | ~0.11–0.17 ms/step (7 boundaries × ~1–1.5µs × 16F) | candidate (re-scoped: HISA ≈ 0.7 % of step) |
-| H3b | Per-row live-length candidate scaling (caller-only: per-row `candidate_context_lens`/`selected_lengths` from `prefix_lens`; kernels already walk `[0,num_kv)` — verified fp4_paged_mqa_logits.py:1422 / indexerTopK.cu:663) | indexer | long-band topk radix→insertion 14→6.9µs (real); GEMM 7.2× (latency-bound caveat) | measure in mixed/long-band regime |
+| H3b | Per-row live-length candidate scaling (caller-only: per-row `candidate_context_lens`/`selected_lengths` from `prefix_lens`; kernels already walk `[0,num_kv)` — verified fp4_paged_mqa_logits.py:1422 / indexerTopK.cu:663) | indexer | long-band topk radix→insertion 14→6.9µs (real); GEMM 7.2× (latency-bound caveat) | **RESURRECTED** (0.98 re-screen; set-identical by construction) — long-band A/B in flight |
 | H3c | Incremental block-rep quantize (only the boundary block changes/step; indexerHisaNvfp4.cu:279 rebuilds all) | indexer | ~0.08–0.11 ms/step | candidate |
-| H4 | HISA `compression_ratio` sweep {4,6,8,12}, recall-gated (`hisa_block_topk=64` is dead config when ratio>0) | indexer | ckpt-specific; config-only | candidate |
+| ~~H4~~ | ~~HISA `compression_ratio` sweep {4,6,8,12}~~ | indexer | — | **KILLED by format mandate** — the checkpoint pins HISA4to1; only intra-4to1 tuning remains |
 | ~~H1~~ | ~~short-band candidate-width allocation shrink~~ | indexer | **REGRESSED −6% (40.28→37.82)** — short kv is latency-bound | **discarded (measured)** |
 | S2 | Collapse 10 host MPI collectives → ~3 | scheduler | 150–400 µs + 7 barriers of jitter | **MOOT under WarpDecode+TP** (no ADP collectives); held with that note |
 | N1 | NUMA-pin decode workers to node 1 | system | 0.3–1 ms + jitter | planned (rides manifest) |
-| I2 | `index_topk_freq` 4→8 | indexer | indexer-cost −68% on S-steps (~) | planned (recall gate) |
+| I2 | `index_topk_freq` 4→8 (16 → 9 F-layers) | indexer | 0.23–0.46 ms/step measured ceiling | synthetic recall gate proven **non-predictive**; conditional GO on GATE-B real-activation dump — **blocked on a fixed image** (CRITICAL section) |
 | M1 | MoE A2A two-sided → one-sided + workspace combine | comm | 0.3–0.9 ms/step | planned (sequence after M3) |
 | K1 | PDL coverage completion | kernel | +1–3% | planned |
 | ~~K2~~ | ~~FC2 N-tile 256→160~~ | kernel | **N=160 is numerically broken** (SFB miscompute, cos 0.790 vs TRUE f32; + prefill M=1024 OOB) | **KILLED** `29f492b49`→`d01737397` — see killed list |
@@ -275,19 +365,53 @@ the full scan. **Shipped** `a1b13ea78` (op-trt). Within tight-harness noise at
 c16 (host-bound regimes benefit more); removes real sync work, cannot regress
 correctness.
 
-## C2 — KVarN delta-restore (impl opt-in, verification pending)
+## C2 — KVarN delta-restore (SHIPPED default-on `5bc2b2cb8`)
 
 C1 skips the pre-replay restore scan when *nothing* changed; when something
-*did* change, the scan still walks/restores far more than the delta. At **TP
-bs=16** (every rank sees the full batch) the pre-replay scan is **~4 ms/step
-amortized — the single biggest TP-regime cost** (at DP4/bs=4 it is much
-smaller, which is why C1 alone sufficed there). Delta-restore restores **only
-the changed rows/blocks** instead of re-deriving the full set. Implemented
-**opt-in**; before any default flip it needs the **5-scenario equivalence
-verification** (delta vs full restore: onboard, free, block-boundary crossing,
-recycle/re-commit, mixed) — KVarN correctness is cache-content correctness, so
-the gate is bit-equality of the restored pool, not a cosine. See
-[kvarn.md](kvarn.md) for the restore architecture this extends.
+*did* change, the 61-layer masked-select scan walk still re-derived far more
+than the delta. Delta-restore (`TRTLLM_OPTRT_KVARN_DELTA_RESTORE=1`, default)
+replaces it with an **O(batch) host-integer delta** — blocks newly full +
+newly onboarded, filtered by the pools' host mirrors; **any uncertainty
+returns False WITHOUT mutation** and falls through to the full scan.
+
+- **Equivalence (state-machine gate, not cosine):** 5-scenario lockstep vs
+  the full scan — no-op key, boundary crossing, multi-request churn,
+  onboard/free/rewind/recycle, fallback-decline — **all PASS** (non-buffer
+  state byte-exact; restored buffers reference-exact 0 ulp where the full
+  scan itself wanders 3–9 ulp from batched-dequant nondeterminism).
+- **Adversarial probes favored the delta**: the full scan CLOBBERS a
+  recycled-id owner with the stale record — a pre-existing bug in the
+  *fallback* path, fixed separately in `34fe7aaec` (next).
+- **Win:** host cost/fire 48.8 → 0.3 ms (162× on the common uncommitted
+  fire); amortized at TP bs=16 **12.1 → 0.08 ms/step** — the TP-regime cost
+  this lever was ranked on is gone. See [kvarn.md](kvarn.md).
+
+### C2b — KVarN stale-record-on-recycle fix (SHIPPED default-on `34fe7aaec`)
+
+The adversarial probe above exposed a real production bug:
+`KVarNLatentPool.valid` was set by `store_block` and **never cleared when the
+paged KV block was freed and recycled** to a new request.
+`kvarn_commit_full_blocks` skips valid blocks, so a recycled id kept the OLD
+owner's packed record and was never re-committed; the full-scan restore path
+(`keep = pool.valid[cand]`, no epoch check) then dequantized the OLD owner's
+record **over the NEW owner's fresh fp16 latent** — stale-KV poisoning on
+every restore fire for that block (harness scenario d3: restored content =
+the old record, cos −0.02 vs the new owner's data). The delta path was immune
+via its host-mirror epoch filter; the full scan is the fallback and the eager
+default.
+
+Fix (default-ON, `TRTLLM_KVARN_INVALIDATE_ON_FREE=0` escape hatch):
+`KVarNLatentPool.invalidate_blocks()` clears `valid`/`valid_host` and resets
+`restored_gen_host`; `DSACacheManager.free_resources` (ids snapshotted before
+the C++ free) and `rewind_kv_cache` (freed blocks + the new tail block) fan
+out to all local layer pools with one shared device-id tensor — restoring the
+documented "re-committed when block-id is recycled" contract that no code
+path actually honored. Gates (B200): d3 fixed — gate-ON restore is
+**bit-equivalent to a never-recycled universe (cos 1.0) on all 4 restore
+paths**; the full a–e scenario suite passes on BOTH delta and full-scan paths
+(worst cos 0.99964 = the k2v2 quant floor); 7/7 unit tests. Cost: the decode
+walk is byte-identical (no per-token change); 1.46 ms once per request-free
+at the full 61-pool fan-out.
 
 ## C3 — Cache debug env-gates (SHIPPED)
 
@@ -344,10 +468,24 @@ bs=4, bs=16, and prefill, under both attention-DP and pure TP.
   All bit-identical to the default backend (max|diff| == 0 at M ∈ {4,16}).
   **+1.62 ms/token (TP4) incremental** on top of `4220bf4bd`.
 
+> **Post-audit correction (2026-06-10):** the `3e03d665d` indexer-triple
+> equality ("all bit-identical, max|diff| == 0") was **VACUOUS** — both sides
+> were all-zero through the pre-`5bc2b2cb8` input_scale bug (CRITICAL
+> section). The 1.18–1.30× timing stands. Re-proof under HEAD dynamic-quant
+> semantics (`wkwp_driver2`): **wk and weights_proj re-proven**
+> (cutlass↔cuBLASLt cos 1.000000 / 0.999996); **wq_b re-proven** (close-out
+> B, 2026-06-10: cos 1.000000 / max|diff| 0 with liveness asserted,
+> M ∈ {4,16} × layers {5,30}; cuBLASLt 1.18–1.21× — remains the right wq_b
+> pick; 001 `/tmp/fp4mqa_closeout_work/closeout_b.json`). The full indexer
+> triple is re-proven. The MLA proj (`4220bf4bd`) and MLP claims are
+> unaffected — those modules have in-checkpoint `input_global_scale` and were
+> gated against a true-f32 reference.
+
 The bf16 GEMMs were audited in the same pass: lm_head / gate_proj / router are
-already optimally dispatched — no lever there. Companion negative: NVFP4-
-*quantizing* the remaining dense MLA proj GEMMs fails accuracy (cos 0.63–0.83;
-see killed list) — the win is the backend, not more quantization.
+already optimally dispatched — no lever there. The companion accuracy verdict
+on the dense MLA proj W4A4 path ("fails accuracy, cos 0.63–0.83") has since
+been **REVERSED** — the reference was corrupted; corrected cosines are 0.995+
+everywhere (see the record-corrected list).
 
 ## G1 — Gated-norm + glue fusions (SHIPPED `3e03d665d` + `33e801fd1`)
 
@@ -379,17 +517,36 @@ hiding in the dense-proj profile bucket**: a pathological `gemmSN_TN`
   warmup helper compiles pre-capture). tcgen05/TMA were *rejected* at
   rank-16/M≤16 — latency-bound (CN sweep CN1 10.6 µs → CN7 3.95 µs confirms).
 
-## G2 — Gated-norm → PRE_MOE_FUSION absorb/fold (design)
+## G2 — Gated-norm → PRE_MOE_FUSION (chain SHIPPED `68866e061`; absorb rejected-as-measured, 0.98-bar re-screen in flight)
 
-With G1 shipped, the residual lever is structural: the gate output is measured
-**0.500 ± 0.0025** across real activations — i.e. the sigmoid sits at its
-midpoint, so the gate is (near-)absorbable. Two designs: **absorb** the
-constant 0.5 into the adjacent scale (validity gated on the ±0.0025 band being
-checkpoint-stable), or **fold** the lowrank-gate computation into the
-PRE_MOE_FUSION region (the fused add+RMSNorm+quant pass,
-[nvfp4_fusions.md](nvfp4_fusions.md) #13) so the gate rides an existing kernel
-instead of its own 2 launches × 122 sites/step. Expected **~1–1.5 ms/step**.
-Gate: bit-equality (fold) or bounded-delta vs the G1 path (absorb).
+Of the two designs, **the chain landed and the absorb was measured and
+REJECTED by the routing gate**:
+
+- **Chain — single-launch CuTe lowrank-gate + NVFP4-quant epilogue
+  (`apply_fused_lowrank_gate_quant_nvfp4`, SHIPPED `68866e061`):** the
+  gated-norm output now quantizes to a LINEAR-SF `Fp4QuantizedTensor`
+  **inside the gate kernel itself**, replacing gate + separate
+  `fp4_quantize` on the routed-MoE input path (the prior in-tree handoff was
+  a 2-launch Triton pair). Chain cost 7.04 → 4.19 µs (M=4) / 7.17 → 4.48 µs
+  (M=16): **−165 µs/token at M=4 across 58 MoE layers** (−254 µs/token vs the
+  pre-lowrank-gate unfused chain). Gates: y cosine vs true reference
+  ≥ 0.999997; fp4 codes + scales bit-exact vs `trtllm.fp4_quantize` on the
+  same y; top-8 routing overlap 1.0 vs the current path (the fp4-vs-bf16
+  quantization noise floor is shared with the existing production path, not
+  added by this kernel); CUDA-graph capture + replay bit-exact. Full
+  absorb-into-AR-quant is additionally blocked by kernel layout: the AR NVFP4
+  epilogues emit SWIZZLED SF only while the MoE permute path requires LINEAR.
+  Documented as [nvfp4_fusions.md](nvfp4_fusions.md) #13c.
+- **Absorb (constant-0.5 fold) — REJECTED on routing as measured:** the
+  "0.500 ± 0.0025" gate band is **layer-5-local**. Across depth the gate std
+  grows (0.0023 @ L3 → 0.0152 @ L50; modulation up to 28.9 %): on real
+  noaux_tc routing the top-8 overlap falls to **0.965–0.988 at layers
+  20–60** (exact-top8 tokens 77.9 % at L50) — fails the routing gate.
+  Recorded, not shipped: `/tmp/premoe_work/absorb_premoe.REJECTED.patch`.
+  The 0.98-bar re-screen resurrects the question under a **MoE-output-cosine
+  gate** (decisive experiment in flight) — the measured routing divergence is
+  the evidence it must beat. The remaining gap to the absorb floor is
+  ~117 µs/token.
 
 ## K3 — Shared-expert swiglu+FP4-out fusion at decode M (SHIPPED `fd705a6f5`)
 
@@ -437,11 +594,16 @@ Decode GPUs 4–7 are NUMA node 1, but rank-0 had 110/115 threads on node 0
 pinned-buffer staging + wake jitter. Fix: cpuset/membind in the DGD
 `extraPodSpec`. Zero code, 0.3–1 ms + jitter.
 
-### S5 — Per-iter stats/perf-metrics decimation (planned)
-`iteration_stats_interval=1` + per-iter `IterationStats` pickle on the rank-state
-AG + per-request `append_step_metrics`/`update_perf_metrics` every iter + 3 CUDA
-timing events/step. Sample 1/16; keep the cheap host/device step-time fields.
-100–250 µs/step, hours, low risk.
+### S5 — Per-iter stats/perf-metrics decimation (SHIPPED `5bc2b2cb8`)
+`TRTLLM_OPTRT_STATS_DECIMATE=16`: the full IterationStats / per-request
+metrics / CUDA-timing-event triplet is sampled 1/16; first + finishing
+per-request calls stay exact (TTFT/E2E preserved); sampling derives only from
+`iter_counter` so all ranks agree (collective payloads are fixed-width either
+way). 29/29 host tests incl. a 4-rank lockstep sim + a negative desync test.
+Stats block 48.2 → 16.1 µs/iter, p99 69 → 35. **Honest accounting: the
+exposed TPOT win is ~0 at c16** — the host work was overlapped; this removes
+a jitter source between lockstep collectives. The earlier "100–250 µs/step"
+premise here was stale.
 
 ---
 
@@ -479,21 +641,45 @@ bit-identical selected set** (top-1024 recall 1.0). Width-override removed;
 CuTe kernel (incl. the `81cfeb88c` fused single-pass cluster top-k) now runs
 only for genuinely long live kv, which the kv gate already routes to it.
 
-### I5 — Indexer wk+wp fused GEMM (impl, verification in progress)
-Fuse the indexer `wk` and `weights_proj` GEMMs (same input x) into one launch
-+ one read of x per F-layer. Implemented; **verification in progress** — the
-open question is `build()` gating vs the production loader (whether the fused
-weight is constructed on the path the production checkpoint loader actually
-takes), under investigation before any default.
+### I5 — Indexer wk+wp fused GEMM (SHIPPED default-on `68866e061`)
+Fuses the indexer `wk` and `weights_proj` GEMMs (same input x) into one NVFP4
+GEMM launch + one read of x per F-layer (`TRTLLM_INDEXER_FUSE_WK_WP=1`,
+default). The earlier "fails the cosine gate (cos = 0.000000), do not enable"
+verdict was **the input_scale hazard, not the fusion**: the v1 driver
+compared all-zero against all-zero through the pre-`5bc2b2cb8`
+uninitialized-input_scale bug — cos(0,0) = 0 (CRITICAL section). Under HEAD
+dynamic-quant semantics the gate is **cos(indexer_k) = 1.000000
+(bit-identical)** and **cos(weights) = 0.999996** (1 bf16 ulp from the wp
+out-scale fold; f32 in production) at M ∈ {4,16}, cutlass cross-backend
+identical. Timing under CUDA-graph replay: M=4 fused 23.5 µs vs split 46.5,
+M=16 34.6 vs 67.6 (**1.96–1.97×**) → **~2.0 ms/token across 61 layers** —
+bigger than the static estimate because the fusion also halves the dynamic
+amax+quantize work.
 
-### I2 — `index_topk_freq` 4→8 (planned, recall-gated)
-FSSS is **cross-layer** (not cross-step): the doc's −39/60/68% @ stride 2/4/8
-(`indexer.md` win #4) is *indexer-cost-relative* and traces to the XSTEP
-prototype (`llm_args.py:329-341` docstring flags accuracy-must-be-validated).
-Escalating to 8 reuses the F-layer top-k across more S-layers. Gate:
-top-1024 SET recall vs `freq=1` ground truth on real-shape synthetic. Open
-question: recency drift between F-layers at stride 8 — read
-`indexerXstepRecencyPatch.cu`'s window and whether it must widen.
+### I2 — `index_topk_freq` 4→8 (synthetic gate NON-PREDICTIVE; conditional GO blocked on a fixed image)
+FSSS is **cross-layer** (not cross-step); freq=8 means **9** F-layers (not 8)
+vs prod freq=4's 16, so the lever is 7 F-layers/step. Measured (B200, real
+per-layer NVFP4 indexer weights):
+
+- **The planned synthetic recall gate is non-predictive.** 8 configs × 3
+  seeds: cross-layer top-1024 recall == **chance at every stride**
+  (0.222 @ kv 4.6k = 1024/4608, 0.031 @ kv 33k), flat in F-distance 1..7 —
+  including the freq=4 production setting. Harness sanity passed (dequant
+  max|diff| 3e-8 vs the reference op; self-recall 0.99 at 1 % input noise),
+  so the conclusion is structural: **cross-layer top-k agreement in prod is
+  100 % activation-borne**; synthetic activations carry none of it.
+- **Recency is a non-issue:** the recency patch is cross-step only and its
+  window is independent of `index_topk_freq`; cross-layer reuse has ZERO
+  intra-step staleness (code-firm).
+- **Timing ceiling:** pipeline 12–33 µs/F-layer (graphed) + proj proxy
+  15–27 µs ⇒ 7 F-layers ≈ **0.23–0.46 ms/step (~1.1–2.2 %)**.
+
+Verdict: NO-GO as an immediate flip on the synthetic gate; **conditional GO**
+under the 0.98-bar GATE-B judgment — downstream attention cosine of
+freq=8-selected vs freq=1-selected sets on a **real-activation top-k dump,
+which must wait for a FIXED image: the live 002 deploy's indexer activations
+are the zero-poisoned path** (CRITICAL section), so any dump taken today
+gates garbage.
 
 ### I3 — `seq_len_threshold` short band (was: folds into H1; still valid standalone)
 Currently unset → one effective band → width always 132096. Setting 65536
@@ -628,10 +814,15 @@ payload grew, so re-measure sync vs overlap at the real 128k/large-batch shape
 with real compute; activate if it wins. Affects TTFT, not TPOT. Same code region
 as C9 — design together.
 
-### L2 — Read-set block-id hoist (planned)
-`_layersplit_compute_read_block_ids` is metadata-derived and identical across all
-61 layers in a step but recomputed per layer. Hoist once per step. (The dense
-top-k set legitimately differs per layer — only the read-set computation hoists.)
+### L2 — Read-set block-id hoist (SHIPPED `5bc2b2cb8`)
+`_layersplit_compute_read_block_ids` is per-step-invariant but ran
+61×/prefill-step with 2 host syncs each. Now memoized once per step keyed on
+(ptrs, num_seqs, host kv_lens values, capturing) —
+`TRTLLM_OPTRT_LAYERSPLIT_READSET_HOIST=1` default. 4-scenario set-equality
+PASS (single-chunk, multi-chunk incl. the defensive no-clear chunk,
+prefix-hit, mixed batch). **11.6–12.4 → 0.4 ms per prefill step** (TTFT,
+CP2×TP2 worker). (The dense top-k set legitimately differs per layer — only
+the read-set computation hoists.)
 
 ---
 
@@ -649,6 +840,88 @@ campaign's own audit *requires* the `handoff_mode="generation_first"` marker and
 dispatch). Closing this needs a **new router build** (Rust), not just the python
 slice the status doc assumed. TTFT lever only (not post-first-token) — tracked
 but lower priority for this metric.
+
+---
+
+## Re-screen at the 0.98 functional bar (2026-06-10)
+
+The owner's new bar (downstream-functional cosine ≥ 0.98; formats pinned to
+the checkpoint; bit-identical never required) triggered a full re-screen of
+the killed list and the pending gates (`/tmp/rescreen_098/RESCREEN.md`).
+
+**RESURRECTED:**
+
+1. **G2-absorb** (~1–1.5 ms/step ceiling): the old gate demanded what
+   amounted to bit-exactness; the new judge is a **MoE-output-cosine** gate.
+   The premoe lane's measured routing rejection (top-8 overlap 0.965–0.988 at
+   layers 20–60 — see G2) is the evidence the experiment must beat.
+2. **I2 `index_topk_freq` 4→8** (0.23–0.46 ms/step): gate relaxed from set
+   recall to GATE-B downstream attention cosine (freq=8-selected vs
+   freq=1-selected sets). The real-activation dump it needs is **blocked on a
+   fixed image** — the live 002 indexer activations are the zero-poisoned
+   path.
+3. **H3b per-row candidate scaling** (~0.1–0.3 ms/step in mixed/long-band
+   traffic): selection is **identical by construction** at any bar
+   (caller-only; the kernels already walk per-row lengths —
+   `fp4_paged_mqa_logits.py:1422`, `indexerTopK.cu:663`); only the long-band
+   perf A/B remains, in flight.
+4. **FP4MQALogits index-scoring formal close-out** (0 incremental tok/s —
+   already live): the cycle-4 kill ("IoU 0.69–0.83, do NOT default-on
+   without an e2e accuracy eval") is **RETIRED**. The fp4 chain is the
+   checkpoint-faithful setting (`IndexerK4`) and has been the r20 production
+   config all along (`indexer_k_dtype: fp4` +
+   `use_cute_dsl_paged_mqa_logits: true`); the correct judgment is
+   downstream, and it already exists — GATE-B measured the attention cosine
+   of the fp4-chain-selected set vs the TRUE-f32-selected set at **1.000000
+   (6 dp) on all 6 shapes** (B {4,16} × kv {4.6k, 33k, 66k}): the IoU
+   boundary disagreement is near-tied tail tokens with ~zero softmax mass.
+   The "only 1.0–1.02×" speed leg was DP4-specific (bs=4/rank); bs=16 under
+   the WarpDecode+TP plan **is** the 1.6× memory-bound regime.
+   **CLOSED — GATE PASSED (2026-06-10):** the FP8-chain GATE-B leg ran on 001
+   (wave2 image, production top-k routing: C++ at kv 4.6k, DSL at 33k/66k) —
+   downstream attention cosine **1.000000 for fp4-set vs fp8-set AND each vs
+   the TRUE-f32 set, at all 6 shapes** (B {4,16} × kv {4.6k, 33k, 66k},
+   incl. B=16/kv=66k), while the same run reproduced the kill's divergence
+   regime (fp4↔fp8 IoU 0.67–0.81) — confirming the wrong-metric diagnosis.
+   The kill is formally retired. Artifacts: 001 `/tmp/fp4mqa_closeout_work/`
+   (STATUS `OVERALL=PASS`).
+
+**STAYS DEAD at the new bar:** K2 FC2 N=160 (true-f32 cos 0.790 < 0.98, and
+the prefill M=1024 crash is bar-independent); the megakernel
+**dispatch-fusion** win claim (timing-neutral under PDL — a timing fact,
+bar-irrelevant; P1's structural persistent-kernel case is unchanged); the H4
+ratio sweep (the format mandate pins HISA4to1 — moved to the killed list);
+bf16 indexer logits (fp16 shipped and strictly dominant — equal time, better
+boundary fidelity 0.994–0.996 vs bf16's 0.971–0.990, downstream cos
+1.000000). Every other kill was speed / arithmetic / topology / mandate —
+bar-irrelevant — and stands.
+
+---
+
+## Record-corrected (moved OUT of the killed list)
+
+- **NVFP4 dense MLA proj GEMM accuracy** (was killed as "FAILS accuracy: cos
+  0.63–0.83 vs the bf16 path") — **REVERSED 2026-06-10**. The 0.63–0.85
+  cosines measured a **corrupted reference**: the harness's `f32_weight()`
+  passed `isSfSwizzledLayout=True` to `e2m1_and_ufp8sf_scale_to_float_v2` on
+  checkpoint `weight_scale` tensors that are LINEAR layout (the prod loader
+  runs `block_scale_interleave` on them, which takes linear input) — the
+  scrambled block scales corrupted the "true f32" reference itself
+  (old-vs-corrected weight cos 0.65–0.87). With the corrected reference
+  (validated against the CPU op at the correct flag, cos 0.99999994), the
+  **unmodified production W4A4 path passes everywhere**: cos vs true-f32 at
+  L5/M4 cutlass — **o_proj 0.9953 / q_b 0.9966 / q_a 0.9954 / kv_a 0.9953**;
+  per-proj minima 0.9951–0.9954 over the full **n=144** sweep (layers
+  {5,20,45} × M {4,16} × {spread, outlier} activations × 3 backends). **ALL
+  PASS the 0.98 bar.** No production change follows: W4A4 on these projs is
+  the checkpoint-faithful mode already in service (these modules ship
+  NVFP4-packed with `input_global_scale`), so no faster mode is unlocked —
+  the entry's value is the record correction plus one real caveat:
+  **out-of-calibration inputs clip** (an activation with amax ≫ the
+  calibrated `input_global_scale` clips against the static input scale;
+  excluded-by-construction in calibrated traffic; the mitigation is
+  recalibration, not code). Artifacts:
+  001 `/tmp/dense_proj_work/corrected_accuracy.json`.
 
 ---
 
@@ -680,10 +953,14 @@ but lower priority for this metric.
 - **Attention-tactic retune at TP bs=16** — already optimal: the autotuner
   re-selects correct tactics at the TP shapes, and TP-rank attention is
   *faster* than ADP at equal load (part of the WarpDecode+TP case). No lever.
-- **NVFP4-quantizing the dense MLA proj GEMMs** — FAILS accuracy: cos
-  0.63–0.83 vs the bf16 path. The proj win is the cuBLASLt backend (B1,
-  bit-identical), not more quantization. Do not revisit without a new quant
-  scheme.
+- **H4 HISA `compression_ratio` sweep ({6,8,12} legs)** — dead by **format
+  mandate**: the checkpoint pins HISA4to1, so non-4:1 ratios are a format
+  change regardless of recall. Only intra-4to1 tuning remains in scope.
+- **bf16 indexer logits** — dead by **dominance**, not by bar: timing equals
+  fp16 (both take 2 radix rounds) with strictly worse top-boundary fidelity
+  (set-overlap vs fp32 sets 0.971–0.990 vs fp16's 0.994–0.996); fp16 (I6) is
+  shipped and already passes a stricter gate (downstream cos 1.000000, ~180×
+  fp16 range margin).
 - **Indexer score→top-k fusion (I4)** — net-zero under CUDA graphs: the mask
   is already fused into the top-k kernel, the logits round-trip is <1 µs at
   decode B, and the launch overhead is hidden by graph replay. Bench shipped
@@ -735,6 +1012,12 @@ but lower priority for this metric.
   (IoU 0.69–0.83 vs FP8's 0.92–0.95) on random inputs. Do NOT default-on without an
   e2e accuracy eval on real indexer activations. Bench:
   `tests/scripts/cute_dsl_kernels/paged_mqa_logits/bench_fp4_vs_fp8_decode.py`.
+  **[RETIRED 2026-06-10 at the 0.98-bar re-screen; close-out GATE PASSED** —
+  the fp4 chain is the checkpoint-faithful setting (IndexerK4), is the live
+  r20 production config, and is GATE-B-judged at downstream attention cos
+  1.000000 (fp4-set vs fp8-set and each vs the TRUE-f32 set, all 6 shapes
+  B {4,16} × kv {4.6k,33k,66k}); the IoU kill measured the wrong metric and
+  the 1.0–1.02× was the wrong (DP4) regime. See the re-screen section.]
 - **Cycle 4b** (shipped `81cfeb88c`): fused single-pass cluster top-k
   (1.28–1.59× at width 132096, IoU 1.0) + HISA-gate eager d2h-sync unification
   (`max_gen_kv_len` in both branches, eager indexer host wall 33k 21.3→1.18 µs).
@@ -775,6 +1058,61 @@ but lower priority for this metric.
   is **already OVERLAPPED at c16** — correct but flat, no exposed-time win.
   Status revised from "queued exposure check" to closed-no-win at c16 (revisit
   only if the overlap structure changes).
-- **Queued**: M3 flip decision (LL token-limit sizing); C2 5-scenario
-  equivalence verification; G2 absorb-or-fold design; I5 `build()`-gating
-  investigation; then N1, I2, K1 PDL. Held: S2 (moot under WarpDecode+TP).
+- **Cycle 11** (shipped `5bc2b2cb8`): **C2 KVarN delta-restore DEFAULT-ON**
+  (O(batch) host-integer delta; 5-scenario lockstep equivalence PASS; host
+  48.8 → 0.3 ms/fire, 12.1 → 0.08 ms/step amortized at TP bs=16) + **L2
+  read-set hoist** (11.6–12.4 → 0.4 ms/prefill step, CP2×TP2) + **S5 stats
+  decimation** (48.2 → 16.1 µs/iter, p99 69 → 35; exposed TPOT win ~0 at c16
+  — jitter removal; the old 100–250 µs premise was stale) + **the linear.py
+  input_scale fix itself** (drop never-initialized placeholder Parameters —
+  the fix whose absence is the CRITICAL hazard above). Also carried, both
+  opt-in/off at this commit: the wk+wp fused GEMM (then mis-flagged by the
+  zero-vs-zero gate) and the S2 ADP-collective fusion (held; moot under
+  WarpDecode+TP).
+- **Cycle 12** (shipped `68866e061`): **I5 wk+wp fused GEMM DEFAULT-ON**
+  (1.96–1.97× → ~2.0 ms/token; the v1 cos=0.0 was the input_scale bug — the
+  fusion was always correct, re-gated at cos 1.000000 / 0.999996) +
+  **single-launch CuTe gate+quant on the MoE input** (7.04 → 4.19 µs/layer,
+  −165 µs/token; LINEAR-SF `Fp4QuantizedTensor` handoff skips the MoE's own
+  quant) + **G2-absorb measured and REJECTED on routing** (top-8 overlap
+  0.965–0.988 at layers 20–60; patch recorded, not shipped).
+- **Cycle 13** (shipped `34fe7aaec`): **KVarN stale-record-on-recycle fix,
+  default-on** — pool records now invalidated on block free/recycle
+  (`invalidate_blocks` + free/rewind fan-out); the d3 stale-KV clobber on the
+  full-scan restore path is fixed; restore bit-equivalent to a never-recycled
+  universe (cos 1.0) on all 4 paths; the documented re-commit contract is now
+  actually honored. C2b.
+- **Live-hazard audit (2026-06-10)**: the pre-`5bc2b2cb8` input_scale bug
+  traced into the LIVE 002 r20 deploy — runtime-proven all-zero indexer-proj
+  outputs, DSA top-k degenerate past 8192 tokens; no escape hatch in the
+  served config. CRITICAL section added at the top of this doc; remediation
+  runbook staged (`/tmp/livehazard_work/REMEDIATION.md`); `3e03d665d`
+  indexer-triple equality claims marked vacuous (wk/wp re-proven same day;
+  wq_b re-proven in the close-out entry below).
+- **Dense-proj NVFP4 accuracy record-corrected (2026-06-10)**: the killed
+  "cos 0.63–0.83" verdict measured a corrupted reference
+  (`isSfSwizzledLayout=True` on linear-layout checkpoint scales); corrected
+  W4A4-vs-true-f32 cosines are 0.995+ everywhere (n=144, layers 5/20/45) —
+  moved to the record-corrected list. No production change (W4A4 already the
+  checkpoint-faithful mode); out-of-calibration clipping caveat recorded.
+- **0.98-bar re-screen (owner directive 2026-06-10)**: functional gates are
+  now cosine ≥ 0.98 downstream (bit-identical never required; formats
+  checkpoint-pinned: NVFP4-W4A4KV4-IndexerK4 + HISA4to1, FP/BF16 logits ok).
+  Resurrected: G2-absorb (MoE-output-cosine gate), I2 (GATE-B), H3b A/B,
+  FP4MQA formal close-out. Stays dead: K2 N=160, megakernel dispatch-fusion,
+  H4 ratio sweep, bf16 logits. See the re-screen section.
+- **FP4MQA + wq_b formal close-outs PASSED (2026-06-10, 001 GPU 4, wave2
+  image)**: (A) fp4-vs-fp8 scoring-chain GATE-B — downstream attention
+  cosine 1.000000 (fp4-set vs fp8-set, each vs the TRUE-f32 set) at all 6
+  shapes B {4,16} × kv {4.6k,33k,66k} under the production top-k routing,
+  while reproducing the cycle-4 divergence regime (fp4↔fp8 IoU 0.67–0.81) —
+  the cycle-4 FP4-scoring kill is formally retired; (B) wq_b
+  cutlass↔cuBLASLt re-gate under HEAD dynamic-quant semantics —
+  bit-identical with liveness asserted (cos 1.000000, max|diff| 0; cuBLASLt
+  1.18–1.21×, stays the pick), closing the last vacuous `3e03d665d` claim.
+  Artifacts: 001 `/tmp/fp4mqa_closeout_work/`.
+- **Queued**: live-deploy input_scale remediation rollout (owner's call,
+  CRITICAL section); M3 flip decision (LL token-limit sizing); the re-screen
+  experiments (G2-absorb MoE-output-cosine gate, I2 GATE-B on a fixed image,
+  H3b long-band A/B); C9 GPU re-validation; then N1, M1, K1 PDL. Held: S2
+  (moot under WarpDecode+TP).
