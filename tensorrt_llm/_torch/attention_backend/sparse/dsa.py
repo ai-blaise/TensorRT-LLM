@@ -3357,7 +3357,11 @@ class Indexer(nn.Module):
                 candidate_indices = (top_blocks_i64.unsqueeze(-1) *
                                      self.hisa_block_size + offsets).reshape(
                                          num_rows, candidate_len)
-                candidate_valid = candidate_indices < prefix_lens.view(-1, 1)
+                # -1-padded top_blocks slots derive negative candidate
+                # indices; they alias page 0 upstream and must be invalid.
+                candidate_valid = ((candidate_indices >= 0) &
+                                   (candidate_indices
+                                    < prefix_lens.view(-1, 1)))
                 candidate_scores = candidate_scores.masked_fill(
                     ~candidate_valid, float("-inf"))
         else:
@@ -3367,7 +3371,11 @@ class Indexer(nn.Module):
             candidate_indices = (top_blocks_i64.unsqueeze(-1) *
                                  self.hisa_block_size + offsets).reshape(
                                      num_rows, candidate_len)
-            candidate_valid = candidate_indices < prefix_lens.view(-1, 1)
+            # -1-padded top_blocks slots derive negative candidate indices;
+            # they alias page 0 upstream and must be invalid.
+            candidate_valid = ((candidate_indices >= 0) &
+                               (candidate_indices
+                                < prefix_lens.view(-1, 1)))
             candidate_pages = torch.div(candidate_indices,
                                         k_cache.shape[1],
                                         rounding_mode="floor")
@@ -3428,9 +3436,15 @@ class Indexer(nn.Module):
         candidate_indices = (top_blocks_i64.unsqueeze(-1) *
                              self.hisa_block_size + offsets).reshape(
                                  num_rows, candidate_len)
-        topk_indices = candidate_indices.gather(1, selected.long())
+        # indexer_topk_decode pads short rows' `selected` with -1; clamp for
+        # the gather and sentinel them, along with negative candidate indices
+        # from -1-padded top_blocks slots (the -1 sentinel is what
+        # convert_req_index_to_global expects for invalid entries).
+        topk_indices = candidate_indices.gather(1,
+                                                selected.clamp_min(0).long())
         topk_indices = topk_indices.masked_fill(
-            topk_indices >= prefix_lens.view(-1, 1), -1)
+            (selected < 0) | (topk_indices < 0)
+            | (topk_indices >= prefix_lens.view(-1, 1)), -1)
         if topk < self.index_topk:
             padding = torch.full((num_rows, self.index_topk - topk),
                                  -1,

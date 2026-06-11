@@ -428,7 +428,7 @@ __global__ void indexerHisaCandidatePagesKernel(int32_t const* __restrict__ topB
 
 __global__ void indexerHisaMaskScoresKernel(float* __restrict__ candidateScores,
     int32_t const* __restrict__ topBlocks, int32_t const* __restrict__ prefixLens, int32_t numRows, int32_t blockTopK,
-    int32_t candidateLen, int32_t blockSize)
+    int32_t candidateLen, int32_t blockSize, int64_t scoreStride0)
 {
     int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     int total = numRows * candidateLen;
@@ -438,18 +438,26 @@ __global__ void indexerHisaMaskScoresKernel(float* __restrict__ candidateScores,
     }
     int row = idx / candidateLen;
     int col = idx - row * candidateLen;
+    // The paged MQA logits output is row-padded (scoreStride0 > candidateLen);
+    // flat indexing would drift every row > 0's writes into the wrong slots.
+    int64_t dst = static_cast<int64_t>(row) * scoreStride0 + col;
     int blockSlot = col / blockSize;
     if (blockSlot >= blockTopK)
     {
-        candidateScores[idx] = -FLT_MAX;
+        candidateScores[dst] = -FLT_MAX;
         return;
     }
     int offset = col - blockSlot * blockSize;
     int topBlock = topBlocks[row * blockTopK + blockSlot];
     int token = topBlock * blockSize + offset;
-    if (token >= prefixLens[row])
+    // token < 0 marks a -1-padded top_blocks slot (indexer_topk_decode pads
+    // short rows: block_counts < block_topk). Its candidate page aliased
+    // logical page 0 in indexerHisaCandidatePagesKernel, so the GEMM scored a
+    // live sink-token duplicate there; mask it so padding cannot displace
+    // real candidates in the candidate top-k.
+    if (token < 0 || token >= prefixLens[row])
     {
-        candidateScores[idx] = -FLT_MAX;
+        candidateScores[dst] = -FLT_MAX;
     }
 }
 
@@ -471,10 +479,16 @@ __global__ void indexerHisaRemapSelectedKernel(int32_t const* __restrict__ selec
         int selectedOffset = selected[row * selectedTopK + col];
         int blockSlot = selectedOffset / blockSize;
         int offset = selectedOffset - blockSlot * blockSize;
-        if (blockSlot >= 0 && blockSlot < blockTopK)
+        // selectedOffset >= 0: indexer_topk_decode emits -1 for rows shorter
+        // than the top-k; truncating division maps -1 to blockSlot 0, which
+        // would mis-remap the pad entry into block 0. token >= 0: a selected
+        // slot of a -1-padded top_blocks entry derives a negative token; both
+        // must keep the -1 sentinel that the downstream consumers
+        // (convert_req_index_to_global, sparse MLA) expect for invalid slots.
+        if (selectedOffset >= 0 && blockSlot < blockTopK)
         {
             int token = topBlocks[row * blockTopK + blockSlot] * blockSize + offset;
-            if (token < prefixLens[row])
+            if (token >= 0 && token < prefixLens[row])
             {
                 value = token;
             }
@@ -665,7 +679,8 @@ void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* bl
 }
 
 void invokeIndexerHisaMaskScores(float* candidateScores, int32_t const* topBlocks, int32_t const* prefixLens,
-    int32_t numRows, int32_t blockTopK, int32_t candidateLen, int32_t blockSize, cudaStream_t stream)
+    int32_t numRows, int32_t blockTopK, int32_t candidateLen, int32_t blockSize, int64_t scoreStride0,
+    cudaStream_t stream)
 {
     if (numRows == 0 || candidateLen == 0)
     {
@@ -673,11 +688,13 @@ void invokeIndexerHisaMaskScores(float* candidateScores, int32_t const* topBlock
     }
     TLLM_CHECK_WITH_INFO(blockTopK > 0, "indexer_hisa_mask_scores requires block_topk > 0");
     TLLM_CHECK_WITH_INFO(blockSize > 0, "indexer_hisa_mask_scores requires block_size > 0");
+    TLLM_CHECK_WITH_INFO(
+        scoreStride0 >= candidateLen, "indexer_hisa_mask_scores requires score row stride >= candidate_len");
     constexpr int kThreads = 256;
     int total = numRows * candidateLen;
     int blocks = (total + kThreads - 1) / kThreads;
     indexerHisaMaskScoresKernel<<<blocks, kThreads, 0, stream>>>(
-        candidateScores, topBlocks, prefixLens, numRows, blockTopK, candidateLen, blockSize);
+        candidateScores, topBlocks, prefixLens, numRows, blockTopK, candidateLen, blockSize, scoreStride0);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
