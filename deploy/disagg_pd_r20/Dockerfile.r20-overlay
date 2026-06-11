@@ -123,4 +123,12 @@ RUN /opt/dynamo/venv/bin/python -m py_compile \
     ${SITE_PACKAGES}/tensorrt_llm/executor/rpc_worker_mixin.py \
     ${SITE_PACKAGES}/tensorrt_llm/executor/worker.py
 
+# NEW module files (not edits to listed ones) land here — a missing entry is
+# an instant worker ImportError crashloop, invisible to grep-the-Dockerfile
+# coverage checks. Verify with: docker run IMAGE test -f <site-packages path>.
+COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/fused_lowrank_gate.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/fused_lowrank_gate.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/modules/cute_lowrank_gate.py ${SITE_PACKAGES}/tensorrt_llm/_torch/modules/cute_lowrank_gate.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fused_moe_megakernel.py ${SITE_PACKAGES}/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fused_moe_megakernel.py
+COPY --chown=dynamo:0 tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fused_moe_megakernel_jit.py ${SITE_PACKAGES}/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fused_moe_megakernel_jit.py
+
 USER dynamo
