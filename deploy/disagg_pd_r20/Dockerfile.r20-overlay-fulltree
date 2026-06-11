@@ -1,0 +1,29 @@
+# Full-tree Python overlay: copy the ENTIRE repo tensorrt_llm/ package over
+# site-packages instead of a curated COPY list. The curated list
+# (Dockerfile.r20-overlay) rotted twice in one day — a missing NEW module is
+# an instant worker ImportError crashloop, and a missing EDITED file is a
+# stale-code mismatch (e.g. PerfMetricsManager 'decimate' TypeError) that
+# presence-checks cannot catch. The repo tree carries no compiled artifacts
+# (bindings/, libs/, *.so are absent or dockerignored), so this is strictly a
+# Python overlay on the base image's runtime — same scheme the bench
+# container validates. ABI caveat from the curated Dockerfile still applies:
+# the base image's .so must be from the same C++ lineage as the Python tree
+# (here: 0be07d6df-era C++, which HEAD's Python targets).
+#
+# Build:
+#   docker build -f deploy/disagg_pd_r20/Dockerfile.r20-overlay-fulltree \
+#     --build-arg BASE_IMAGE=<proven base> -t <registry>/<name>:<tag> .
+# Verify (content, not presence):
+#   for every changed file: md5(repo) == md5(image site-packages)
+ARG BASE_IMAGE=local/dynamo-trtllm-optrt-custom:r20-nixl-layersplit-base
+FROM ${BASE_IMAGE}
+USER root
+
+LABEL ai.blaise.r20-overlay="fulltree"
+
+ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages
+
+COPY --chown=dynamo:0 tensorrt_llm/ ${SITE_PACKAGES}/tensorrt_llm/
+RUN find ${SITE_PACKAGES}/tensorrt_llm -name __pycache__ -type d -prune -exec rm -rf {} + || true
+
+USER dynamo
