@@ -13,9 +13,22 @@ Phase-3 deltas (each compile-time gated for A/B):
   table, no nv=0 padding walk: the live bound nnet*(FC1_B+FC2_B) is read on
   device per invocation (the production num_non_exiting_tiles pattern), so
   a CUDA graph captured once replays correctly for ANY routing. Remaining
-  mutable state is the fc1_done counters + pop cursor: one [n_tiles+2] i32
-  buffer zeroed by a single graphed fill node (replaces the phase-2
-  two-launch eager reset).
+  mutable state is the fc1_done counters + pop cursor + exit counter: one
+  [n_tiles+2] i32 buffer that the kernel SELF-RESETS (the last CTA out,
+  detected by an acq_rel exit fetch-add in the spare slot, re-zeroes it),
+  so an invocation needs no host fill node at all (zeroed once at alloc;
+  replaces the phase-2 two-launch eager reset and the earlier phase-3
+  fill: ~9us as an eager fill, ~1.2us as a graph node -- both measured).
+
+* pipelined pop -- the scheduler issues the NEXT item's cursor fetch-add
+  at the top of the loop body and consumes it (shfl) at the tail, so the
+  atomic's L2 round trip overlaps the current item's decode + dependency
+  spin + dispatch instead of serializing between items. Measured B200,
+  20-tile decode shape, graphed: variant C 91.7 -> 85.95us with the fill
+  still in-graph; with the self-reset too, 84.77us vs the production
+  2-kernel chain's 90.74us (-6.6%) -- the persistent grid now BEATS the
+  chain it replaces, with bit-equal c_q/sf and outputs at the same
+  requant floor (cos 0.996 vs true f32, equal to prod's own).
 
 * ``dyn_pop`` -- CTAs pop the queue through a global atomic cursor instead
   of the static item = bidx + k*grid partition. FC1-first pop order keeps
@@ -151,6 +164,22 @@ def atom_add_ret_u32(ptr: cute.Pointer, val: cutlass.Int32, *, loc=None,
             [ptr.toint(loc=loc, ip=ip).ir_value(),
              cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
             "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r", has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT))
+
+
+@dsl_user_op
+def atom_acq_rel_add_ret_u32(ptr: cute.Pointer, val: cutlass.Int32, *,
+                             loc=None, ip=None) -> cutlass.Int32:
+    """Acq-rel gpu-scope fetch-add (the exit counter): release-orders this
+    CTA's prior done[] publishes; acquire gives the last-out winner
+    visibility of every other CTA's publishes before its self-reset."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr.toint(loc=loc, ip=ip).ir_value(),
+             cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
             "=r,l,r", has_side_effects=True, is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT))
 
@@ -920,6 +949,18 @@ class MegaPersistentMoEKernel:
                 item = shfl_idx_b32(popped, cutlass.Int32(0))
 
             while item < n_live:
+                # Software-pipelined pop: issue the NEXT item's fetch-add at
+                # the top of the body so its L2 round trip overlaps the
+                # decode + dependency spin + dispatch below, instead of
+                # serializing between items. The shfl at the loop tail is
+                # the consume point (the register dependency stalls there,
+                # by which time the atomic has long landed).
+                popped_next = cutlass.Int32(0)
+                if cutlass.const_expr(self.dyn_pop):
+                    if lane_idx == 0:
+                        popped_next = atom_add_ret_u32(
+                            elem_ptr(mDone, (self.n_tiles_bound,)),
+                            cutlass.Int32(1))
                 stage = cutlass.Int32(0)
                 m_tile = cutlass.Int32(0)
                 n_blk = cutlass.Int32(0)
@@ -963,12 +1004,7 @@ class MegaPersistentMoEKernel:
                 tile_info_pipeline.producer_commit(tile_info_producer_state)
                 tile_info_producer_state.advance()
                 if cutlass.const_expr(self.dyn_pop):
-                    popped = cutlass.Int32(0)
-                    if lane_idx == 0:
-                        popped = atom_add_ret_u32(
-                            elem_ptr(mDone, (self.n_tiles_bound,)),
-                            cutlass.Int32(1))
-                    item = shfl_idx_b32(popped, cutlass.Int32(0))
+                    item = shfl_idx_b32(popped_next, cutlass.Int32(0))
                 else:
                     item = item + gdim
 
@@ -1964,6 +2000,22 @@ class MegaPersistentMoEKernel:
 
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
+            # In-kernel self-reset: the last CTA out re-zeroes the done
+            # counters + pop cursor + exit slot, so the next invocation
+            # needs NO host fill node (the buffer is zeroed once at alloc).
+            # Ordering: this CTA's done[] red.release publishes precede the
+            # epilog barrier above; the acq_rel fetch-add then release-
+            # orders them for other CTAs and acquire-orders every other
+            # CTA's publishes for the winner, whose plain re-zero stores
+            # are ordered before the next invocation by kernel completion.
+            if warp_idx == self.epilog_warp_id[0]:
+                if tidx % 32 == 0:
+                    exit_old = atom_acq_rel_add_ret_u32(
+                        elem_ptr(mDone, (self.n_tiles_bound + 1,)),
+                        cutlass.Int32(1))
+                    if exit_old == gdim - 1:
+                        for ri in cutlass.range(self.n_tiles_bound + 2):
+                            mDone[ri] = cutlass.Int32(0)
             tmem.free(tmem_ptr)
             c_pipeline.producer_tail()
 
@@ -2327,7 +2379,9 @@ def run_mega_persistent_moe_v2(
         inst.items_dummy = probe.items_dummy
         _V2_CACHE[key] = inst
 
-    inst.donecur.zero_()
+    # No per-call reset: the kernel self-resets the done/cursor/exit buffer
+    # (the last CTA out re-zeroes it), so the only zeroing is the one-time
+    # torch.zeros at instance alloc. Saves a fill node per MoE layer.
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     inst.compiled(*build_args(inst), stream)
     return moe_output

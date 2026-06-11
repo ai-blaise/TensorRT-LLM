@@ -451,7 +451,7 @@ no longer the top hill-climb priority.
 | K1 | PDL coverage completion | kernel | +1–3% | planned |
 | ~~K2~~ | ~~FC2 N-tile 256→160~~ | kernel | **N=160 is numerically broken** (SFB miscompute, cos 0.790 vs TRUE f32; + prefill M=1024 OOB) | **KILLED** `29f492b49`→`d01737397` — see killed list |
 | L1 | z.ai dense-broadcast overlap | prefill | exposed broadcast 65–82 → 2.5–8.2 ms/step; **TTFT −544 ms @64k, ~−1.1 s @128k** | **SHIPPED default-on** `0a1504755` (20/20 correctness, both ranks, CP2 + real fp8_fp4 scoring) |
-| P1 | Persistent decode-layer megakernel | kernel | dispatch fusion itself Δ≈0 under PDL (the −13.9% previously attributed to it was K2's broken N=160); structural case now MEASURED: **1.13 µs/launch removable × 300–500 launches = 340–565 µs/step**; re-profile: the expert-GEMM chain is **7.2 ms/step (23.3 %)** | **phases 1–2 VALIDATED** (persistent 148-CTA control plane cos 0.999992 vs prod; tcgen05/TMA mainloop at **PARITY**, 91.7 vs 90.4 µs graphed); **phase 3 IN FLIGHT** (dynamic producer + wave packing + glue absorption); shipped op stays opt-in (`MOE_MEGAKERNEL`), FC2_N default 256 `e105fd7a1` |
+| P1 | Persistent decode-layer megakernel | kernel | **BEATS the prod chain: 84.77 vs 90.74 µs graphed (−6.6 %/layer ≈ −0.35 ms/step when flipped on)**; structural case also MEASURED: 1.13 µs/launch removable × 300–500 launches = 340–565 µs/step; the expert-GEMM chain is 7.2 ms/step (23.3 %) | **phase 3 LANDED opt-in** (`TRTLLM_OPTRT_MOE_MEGAKERNEL_V2`) and self-optimized past prod: device producer (graph-safe for ANY routing) + dyn-pop with **pipelined pop** (91.7 → 85.95 µs) + **in-kernel self-reset** (host fill node eliminated → 84.77 µs); gates bit-equal c_q/sf + 0.996 requant floor + ~520-replay self-reset soak + donecur-zero exit; default flip awaits the e2e A/B; FC2_N default 256 `e105fd7a1` |
 | MO1 | MORI-style generation-first / write-mode handoff | transport | TTFT ~−12–17 ms @8k / ~−20–27 ms @64k intra-node fp8 (estimate) | **DEPLOY-READY** — release `_core.abi3.so` built in the target image (cargo test 18/18 `prefill_router`; GPU-7 smoke 39/39 incl. 5 gen-first tests); python activation gap **closed** (legacy-path port, +113 lines, ZERO manifest delta); `INSTALL_RUNBOOK.md` staged; rollout = owner's call (see MO1) |
 
 ---
@@ -1212,8 +1212,34 @@ single-`@cute.jit` artifact + `decode_1cta` tiles. Composes with WarpDecode on
 the MoE side; attention-side persistent chain (q_a/q_b/rope/gather/FMHA) is the
 companion.
 
-**Status (2026-06-11): phases 1–2 VALIDATED, phase 3 IN FLIGHT** — the
-composite re-profile re-ranks the expert-GEMM chain at **7.2 ms/step
+**Status (2026-06-11): phase 3 LANDED opt-in and self-optimized PAST the
+production chain.** `TRTLLM_OPTRT_MOE_MEGAKERNEL_V2` (default OFF pending the
+e2e A/B) ships the device producer (work items derived on device from the
+moe_sort outputs — one captured graph replays for ANY routing) + dyn-pop
+scheduling. Two post-landing optimizations (B200, 20-tile decode shape,
+graphed, artifacts 001 `/tmp/mega_opt_work/`):
+
+- **Pipelined pop** — the scheduler issues the next item's cursor fetch-add
+  at the top of the loop body and consumes it (shfl) at the tail, hiding the
+  atomic's L2 round trip under the current item's decode/spin/dispatch
+  instead of serializing between items: variant C **91.7 → 85.95 µs**.
+- **In-kernel self-reset** — the last CTA out (acq_rel exit fetch-add in the
+  spare done-buffer slot) re-zeroes the done/cursor/exit words, eliminating
+  the per-invocation host fill node entirely (~9 µs eager / ~1.2 µs as a
+  graph node): **→ 84.77 µs vs the production 2-kernel chain's 90.74 µs
+  (−6.6 %)** — the persistent grid now BEATS the chain it replaces,
+  ≈ −0.35 ms/step across 58 MoE layers once flipped on.
+
+Gates (both optimizations): producer A/B/C bit-equal c_q/sf + out cos
+0.99999 across random/same8/spread routings; 0.996 vs true f32 (= prod's own
+requant floor); replay gates across routings; **post-timing cos after ~520
+consecutive replays, each chained through the previous replay's in-kernel
+self-reset** (0.996024 — the reset soak); `donecur` all-zero at exit. The
+experimental `absorb_quant` (D) variant remains broken (cos 0.139,
+pre-existing — runs 3/4/5 identical; isolated to the quant-staging half,
+E2 split passes 0.996) and is NOT in the shipped wrapper (absorb pinned off).
+
+The composite re-profile re-ranks the expert-GEMM chain at **7.2 ms/step
 (23.3 %**: expert 3.95 + fc1 2.08 + fc2 1.13 ms, still spanning nvjet_ootst
 at 193 launches/step + cutlass3x + DSL persistent launches**)**, making the
 persistent worker grid the standing multi-day lever (re-profile target #2).
@@ -1803,9 +1829,12 @@ bar-irrelevant — and stands.
   sizing −1.48–1.57 ms/step median + tail-class elimination; ADP +
   `moe_tp_size=1` precondition feeds the ADP-vs-TP call); **MO1 install**
   (deploy-ready; owner's call); **N1 NUMA-pin snippet** (rides the rollout
-  manifest edit). **In flight: the C9 wedge bisect; megakernel phase 3
-  (dynamic producer + wave packing + glue absorption); the LL adapter
-  give-back (0.7–0.9 ms/step)**. Then: I2 GATE-B real-activation dump
-  (unblocked — fixed image on 001); a kv ≫ 1024 profiling leg (the
-  long-kv indexer-share check); M1, K1 PDL, H3a/H3c. Parked: C9 (wedge
-  reproduced; bisect in flight). Held: S2 (moot under WarpDecode+TP).
+  manifest edit). **In flight: the LL adapter give-back (0.7–0.9
+  ms/step)**. Then: the megakernel-v2 e2e A/B (it now beats the chain at
+  the kernel level — the default flip needs the serving A/B); I2 GATE-B
+  real-activation dump (unblocked — fixed image on 001); a kv ≫ 1024
+  profiling leg (the long-kv indexer-share check); M1, K1 PDL, H3a/H3c.
+  Resolved since: the C9 wedge (root-caused + fixed `e7cbc9b06`, IPC
+  stays opt-in); megakernel phase 3 (landed `db0c1b41d`, then
+  self-optimized past prod: pipelined pop + in-kernel self-reset, 91.7 →
+  84.77 µs vs prod 90.74 — see P1). Held: S2 (moot under WarpDecode+TP).
