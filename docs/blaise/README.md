@@ -20,10 +20,11 @@ in `0a1504755`) — rather than chasing the bandwidth roofline.
 fixed image with the **full shipped stack default-on** measures
 **30.8 ms/step/GPU, −26.1 % vs the 2026-06-10 baseline (41.7 ms),
 composition CLEAN** (rc=0, zero tracebacks/NaN). Current ranking: MoE 74.6 %
-(a2a 48.4 % eager-exposed, expert GEMMs 23.3 %), dense-proj 10.0 %,
-norm/rope/quant 5.4 %, glue 5.3 %, sparse-MLA 2.5 %, Indexer 1.3 %, HISA
-0.7 %. The per-stage deltas map to commits — see the methodology section of
-[optimization_candidates.md](optimization_candidates.md).
+(a2a 48.4 % eager-exposed — **14–15 % truly exposed under graphs+overlap**,
+per the 2026-06-11 a2a-graphed sizing — expert GEMMs 23.3 %), dense-proj
+10.0 %, norm/rope/quant 5.4 %, glue 5.3 %, sparse-MLA 2.5 %, Indexer 1.3 %,
+HISA 0.7 %. The per-stage deltas map to commits — see the methodology
+section of [optimization_candidates.md](optimization_candidates.md).
 
 Every piece here is **production code**. Each was validated by *kernel-level*
 correctness (top-k set match / partial-O + LSE / numerical cosine vs a torch
@@ -58,7 +59,7 @@ a correctness signal — see "Validation philosophy" below).
 | 16 | SMC-SD: static-particle speculative decode | [smc_sd.md](smc_sd.md) | draft validated; e2e in progress | opt-in (draft model) |
 | 17 | LayerSplit: per-layer CP KV/indexer-K split | [../source/features/layersplit.md](../source/features/layersplit.md) | 21× broadcast latency @ scale | opt-in (`layersplit_enabled`) |
 | 18 | Topology + deploy: DP2/TP4 disaggregated decode | [topology_deploy.md](topology_deploy.md) | DP2/TP4 best (64/49/41/40) | deployment choice |
-| 19 | tok/s/user optimization candidates (open levers) | [optimization_candidates.md](optimization_candidates.md) | re-profile 30.8 ms/step (−26.1 %); ranked plan: MoE a2a (M3 flip + graphed re-measure), expert-GEMM megakernel (P1), dense-proj batching (B2) | living hill-climb plan |
+| 19 | tok/s/user optimization candidates (open levers) | [optimization_candidates.md](optimization_candidates.md) | re-profile 30.8 ms/step (−26.1 %); ranked plan: MoE a2a (M3 flip GO, graphed sizing −1.48–1.57 ms/step), expert-GEMM megakernel (P1 phases 1–2 validated, phase 3 in flight), MLA gate overlap (B2 SHIPPED `833ecf794`, −0.55/−0.50 ms/step) | living hill-climb plan |
 
 > LayerSplit (17) has its canonical long-form doc at
 > `docs/source/features/layersplit.md` (on `op-trt`); WarpDecode

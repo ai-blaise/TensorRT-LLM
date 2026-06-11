@@ -264,13 +264,17 @@ Per-stage deltas map cleanly to commits (artifacts: 001
 > **long-kv traffic**; a kv ≫ 1024 profiling leg is the follow-up that
 > would show it.
 
-> **A2A measurement caveat:** dispatch/combine are dominated by notify/spin
+> **A2A measurement caveat — the graphed re-measure is DONE (2026-06-11):**
+> dispatch/combine in this eager profile are dominated by notify/spin
 > kernels (notify_dispatch 9.5 ms) — skew, not payload — and inflate under
 > eager launch jitter (this stage alone moved ±15 % between two same-image
-> legs while every compute stage reproduced < 1 %). **Re-measure the
-> exposed comm under graphs + overlap before sizing further a2a work**, and
-> the LL flip is REQUIRED to even engage it (the factory never auto-picks
-> LL — see M3).
+> legs while every compute stage reproduced < 1 %). The graphed+overlap
+> study quantifies the inflation: the **TRUE exposed normal-mode a2a is
+> 75–82 µs/layer = 4.35–4.75 ms/step = 14.1–15.4 % of the step** — the
+> eager 48.4 % deflates **3.4×** under graphs' lockstep (eager a2a
+> percentages measure skew attribution, not comm cost). The LL flip is
+> REQUIRED to engage any of it (the factory never auto-picks LL) and its
+> honest step-level win is −1.48–1.57 ms/step — see M3.
 
 Lineage: the campaign's original "Indexer is 50–74 % of TPOT" premise
 described the pre-campaign state. The first eager c16 profile (2026-06)
@@ -279,9 +283,10 @@ which an "indexer FSSS cub select" slice (~3 %) was a **MISATTRIBUTION**
 (KVarN restore host-path compaction — 671 ATen cub kernels + 183 D2H syncs
 per step-rank selecting an EMPTY set — fixed as C4 in `0a1504755`). The
 composite re-profile above is the current source of truth; the ranked
-levers follow it: MoE a2a (M3 flip + graphed re-measure), the expert-GEMM
-chain (P1 megakernel, phase-1 in flight), the dense-proj residual (B2, in
-flight).
+levers follow it: MoE a2a (M3 flip — graphed step-level sizing DONE, see
+M3), the expert-GEMM chain (P1 megakernel — phases 1–2 validated, phase 3
+in flight), the dense-proj residual (B2 — CLOSED by the `833ecf794`
+gate-overlap ship).
 
 ### The two batch regimes (DP4 vs TP16)
 
@@ -358,10 +363,11 @@ disabling it:
 | NVFP4 indexer-K (MX E2M1+UE8M0) | on | score→top-k fusion measured net-zero under graphs — killed |
 | Indexer decode top-k | on — prod live-kv routes to vanilla C++ (`841f9874a`), DSL only at kv ≥ 16k; **short-band auto-default restored to `index_topk` (`8e44aeae1`)** — kv ≤ 1024 graphs capture indexer-FREE again; dead `_DSL_TOPK_MIN_COLS` removed | fp16 logits (`indexer_logits_dtype=auto`→fp16 on the DSL path, `3e03d665d`) |
 | MLA / MLP / indexer proj GEMM backend | on — cuBLASLt forced for the NVFP4 proj Linears (`TRTLLM_MLA_PROJ_NVFP4_BACKENDS` + `TRTLLM_DSV3_MLP_NVFP4_BACKENDS` + `TRTLLM_INDEXER_NVFP4_BACKENDS`, default `cublaslt`) | 1.2–2.1× per GEMM (B1, `4220bf4bd`+`3e03d665d`); bit-identical on the MLA/MLP set — the indexer-triple equality was vacuous pre-input_scale-fix; full triple re-proven post-fix (wk/wp `wkwp_driver2`, wq_b close-out B; CRITICAL section) |
+| MLA output-gate overlap | on (`TRTLLM_OPTRT_MLA_GATE_OVERLAP=1` default, `833ecf794`) | gate_proj is AT SOL (6.65 TB/s vs the 6.53 TB/s copy ceiling — no per-kernel lever; NVFP4 gate format-blocked); the win is scheduling: c=2 side-stream fork at MLA entry / event-join at the sigmoid·mul, BITEXACT, **−0.55/−0.50 ms/step** (B2) |
 | Indexer wk+weights_proj fused GEMM | on (`68866e061`, `TRTLLM_INDEXER_FUSE_WK_WP=1` default) | 1.96–1.97× → **~2.0 ms/token**; also halves the dynamic amax+quantize work (I5) |
 | Gated-norm / glue | on — `fused_lowrank_gate` with the CuTe DSL kernel as default impl (`TRTLLM_OPTRT_LOWRANK_GATE_IMPL=cute`, `33e801fd1`) + fused sigmoid·mul at both attention gate sites + **single-launch gate+NVFP4-quant on the MoE input** (`68866e061`) + **dense-MLP (layers 0–2) gate→quant handoff, swizzled-SF epilogue** (`TRTLLM_OPTRT_GATED_PREMLP_QUANT`, `8e44aeae1`) | −91.6 % on the gated-norm chain (G1); the quant epilogue takes the chain 7.04 → 4.19 µs/layer (−165 µs/tok, G2 chain); dense-MLP handoff 4→3 kernels, ~6–8 µs/tok, bit-exact; absorb **CLOSED PERMANENTLY** (MoE-output cosine FAIL, see G2) |
 | Shared-expert swiglu+FP4-out fusion | on at decode M — `_FP4OUT_MIN_M=128` guard lifted (`fd705a6f5`) | exact vs TRUE-f32 (cos 1.0, max_abs 0.0) at every m |
-| MoE EP comm | NVLINK_TWO_SIDED today; DeepEP low-latency **DECIDED GO** (M3, 2026-06-11) — env delta staged | `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + **explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`** (the "inversion at 64" was an artifact — see M3); **topology precondition: ADP + `moe_tp_size=1`, inert under plain TP** |
+| MoE EP comm | NVLINK_TWO_SIDED today; DeepEP low-latency **DECIDED GO** (M3, 2026-06-11) — env delta staged; **graphed step-level sizing done: flip = −1.48–1.57 ms/step median + kills the 3.7 ms-class normal-mode tail** | `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + **explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`** (the "inversion at 64" was an artifact — see M3); **topology precondition: ADP + `moe_tp_size=1`, inert under plain TP** |
 | NIXL transport + request pinning + Moondream overlap | on | generation-first/write-mode is the open gate |
 
 HISA stays **enabled whenever the Indexer is on**. HISA is a core part of the
@@ -385,43 +391,48 @@ no longer the top hill-climb priority.
    owner's decision** (live workload). Every future build must carry
    ≥ `5bc2b2cb8` **and ≥ `31e0b5be7`** (the HISA AOT fix — second hazard
    section).
-2. **MoE a2a — the top lever by the composite re-profile (48.4 % of the
-   eager step)**: apply the staged M3 LL env delta
-   (`/tmp/m3_sizing_work/production_env_delta.yaml`:
+2. **MoE a2a — graphed step-level sizing DONE (2026-06-11; see M3)**: the
+   TRUE exposed normal-mode a2a under graphs+overlap is **4.35–4.75
+   ms/step (14–15 % of the step)** — the eager 48.4 % deflates 3.4× — and
+   the M3 flip buys a **median −1.48–1.57 ms/step (4.8–5.1 %) plus
+   eliminates the 3.7 ms-class normal-mode tail**. Apply the staged LL env
+   delta (`/tmp/m3_sizing_work/production_env_delta.yaml`:
    `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + explicit
    `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`) — **REQUIRED, the comm factory never
    auto-picks LL at defaults**; topology precondition ADP + `moe_tp_size=1`
-   (`communication_factory.py:126`, feeds the ADP-vs-TP call) — and
-   **re-measure the exposed comm under graphs + overlap** (the eager spin
-   kernels inflate ±15 % leg-to-leg; every compute stage reproduces < 1 %).
+   (`communication_factory.py:126`, feeds the ADP-vs-TP call). Post-flip
+   lever in flight: the **LL adapter give-back, 0.7–0.9 ms/step**.
 3. **Expert-GEMM chain (7.2 ms/step, 23.3 % of the re-profile)** → the
-   single-CTA persistent megakernel — **phase-1 in flight** (P1).
-4. **Dense-proj residual (B2, in flight)** — `nvjet_tst_128x8` 38 µs/call
-   × 61/step is latency-bound, not FLOP-bound; cross-layer / per-layer
-   batching.
+   single-CTA persistent megakernel — **phases 1–2 VALIDATED** (control
+   plane + tcgen05/TMA parity), **phase 3 in flight** (P1).
+4. **Dense-proj residual (B2) — CLOSED, SHIPPED `833ecf794`**: gate_proj
+   is AT SOL (6.65 TB/s vs the 6.53 copy ceiling; backend sweep exhausted;
+   NVFP4 gate format-blocked), so the lever was scheduling — the side-stream
+   gate overlap hides **−0.55/−0.50 ms/step**; the ~1.78 ms residual is
+   irreducible weight reads, megakernel-lane territory.
 5. The remainder: I2 GATE-B real-activation dump (unblocked by the fixed
    image); **MO1 is DEPLOY-READY** (release `.so` built + the activation
    gap closed + runbook staged; rollout = owner's call); the 0.98-bar
    re-screen stays settled (G2-absorb closed permanently, H3b dead, FP4MQA
    + wq_b close-outs passed); then N1 (rides the rollout manifest edit),
-   M1, K1 PDL, H3a/H3c. C9 stays **parked** (the IPC channel wedges under
-   the L1 overlap pattern); S2 held (moot under WarpDecode+TP). **Shipped
-   this round: `8e44aeae1` (I3 closed dead + short-band default restore +
-   dense-MLP gate+quant handoff) + `31e0b5be7` (the HISA pad-poisoning /
-   logits-stride correctness fix).**
+   M1, K1 PDL, H3a/H3c. C9 stays **parked** — the wedge is now
+   **REPRODUCED in a minimal harness** (first IPC mailbox publish never
+   observed; bisect in flight); S2 held (moot under WarpDecode+TP).
+   **Shipped this round: `833ecf794` (B2 closed — MLA output-gate overlap,
+   −0.55/−0.50 ms/step, BITEXACT).**
 
 ## Ranked candidates
 
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
-| **M3** | **DeepEP low-latency production flip** (`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`) | comm | LL wins at **every** point: 2.4–2.5× at steady c16, 2.06× worst case (actual=64); the prior "INVERTS at limit 64" was an **emulated-FFN artifact, REFUTED**; re-profile: a2a is **48.4 % of the eager step** and the env delta is **REQUIRED** (the factory never auto-picks LL) | **DECIDED GO** (2026-06-11, sizing sweep) — env delta staged; **requires ADP + `moe_tp_size=1`** (`communication_factory.py:126`); post-flip: re-measure exposed comm under graphs+overlap |
+| **M3** | **DeepEP low-latency production flip** (`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`) | comm | LL wins at **every** point: 2.4–2.5× at steady c16 a2a-level; **graphed step-level (the honest number): median −1.48–1.57 ms/step (4.8–5.1 %) + kills the 3.7 ms-class normal tail** — the TRUE exposed normal a2a is 14–15 % of the step (eager 48.4 % deflates 3.4×); env delta **REQUIRED** (the factory never auto-picks LL) | **DECIDED GO** (2026-06-11); graphed re-measure **DONE** (a2a-graphed study); env delta staged; **requires ADP + `moe_tp_size=1`** (`communication_factory.py:126`); post-flip lever in flight: LL adapter give-back 0.7–0.9 ms/step |
 | C2 | KVarN delta-restore (restore only the changed rows/blocks) | scheduler | host 48.8 → 0.3 ms/fire (147–162×); **12.1 → 0.08 ms/step amortized at TP bs=16** | **SHIPPED default-on** `5bc2b2cb8` (5-scenario lockstep equivalence PASS) |
 | G2 | Gated-norm → PRE_MOE_FUSION (chain quant-epilogue + absorb) | glue | chain: −165 µs/tok shipped; absorb floor: ~117 µs/tok — **irreducible** | **chain SHIPPED** `68866e061`; **absorb CLOSED PERMANENTLY** (2026-06-11) — MoE-output cosine FAILs every cell at the 0.98 bar (see G2) |
 | I5 | Indexer wk+wp fused GEMM (one launch + one read of x per F-layer) | indexer | fused 23.5 vs split 46.5 µs @ M=4 (1.96×) → **~2.0 ms/token** | **SHIPPED default-on** `68866e061` (the v1 cos=0.0 gate-fail was the input_scale bug, not the fusion) |
 | C4 | KVarN eager decode-restore host-path (`_kvarn_step_cand_host` host-mirror selection) | scheduler | 13.3 → 0.69 ms/61-layer step (19.4×) steady, 17.0 → 1.7 ms churn; kills the misattributed "indexer FSSS cub select ~3 %" profile slice | **SHIPPED default-on** `0a1504755` (300-trial set-equality, 0 failures) |
-| C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl; **PARKED** — the IPC channel wedges both ranks under the L1 overlap pattern; L1 ships the win NCCL-only |
+| C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl; **PARKED** — wedge **REPRODUCED in a minimal harness** (both ranks at step 0/L1, `stream_completed_through=None`: the first mailbox publish never satisfies the consumer wait; ring depth irrelevant); **bisect in flight**; NCCL fallback until root-caused |
 | B1 | cuBLASLt NVFP4 backend force: MLA proj + shared/dense MLP + indexer proj | GEMM | ~1.62 ms/tok (`4220bf4bd`) + 1.62 ms/tok incremental (`3e03d665d`, TP4); bit-identical | **SHIPPED** `4220bf4bd`+`3e03d665d`; re-profile: dense-proj bucket **−62.5 %** |
-| **B2** | **Dense-proj residual batching** (cross-layer / per-layer consolidation of the M=4 proj GEMMs; CuTe persistent variant / absorption are the alternates) | GEMM | re-profile: `nvjet_tst_128x8` **38 µs/call × 61/step = 2.33 ms** — tiny-M latency-bound, not FLOP-bound (same attack covers the 269 µs once-per-step 128×8 tail) | **IN FLIGHT** (re-profile target #3) |
+| **B2** | **Dense-proj residual → MLA output-gate overlap** (the 38 µs × 61 kernel IS the attention output gate; AT SOL ⇒ the lever is scheduling, not batching) | GEMM | gate GEMM at 6.65 TB/s vs the 6.53 copy ceiling (no per-kernel lever; NVFP4 format-blocked); side-stream c=2 overlap hides **+9.0/+8.3 µs/layer → −0.55/−0.50 ms/step**, BITEXACT; ~1.78 ms residual irreducible (megakernel-lane) | **SHIPPED default-on** `833ecf794` (`TRTLLM_OPTRT_MLA_GATE_OVERLAP`) — **lane CLOSED** |
 | G1 | Gated-norm + glue fusions (`fused_lowrank_gate` −91.6 %, fused sigmoid·mul, HISA invariant memo) + CuTe DSL port (−36 % vs Triton, default impl) | glue | −6.27 (bs4) / −9.38 (bs16) ms/step eager GPU | **SHIPPED** `3e03d665d`+`33e801fd1` |
 | I6 | fp16 indexer logits (`indexer_logits_dtype`, auto→fp16 on the DSL path) | indexer | top-k −15…−22 % @ kv ≥ 33k; logits buffer halved | **SHIPPED** `3e03d665d` |
 | I7 | Prod decode top-k → vanilla C++ (drop the stale width-override) | indexer | ~1.7× top-k @ prod live-kv (~29–33 % of the top-k pipeline) | **SHIPPED** `841f9874a` |
@@ -440,7 +451,7 @@ no longer the top hill-climb priority.
 | K1 | PDL coverage completion | kernel | +1–3% | planned |
 | ~~K2~~ | ~~FC2 N-tile 256→160~~ | kernel | **N=160 is numerically broken** (SFB miscompute, cos 0.790 vs TRUE f32; + prefill M=1024 OOB) | **KILLED** `29f492b49`→`d01737397` — see killed list |
 | L1 | z.ai dense-broadcast overlap | prefill | exposed broadcast 65–82 → 2.5–8.2 ms/step; **TTFT −544 ms @64k, ~−1.1 s @128k** | **SHIPPED default-on** `0a1504755` (20/20 correctness, both ranks, CP2 + real fp8_fp4 scoring) |
-| P1 | Persistent decode-layer megakernel | kernel | dispatch fusion itself Δ≈0 under PDL (the −13.9% previously attributed to it was K2's broken N=160); structural persistent-kernel case unchanged; re-profile: the expert-GEMM chain is **7.2 ms/step (23.3 %)** | **code shipped, opt-in** (`MOE_MEGAKERNEL`); FC2_N default fixed 160→256 `e105fd7a1`; **phase-1 persistent worker grid IN FLIGHT** (re-profile target #2) |
+| P1 | Persistent decode-layer megakernel | kernel | dispatch fusion itself Δ≈0 under PDL (the −13.9% previously attributed to it was K2's broken N=160); structural case now MEASURED: **1.13 µs/launch removable × 300–500 launches = 340–565 µs/step**; re-profile: the expert-GEMM chain is **7.2 ms/step (23.3 %)** | **phases 1–2 VALIDATED** (persistent 148-CTA control plane cos 0.999992 vs prod; tcgen05/TMA mainloop at **PARITY**, 91.7 vs 90.4 µs graphed); **phase 3 IN FLIGHT** (dynamic producer + wave packing + glue absorption); shipped op stays opt-in (`MOE_MEGAKERNEL`), FC2_N default 256 `e105fd7a1` |
 | MO1 | MORI-style generation-first / write-mode handoff | transport | TTFT ~−12–17 ms @8k / ~−20–27 ms @64k intra-node fp8 (estimate) | **DEPLOY-READY** — release `_core.abi3.so` built in the target image (cargo test 18/18 `prefill_router`; GPU-7 smoke 39/39 incl. 5 gen-first tests); python activation gap **closed** (legacy-path port, +113 lines, ZERO manifest delta); `INSTALL_RUNBOOK.md` staged; rollout = owner's call (see MO1) |
 
 ---
@@ -655,6 +666,20 @@ wedge; L1 already removes most of the exposed cost C9 targeted (the sync
 path's cost was the masked_select+unique host syncs, not wire time — see
 L1).
 
+**Wedge REPRODUCED in a minimal harness (2026-06-11); bisect in flight.**
+A standalone 2-rank repro (real LayerSplit module + IPC channel, kv 8192)
+wedges **both ranks at step 0 / layer 1** deterministically: after 20 s the
+consumer still reports `stream_completed_through=None` (r0 stalled at
+s0/L1/ids, r1 at s0/L1/idx) — **the very FIRST IPC mailbox publish never
+satisfies the consumer's wait**, and it reproduces under the plain sync
+pattern, so this is not overlap-specific backpressure. **Ring depth is
+irrelevant** (depth=2 wedges identically — no slot is ever consumed, so
+no depth can help). The bisect — publish-path visibility (pinned-host
+`cuMemcpyAsync` sequence write) vs the consumer's
+`cuStreamWaitValue64(GEQ)` semantics on the imported mailbox — is in
+flight; **C9 stays PARKED on the NCCL fallback until root-caused.**
+Artifacts: 001 `/tmp/c9_wedge_work/` (harness + forensics logs).
+
 ---
 
 ## B1 — cuBLASLt NVFP4 backend force (SHIPPED `4220bf4bd` + `3e03d665d`)
@@ -705,15 +730,45 @@ on the dense MLA proj W4A4 path ("fails accuracy, cos 0.63–0.83") has since
 been **REVERSED** — the reference was corrupted; corrected cosines are 0.995+
 everywhere (see the record-corrected list).
 
-### B2 — Dense-proj residual batching (IN FLIGHT; re-profile target #3)
+### B2 — Dense-proj residual → MLA output-gate overlap (SHIPPED `833ecf794`; lane CLOSED)
 
-Post-B1 the dense-MLA proj bucket is 3.09 ms/step (10.0 %) and its floor is
-structural, not a backend mispick: `nvjet_tst_128x8` costs **38 µs/call ×
-61 calls/step = 2.33 ms** — a tiny-M=4 NVFP4 GEMM paying 38 µs/call is
-**latency-bound, not FLOP-bound** (the once-per-step 269 µs 128×8 tail
-kernel has the same shape problem). Attack: cross-layer / per-layer
-batching of the small proj GEMMs into fewer launches (alternates: a CuTe
-persistent variant, or absorption into adjacent kernels). In flight.
+Post-B1 the dense-MLA proj bucket is 3.09 ms/step (10.0 %); the lane
+identified its dominant line and closed it. The `nvjet_tst_128x8` kernel
+(**38 µs/call × 61 calls/step = 2.33 ms**) is **not** an NVFP4 proj — it is
+the DeepSeek-V3.2 **attention OUTPUT GATE** (`MLA.gate_proj`, bf16
+[16384, 7168], REPLICATED per rank under attention-DP ⇒ 234.9 MB of weight
+reads per layer at M=4; lm_head is the 270 µs once-per-step sibling).
+Findings (001 GPU 5, `/tmp/projbatch_work/FINDINGS.md`):
+
+- **The gate GEMM is AT SOL** — isolated 35.3 µs = **6.65 TB/s effective vs
+  the 6.53 TB/s d2d copy ceiling** (sum-read 4.58); the in-step 38.1 µs is
+  live contention, not headroom. **Backend sweep exhausted**: cublas ==
+  F.linear == matmul (same nvjet kernel); cute_dsl bf16, Triton, and
+  chunked-alone all worse or parity-at-best. No per-kernel lever exists.
+- **NVFP4 gate is FORMAT-BLOCKED**: the checkpoint ships the gate bf16
+  (Linear constructed with quant_config=None); an fp4 gate (~59 MB,
+  ~1.6 ms/step back) is documented, not pursued — format mandate.
+- **The win is SCHEDULING**: the gate GEMM reads only `hidden_states`
+  (live at attention entry) and is consumed only by the post-attention
+  sigmoid·mul ⇒ legal to run on a side stream overlapping the **entire
+  attention block**. Shipped as a c=2-chunked side-stream launch — fork at
+  MLA entry, event-join right before `fused_sigmoid_mul`; c=2 fits the
+  inter-kernel windows (a monolithic kernel hides poorly next to big-GEMM
+  exclusivity windows; the limit is exclusivity, not DRAM — span demand
+  ~1.2 TB/s ≪ the 6.5 ceiling). Under CUDA graphs the fork is genuinely
+  concurrent (canary-verified); eager keeps the inline path (eager fork
+  serializes — the multi-stream gate is correct). Default-on,
+  `TRTLLM_OPTRT_MLA_GATE_OVERLAP=0` kill-switch to inline.
+- **Gates**: **BITEXACT** (`torch.equal`) vs the inline path on every arm
+  at M ∈ {4,16}; multi-stream-OFF fallback time-neutral. Timing (graph
+  replay): **+9.0/+8.3 µs hidden per layer → −0.55/−0.50 ms/step** on the
+  dense-proj stage (1.8–2.0 % of the step).
+- **Residual closure**: of the 2.33 ms gate cost, **~1.78 ms (61 ×
+  ~29 µs) is irreducible** — at-SOL bf16 weight reads sitting in big-kernel
+  exclusive windows; only the (blocked) format change or attention-span
+  restructuring (the megakernel lane) can touch it. The other dense-proj
+  lines (q/kv BMMs, o_proj) are already fp4 + cuBLASLt-forced (B1).
+  **Lane closed.**
 
 ## G1 — Gated-norm + glue fusions (SHIPPED `3e03d665d` + `33e801fd1`)
 
@@ -965,7 +1020,7 @@ Moved to the killed list; do not rebuild.
 
 ## MoE / communication
 
-### M3 — DeepEP low-latency production flip (enablement SHIPPED `51918fba2`; **DECIDED GO 2026-06-11**)
+### M3 — DeepEP low-latency production flip (enablement SHIPPED `51918fba2`; **DECIDED GO 2026-06-11**; graphed step-level sizing DONE)
 The top open lever per the composite re-profile: **a2a = 48.4 % of the eager
 step** (dispatch 11.0 ms + combine 3.8 ms/step — dominated by notify/spin
 kernels, i.e. skew not payload, and inflated under eager launch jitter:
@@ -973,9 +1028,50 @@ kernels, i.e. skew not payload, and inflated under eager launch jitter:
 consequences: **the flip is REQUIRED, not optional** — at pure defaults the
 comm factory never auto-picks LL (the re-profile leg fell back to
 DeepEP-normal; NVLink one/two-sided additionally die on `pidfd_getfd`
-without SYS_PTRACE — a prod-container-spec candidate) — and the post-flip
-exposed comm must be **re-measured under graphs + overlap** before sizing
-further a2a work.
+without SYS_PTRACE — a prod-container-spec candidate) — and the eager 48.4 %
+must NOT be read as the flip's prize: the graphed+overlap re-measure (the
+step-level sizing block below) shows the truly exposed a2a is **14–15 % of
+the step** and the flip's honest median win is **−1.48–1.57 ms/step**.
+
+**Graphed step-level sizing (2026-06-11, a2a-graphed study — the honest
+numbers; artifacts 001 `/tmp/a2a_graphed_work/SUMMARY.md`).** Two
+independent methods agree (EP2, prod per-rank load: 32 experts/rank, top-8,
+graphed per-layer MoE block replica with the shipped gate+quant kernel and
+the aux-stream shared-expert fork; v2 = a 4-layer ONE-graph slice with a
+compute-only CONTROL arm whose recv multiset matches the real dispatch —
+subtractive exposure, net-of-floor by construction; 300 replays/arm, ranks
+agree to ~1 µs):
+
+- **TRUE exposed normal-mode a2a under graphs+overlap: 75–82 µs/layer =
+  4.35–4.75 ms/step = 14.1–15.4 % of the 30.8 ms step.** The eager 48.4 %
+  **deflates 3.4×**: in eager, notify_dispatch + cached_notify_combine carry
+  1.0–2.7 ms/step of PEER-WAIT SPIN (per-rank eager a2a "share" ranged
+  17–79 % run-to-run) — eager a2a percentages measure **skew attribution,
+  not comm cost**; graphs' lockstep removes most of it. Overlap hides only
+  ~5–10 µs/layer behind the shared-expert aux slice — normal-mode a2a is
+  ~90–95 % exposed at graphed steady state.
+- **LL exposed: 48–57 µs/layer = 2.81–3.28 ms/step.** **Flip verdict at
+  step level: median −1.48–1.57 ms/step = 4.8–5.1 % of the step (~7.5 % of
+  a 20.8 ms TPOT-class step)** — NOT the naive 70 µs × 58 = 4.1 ms
+  kernel-level projection (which double-counts the spin that graphs already
+  collapse). v1 (trace-based) and v2 (subtractive) agree within harness
+  spread.
+- **The tail case is the robustness argument:** the normal arm reproduced a
+  **3750 µs outlier replay** (3.4× p50 — the 3.7 ms-class spikes seen in
+  prior prod data) while **LL/control maxes stayed ≤ 1211 µs across all
+  4200 replay samples**. Injected once-per-step skew (50/200 µs on one
+  rank) passes through BOTH modes identically (~0.65–0.92× pass-through,
+  p95 tracks p50): **no super-linear in-graph barrier amplification at EP2**
+  — graphs transmit skew but do not multiply it — and LL's absolute step
+  stays strictly lower under every skew level.
+- Gates: cross-arm cosine ≥ 0.999998 on all 6 cells (t4/16/32 × rank0/1),
+  replay-vs-eager ≥ 0.999999, LL capture/replay clean everywhere (300
+  replays/arm). Caveat: EP2 models prod per-rank load, not EP4 fan-out —
+  same approximation as the sizing sweep below.
+- **Post-flip lever identified (IN FLIGHT): the LL adapter give-back** —
+  ~12–16 µs/layer of expert-major-adapter elementwise (mask/where/ones) +
+  padded-chain delta = **0.7–0.9 ms/step**; fold the adapter into moe_sort
+  or consume `recv_expert_count` natively in the cute_dsl sort.
 `51918fba2` shipped the two fixes that unblock
 `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` on the WARPDECODE decode path
 (both inert when LL is not active):
@@ -1116,11 +1212,37 @@ single-`@cute.jit` artifact + `decode_1cta` tiles. Composes with WarpDecode on
 the MoE side; attention-side persistent chain (q_a/q_b/rope/gather/FMHA) is the
 companion.
 
-**Status (2026-06-11): phase-1 IN FLIGHT** — the composite re-profile
-re-ranks the expert-GEMM chain at **7.2 ms/step (23.3 %**: expert 3.95 +
-fc1 2.08 + fc2 1.13 ms, still spanning nvjet_ootst at 193 launches/step +
-cutlass3x + DSL persistent launches**)**, making the persistent worker grid
-the standing multi-day lever (re-profile target #2).
+**Status (2026-06-11): phases 1–2 VALIDATED, phase 3 IN FLIGHT** — the
+composite re-profile re-ranks the expert-GEMM chain at **7.2 ms/step
+(23.3 %**: expert 3.95 + fc1 2.08 + fc2 1.13 ms, still spanning nvjet_ootst
+at 193 launches/step + cutlass3x + DSL persistent launches**)**, making the
+persistent worker grid the standing multi-day lever (re-profile target #2).
+
+- **Phase 1 — control plane VALIDATED** (artifacts 001 `/tmp/mega_p1_work/`):
+  a **persistent 148-CTA grid** (never more CTAs than SMs) consuming a
+  device **work-queue** under an **FC1-first deadlock-free schedule** runs
+  the full FC1→FC2 decode tile stream (20 tiles, 720 work items) and
+  matches production numerically — **cos 0.999992 vs the prod 2-kernel
+  chain** (0.99603 vs true-f32, equal to prod's own 0.99603 vs the same
+  reference). The phase-1 mainloop was a scalar placeholder (slow by
+  design); its job was proving the persistent control plane. **Ramp
+  arithmetic measured** (148-CTA × 256-thread decode-shaped grids): eager
+  5.69 µs/launch, graph replay 1.21 µs/launch, persistent work-item
+  0.075 µs ⇒ **1.13 µs/launch of structural overhead removable × the
+  ~300–500 launches/step = 340–565 µs/step** — the strategic case,
+  independent of mainloop quality (most of those launches are glue, not
+  PDL-chained cute ops).
+- **Phase 2 — tcgen05/TMA mainloop at PARITY** (artifacts 001
+  `/tmp/mega_p2_work/`): the real tcgen05 MMA + TMA mainloop ported inside
+  the persistent worker reaches **91.7 µs vs the prod 2-kernel chain's
+  90.4 µs (graphed, 20-tile decode load; cos vs prod 0.99999)** — the
+  persistent substrate carries the production math with no kernel-level
+  penalty. **The substrate is de-risked.**
+- **Phase 3 — IN FLIGHT**: dynamic device-side producer (graph-replay-safe
+  work generation), wave-tail packing, and glue absorption
+  (norm/quant/routing/sort into the persistent grid) — where the
+  340–565 µs structural win and the launch-population collapse actually
+  land.
 
 ---
 
@@ -1633,14 +1755,57 @@ bar-irrelevant — and stands.
   FIX == HEAD. **AOT `.cu`/`.h`/`.cpp` parts ride the NEXT image build;
   python fallbacks live.** Hazard section added; all pre-fix HISA
   selection-quality observations marked suspect.
-- **Queued**: input_scale remediation ROLLOUT (owner's call; image staged —
-  the **next full-source build must carry ≥ `31e0b5be7`** for the HISA AOT
-  fix too); **the M3 production flip + a2a re-measure under
-  graphs+overlap** (env delta REQUIRED — the factory never auto-picks LL;
-  ADP + `moe_tp_size=1` precondition feeds the ADP-vs-TP call); **P1
-  single-CTA persistent megakernel phase-1 (in flight)**; **B2 dense-proj
-  residual batching (in flight)**; I2 GATE-B real-activation dump
-  (unblocked — fixed image on 001); MO1 ROLLOUT (deploy-ready; owner's
-  call); a kv ≫ 1024 profiling leg (the long-kv indexer-share check); then
-  N1 (rides the rollout manifest), M1, K1 PDL, H3a/H3c. Parked: C9 (IPC
-  wedge under L1 overlap). Held: S2 (moot under WarpDecode+TP).
+- **A2A-graphed step-level sizing (2026-06-11, study — no code)**: under
+  graphs+overlap the TRUE exposed normal-mode a2a is **75–82 µs/layer =
+  4.35–4.75 ms/step = 14–15 % of the step** (the eager 48.4 % deflates
+  3.4× — graphs' lockstep removes the spin attribution); LL exposed
+  48–57 µs/layer; **M3 flip step-level verdict: median −1.48–1.57 ms/step
+  (4.8–5.1 %)** plus the tail case — the normal arm reproduced a **3750 µs
+  outlier replay** (the 3.7 ms prod pathology class) while LL maxed
+  ≤ 1211 µs across 4200 samples; injected skew passes through identically
+  in both modes (no in-graph barrier amplification at EP2). Post-flip
+  lever identified: the **LL adapter give-back ~12–16 µs/layer
+  (0.7–0.9 ms/step) — in flight**. Two independent methods (trace-based +
+  subtractive-control) agree; cross-arm cosine ≥ 0.999998. M3 section
+  updated with the honest sizing. Artifacts
+  `/tmp/a2a_graphed_work/SUMMARY.md`.
+- **Megakernel phases 1–2 (2026-06-11, P1)**: **phase-1 control plane
+  VALIDATED** — persistent 148-CTA grid + device work-queue + FC1-first
+  deadlock-free schedule, cos 0.999992 vs the prod 2-kernel chain; ramp
+  arithmetic measured **1.13 µs/launch structural × 300–500 launches/step
+  = 340–565 µs/step**. **Phase-2 tcgen05/TMA mainloop port at PARITY**
+  with the prod chain (**91.7 vs 90.4 µs graphed at 20 tiles, cos
+  0.99999**) — the persistent substrate is de-risked. **Phase 3 in
+  flight** (dynamic producer + wave packing + glue absorption). Artifacts
+  `/tmp/mega_p1_work/` + `/tmp/mega_p2_work/`.
+- **C9 wedge REPRODUCED (2026-06-11)**: a minimal 2-rank harness wedges
+  both ranks at **step 0 / layer 1** (`stream_completed_through=None` —
+  the first IPC mailbox publish never satisfies the consumer wait; ring
+  depth irrelevant, depth=2 wedges identically; reproduces under the plain
+  sync pattern, so not overlap-specific). **Bisect in flight; C9 stays
+  PARKED / NCCL-fallback until root-caused.** Artifacts
+  `/tmp/c9_wedge_work/`.
+- **Cycle 17** (shipped `833ecf794`): **B2 CLOSED — MLA output-gate
+  overlap, default-on** (`TRTLLM_OPTRT_MLA_GATE_OVERLAP`). The dense-proj
+  residual's 38 µs × 61 kernel is the attention output gate (bf16
+  [16384,7168], ADP-replicated) and is **AT SOL** (6.65 TB/s vs the 6.53
+  copy ceiling; backend sweep exhausted; NVFP4 gate FORMAT-BLOCKED) — the
+  win is scheduling: c=2 side-stream fork-at-entry / join-at-the-mul,
+  **BITEXACT** vs inline on every arm, **+9.0/+8.3 µs/layer hidden →
+  −0.55/−0.50 ms/step**; the ~1.78 ms residual is irreducible at-SOL
+  weight reads in big-kernel exclusive windows (megakernel-lane
+  territory). Artifacts `/tmp/projbatch_work/FINDINGS.md`.
+- **Queued**: input_scale remediation ROLLOUT on 002 (owner's call; image
+  staged — **the build floor for any next full-source build is now
+  ≥ `31e0b5be7`**, which carries the HISA AOT `.cu` fixes the staged image
+  predates); **the M3 production env flip** (owner's call; env delta
+  staged + REQUIRED — the factory never auto-picks LL; honest step-level
+  sizing −1.48–1.57 ms/step median + tail-class elimination; ADP +
+  `moe_tp_size=1` precondition feeds the ADP-vs-TP call); **MO1 install**
+  (deploy-ready; owner's call); **N1 NUMA-pin snippet** (rides the rollout
+  manifest edit). **In flight: the C9 wedge bisect; megakernel phase 3
+  (dynamic producer + wave packing + glue absorption); the LL adapter
+  give-back (0.7–0.9 ms/step)**. Then: I2 GATE-B real-activation dump
+  (unblocked — fixed image on 001); a kv ≫ 1024 profiling leg (the
+  long-kv indexer-share check); M1, K1 PDL, H3a/H3c. Parked: C9 (wedge
+  reproduced; bisect in flight). Held: S2 (moot under WarpDecode+TP).
