@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -148,6 +149,22 @@ def _layersplit_readset_hoist_enabled() -> bool:
     DSV3.2). Default on; set TRTLLM_OPTRT_LAYERSPLIT_READSET_HOIST=0 to
     recompute per layer (pre-hoist behavior, identical sets either way)."""
     return os.environ.get("TRTLLM_OPTRT_LAYERSPLIT_READSET_HOIST",
+                          "1") != "0"
+
+
+def _layersplit_prefill_overlap_enabled() -> bool:
+    """L1 gate: z.ai dense-broadcast overlap on pure-context steps.
+
+    Indexer.forward issues the dense KV (+ NVFP4 scale) READ-SET broadcast
+    on the LayerSplit comm stream right after the indexer-K broadcast, so
+    it hides behind the indexer scoring; sparse_attn_predict waits on the
+    comm-stream event just before the dense read instead of running the
+    per-layer top-k-union broadcast (whose masked_select + unique host
+    syncs dominate the sync path's exposed cost: measured 71.5 -> 6.9 ms
+    exposed per 61-layer prefill step at kv=64k on the CP2 worker, equal
+    wire bytes, byte-identical consumer-visible rows). Default on; set
+    TRTLLM_OPTRT_LAYERSPLIT_PREFILL_OVERLAP=0 for the legacy sync path."""
+    return os.environ.get("TRTLLM_OPTRT_LAYERSPLIT_PREFILL_OVERLAP",
                           "1") != "0"
 
 
@@ -4811,6 +4828,43 @@ class Indexer(nn.Module):
                 cp_group=layersplit_state.cp_group,
             )
 
+            # L1 (z.ai Fig 4(b) overlap): on pure-context steps the dense
+            # top-k union equals the read set, so the dense KV (+ NVFP4
+            # scale) broadcast does not need to wait for the TopK — issue
+            # it NOW on the comm stream, hidden behind the indexer scoring
+            # below. sparse_attn_predict consumes the comm-stream event
+            # just before the dense read (read-before-ready) and skips the
+            # legacy union broadcast and its per-layer masked_select +
+            # unique host syncs. Generation steps keep the legacy path:
+            # at decode the top-k union is ~32 blocks/seq, far smaller
+            # than the read set, so the early superset broadcast would
+            # multiply wire bytes there.
+            if (metadata.num_generations == 0
+                    and _layersplit_prefill_overlap_enabled()):
+                try:
+                    dense_kv_slot = kv_cache_manager.get_buffers(
+                        self.layer_idx)
+                except (AttributeError, IndexError, KeyError):
+                    dense_kv_slot = None
+                dense_scale_slot = None
+                get_scale_slot = getattr(kv_cache_manager,
+                                         "get_dense_scale_slot", None)
+                if get_scale_slot is not None:
+                    try:
+                        dense_scale_slot = get_scale_slot(self.layer_idx)
+                    except (AttributeError, IndexError, KeyError,
+                            RuntimeError):
+                        dense_scale_slot = None
+                if dense_kv_slot is not None:
+                    flat_dense = dense_kv_slot.view(dense_kv_slot.shape[0],
+                                                    -1)
+                    layersplit_state.overlap_broadcast_readset(
+                        layer_idx=self.layer_idx,
+                        cache_slots=(flat_dense, dense_scale_slot),
+                        read_block_ids=read_block_ids,
+                        cp_group=layersplit_state.cp_group,
+                    )
+
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
 
@@ -4904,7 +4958,16 @@ class DSATrtllmAttention(TrtllmAttention):
         kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
         layersplit_state = getattr(kv_cache_manager, "layersplit_state",
                                    None) if kv_cache_manager is not None else None
-        if layersplit_state is not None and layersplit_state.enabled:
+        if (layersplit_state is not None and layersplit_state.enabled
+                and layersplit_state.consume_overlap_event(self.layer_idx)):
+            # L1 overlap consumed: Indexer.forward already broadcast this
+            # layer's dense KV (+ scale) READ set on the comm stream — a
+            # byte-equivalent superset of the top-k union below — and the
+            # event wait just ordered it before the dense sparse-MLA read.
+            # Skip the legacy union broadcast (and its masked_select +
+            # unique host syncs).
+            pass
+        elif layersplit_state is not None and layersplit_state.enabled:
             stride_factor = getattr(metadata, "_cached_stride_factor", None)
             dense_block_ids = _layersplit_topk_global_block_ids(
                 topk_indices_global, stride_factor)
@@ -4995,6 +5058,56 @@ class DSATrtllmAttention(TrtllmAttention):
         bt = metadata.block_table
         return bt.to("cpu") if bt.is_cuda else bt
 
+    def _kvarn_step_cand_host(self, metadata, tpb: int, lo: int,
+                              hi: int) -> Optional["np.ndarray"]:
+        """Step-invariant host candidate set for the eager decode restore.
+
+        Returns the sorted-unique block ids (np.int64) covered by the
+        generation rows' FULL blocks, derived purely from host state: the
+        host block table stashed by prepare() plus the host kv lens. Returns
+        None when that state is unavailable or inconsistent (caller falls
+        back to the device scan). The set is identical for every layer
+        within a step, so it is memoized on the metadata keyed by
+        (request ids, per-row full-block counts) -- the same invariant the
+        pre-replay step gate relies on: a row's already-full block ids
+        cannot change while its request id and full-block count are stable.
+        """
+        hbt = getattr(metadata, "kvarn_host_block_table", None)
+        if (hbt is None or not torch.is_tensor(hbt) or hbt.is_cuda
+                or hbt.dim() != 2):
+            return None
+        req_ids = getattr(metadata, "request_ids", None)
+        kv_lens = metadata.kv_lens_runtime
+        if (req_ids is None or len(req_ids) < hi or hbt.shape[0] < hi
+                or kv_lens is None or len(kv_lens) < hi):
+            return None
+        n_full = tuple(int(kv_lens[i]) // tpb for i in range(lo, hi))
+        key = (tuple(req_ids[lo:hi]), n_full, lo, hi, tpb)
+        memo = getattr(metadata, "_blaise_kvarn_step_cand", None)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        table = hbt.numpy()
+        width = table.shape[1]
+        segs = []
+        for r, nf in enumerate(n_full):
+            if nf <= 0:
+                continue
+            if nf > width:
+                return None
+            seg = table[lo + r, :nf]
+            if (seg < 0).any():
+                # Padding inside the full range: the table and kv lens
+                # disagree; let the device scan decide rather than guess.
+                return None
+            segs.append(seg)
+        if segs:
+            cand = np.unique(np.concatenate(segs).astype(np.int64,
+                                                         copy=False))
+        else:
+            cand = np.empty((0, ), dtype=np.int64)
+        metadata._blaise_kvarn_step_cand = (key, cand)
+        return cand
+
     def kvarn_commit_full_blocks(self, metadata, is_generation):
         """KVarN-store every newly-FULL latent block (skip the sink + the
         in-progress tail block, which stay fp16). Idempotent via pool.valid."""
@@ -5058,14 +5171,44 @@ class DSATrtllmAttention(TrtllmAttention):
         if hi <= lo:
             return
         amortize = bool(getattr(mgr, "kvarn_amortize_restore", False))
+
+        # Host-mirror fast path: derive the stale set purely from host state
+        # (the host block table stashed by prepare() + the pool's numpy
+        # mirrors), the same machinery the pre-replay delta walk trusts. The
+        # device scan below costs 3 boolean-index nonzeros (cub DeviceSelect
+        # sweep + compact-init + count-reduce + write_indices) plus a unique
+        # per layer per step -- ~20 us GPU and 3 forced d2h syncs per layer,
+        # ~1.24 ms GPU / 183 syncs per eager step at 61 layers (the
+        # "indexer_select_cub" 3.0% line in the EAGER_C16 decode profile) --
+        # in the common case only to discover the stale set is empty. The
+        # candidate set is layer-invariant within a step, so it is memoized
+        # on the metadata; the per-layer residual is one numpy filter over
+        # ~B*n_full ids and zero launches when nothing is stale.
+        cand_host = self._kvarn_step_cand_host(metadata, tpb, lo, hi)
+        if cand_host is not None and hasattr(pool, "stale_committed_host"):
+            if cand_host.size == 0:
+                return
+            if amortize:
+                todo = pool.stale_committed_host(cand_host)
+            else:
+                # Un-amortized semantics: restore every committed candidate
+                # each step (no epoch filter), matching the device scan.
+                todo = cand_host[pool.valid_host[cand_host]].tolist()
+            if not todo:
+                return
+            self.kvarn_restore_block_ids(metadata, todo)
+            pool.mark_restored_host(todo)
+            return
+
         dev = pool.valid.device
 
-        # Vectorized stale-block selection: gather the committed block ids of the
-        # generation rows straight off the (device) block table, mask out padding
-        # / uncommitted / (under amortize) blocks whose fp16 slot already holds
-        # their current content. The old Python double-loop over B*32 entries
-        # dominated decode at batch>=8 (host-scan-only 2779 us/step @ b32, vs
-        # ~16 us for the d2h); this keeps the whole set-diff on-device.
+        # Device-scan fallback (host block table unavailable): gather the
+        # committed block ids of the generation rows straight off the (device)
+        # block table, mask out padding / uncommitted / (under amortize) blocks
+        # whose fp16 slot already holds their current content. The old Python
+        # double-loop over B*32 entries dominated decode at batch>=8
+        # (host-scan-only 2779 us/step @ b32, vs ~16 us for the d2h); this
+        # keeps the whole set-diff on-device.
         bt = metadata.block_table  # [num_all_seqs, max_blocks], device, -1 pad
         bt_gen = bt[lo:hi].to(dev, non_blocking=True)            # [B, max_blocks]
         kv_t = torch.as_tensor(kv_lens[lo:hi], device=dev, dtype=torch.long)

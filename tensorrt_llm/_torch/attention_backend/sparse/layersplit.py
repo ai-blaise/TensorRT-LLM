@@ -850,6 +850,13 @@ class LayerSplitRuntimeState:
     # keeps the NCCL dist.broadcast path unchanged.
     _ipc_broadcast: Optional[Any] = field(default=None, repr=False,
                                           init=False)
+    # L1: per-layer comm-stream events for the z.ai prefill dense-broadcast
+    # overlap. ``overlap_broadcast_readset`` records the event on the comm
+    # stream after the read-set dense(+scale) broadcast;
+    # ``consume_overlap_event`` pops it and makes the default stream wait
+    # just before the dense sparse-MLA read.
+    _overlap_dense_events: Dict[int, Any] = field(default_factory=dict,
+                                                  repr=False, init=False)
 
     def bind_cp_group(self,
                       cp_group: Any,
@@ -1332,6 +1339,101 @@ class LayerSplitRuntimeState:
             flat.index_copy_(0, active_block_ids, chunk)
             # When we reshaped above, ``flat`` is a view of ``slot`` so
             # the index_copy_ already updated ``slot`` in place.
+        return True
+
+    def overlap_broadcast_readset(
+            self,
+            layer_idx: int,
+            cache_slots,
+            read_block_ids: Optional[Any],
+            cp_group: Optional[Any] = None) -> bool:
+        """L1: issue layer ``layer_idx``'s dense(+scale) READ-SET broadcast
+        on the comm stream so it hides behind the indexer scoring compute
+        that follows on the default stream (z.ai "Scaling Pain" Fig 4(b)).
+
+        At prefill the dense top-k union equals the read set (measured
+        union fraction 1.0 at 8k-64k kv on the CP2 worker shapes), so the
+        read-set payload is a byte-equivalent superset of every row the
+        dense sparse-MLA read consumes — and it is known BEFORE the
+        indexer runs (the L2-hoisted per-step read set), unlike the top-k
+        union. Moving the broadcast here removes (a) the per-layer
+        ``masked_select`` + ``unique`` host syncs of the union computation
+        (~52 ms / 61-layer step measured) and (b) the exposed broadcast
+        wait itself (~23 ms / step), at equal wire bytes.
+
+        Always routes through ``dist.broadcast`` (NCCL) and never the C9
+        IPC channel: the channel's pinned-mailbox slot reuse is only
+        stream-ordered when every channel op issues on ONE stream, and the
+        indexer-K broadcast stays on the default stream (a mixed-stream
+        IPC sequence wedges both ranks — reproduced on the L1 microbench).
+
+        Records a CUDA event after the scatter; the consumer MUST call
+        ``consume_overlap_event(layer_idx)`` before the dense read (the
+        read-before-ready contract). An un-consumed event is clobbered by
+        the next step's issue for the same layer (waiting on an elapsed
+        event is a no-op, so a skipped consume degrades gracefully).
+
+        Returns True iff the broadcast was issued and the event recorded;
+        on any False path the caller must keep the legacy sync top-k
+        broadcast in ``sparse_attn_predict``.
+        """
+        if not self.enabled or self.ownership is None:
+            return False
+        if self.cp_size <= 1 or cp_group is None:
+            return False
+        if read_block_ids is None or self.comm_stream is None:
+            return False
+        if torch is None or not torch.cuda.is_available():
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return False
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+        if read_block_ids.numel() == 0:
+            return False
+        slots = [slot for slot in cache_slots if slot is not None]
+        if not slots:
+            return False
+
+        src_rank = self.broadcast_src_rank(layer_idx)
+        ready = torch.cuda.Event()
+        ready.record()
+        with torch.cuda.stream(self.comm_stream):
+            # The gather may only read the owner pool after everything the
+            # default stream issued so far (this step's earlier writes and
+            # the indexer-K broadcast) — the same visibility point the
+            # legacy sync gather had.
+            self.comm_stream.wait_event(ready)
+            for slot in slots:
+                work = self._f8_byte_alias(slot)
+                send_buffer = work.index_select(0,
+                                                read_block_ids).contiguous()
+                dist.broadcast(send_buffer,
+                               src=src_rank,
+                               group=cp_group,
+                               async_op=False)
+                work.index_copy_(0, read_block_ids, send_buffer)
+            done = torch.cuda.Event()
+            done.record(self.comm_stream)
+        self._overlap_dense_events[layer_idx] = done
+        return True
+
+    def consume_overlap_event(self, layer_idx: int) -> bool:
+        """Have the current (default) stream wait on layer ``layer_idx``'s
+        in-flight overlapped dense broadcast (recorded by
+        ``overlap_broadcast_readset``). Returns True iff one was pending —
+        the caller must then SKIP the legacy sync top-k broadcast; False
+        means no overlap was issued and the legacy path must run.
+        """
+        event = self._overlap_dense_events.pop(layer_idx, None)
+        if event is None:
+            return False
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.current_stream().wait_event(event)
         return True
 
     @classmethod
