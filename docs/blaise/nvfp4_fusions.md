@@ -2,12 +2,13 @@
 
 Decode on the NVFP4 target is overhead-bound, so removing standalone kernel
 launches and HBM round-trips on the per-layer elementwise+quant paths is a
-direct win. Four fusions land here:
+direct win. Five fusions land here:
 
 | # | Fusion | Op / file | Figure | Default |
 |---|--------|-----------|--------|---------|
 | 13 | add + RMSNorm + NVFP4 quant | `residual_add_norm.py` (torch.compile pattern) | −48…−54 % norm→quant sub-path (113–144 µs/step) | on |
 | 13b | shared-expert SwiGLU + FP4-output (decode-M guard lift) | `cute_dsl_custom_ops.py` / `gated_mlp.py` | ~100 µs/step + 58 act-quant launches | on (guard lifted `fd705a6f5`) |
+| 13c | lowrank-gate + NVFP4-quant single-launch epilogue (MoE input) | `cute_lowrank_gate.py` / `fused_lowrank_gate.py` | chain 7.04 → 4.19 µs/layer ⇒ −165 µs/tok | on (`68866e061`) |
 | 14 | fused RoPE-cat-FP4 | `fusedRopeCatFp4Op.cpp` / `fusedRopeCatFp4.cu` | −3.2…−4.1 µs / F-layer (graphed) | on when shape matches |
 | 15 | KVarN-BDR fold | see `kvarn.md` | (capacity, not latency) | opt-in |
 
@@ -86,6 +87,51 @@ small-m partial tiles are the same code path as the last partial tile of any
 - **Composes with:** WarpDecode (`warpdecode.md` — shared-expert vs routed-
   expert paths are independent), #13 (different fusion sites on the same MoE
   layer).
+
+## lowrank-gate + NVFP4-quant single-launch epilogue (MoE input)
+
+**Idea.** The routed-MoE input path ran the REAP lowrank gated-norm and then a
+standalone `fp4_quantize` of the gated output (the in-tree handoff was a
+2-launch split-K Triton pair feeding a separate quant). The gate kernel
+already touches every output element last — the NVFP4 quantization can ride
+its epilogue.
+
+**Fix (`68866e061`).** `apply_fused_lowrank_gate_quant_nvfp4`: the existing
+single-launch CuTe cluster lowrank-gate kernel
+([optimization_candidates.md](optimization_candidates.md) G1) gains an NVFP4
+epilogue — e2m1 packing via the same `cvt.rn.satfinite.e2m1x2.f32` hardware
+instruction as `quantization.cuh::fp32_vec_to_e2m1` (LINEAR SF layout), e4m3
+block scales via `cvt.rn.satfinite.e4m3x2.f32` with the exact-arithmetic
+zero-block guard mirroring the Triton epilogue, 16-element blocks pairing
+adjacent lanes (one butterfly shuffle for the block amax; CTA K-slices proven
+never to split a block at the supported shapes). The gated bf16 plus a
+LINEAR-SF `Fp4QuantizedTensor` go straight into the MoE, which skips its own
+`fp4_quantize`.
+
+- **Files:** `tensorrt_llm/_torch/modules/cute_lowrank_gate.py`,
+  `tensorrt_llm/_torch/modules/fused_lowrank_gate.py` (dispatch),
+  `tensorrt_llm/_torch/models/modeling_deepseekv3.py` (handoff).
+- **Win:** chain cost 7.04 → 4.19 µs (M=4) / 7.17 → 4.48 µs (M=16) per MoE
+  layer ⇒ **−165 µs/token at M=4 across 58 MoE layers** (−254 µs/token vs the
+  pre-lowrank-gate unfused chain).
+- **Enable:** on (default impl of the gate+quant handoff). WarpDecode is a
+  mode of `CuteDslFusedMoE`, so the handoff engages under the production
+  pure-TP decode plan.
+- **Correctness:** y bitmatch vs eager 99.99988 % of elements with y cosine
+  vs a **true-f32 reference** min 0.9999971; **fp4 codes + scales bit-exact
+  vs `trtllm.fp4_quantize` on the same y** (layers 5/20/50,
+  M ∈ {1,4,16,256}, through the production dispatcher with real `nn.Linear`
+  modules); top-8 routing overlap 1.0 vs the eager-input path; CUDA-graph
+  capture + replay bit-exact. The fp4-vs-bf16 quantization noise floor is
+  shared with the existing production path, not added by this kernel.
+- **Note:** full absorb-into-AR-quant (quantizing inside the allreduce
+  epilogue instead) is blocked by layout — the AR NVFP4 epilogues emit
+  SWIZZLED SF only while the MoE permute path requires LINEAR. The
+  constant-0.5 gate ABSORB variant was measured and rejected on routing
+  accuracy (optimization_candidates.md G2).
+- **Composes with:** #13 (different fusion site on the same layer: #13 is the
+  post-AR residual+norm+quant, this is the gated-branch MoE input), WarpDecode
+  (consumes the `Fp4QuantizedTensor` natively).
 
 ## fused RoPE-cat-FP4
 
