@@ -302,3 +302,35 @@ The output tensor is allocated uninitialized and the kernel writes only valid po
 - Bench container: `optrt-bench-claude` from image `optrt-fusionproof-20260609134115`, GPU 0 only, repo mounted read-only-in-practice at `/repo` (SELinux blocks container→host writes; logs were kept container-local for that reason).
 - `sparse_mla_decode_nvfp4` baseline tensor saved at `optrt-bench-claude:/tmp/sparse_mla_baseline.pt` (B=32, s_q=1, topk=2048, pages=4096, seed=1234) for future `--compare` regression runs.
 - Audit provenance: six parallel code sweeps (KVarN, DSA/HISA, LayerSplit, SMC+MoE, host/executor, methodology) + line-level verification passes on every [V]/[C] finding above.
+
+---
+
+## 7. E2E serving session (2026-06-11) — baseline numbers; integrated A/B blocked; six new findings
+
+**Baseline (image `optrt-0be07d6df64e-smcquietadpfix-20260608203818`, DSV3.2-REAP-345B, disagg TP2xCP2 prefill + TP4 decode, ISL 4161 / OSL 256, streamed, token counts from usage):**
+
+| C | TTFT p50 | TTFT p95 | tok/s/user p50 | aggregate out tok/s |
+|---|---|---|---|---|
+| 1 | 610 ms | 660 ms | 42.6 | 44 |
+| 4 | 927 ms | 1.22 s | 41.9 | 162 |
+| 8 | 1.29 s | 1.94 s | 32.9 | 246 |
+| 16 | 1.56 s | 3.20 s | 34.0 | 454 |
+| 32 | 1.68 s | 5.78 s | 29.3 | 719 |
+
+Client: `.bench_runs_claude/e2e_sweep.py` (aiohttp streaming, per-request TTFT + steady rate, 2C requests per point).
+
+**The integrated-branch A/B is BLOCKED** on a remote-prefill hang (F-54). Three images tried: merged HEAD, pre-merge (`bb58b7098`), pre-merge-minus-quorum — all overlays on the June-8 base; all hang/fail the >2048-token remote-prefill path while ≤2048 (decode-local prefill) works.
+
+**F-50 [V][HIGH][pre-existing] Prefill engine sampler assert kills the worker.** The ORIGINAL baseline prefill (35h-old pod) died at 01:44 with `AssertionError: Sampling failed` (RANK 2, 2 requests inflight) — before any new code was deployed. Recurring engine bug in the June-8 lineage.
+
+**F-51 [V][HIGH] Dead engines leave pods `Running`/ready.** Three zombie incidents in one session: engine fatal (MPI worker exit / event-loop death) while the pod's 9090 probes stay green, so the router keeps/regains the instance and requests blackhole. The liveness probe must reflect executor health.
+
+**F-52 [V][HIGH] Decode local-prefill fallback fatally asserts.** A 4162-token prompt classified decode-local trips `total_num_tokens <= max_num_tokens (2048)` as an assert → MPI death — one mis-routed request kills the whole decode engine. Should reject the request (or chunk) instead.
+
+**F-53 [V][MED] Discovery races route around the prefill leg.** A fresh frontend (or freshly-registered decode) routes decode-direct until a discovery snapshot lands: instant 500 `Disaggregated params are required for decode mode`; combined with F-52, the FIRST request after a worker boot can kill decode. The 4-minute settle is the operational workaround.
+
+**F-54 [V][BLOCKER, unresolved] Post-June-8 Python overlay on the June-8 base hangs remote prefill.** Symptom: request received by the prefill dynamo handler, never enqueued to the engine — rank0 idle at `ipc.get`, ranks 1-3 parked at the request broadcast, handler coroutine await-parked; hang detector eventually kills the ranks. Ruled out as sole causes (each tested by deployment): Spencer's cycles 5-10 (pre-merge image also hangs), the TP-quorum cherry-pick (no-quorum image also fails), FC2 N-tile 160 (env-disabled). Remaining suspects: the June-7-9 LayerSplit/NIXL Python (`f33372f54`/`fc8cdba85` lineage) against June-8 NIXL binaries, and/or our dsa.py prefill-path changes (F-1/F-2/F-5/F-18) under real TP2xCP2 — neither testable single-GPU. Next steps: (a) pair the integrated tree with its own binaries via `build_fullsource_image.sh` (Spencer's flow — his cycles were validated that way), (b) build a 2-GPU CP=2 remote-prefill repro rig for cheap bisecting.
+
+**F-55 [V][HIGH][confirmation] FC2 N-tile 160 faults at decode autotune.** The pre-merge image (which still carried F-31's default-on 160 sweep) crashed decode warmup with `CUDA illegal memory access` inside autotune — independently confirming `e105fd7a1`'s SFB/partial-tile analysis at decode shapes (his report covered prefill M=1024). The F-31 env gate (`TRTLLM_OPTRT_FC2_NTILE_160=0`) mitigated without a rebuild; the merged branch has 160 fully removed.
+
+**Ops notes:** `render_dgd.sh` defaults `--target-node` to a4-us-001-rl9 — always pass the node; the curated overlay COPY list rotted (ImportError + stale-module TypeError) — use `Dockerfile.r20-overlay-fulltree` and verify by per-file content hash against the built image; the lab deployment was rolled back to the baseline image and verified at session end.
