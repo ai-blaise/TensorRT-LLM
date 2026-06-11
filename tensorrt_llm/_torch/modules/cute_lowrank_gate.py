@@ -339,19 +339,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """Gate kernel with an NVFP4 epilogue in the same launch.
 
         Phase B additionally emits the packed e2m1 codes (one i32 per thread
-        per iter, covering the 8 elements it gated) and LINEAR-layout e4m3
-        block scales (one byte per 16 elements, written by the even lane of
-        each pair). The e2m1 conversion is the same hardware cvt the CUDA
-        fp4_quantize uses; the scale math mirrors the Triton pair epilogue.
-        Outputs are bit-exact against both (test_cute_quant, B200).
+        per iter, covering the 8 elements it gated) and e4m3 block scales
+        (one byte per 16 elements, written by the even lane of each pair).
+        The e2m1 conversion is the same hardware cvt the CUDA fp4_quantize
+        uses; the scale math mirrors the Triton pair epilogue. Outputs are
+        bit-exact against both (test_cute_quant, B200).
+
+        Block scales are LINEAR [M, N/16] by default (the EP-a2a / MoE
+        token-permute requirement). With sf_swizzled=True they are written
+        in the computeSFIndex 512-byte block layout instead (fp8Op.h):
+        rows tile by 128, column blocks by 4, one [128, 4] tile = 512 bytes
+        with the 32x4 M-tile column-major inside. That is the layout every
+        nvfp4_gemm backend (and so Linear / the dense-MLP gate_up_proj)
+        consumes; mSF must then view the padded flat buffer as
+        [pad_up(M,128)/128, 128*pad_up(N/16,4)]. Padding bytes are left
+        uninitialized, matching fp4_quantize's empty allocation.
         """
 
-        def __init__(self, n: int, r: int, cluster_n: int):
+        def __init__(self,
+                     n: int,
+                     r: int,
+                     cluster_n: int,
+                     sf_swizzled: bool = False):
             super().__init__(n, r, cluster_n)
             # 16-element quant blocks pair adjacent threads; CTA slices must
             # not split a block.
             assert self.threads % 2 == 0
             assert (self.iters * self.threads) % 2 == 0
+            self.sf_swizzled = sf_swizzled
 
         @cute.jit
         def __call__(self, mX: cute.Tensor, mWd: cute.Tensor,
@@ -494,7 +509,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       yq[6] * osc, yq[7] * osc)
                 mQ[row, vn] = packed
                 if lane % 2 == 0:
-                    mSF[row, vn // 2] = sfbyte.to(cutlass.Uint8)
+                    if cutlass.const_expr(self.sf_swizzled):
+                        # computeSFIndex(row, k) with k = vn // 2: dim 0 is
+                        # the 128-row group, dim 1 the 128 * pad_up(N/16, 4)
+                        # bytes inside it.
+                        k = vn // 2
+                        mSF[row // 128, (k % 4) + (k // 4) * 512 +
+                            (row % 32) * 16 +
+                            ((row % 128) // 32) * 4] = sfbyte.to(cutlass.Uint8)
+                    else:
+                        mSF[row, vn // 2] = sfbyte.to(cutlass.Uint8)
 
     _compile_cache = {}
 
@@ -633,6 +657,67 @@ if IS_CUTLASS_DSL_AVAILABLE:
         wu = torch.zeros(r, n, dtype=torch.bfloat16, device=device)
         gs = torch.ones(1, dtype=torch.float32, device=device)
         cute_lowrank_gate_quant_nvfp4(x, wd, wu, gs)
+
+    @torch.library.custom_op("trtllm::cute_lowrank_gate_quant_nvfp4_swizzled",
+                             mutates_args=())
+    def cute_lowrank_gate_quant_nvfp4_swizzled(
+            x: torch.Tensor, wd_bf16: torch.Tensor, wu_t_bf16: torch.Tensor,
+            global_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused gate + NVFP4 quant with SWIZZLED block scales: (y, q, sf).
+
+        Same single launch as cute_lowrank_gate_quant_nvfp4, but the e4m3
+        block scales are written in the computeSFIndex 512-byte block layout
+        as a flat [pad_up(M,128) * pad_up(N/16,4)] uint8 buffer (padding
+        uninitialized), so the fp4 output can feed nvfp4_gemm consumers
+        (Linear / the dense-MLP gate_up_proj) directly. Bit-exact against
+        fp4_quantize(y, global_scale, 16, False, True) at valid positions.
+        """
+        m, n = x.shape
+        r = wd_bf16.shape[0]
+        y = torch.empty_like(x)
+        q = torch.empty(m, n // 2, device=x.device, dtype=torch.uint8)
+        pad_m = (m + 127) // 128 * 128
+        pad_cols = (n // 16 + 3) // 4 * 4
+        sf = torch.empty(pad_m * pad_cols, device=x.device, dtype=torch.uint8)
+        cluster_n = _default_cluster_n()
+        key = ("quant_swizzled", n, r, cluster_n)
+        x_t = _to_cute_2d_dynamic_rows(x)
+        y_t = _to_cute_2d_dynamic_rows(y)
+        q_t = _to_cute_2d_dynamic_rows(q.view(torch.int32))
+        sf_t = _to_cute_2d_dynamic_rows(sf.view(pad_m // 128, 128 * pad_cols))
+        wd_t = _to_cute_2d_static(wd_bf16)
+        wu_t = _to_cute_2d_static(wu_t_bf16)
+        gs_t = _to_cute_2d_static(global_scale.reshape(1))
+        stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled = _compile_cache.get(key)
+        if compiled is None:
+            kernel = _LowRankGateQuantKernel(n, r, cluster_n, sf_swizzled=True)
+            compiled = cute.compile(kernel, x_t, wd_t, wu_t, y_t, q_t, sf_t,
+                                    gs_t, stream)
+            _compile_cache[key] = compiled
+        compiled(x_t, wd_t, wu_t, y_t, q_t, sf_t, gs_t, stream)
+        return y, q, sf
+
+    @cute_lowrank_gate_quant_nvfp4_swizzled.register_fake
+    def _(x, wd_bf16, wu_t_bf16, global_scale):
+        m, n = x.shape
+        pad_m = (m + 127) // 128 * 128
+        pad_cols = (n // 16 + 3) // 4 * 4
+        return (torch.empty_like(x),
+                torch.empty(m, n // 2, device=x.device, dtype=torch.uint8),
+                torch.empty(pad_m * pad_cols,
+                            device=x.device,
+                            dtype=torch.uint8))
+
+    def warmup_cute_lowrank_gate_quant_swizzled(n: int, r: int,
+                                                device) -> None:
+        """Compile ahead of CUDA graph capture."""
+        x = torch.zeros(1, n, dtype=torch.bfloat16, device=device)
+        wd = torch.zeros(r, n, dtype=torch.bfloat16, device=device)
+        wu = torch.zeros(r, n, dtype=torch.bfloat16, device=device)
+        gs = torch.ones(1, dtype=torch.float32, device=device)
+        cute_lowrank_gate_quant_nvfp4_swizzled(x, wd, wu, gs)
 
 else:
 

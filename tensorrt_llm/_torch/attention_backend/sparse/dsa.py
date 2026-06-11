@@ -525,32 +525,23 @@ def _build_hisa_candidate_schedule(sparse_attention_config, kv_lens_gen: torch.T
 # produce identical selected sets (recall 1.0). Below this threshold prefer C++.
 _DSL_TOPK_MIN_KV_LEN = 16384
 
-# _DSL_TOPK_MIN_COLS is a logits-WIDTH bucket used ONLY by the width-correction
-# helper below (DSL-scratch sizing / logits-buffer bucketing for the long-kv DSL
-# path). It is NO LONGER a top-k dispatch gate: the earlier width-based override
-# (route to DSL whenever the logits width >= this) was REMOVED because it forced
-# the SLOWER DSL kernel at prod (width 132096 >> 12288) on the false premise that
-# the C++ kernel slows at width >= 12288. Direct measurement shows C++ is
-# ~width-independent (~11us flat), so the top-k dispatch is now gated on live kv
-# only (_DSL_TOPK_MIN_KV_LEN above).
-_DSL_TOPK_MIN_COLS = 12288
-
-
-# Width-correct the decode logits buffer so main's _DSL_TOPK_MIN_COLS gate
-# (above) picks the cheaper C++ insertion top-k for short kv. The DSL
-# paged-MQA-logits op allocates its output to exactly the column count it is
-# passed (CuteDSLFP4PagedMQALogitsRunner.forward); passing the static
-# max_model_len makes logits_decode.shape[1] == max_seq_len >= 12288 every
-# step, which forces topk onto the DSL/radix path even when the live kv is
-# short. Sizing the logits width to a power-of-2 bucket of the real max-kv
-# (clamped to the hard cap) keeps the kernel's valid [0,kv) output
-# byte-identical (it only writes columns < kv, gated by context_lens) while
-# dropping shape[1] below _DSL_TOPK_MIN_COLS so the topk dispatch falls to the
-# fast insertion launch. The bucket is a captured constant under CUDA graphs:
-# at capture max_gen_kv_len equals the per-graph warmup kv (the upper bound of
-# that graph's short/long seq-len band), so every replay's real kv <= the
-# captured width and the topk seq_lens mask the [kv, width) tail. Power-of-2
-# bucketing keeps the captured-width set small and stable across batches.
+# Width-correct the decode logits buffer to a power-of-2 bucket of the real
+# max-kv per graph band. With the top-k dispatch keyed on live kv only (no
+# consumer keys on the logits width anymore), the bucket is NOT a latency
+# lever: measured on B200 (2026-06-11, live kv 4608, B=4/16, fp16 logits +
+# C++ top-k, CUDA-graph replay, interleaved widths) the scoring+top-k
+# pipeline is flat (~15.4us) from width 8192 to 132096 and logits[:, :kv) is
+# bitwise identical -- the scoring kernel walks ceil(kv/block_kv) tiles from
+# the context_lens schedule and the C++ top-k walks [0, live_kv), so the
+# [kv, width) pad is never written or read; width is only the output row
+# stride. The bucket survives as the graph-safety upper bound for a band's
+# replays plus a captured-allocation trim (rows x width x 2B fp16, e.g.
+# 4.2MB -> 0.26MB at 16 rows) when an operator opts into a short band above
+# index_topk. The bucket is a captured constant under CUDA graphs: at capture
+# max_gen_kv_len equals the per-graph warmup kv (the upper bound of that
+# graph's short/long seq-len band), so every replay's real kv <= the captured
+# width and the topk seq_lens mask the [kv, width) tail. Power-of-2 bucketing
+# keeps the captured-width set small and stable across batches.
 
 
 def _indexer_logits_width(max_gen_kv_len: int, hard_cap: int) -> int:
@@ -568,8 +559,7 @@ def _indexer_logits_width(max_gen_kv_len: int, hard_cap: int) -> int:
     its full max_model_len width (no narrowing, no regression, no tail
     miss). Only genuinely short bands (kv <= hard_cap // 2) are narrowed,
     where the next-pow2 bucket strictly exceeds max_gen_kv_len and thus
-    bounds the whole band. The < 12288 (_DSL_TOPK_MIN_COLS) insertion-launch
-    boundary is hit by any pow2 bucket <= 8192.
+    bounds the whole band.
     """
     if max_gen_kv_len <= 0 or hard_cap <= 0:
         return hard_cap
@@ -4253,9 +4243,9 @@ class Indexer(nn.Module):
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
             # Width-correct the decode logits buffer to a graph-safe bucket of
-            # the live max-kv so the downstream topk dispatch (gated on
-            # logits_decode.shape[1] vs _DSL_TOPK_MIN_COLS) takes its cheaper
-            # insertion launch for short kv (see _indexer_logits_width).
+            # the live max-kv (see _indexer_logits_width). Allocation trim
+            # only: no kernel cost or dispatch keys on the width (the topk
+            # dispatch is gated on live kv, _DSL_TOPK_MIN_KV_LEN).
             # max_gen_kv_len is the captured constant under CUDA graphs
             # (== per-graph warmup kv).
             logits_width = _indexer_logits_width(metadata.max_gen_kv_len,
@@ -4504,7 +4494,7 @@ class Indexer(nn.Module):
                     # kernel wins -- it walks only [0, live_kv) per row, while the
                     # DSL kernel's cost scales with the padded logits WIDTH. The
                     # earlier width-based override (route to DSL whenever logits
-                    # width >= _DSL_TOPK_MIN_COLS) was REMOVED: it forced DSL at
+                    # width >= 12288) was REMOVED: it forced DSL at
                     # prod (width 132096, live kv ~4.6k) on the false premise that
                     # the C++ kernel slows at width >= 12288. Direct B200
                     # measurement (3-seed, CUDA-graph replay) shows C++ is

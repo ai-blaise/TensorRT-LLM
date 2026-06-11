@@ -63,11 +63,11 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
-from ..modules.fused_lowrank_gate import (apply_fused_lowrank_gate,
-                                          apply_fused_lowrank_gate_quant_nvfp4,
-                                          get_lowrank_gate_weights,
-                                          lowrank_gate_quant_nvfp4_supported,
-                                          lowrank_gate_supported)
+from ..modules.fused_lowrank_gate import (
+    apply_fused_lowrank_gate, apply_fused_lowrank_gate_quant_nvfp4,
+    apply_fused_lowrank_gate_quant_nvfp4_swizzled, get_lowrank_gate_weights,
+    lowrank_gate_quant_nvfp4_supported,
+    lowrank_gate_quant_nvfp4_swizzled_supported, lowrank_gate_supported)
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
@@ -1524,6 +1524,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.has_gated_norm and os.environ.get(
                 "TRTLLM_OPTRT_GATED_PREMOE_QUANT", "1") == "1")
         self._premoe_quant_scale = None
+        # Quantized dense-MLP-input handoff (layers < first_k_dense_replace):
+        # same kernel, SWIZZLED scales for the gate_up_proj GEMM.
+        self._premlp_gate_quant_enabled = (
+            self.has_gated_norm and os.environ.get(
+                "TRTLLM_OPTRT_GATED_PREMLP_QUANT", "1") == "1")
+        self._premlp_quant_scale = None
 
         # When enable_attention_dp is True, we normally skip attention all-reduce since each
         # DP rank works on different batch elements. However, with CP > 1, attention is split
@@ -1653,6 +1659,50 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 flat, gate_down, gate_up, quant_scale)
             return (y.reshape(hidden_states.shape),
                     Fp4QuantizedTensor(y_fp4, y_sf, is_sf_swizzled=False))
+        return self._maybe_apply_gated_norm(hidden_states, gate_down,
+                                            gate_up), None
+
+    def _resolve_premlp_quant_scale(self) -> Optional[torch.Tensor]:
+        """input_scale of the dense gate_up_proj, or None if the dense MLP
+        cannot take a pre-quantized swizzled-sf NVFP4 tensor. Probed once."""
+        if self._premlp_quant_scale is None:
+            scale = None
+            if self._premlp_gate_quant_enabled and isinstance(
+                    self.mlp, GatedMLP):
+                gate_up = self.mlp.gate_up_proj
+                if (getattr(gate_up, "has_nvfp4", False)
+                        and getattr(gate_up, "input_scale", None) is not None
+                        and getattr(gate_up, "pre_quant_scale", None) is None
+                        and not getattr(gate_up, "force_dynamic_quantization",
+                                        False)):
+                    scale = gate_up.input_scale
+            self._premlp_quant_scale = (scale, ) if scale is not None else ()
+        return self._premlp_quant_scale[0] if self._premlp_quant_scale else None
+
+    def _apply_post_attention_gated_norm_quant_dense(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor]]:
+        """Post-attention gated norm with an NVFP4 handoff for dense layers.
+
+        Returns (gated bf16 hidden states, Fp4QuantizedTensor of the same
+        values quantized with gate_up_proj's input scale in SWIZZLED sf
+        layout, or None). Unlike the MoE handoff, the swizzled scales feed
+        Linear consumers directly, replacing the GatedMLP-side fp4_quantize.
+        """
+        gate_down = self.post_attention_gated_norm_down
+        gate_up = self.post_attention_gated_norm_up
+        if gate_down is None or gate_up is None:
+            return hidden_states, None
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rank = gate_down.weight.shape[0]
+        quant_scale = self._resolve_premlp_quant_scale()
+        if (quant_scale is not None
+                and lowrank_gate_quant_nvfp4_swizzled_supported(
+                    flat, rank, gate_down, quant_scale)):
+            y, y_fp4, y_sf = apply_fused_lowrank_gate_quant_nvfp4_swizzled(
+                flat, gate_down, gate_up, quant_scale)
+            return (y.reshape(hidden_states.shape),
+                    Fp4QuantizedTensor(y_fp4, y_sf, is_sf_swizzled=True))
         return self._maybe_apply_gated_norm(hidden_states, gate_down,
                                             gate_up), None
 
@@ -1839,12 +1889,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # We need to add twoshot allreduce here to avoid modifying MLA logic
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        hidden_states = self._maybe_apply_gated_norm(
-            hidden_states, self.post_attention_gated_norm_down,
-            self.post_attention_gated_norm_up)
+        hidden_states, hidden_states_fp4 = (
+            self._apply_post_attention_gated_norm_quant_dense(hidden_states))
 
         hidden_states = self.mlp(
-            hidden_states,
+            hidden_states_fp4
+            if hidden_states_fp4 is not None else hidden_states,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)),
         )
