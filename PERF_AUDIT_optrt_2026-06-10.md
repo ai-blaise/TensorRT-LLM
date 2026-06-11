@@ -289,6 +289,11 @@ Audit findings fixed and validated:
 
 Still open: LayerSplit CP=2 e2e revalidation before the next R20 image bake (multiproc NCCL machinery test run in a 2-GPU container; a real TP2xCP2 model A/B is the remaining gate), `topk_scheme_probe.py` reconstruction (its `logits_launch_probe` helper was never committed), F-20 incremental block-version broadcast (substantial design work), F-36 idle-poll wakeup (idle-time only, low value).
 
+**F-49 [V][MED] `bench_sparse_mla.py` --compare diffs uninitialized output regions.**
+The output tensor is allocated uninitialized and the kernel writes only valid positions, so cross-run comparison of the unwritten slots produces NaN diffs and `bit_identical=False` even when the kernel is unchanged (same `.so`, same seed: the LSE plane — fully written — diffs at exactly 0.0 while `o_max_abs=nan`). Fix: zero-init the output or mask the comparison to the valid region; until then treat `lse_max_abs` + timing as the equivalence signal.
+
+**2026-06-11 full-suite re-run (v3, post-merge of Spencer cycles 5-10 + local work):** 28/29 entries pass (only the known-broken topk probe fails, F-42). KVarN system numbers reproduce yesterday's post-fix values within noise (cycle cos 0.99363, component 30.46 µs/blk, store 3245.9 µs ≈ 3.0× over original, amortize 8.8×); `sparse_mla` timing identical to the pre-merge baseline (295.88 vs 296.02 µs, LSE exact — see F-49 for the NaN artifact); NVFP4 winner histogram with untrimmed medians {cutedsl 55, cublaslt 13, cuda_core 2} — the CuteDSL-enable conclusion is robust to the F-40 methodology fix; per-sub-block BDR read 0.64× fp8 and the 128K accuracy verdict reproduce; the corrected fmha probe prints honest coverage (27%). Lever-2 wall numbers swung the OTHER way this run (wired S 2.524 µs ≈ the original doc claim; standalone full-remap an outlier at 14.7 µs) — third consecutive day of large swings, reinforcing that only the nsys device times (1.60/1.30 µs) are trustworthy at these scales without clock locking.
+
 ---
 
 ## 6. Raw artifacts
