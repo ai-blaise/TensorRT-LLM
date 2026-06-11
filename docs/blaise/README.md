@@ -12,8 +12,9 @@ decode token costs ~20.8 ms while the HBM bandwidth floor is ~20–40× lower.
 The campaign therefore attacks *overhead* — launch-bound PyTorch op chains,
 redundant d2h syncs, recomputation across decode steps, un-fused
 elementwise+quant, and the DSA Indexer (which was ~50–74 % of TPOT at campaign
-start; the indexer.md wins drove it to ≈ 4 % of the eager c16 profile) —
-rather than chasing the bandwidth roofline.
+start; the indexer.md wins drove it to ≈ 1 % of the eager c16 profile — the
+≈ 4 % previously reported included a misattributed KVarN-restore slice, fixed
+in `0a1504755`) — rather than chasing the bandwidth roofline.
 
 Every piece here is **production code**. Each was validated by *kernel-level*
 correctness (top-k set match / partial-O + LSE / numerical cosine vs a torch
@@ -62,7 +63,7 @@ a correctness signal — see "Validation philosophy" below).
    why decode is overhead-bound. Sets the cost model the rest of the campaign
    optimizes against.
 2. [indexer.md](indexer.md) — the campaign's **first big lever** (Indexer was
-   50–74 % of TPOT at campaign start, now ≈ 4 % of the eager c16 profile).
+   50–74 % of TPOT at campaign start, now ≈ 1 % of the eager c16 profile).
    Seven composable wins on the DSA Indexer.
 3. [sparse_mla.md](sparse_mla.md) — the sparse-MLA attention kernel that
    consumes the Indexer's top-k (MSA streams + scheduler-meta + scoring).

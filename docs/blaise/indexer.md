@@ -7,9 +7,12 @@ path the Indexer **was ~50–74 % of TPOT at campaign start** — by far the
 biggest single lever — so this is where the campaign spent the most effort.
 That premise is now **spent**: after the wins below (plus fp16 logits and the
 C++ prod top-k routing), the fresh eager c16 GPU profile measures the Indexer
-at **≈ 4 % of the decode step (HISA ≈ 0.7 %)** — see
-[optimization_candidates.md](optimization_candidates.md) for where the open
-levers moved (MoE/EP comm, proj GEMMs, glue).
+at **≈ 1 % of the decode step (HISA ≈ 0.7 %)** — the previously-reported
+≈ 4 % included an "indexer FSSS cub select" slice (~3 %) that was a
+**misattribution**: those cub kernels were KVarN's eager decode-restore
+host-path, fixed in `0a1504755` (see the profile-correction note in
+[optimization_candidates.md](optimization_candidates.md)). See that doc for
+where the open levers moved (MoE/EP comm, proj GEMMs, glue).
 
 The Indexer runs once per "F" (full-compute) layer. Its decode step is:
 

@@ -57,6 +57,30 @@ timing is the owner's call (active workload). **ALL 001-resident images and
 the 001 host trees predate the fix** — any future build must include
 ≥ `5bc2b2cb8` or it re-introduces the hazard.
 
+**Remediation STAGED (2026-06-11): the fixed image is built, pushed, and
+verified.** Tag `optrt-34fe7aaec-fixed-20260611011615` (001's
+`localhost:5000` registry + dockerd; base = the dynrouterpin full-wheel
+image every wave/r20 overlay was built from, proven by RootFS layer-prefix)
+carries a **47-file .py overlay = every `tensorrt_llm` .py differing from
+the base** (recursive md5 diff, not a hand list) — python content exactly
+commit `34fe7aaec` (HEAD at build time; `0a1504755`'s L1 + KVarN-host-path
+python **postdates this image** — fold it into the next build). Verification
+**4/4 PASS** (001 GPU 7, ephemeral `--rm`): imports; fix present + 47/47
+md5 == the Mac tree; **the zero-probe passes — all three layer-5 indexer
+projections output dense NONZERO on the real checkpoint** (wk 2048/2048,
+weights_proj 1024/1024, wq_b 131072/131072; the pre-fix garbage alphas are
+bypassed via `input_scale=None` → dynamic quant); env defaults clean.
+`/tmp/fixed_image_work/ROLLOUT.md` stages the rest: 002 transport
+(`docker save | zstd | ssh … k3s ctr import` — 002's registry is
+loopback-only and lacks the base layers), the DGD image swap on CR
+`topo-c1-dp2tp4-disagg-r20` (render from the in-tree
+`deploy/disagg_pd_r20/render_dgd.sh`), the **N1 NUMA-pin snippet in the same
+manifest edit** (`numactl --cpunodebind=1 --membind=1` on the decode
+service; node-1 CPUs `56-111,168-223` verified on identical hardware), and
+read-only post-roll checks (fix-in-mount-ns grep, Cpus_allowed_list,
+long-context canary). **Applying it to the live 002 workload is the owner's
+decision; nothing is deployed.**
+
 **Invalidated claims** (zero-vs-zero comparisons are vacuously "equal"):
 
 - `3e03d665d`'s indexer-proj backend claim "bit-identical (max|diff| == 0 at
@@ -124,6 +148,15 @@ the Indexer stack is a single-digit slice. The ranked levers now follow the
 profile: MoE/EP comm (M3), proj GEMMs (B1, shipped), glue (G1 shipped / G2
 open), host overhead.
 
+> **Profile correction (`0a1504755`):** the "Indexer ≈ 4 %" bucket carried an
+> "indexer FSSS cub select" line (~3 % of decode GPU) that was a
+> **MISATTRIBUTION** — those cub kernels were `kvarn_restore_for_decode`'s
+> boolean-mask indexing (671 ATen cub kernels + 183 D2H syncs per step-rank,
+> 61 layers × 3 `torch.nonzero`, ~1.24 ms/step of GPU compaction selecting an
+> **EMPTY set** in steady state), i.e. KVarN restore host-path overhead, not
+> indexer work. The host-mirror fix shipped in `0a1504755` (C4 below) removes
+> the slice outright; **the Indexer's true share is ≈ 1 %**.
+
 ### The two batch regimes (DP4 vs TP16)
 
 Two attention-batch regimes are measured separately, because levers move
@@ -139,6 +172,19 @@ no mispick at bs=16), and pure TP drops the per-step ADP host collectives
 entirely (which is what moots S2 below). Per-lever microbenches are therefore
 taken at **bs=4 AND bs=16**; TP-regime-specific costs (e.g. the KVarN
 pre-replay scan, C2) are called out explicitly.
+
+> **M3 ⇄ topology interaction (decision-relevant, 2026-06-11).** EP a2a —
+> **any** strategy, including the DeepEP-LL flip now decided GO (M3) —
+> engages **only under attention-DP with `moe_tp_size=1`**: with plain-TP
+> attention the MoE comm factory returns **no strategy at all**
+> (`tensorrt_llm/_torch/modules/fused_moe/communication/`
+> `communication_factory.py:126` — `(not enable_attention_dp) or dp_size==1
+> ⇒ None`; `moe_tp_size != 1 ⇒ AllGather/ReduceScatter`, no a2a). So **ADP
+> unlocks the measured 2.4–2.5× a2a win; pure TP has no a2a path to
+> optimize and forfeits M3 entirely.** The WarpDecode+TP case (faster
+> attention at equal load, no ADP host collectives, S2 moot) must now be
+> weighed against losing M3 — the ADP-vs-TP production call owns this
+> trade. Also recorded in [topology_deploy.md](topology_deploy.md).
 
 ### Correctness gating (untrained checkpoint; the 0.98 functional bar)
 
@@ -178,18 +224,18 @@ disabling it:
 
 | Piece | State | Optimal-mode note |
 |-------|-------|-------------------|
-| LayerSplit (prefill) | on, CP2×TP2, owner-local, read-set broadcast | + CP=2 IPC push primitive (C9) |
+| LayerSplit (prefill) | on, CP2×TP2, owner-local, read-set broadcast + **dense-broadcast overlap default-on (L1, `0a1504755`)** | exposed broadcast 65–82 → 2.5–8.2 ms/step, TTFT −544 ms @64k; C9 IPC push stays **parked** — the IPC channel wedges under the overlap pattern, overlap traffic is NCCL-only |
 | WarpDecode (decode) | on, forced `decode_1cta`, fixed tactic | persistent-megakernel is the structural ceiling; megakernel FC2 N-tile default is now 256 (160 numerically broken, cycle 5) |
-| dense KVarN `kvarn_k2v2` | on, amortized + **delta** restore (C2 default-on `5bc2b2cb8`) | C1 host-gate retained as the no-change fast path; stale-record-on-recycle invalidation default-on (`34fe7aaec`) |
+| dense KVarN `kvarn_k2v2` | on, amortized + **delta** restore (C2 default-on `5bc2b2cb8`) + **eager decode-restore host-path (C4, `0a1504755`)** | C1 host-gate retained as the no-change fast path; stale-record-on-recycle invalidation default-on (`34fe7aaec`); eager restore 19.4× via host-mirror selection |
 | Indexer IndexCache + FSSS | on, `index_topk_freq=4` | escalation to 8 under recall gate |
 | **HISA** | **on whenever the Indexer is on; capture gate + candidate width track live kv via `metadata.max_gen_kv_len` (cycle 4); engages at kv ≥ `hisa_min_seq_len` (default 32768)** | **never slower than off, wins whenever active (forced-on gate=1024 proven never-slower, up to 2.56× at 33k); per-step invariant memo shipped `3e03d665d`** |
 | NVFP4 indexer-K (MX E2M1+UE8M0) | on | score→top-k fusion measured net-zero under graphs — killed |
 | Indexer decode top-k | on — prod live-kv routes to vanilla C++ (`841f9874a`), DSL only at kv ≥ 16k | fp16 logits (`indexer_logits_dtype=auto`→fp16 on the DSL path, `3e03d665d`) |
 | MLA / MLP / indexer proj GEMM backend | on — cuBLASLt forced for the NVFP4 proj Linears (`TRTLLM_MLA_PROJ_NVFP4_BACKENDS` + `TRTLLM_DSV3_MLP_NVFP4_BACKENDS` + `TRTLLM_INDEXER_NVFP4_BACKENDS`, default `cublaslt`) | 1.2–2.1× per GEMM (B1, `4220bf4bd`+`3e03d665d`); bit-identical on the MLA/MLP set — the indexer-triple equality was vacuous pre-input_scale-fix; full triple re-proven post-fix (wk/wp `wkwp_driver2`, wq_b close-out B; CRITICAL section) |
 | Indexer wk+weights_proj fused GEMM | on (`68866e061`, `TRTLLM_INDEXER_FUSE_WK_WP=1` default) | 1.96–1.97× → **~2.0 ms/token**; also halves the dynamic amax+quantize work (I5) |
-| Gated-norm / glue | on — `fused_lowrank_gate` with the CuTe DSL kernel as default impl (`TRTLLM_OPTRT_LOWRANK_GATE_IMPL=cute`, `33e801fd1`) + fused sigmoid·mul at both attention gate sites + **single-launch gate+NVFP4-quant on the MoE input** (`68866e061`) | −91.6 % on the gated-norm chain (G1); the quant epilogue takes the chain 7.04 → 4.19 µs/layer (−165 µs/tok, G2 chain); absorb rejected-as-measured, 0.98-bar re-screen in flight |
+| Gated-norm / glue | on — `fused_lowrank_gate` with the CuTe DSL kernel as default impl (`TRTLLM_OPTRT_LOWRANK_GATE_IMPL=cute`, `33e801fd1`) + fused sigmoid·mul at both attention gate sites + **single-launch gate+NVFP4-quant on the MoE input** (`68866e061`) | −91.6 % on the gated-norm chain (G1); the quant epilogue takes the chain 7.04 → 4.19 µs/layer (−165 µs/tok, G2 chain); absorb **CLOSED PERMANENTLY** (MoE-output cosine FAIL, see G2) |
 | Shared-expert swiglu+FP4-out fusion | on at decode M — `_FP4OUT_MIN_M=128` guard lifted (`fd705a6f5`) | exact vs TRUE-f32 (cos 1.0, max_abs 0.0) at every m |
-| MoE EP comm | NVLINK_TWO_SIDED today; DeepEP low-latency enablement shipped (`51918fba2`), production flip is M3 | LL needs `TRTLLM_DEEP_EP_TOKEN_LIMIT` = per-rank concurrency (16), NOT max_batch_size |
+| MoE EP comm | NVLINK_TWO_SIDED today; DeepEP low-latency **DECIDED GO** (M3, 2026-06-11) — env delta staged | `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + **explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`** (the "inversion at 64" was an artifact — see M3); **topology precondition: ADP + `moe_tp_size=1`, inert under plain TP** |
 | NIXL transport + request pinning + Moondream overlap | on | generation-first/write-mode is the open gate |
 
 HISA stays **enabled whenever the Indexer is on**. HISA is a core part of the
@@ -206,32 +252,42 @@ no longer the top hill-climb priority.
 
 ## Priority sequence
 
-1. **Remediate the live input_scale hazard** (CRITICAL section above):
-   overlay `linear_wave2_fixed.py` on the 002 r20 deploy or rebuild from a
-   tree ≥ `5bc2b2cb8`; rollout timing is the owner's call (active workload).
-   Every future image build must carry the fix.
-2. **MoE / EP comm is the top open hill-climb lever (per the eager c16
-   profile: MoE ≈ 60 % of the step, EP comm ≈ 40 %).** M3 — the DeepEP
-   low-latency production flip (enablement shipped `51918fba2`; the open item
-   is the `TRTLLM_DEEP_EP_TOKEN_LIMIT` c16-vs-max_batch sizing decision).
-3. **The 0.98-bar re-screen experiments** (see the re-screen section):
-   G2-absorb (MoE-output-cosine gate), I2 freq 4→8 (GATE-B; real-activation
-   dump blocked on a fixed image), H3b long-band A/B. The FP4MQA formal
-   close-out and the wq_b backend re-gate both **PASSED 2026-06-10** — done.
-4. C9 CP=2 IPC GPU re-validation → push; then the remaining host/kernel
-   levers (N1, M1, K1 PDL, H3a/H3c), then the structural megakernel (P1).
-   **Shipped this round: C2, I5, G2-chain, L2, S5** (`5bc2b2cb8` +
-   `68866e061` + `34fe7aaec`). S2 stays moot under WarpDecode+TP (held).
+1. **Remediate the live input_scale hazard** — the fixed image is **built +
+   verified** (`optrt-34fe7aaec-fixed-20260611011615`, 4/4 incl. the NONZERO
+   indexer probe; CRITICAL section); `ROLLOUT.md` stages 002 transport, the
+   DGD image swap, the N1 NUMA pin, and post-roll checks. **Rollout is the
+   owner's decision** (live workload). Every future build must carry
+   ≥ `5bc2b2cb8`.
+2. **M3 is DECIDED GO** — the "inversion at token_limit=64" was a
+   measurement artifact; LL wins at every measured point. Production env
+   delta staged (`/tmp/m3_sizing_work/production_env_delta.yaml`):
+   `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + **explicit
+   `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`**. **Topology precondition: ADP +
+   `moe_tp_size=1` (`communication_factory.py:126`) — this feeds the
+   ADP-vs-TP production call (see the regimes section above).**
+3. **The 0.98-bar re-screen is now SETTLED** (see the re-screen section):
+   G2-absorb **CLOSED PERMANENTLY** (MoE-output cosine FAILs every cell);
+   H3b **dead again** (set-equality OK, plain ON slower everywhere); the
+   FP4MQA formal close-out and the wq_b backend re-gate **PASSED
+   2026-06-10**. I2 GATE-B is the one open item — its real-activation dump
+   is **unblocked by the fixed image** (runnable on 001).
+4. MO1 needs the release `.so` build + the python activation gap (see MO1);
+   C9 stays **parked** (the IPC channel wedges under the L1 overlap
+   pattern); then N1 (rides the rollout manifest edit), M1, K1 PDL,
+   H3a/H3c, the structural megakernel (P1). **Shipped this round: L1
+   prefill dense-broadcast overlap + C4 KVarN eager decode-restore
+   host-path** (`0a1504755`). S2 stays moot under WarpDecode+TP (held).
 
 ## Ranked candidates
 
 | # | Candidate | Layer | Expected win @ c16 | Status |
 |---|-----------|-------|--------------------|--------|
-| **M3** | **DeepEP low-latency production flip** (`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + `TRTLLM_DEEP_EP_TOKEN_LIMIT=16`) | comm | LL roundtrip 45 vs 115 µs/layer @ limit 16 (~2.5×) — **INVERTS at limit 64** | **enablement SHIPPED** `51918fba2`; flip pending the c16-vs-max_batch sizing decision |
+| **M3** | **DeepEP low-latency production flip** (`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`) | comm | LL wins at **every** point: 2.4–2.5× at steady c16, 2.06× worst case (actual=64); the prior "INVERTS at limit 64" was an **emulated-FFN artifact, REFUTED** | **DECIDED GO** (2026-06-11, sizing sweep) — env delta staged; **requires ADP + `moe_tp_size=1`** (`communication_factory.py:126`) |
 | C2 | KVarN delta-restore (restore only the changed rows/blocks) | scheduler | host 48.8 → 0.3 ms/fire (147–162×); **12.1 → 0.08 ms/step amortized at TP bs=16** | **SHIPPED default-on** `5bc2b2cb8` (5-scenario lockstep equivalence PASS) |
-| G2 | Gated-norm → PRE_MOE_FUSION (chain quant-epilogue + absorb) | glue | chain: −165 µs/tok shipped; absorb floor: ~117 µs/tok more | **chain SHIPPED** `68866e061`; **absorb REJECTED on routing** as measured — 0.98-bar MoE-output-cosine re-screen in flight |
+| G2 | Gated-norm → PRE_MOE_FUSION (chain quant-epilogue + absorb) | glue | chain: −165 µs/tok shipped; absorb floor: ~117 µs/tok — **irreducible** | **chain SHIPPED** `68866e061`; **absorb CLOSED PERMANENTLY** (2026-06-11) — MoE-output cosine FAILs every cell at the 0.98 bar (see G2) |
 | I5 | Indexer wk+wp fused GEMM (one launch + one read of x per F-layer) | indexer | fused 23.5 vs split 46.5 µs @ M=4 (1.96×) → **~2.0 ms/token** | **SHIPPED default-on** `68866e061` (the v1 cos=0.0 gate-fail was the input_scale bug, not the fusion) |
-| C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl, GPU re-validating |
+| C4 | KVarN eager decode-restore host-path (`_kvarn_step_cand_host` host-mirror selection) | scheduler | 13.3 → 0.69 ms/61-layer step (19.4×) steady, 17.0 → 1.7 ms churn; kills the misattributed "indexer FSSS cub select ~3 %" profile slice | **SHIPPED default-on** `0a1504755` (300-trial set-equality, 0 failures) |
+| C9 | CP=2 IPC push broadcast | prefill TTFT | 1.2–3× the per-layer broadcast | impl; **PARKED** — the IPC channel wedges both ranks under the L1 overlap pattern; L1 ships the win NCCL-only |
 | B1 | cuBLASLt NVFP4 backend force: MLA proj + shared/dense MLP + indexer proj | GEMM | ~1.62 ms/tok (`4220bf4bd`) + 1.62 ms/tok incremental (`3e03d665d`, TP4); bit-identical | **SHIPPED** `4220bf4bd`+`3e03d665d` |
 | G1 | Gated-norm + glue fusions (`fused_lowrank_gate` −91.6 %, fused sigmoid·mul, HISA invariant memo) + CuTe DSL port (−36 % vs Triton, default impl) | glue | −6.27 (bs4) / −9.38 (bs16) ms/step eager GPU | **SHIPPED** `3e03d665d`+`33e801fd1` |
 | I6 | fp16 indexer logits (`indexer_logits_dtype`, auto→fp16 on the DSL path) | indexer | top-k −15…−22 % @ kv ≥ 33k; logits buffer halved | **SHIPPED** `3e03d665d` |
@@ -240,19 +296,19 @@ no longer the top hill-climb priority.
 | C1 | KVarN pre-replay restore host-gate | scheduler | ~0.75–2 ms host (within harness noise) | **shipped** `a1b13ea78` |
 | C3 | Cache debug env-gates / no eager kwargs | scheduler | ~0.1 ms/step | **shipped** `0adc87009` |
 | H3a | PDL-chain the 5 HISA glue kernels (candidate_pages/mask/remap/block_reps/block_scores; indexerHisaNvfp4.cu has 0 PDL, indexerTopK.cu has 9) | indexer | ~0.11–0.17 ms/step (7 boundaries × ~1–1.5µs × 16F) | candidate (re-scoped: HISA ≈ 0.7 % of step) |
-| H3b | Per-row live-length candidate scaling (caller-only: per-row `candidate_context_lens`/`selected_lengths` from `prefix_lens`; kernels already walk `[0,num_kv)` — verified fp4_paged_mqa_logits.py:1422 / indexerTopK.cu:663) | indexer | long-band topk radix→insertion 14→6.9µs (real); GEMM 7.2× (latency-bound caveat) | **RESURRECTED** (0.98 re-screen; set-identical by construction) — long-band A/B in flight |
+| H3b | Per-row live-length candidate scaling (caller-only: per-row `candidate_context_lens`/`selected_lengths` from `prefix_lens`; kernels already walk `[0,num_kv)` — verified fp4_paged_mqa_logits.py:1422 / indexerTopK.cu:663) | indexer | long-band A/B (driver v2): set-equality OK but **plain ON is SLOWER everywhere** (+1.2–4.1 µs full pipeline); hoisted variant breakeven (best +2.3 µs) | **DEAD again** (2026-06-11) — the HISA-scale fix already captured the width win; stays opt-in/off (`/tmp/h3b_ab_work/h3b_table_v2.txt`) |
 | H3c | Incremental block-rep quantize (only the boundary block changes/step; indexerHisaNvfp4.cu:279 rebuilds all) | indexer | ~0.08–0.11 ms/step | candidate |
 | ~~H4~~ | ~~HISA `compression_ratio` sweep {4,6,8,12}~~ | indexer | — | **KILLED by format mandate** — the checkpoint pins HISA4to1; only intra-4to1 tuning remains |
 | ~~H1~~ | ~~short-band candidate-width allocation shrink~~ | indexer | **REGRESSED −6% (40.28→37.82)** — short kv is latency-bound | **discarded (measured)** |
 | S2 | Collapse 10 host MPI collectives → ~3 | scheduler | 150–400 µs + 7 barriers of jitter | **MOOT under WarpDecode+TP** (no ADP collectives); held with that note |
 | N1 | NUMA-pin decode workers to node 1 | system | 0.3–1 ms + jitter | planned (rides manifest) |
-| I2 | `index_topk_freq` 4→8 (16 → 9 F-layers) | indexer | 0.23–0.46 ms/step measured ceiling | synthetic recall gate proven **non-predictive**; conditional GO on GATE-B real-activation dump — **blocked on a fixed image** (CRITICAL section) |
+| I2 | `index_topk_freq` 4→8 (16 → 9 F-layers) | indexer | 0.23–0.46 ms/step measured ceiling | synthetic recall gate proven **non-predictive**; conditional GO on GATE-B real-activation dump — **unblocked**: the fixed image is staged (`optrt-34fe7aaec-fixed-…`, CRITICAL section), dump runnable on 001 |
 | M1 | MoE A2A two-sided → one-sided + workspace combine | comm | 0.3–0.9 ms/step | planned (sequence after M3) |
 | K1 | PDL coverage completion | kernel | +1–3% | planned |
 | ~~K2~~ | ~~FC2 N-tile 256→160~~ | kernel | **N=160 is numerically broken** (SFB miscompute, cos 0.790 vs TRUE f32; + prefill M=1024 OOB) | **KILLED** `29f492b49`→`d01737397` — see killed list |
-| L1 | z.ai dense-broadcast overlap | prefill | TTFT (exposed indexer-K broadcast) | planned |
+| L1 | z.ai dense-broadcast overlap | prefill | exposed broadcast 65–82 → 2.5–8.2 ms/step; **TTFT −544 ms @64k, ~−1.1 s @128k** | **SHIPPED default-on** `0a1504755` (20/20 correctness, both ranks, CP2 + real fp8_fp4 scoring) |
 | P1 | Persistent decode-layer megakernel | kernel | dispatch fusion itself Δ≈0 under PDL (the −13.9% previously attributed to it was K2's broken N=160); structural persistent-kernel case unchanged | **code shipped, opt-in** (`MOE_MEGAKERNEL`); FC2_N default fixed 160→256 `e105fd7a1` |
-| MO1 | MORI-style generation-first / write-mode handoff | transport | TTFT (overlaps RDMA with prefill) | needs router build |
+| MO1 | MORI-style generation-first / write-mode handoff | transport | TTFT ~−12–17 ms @8k / ~−20–27 ms @64k intra-node fp8 (estimate) | router slice **exists on dynamo-prod-k8s main** (`01359673f3`) and **now compiles** (this session, first time); remaining: release `.so` build + the python activation gap (see MO1) |
 
 ---
 
@@ -422,7 +478,25 @@ per-step request/metadata summary strings). Cache the gates at import,
 short-circuit the summary helpers, gate the per-iteration executor call at the
 call site. **Shipped** `0adc87009`. ~0.1 ms/step, zero correctness risk.
 
-## C9 — CP=2 IPC push broadcast (impl, GPU re-validating)
+## C4 — KVarN eager decode-restore host-path (SHIPPED default-on `0a1504755`)
+
+The eager decode profile's "indexer FSSS cub select" line (~3 % of decode
+GPU) was a **misattribution**: `kvarn_restore_for_decode`'s boolean-mask
+indexing launched **671 ATen cub kernels + 183 D2H syncs per step-rank**
+(61 layers × 3 `torch.nonzero`) — ~1.24 ms/step of GPU compaction that
+selects an **EMPTY set** in steady state. Fix: host-mirror selection
+(`_kvarn_step_cand_host`): candidates from `kvarn_host_block_table` + host
+kv_lens, memoized on the step key; numpy filter via the same
+`valid`/`commit_gen` host mirrors the C2 delta walk trusts. Empty set ⇒
+zero launches/syncs; non-empty ⇒ the existing restore primitive; **any
+host-state inconsistency ⇒ unchanged device-scan fallback**. Set-equality
+vs an exact HEAD-path replica: **300 randomized trials (B 1/4/16, churn,
+duplicates, recycled epochs, padding) = 0 failures**. Standalone 61-layer
+step: **13.3 → 0.69 ms (19.4×) steady, 17.0 → 1.7 ms churn**. See
+[kvarn.md](kvarn.md); the profile correction is in the methodology section
+above.
+
+## C9 — CP=2 IPC push broadcast (impl, PARKED — IPC wedges under the L1 overlap)
 
 The directive-7 bench showed a single cross-device copy beats NCCL
 `dist.broadcast` 1.2–3× at CP=2 (NCCL wins serial fan-out at CP≥3). Owner-push
@@ -438,9 +512,15 @@ because stream memops reject CUDA-IPC-imported addresses
 re-validation pending). 4-phase unanimous setup (loopback memop probe, handle
 exchange w/ UUID + bidirectional-P2P check, agreement vote, live roundtrip),
 NCCL fallback on cp_size≠2 / capture / oversize / kill-switch / any failure,
-symmetric on both ranks. Local commit `8bcda0809`, **held until GPU
-re-validation** (`c9_test.py`, 2-GPU, 5 cases incl. ring-wrap + float8 alias +
-fallback).
+symmetric on both ranks. Local commit `8bcda0809`, held.
+
+**Status update (`0a1504755`): PARKED.** During the L1 overlap work the C9
+IPC channel **wedged both ranks** under the overlap traffic pattern
+(comm-stream broadcast issued behind indexer compute) — the L1 win ships
+**NCCL-only** and C9 stays parked. Revisit only with a root-cause for the
+wedge; L1 already removes most of the exposed cost C9 targeted (the sync
+path's cost was the masked_select+unique host syncs, not wire time — see
+L1).
 
 ---
 
@@ -476,7 +556,9 @@ bs=4, bs=16, and prefill, under both attention-DP and pure TP.
 > (cutlass↔cuBLASLt cos 1.000000 / 0.999996); **wq_b re-proven** (close-out
 > B, 2026-06-10: cos 1.000000 / max|diff| 0 with liveness asserted,
 > M ∈ {4,16} × layers {5,30}; cuBLASLt 1.18–1.21× — remains the right wq_b
-> pick; 001 `/tmp/fp4mqa_closeout_work/closeout_b.json`). The full indexer
+> pick; 001 `/tmp/fp4mqa_closeout_work/closeout_b.json`; **v2 re-gate adds a
+> pure-torch true-f32 dequant reference: min cos vs f32 ref 0.999999, both
+> backends identical** — `closeout_b_v2.json`). The full indexer
 > triple is re-proven. The MLA proj (`4220bf4bd`) and MLP claims are
 > unaffected — those modules have in-checkpoint `input_global_scale` and were
 > gated against a true-f32 reference.
@@ -517,10 +599,10 @@ hiding in the dense-proj profile bucket**: a pathological `gemmSN_TN`
   warmup helper compiles pre-capture). tcgen05/TMA were *rejected* at
   rank-16/M≤16 — latency-bound (CN sweep CN1 10.6 µs → CN7 3.95 µs confirms).
 
-## G2 — Gated-norm → PRE_MOE_FUSION (chain SHIPPED `68866e061`; absorb rejected-as-measured, 0.98-bar re-screen in flight)
+## G2 — Gated-norm → PRE_MOE_FUSION (chain SHIPPED `68866e061`; absorb CLOSED PERMANENTLY)
 
-Of the two designs, **the chain landed and the absorb was measured and
-REJECTED by the routing gate**:
+Of the two designs, **the chain landed and the absorb is closed for good —
+it failed the decisive MoE-output-cosine gate in every cell**:
 
 - **Chain — single-launch CuTe lowrank-gate + NVFP4-quant epilogue
   (`apply_fused_lowrank_gate_quant_nvfp4`, SHIPPED `68866e061`):** the
@@ -537,16 +619,33 @@ REJECTED by the routing gate**:
   absorb-into-AR-quant is additionally blocked by kernel layout: the AR NVFP4
   epilogues emit SWIZZLED SF only while the MoE permute path requires LINEAR.
   Documented as [nvfp4_fusions.md](nvfp4_fusions.md) #13c.
-- **Absorb (constant-0.5 fold) — REJECTED on routing as measured:** the
-  "0.500 ± 0.0025" gate band is **layer-5-local**. Across depth the gate std
-  grows (0.0023 @ L3 → 0.0152 @ L50; modulation up to 28.9 %): on real
-  noaux_tc routing the top-8 overlap falls to **0.965–0.988 at layers
-  20–60** (exact-top8 tokens 77.9 % at L50) — fails the routing gate.
-  Recorded, not shipped: `/tmp/premoe_work/absorb_premoe.REJECTED.patch`.
-  The 0.98-bar re-screen resurrects the question under a **MoE-output-cosine
-  gate** (decisive experiment in flight) — the measured routing divergence is
-  the evidence it must beat. The remaining gap to the absorb floor is
-  ~117 µs/token.
+- **Absorb (constant-0.5 fold) — CLOSED PERMANENTLY (2026-06-11, decisive
+  MoE-output-cosine gate at the 0.98 bar):** the routing rejection above
+  ("0.500 ± 0.0025" is layer-5-local; top-8 overlap 0.965–0.988 at layers
+  20–60) was re-screened under the new bar with the **functional judge** —
+  per-token MoE OUTPUT cosine through the real production expert chain
+  (`run_moe_nvfp4_impl`, real checkpoint weights, EP=1 full combine, layers
+  {5,20,45} × M {4,16}, 3–4k tokens/cell; instrument determinism floor
+  ≥ 0.999994). **FAIL in every cell, under every reading of the bar**: mins
+  0.60–0.80, p1 0.77–0.96, and at layer 45 even the MEAN fails (0.9695 <
+  0.98). Two independent mechanisms, both real:
+  1. **Routing flips are NOT benign** — the f32-functional control (no
+     activation quant anywhere; pure gate-modulation + routing difference)
+     refutes the near-tied-flip hypothesis: **one flipped expert costs
+     ~3–6 % output cosine** functionally, two cost ~6–12 %, and the
+     any-expert flip rate grows with depth 4.5 % → 8.2 % → **18.9 % at
+     L45**. Near-tied ROUTER SCORES do not imply near-identical EXPERT
+     OUTPUTS.
+  2. **fp4 re-quantization decorrelation amplified by routed/shared
+     cancellation** — present even at 8/8 routing agreement: the gate-vs-0.5
+     input delta crosses NVFP4 bin boundaries (rel_l2 0.10–0.22 through
+     both expert paths), and tokens where routed+shared partially cancel
+     lose up to 25 % cosine with PERFECT routing.
+  The shipped single-launch gate+quant chain kernel (`68866e061`) **stays**;
+  the remaining **~117 µs/token to the absorb floor is irreducible**. Do not
+  re-open without a fundamentally different design (not a constant fold).
+  Artifacts: 001 `/tmp/g2_absorb_work/` (`CLOSEOUT.md`, `out_g2_full/`);
+  patch stays recorded at `/tmp/premoe_work/absorb_premoe.REJECTED.patch`.
 
 ## K3 — Shared-expert swiglu+FP4-out fusion at decode M (SHIPPED `fd705a6f5`)
 
@@ -656,7 +755,7 @@ M=16 34.6 vs 67.6 (**1.96–1.97×**) → **~2.0 ms/token across 61 layers** —
 bigger than the static estimate because the fusion also halves the dynamic
 amax+quantize work.
 
-### I2 — `index_topk_freq` 4→8 (synthetic gate NON-PREDICTIVE; conditional GO blocked on a fixed image)
+### I2 — `index_topk_freq` 4→8 (synthetic gate NON-PREDICTIVE; conditional GO — GATE-B dump now unblocked by the fixed image)
 FSSS is **cross-layer** (not cross-step); freq=8 means **9** F-layers (not 8)
 vs prod freq=4's 16, so the lever is 7 F-layers/step. Measured (B200, real
 per-layer NVFP4 indexer weights):
@@ -676,10 +775,12 @@ per-layer NVFP4 indexer weights):
 
 Verdict: NO-GO as an immediate flip on the synthetic gate; **conditional GO**
 under the 0.98-bar GATE-B judgment — downstream attention cosine of
-freq=8-selected vs freq=1-selected sets on a **real-activation top-k dump,
-which must wait for a FIXED image: the live 002 deploy's indexer activations
-are the zero-poisoned path** (CRITICAL section), so any dump taken today
-gates garbage.
+freq=8-selected vs freq=1-selected sets on a **real-activation top-k dump**.
+The dump had to wait for a FIXED image (the live 002 deploy's indexer
+activations are the zero-poisoned path, CRITICAL section — any dump taken
+from it gates garbage); **now unblocked**:
+`optrt-34fe7aaec-fixed-20260611011615` is verified on 001 (NONZERO indexer
+probe), so the dump can run there without waiting for the 002 rollout.
 
 ### I3 — `seq_len_threshold` short band (was: folds into H1; still valid standalone)
 Currently unset → one effective band → width always 132096. Setting 65536
@@ -700,7 +801,7 @@ Moved to the killed list; do not rebuild.
 
 ## MoE / communication
 
-### M3 — DeepEP low-latency production flip (enablement SHIPPED `51918fba2`; flip pending)
+### M3 — DeepEP low-latency production flip (enablement SHIPPED `51918fba2`; **DECIDED GO 2026-06-11**)
 The top open lever per the eager c16 profile (EP comm ≈ 40 % of the step).
 `51918fba2` shipped the two fixes that unblock
 `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` on the WARPDECODE decode path
@@ -724,15 +825,55 @@ The top open lever per the eager c16 profile (EP comm ≈ 40 % of the step).
 better than normal's 0.9999975); NVSHMEM NVLink-P2P fallback init clean; int32
 topk_idx matches the vendored kernels.
 
-**The sizing caveat (why the flip is not defaulted):** the LL win — **45 µs vs
-115 µs per-layer roundtrip at token_limit=16 (~2.5×) — INVERTS at
-token_limit=64 (225 µs)**. The padded transfer scales with the limit, so
-production must set `TRTLLM_DEEP_EP_TOKEN_LIMIT` to the **actual per-rank
-concurrency (16 for the c16 target), not max_batch_size**. Deploy delta:
-`TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + `TRTLLM_DEEP_EP_TOKEN_LIMIT=16`.
-Open decision before the flip: the c16-vs-max_batch sizing policy (what
-happens when scheduled tokens/rank exceed the limit — the park/restore
-fallback engages, but the limit choice sets how often).
+**The sizing decision (2026-06-11, EP2 GPUs 5,6 sweep): GO at
+`TRTLLM_DEEP_EP_TOKEN_LIMIT=64`.** The prior "inversion at token_limit=64
+(225 µs)" was a **measurement artifact, REFUTED**: both prior LL runs used
+limit=64 (identical `rdma_bytes`); the 225 µs run's `full_roundtrip` included
+`y = recv.float() * s_local` — an **emulated FFN over the FULL padded recv
+buffer** (`[32, 2·64, 7168]` ≈ 29.4 M elements). That emulation scales with
+the limit; **the a2a kernels do not**, and the real compute chain is
+tile-count-driven (moe_sort drops sentinel rows, `tiles_equal=True`,
+cross-layout cosine ≥ 0.999993 at ALL limits incl. ep4_prod L64). The real
+padding curve is **FLAT** (limit > actual costs +0.2 µs p50 at t16, +1.8 µs
+at t4) and **LL wins at EVERY measured point**:
+
+| actual tok/rank | normal | LL L16 | LL L32 | LL L64 |
+|---|---|---|---|---|
+| 4 (ADP c16)     | 107.7  | 42.9   | 44.1   | 44.7   |
+| 16 (TP c16)     | 113.3  | 45.4   | 45.4   | 45.6   |
+| 32              | 117.8  | —      | 47.9   | 48.2   |
+| 64 (max_batch)  | 119.7  | —      | —      | 58.2   |
+
+(p50 µs/layer roundtrip; worst case 58.2 vs 119.7 = **2.06×** at a full
+64-token batch; prod steady range t4–t16 = **2.4–2.5×**; LL tail max ≤ 96 µs
+vs normal's ~150 µs + prior 3.7 ms skew pathology; a2a cosine 1.000000 on
+graph replay, both ranks.)
+
+**Why 64, and why set it explicitly:** the limit must cover the max
+per-rank tokens ever dispatched (`deep_ep_low_latency.py` asserts
+`all_rank_max_num_tokens <= limit`); per-iter cost follows **actual**
+tokens, the env only sizes the reserved NVSHMEM buffer (~235 MB/rank at
+L64, EP2 shape). **Leaving it UNSET is wrong** — the default sizes the
+NVSHMEM symmetric heap to the engine `max_num_tokens` (multi-GB at
+warmup-sized values). Forwards above the limit hit the feasibility guard
+and park/restore (`51918fba2`) — they do not evict LL.
+
+**Production env delta** (staged, `/tmp/m3_sizing_work/
+production_env_delta.yaml`): `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` +
+`TRTLLM_DEEP_EP_TOKEN_LIMIT=64` +
+`TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE=0` (pin NVLink-P2P
+transport) + `TRTLLM_MOE_POST_QUANT_ALLTOALLV=1` (fp4 post-quant dispatch,
+44–48 µs with bf16 combine). `use_low_precision_moe_combine` must stay
+**false** (nvfp4 combine failed the 0.999 gate at 0.9957; bf16 passes at
+0.9999985).
+
+> **CRITICAL TOPOLOGY PRECONDITION:** LL — like **every** a2a strategy —
+> engages only under `enable_attention_dp=true` **and** `moe_tp_size=1`
+> (`communication_factory.py:126`: no ADP ⇒ the comm factory returns None;
+> `moe_tp_size≠1` ⇒ AllGather/ReduceScatter). **Under plain-TP attention
+> M3 is inert.** This feeds the ADP-vs-TP production topology decision:
+> **ADP unlocks the 2.4–2.5× a2a win; pure TP has no a2a at all** — see
+> the regimes section above and [topology_deploy.md](topology_deploy.md).
 
 ### M1 — A2A two-sided → one-sided + workspace combine (planned, sequence after M3)
 Deploy forces `TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED` (FIFO handshake, 4
@@ -806,13 +947,30 @@ companion.
 
 ## Prefill / LayerSplit
 
-### L1 — z.ai dense-broadcast overlap (planned, after C9)
-z.ai's design overlaps the dense-KV broadcast behind indexer compute so only the
-~1/8 indexer-K broadcast is exposed. op-trt defaults sync (M9 bench used
-`cuda._sleep`-simulated compute). With the 1G read-set broadcast the indexer-K
-payload grew, so re-measure sync vs overlap at the real 128k/large-batch shape
-with real compute; activate if it wins. Affects TTFT, not TPOT. Same code region
-as C9 — design together.
+### L1 — z.ai dense-broadcast overlap (SHIPPED default-on `0a1504755`)
+z.ai's design overlaps the dense-KV broadcast behind indexer compute so only
+the ~1/8 indexer-K broadcast is exposed. **Shipped default-on**
+(`TRTLLM_OPTRT_LAYERSPLIT_PREFILL_OVERLAP`, `0` = legacy sync path).
+
+- **What the sync path actually cost:** ~65–82 ms exposed per prefill step
+  (~1.17 ms/layer × 61), dominated **not by wire time** but by the
+  per-layer `masked_select`+`unique` top-k-union **host syncs**.
+- **The overlap:** on pure-context steps the read set == the top-k union
+  (measured `union_fraction=1.0` at every shape), so the dense+scale
+  broadcast is issued for the **READ SET** on the comm stream right after
+  the indexer-K broadcast — hidden behind real indexer compute — and
+  consumed event-gated exactly where the legacy sync broadcast sat.
+  Exposed drops to **2.5–8.2 ms/step**: **TTFT −544 ms per 64k prompt**
+  (584.9 → 41.0 ms exposed over 8 chunk steps), **~−1.1 s at 128k**.
+- **Correctness 20/20:** consumer-visible rows byte-equal AND equal to
+  independently regenerated owner truth, both ranks, CP2 + real fp8_fp4
+  scoring. **Decode keeps the legacy tiny-union path** (unaffected).
+  Graceful fallback on capture / no-group / no-stream / empty-set.
+- **C9 interaction:** the C9 IPC channel **wedges both ranks** under this
+  traffic pattern — overlap routes via **NCCL only**; C9 stays parked
+  (see C9).
+
+TTFT lever only, not TPOT.
 
 ### L2 — Read-set block-id hoist (SHIPPED `5bc2b2cb8`)
 `_layersplit_compute_read_block_ids` is per-step-invariant but ran
@@ -828,18 +986,61 @@ the read-set computation hoists.)
 
 ## Transport
 
-### MO1 — MORI-style generation-first / write-mode handoff (needs router build)
+### MO1 — MORI-style generation-first / write-mode handoff (slice exists + now compiles; release build + python activation remain)
 The MORI-IO blog's best mode is **write mode**: the proxy dispatches prefill and
 decode concurrently and prefill pushes KV layer-by-layer, so the RDMA transfer
 overlaps prefill compute and only its residual adds to TTFT (read mode serializes
 → +1 full prefill pass). Our analogue is `generation_first` handoff, and the
 campaign's own audit *requires* the `handoff_mode="generation_first"` marker and
-*rejects* `completed_prefill`. The live deploy logs `completed_prefill`: the
-`generation_first` string is **absent from the deployed Dynamo router binary**
-(`_core.abi3.so` `prefill_router/mod.rs` exposes only completed-prefill
-dispatch). Closing this needs a **new router build** (Rust), not just the python
-slice the status doc assumed. TTFT lever only (not post-first-token) — tracked
-but lower priority for this metric.
+*rejects* `completed_prefill`.
+
+**Status rewrite (2026-06-10/11 session, findings
+`/tmp/mo1_router_work/MO1_FINDINGS.md`, Mac):**
+
+- **The generation-first slice ALREADY EXISTS end-to-end on
+  `ai-blaise/dynamo-prod-k8s` main** — tip `01359673f3` ("feat(trtllm):
+  route NIXL generation-first handoff", 2026-06-07): the router checks the
+  prefill worker's published
+  `trtllm_generation_first_disaggregated_params` runtime_data, **mints a
+  shared 63-bit `disagg_request_id`**, spawns the `context_only` prefill as
+  a background task, **dispatches decode at t0** with `generation_only`
+  params, and emits the audit marker `handoff_mode="generation_first"`. All
+  op-trt engine dependencies exist (`DisaggScheduleStyle.GENERATION_FIRST`,
+  the py_executor readiness gates, the V2 transceiver gen-first branch,
+  LayerSplit-aware).
+- **But it was NEVER COMPILED**: the commit message itself records `cargo
+  check` never completed (the VM lacks `protoc`; etcd-client's build.rs
+  fails first), and the **deployed `_core.abi3.so` predates the commit** —
+  the live frontend can only do completed-prefill.
+- **This session compiled it for the first time** (Mac, protoc 35.0 +
+  pinned rustc 1.93.1, zig-cross to `x86_64-unknown-linux-gnu`): `cargo
+  check -p dynamo-llm` **PASS**, `--tests` **PASS**, and the `dynamo-py3`
+  crate (the exact `_core.abi3.so` that ships) **PASS**. Session edits
+  (patch `/tmp/mo1_router_work/mo1_session_edits.patch`, Mac-local, not
+  pushed): a **fail-close `handoff_mode="completed_prefill"` marker** on
+  the serialized-fallback arm (before this, a silently-degraded deploy was
+  invisible to the audit grep) + unit tests for
+  `build_trtllm_generation_first_params` (endpoint string/array/empty
+  forms, request-type split, shared ctx/disagg request id, dp_rank
+  insert/null-strip, 63-bit id cap — previously never compiled).
+- **NEW GAP — python activation:** the r20 manifests launch the **legacy
+  worker entrypoint** (`python3 -m dynamo.trtllm` → `llm_worker.py` /
+  `handlers.py`), which **never publishes the gen-first runtime_data**
+  (that code lives only in `llm_engine.py`, launched by `unified_main`) —
+  so the router's generation-first arm never fires and falls back
+  (now at least *visibly*, via the new marker). Close it with either the
+  `unified_main` entrypoint flip (needs flag-parity vs the r20 args) or a
+  ~60-line port to the legacy handler path.
+- **Remaining to production:** the release `.so` build (maturin
+  `dynamo-py3` → unified gate image; test execution needs a Linux host)
+  + the python activation gap above.
+
+**Expected TTFT win** (prod shapes, 61 layers, MLA latent 576 elem/tok/layer;
+hides t_xfer + the serialized decode-setup leg ≈ ½ decode iteration):
+**~12–17 ms @8k, ~20–27 ms @64k** intra-node NVLink fp8 KV; kvarn_k2v2 is
+setup-dominated ~10–18 ms across 8–64k; cross-node 1-rail up to ~60–67 ms
+@64k. TTFT lever only (not post-first-token) — tracked but lower priority
+for this metric.
 
 ---
 
@@ -849,22 +1050,32 @@ The owner's new bar (downstream-functional cosine ≥ 0.98; formats pinned to
 the checkpoint; bit-identical never required) triggered a full re-screen of
 the killed list and the pending gates (`/tmp/rescreen_098/RESCREEN.md`).
 
-**RESURRECTED:**
+**RESURRECTED (all four now resolved):**
 
-1. **G2-absorb** (~1–1.5 ms/step ceiling): the old gate demanded what
-   amounted to bit-exactness; the new judge is a **MoE-output-cosine** gate.
-   The premoe lane's measured routing rejection (top-8 overlap 0.965–0.988 at
-   layers 20–60 — see G2) is the evidence the experiment must beat.
+1. **G2-absorb — re-screened and CLOSED PERMANENTLY (2026-06-11):** the
+   MoE-output-cosine gate ran (the decisive experiment) and **FAILED every
+   (layer, M) cell under every reading of the bar** — mins 0.60–0.80, p1
+   0.77–0.96, L45 mean 0.9695 < 0.98. The f32-functional control refuted
+   the near-tied-flip hypothesis (1 flipped expert = −3..6 % output cosine
+   functionally; L45 any-expert flip rate 18.9 %), and a second
+   bar-independent mechanism (fp4-requant decorrelation amplified by
+   routed/shared cancellation) fails tokens even at 8/8 routing agreement.
+   Full close-out in G2; artifacts 001 `/tmp/g2_absorb_work/`.
 2. **I2 `index_topk_freq` 4→8** (0.23–0.46 ms/step): gate relaxed from set
    recall to GATE-B downstream attention cosine (freq=8-selected vs
-   freq=1-selected sets). The real-activation dump it needs is **blocked on a
-   fixed image** — the live 002 indexer activations are the zero-poisoned
-   path.
-3. **H3b per-row candidate scaling** (~0.1–0.3 ms/step in mixed/long-band
-   traffic): selection is **identical by construction** at any bar
-   (caller-only; the kernels already walk per-row lengths —
-   `fp4_paged_mqa_logits.py:1422`, `indexerTopK.cu:663`); only the long-band
-   perf A/B remains, in flight.
+   freq=1-selected sets). The real-activation dump it needs was blocked on
+   a fixed image — **now unblocked**: `optrt-34fe7aaec-fixed-20260611011615`
+   is verified on 001 (CRITICAL section). The one still-open re-screen item.
+3. **H3b per-row candidate scaling — A/B done, DEAD again (2026-06-11):**
+   set-equality OK on every band (driver v2 masks the OFF path's
+   `-1`-padded `top_blocks` in both arms — those pad slots alias page 0 on
+   mixed bands, a pre-existing OFF-path artifact surfaced by the gate, counts
+   in the table's `offpad` column; flagged for follow-up, not an H3b bug),
+   but **plain ON is SLOWER everywhere** (+1.2–4.1 µs full pipeline,
+   33k/66k/132k/mixed × B4/16/64) and the hoisted-cand_count variant is
+   breakeven at best (+2.3 µs, mostly ~0). The HISA-scale fix
+   (`max_gen_kv_len`, cycle 4) already captured the width win H3b targeted.
+   Stays opt-in/off. Table: 001 `/tmp/h3b_ab_work/h3b_table_v2.txt`.
 4. **FP4MQALogits index-scoring formal close-out** (0 incremental tok/s —
    already live): the cycle-4 kill ("IoU 0.69–0.83, do NOT default-on
    without an e2e accuracy eval") is **RETIRED**. The fp4 chain is the
@@ -927,6 +1138,24 @@ bar-irrelevant — and stands.
 
 ## Killed candidates (considered space)
 
+- **G2-absorb (constant-0.5 gated-norm fold into PRE_MOE_FUSION)** —
+  **CLOSED PERMANENTLY (2026-06-11)** at the 0.98 functional bar itself:
+  MoE-output cosine through the real expert chain FAILs every (layer, M)
+  cell (mins 0.60–0.80, p1 0.77–0.96, L45 mean 0.9695 < 0.98). Two
+  mechanisms: routing flips are functionally expensive (f32 control: 1
+  flipped expert = −3..6 % cosine; L45 flip rate 18.9 %) AND fp4-requant
+  decorrelation + routed/shared cancellation fails tokens even at 8/8
+  routing agreement. The ~117 µs/tok absorb floor is irreducible; the
+  shipped chain kernel (`68866e061`) is the end state. Artifacts
+  `/tmp/g2_absorb_work/`. **Lesson: near-tied router scores do not imply
+  near-identical expert outputs — judge selection changes at the OUTPUT.**
+- **H3b per-row live-length candidate scaling** — dead **twice**: perf-dead
+  at the A/B (set-equality OK; plain ON +1.2–4.1 µs SLOWER at every band ×
+  batch; hoisted variant breakeven at best) after the HISA-scale fix
+  (cycle 4) already captured the width win. The candidate score+topk at
+  decode B is launch/latency-bound (the H1 lesson again) — per-row width
+  shaving buys nothing the band scaling didn't. Code stays opt-in/off.
+  `/tmp/h3b_ab_work/h3b_table_v2.txt`.
 - **FC2 N-tile 160 (K2, all forms)** — **numerically broken**: TRUE-f32
   reference shows cos ~0.790 at BOTH decode and prefill (vs ~0.9999 for
   {128,192,256}); root cause is a broad SFB miscompute (SFB GMEM tiled by
@@ -1050,7 +1279,10 @@ bar-irrelevant — and stands.
   WarpDecode (overlay LL-layout skip-reason + ConfigurableMoE oversize
   park/restore; caveats closed at EP2). Production flip is M3 — LL 45 vs
   115 µs/layer at token_limit=16 but **inverts at 64**, so the limit must be
-  per-rank concurrency, not max_batch_size.
+  per-rank concurrency, not max_batch_size. **[The inversion claim was
+  REFUTED by the 2026-06-11 sizing sweep — an emulated-FFN measurement
+  artifact; the decision is an explicit limit=64. See the M3 GO entry
+  below.]**
 - **Cycle 10** (shipped `fd705a6f5`): `_FP4OUT_MIN_M=128` guard lifted — the
   swiglu+fp4-out fusion now engages at decode M (exact vs TRUE-f32, OOB demo
   clean, ~100 µs/step + 58 launches). K3.
@@ -1111,8 +1343,48 @@ bar-irrelevant — and stands.
   bit-identical with liveness asserted (cos 1.000000, max|diff| 0; cuBLASLt
   1.18–1.21×, stays the pick), closing the last vacuous `3e03d665d` claim.
   Artifacts: 001 `/tmp/fp4mqa_closeout_work/`.
-- **Queued**: live-deploy input_scale remediation rollout (owner's call,
-  CRITICAL section); M3 flip decision (LL token-limit sizing); the re-screen
-  experiments (G2-absorb MoE-output-cosine gate, I2 GATE-B on a fixed image,
-  H3b long-band A/B); C9 GPU re-validation; then N1, M1, K1 PDL. Held: S2
-  (moot under WarpDecode+TP).
+- **Cycle 14** (shipped `0a1504755`): **L1 z.ai prefill dense-broadcast
+  overlap DEFAULT-ON** (the sync path's 65–82 ms/step exposed cost was the
+  masked_select+unique host syncs, not wire; read-set broadcast on the comm
+  stream hidden behind indexer compute; exposed 2.5–8.2 ms/step, **TTFT
+  −544 ms @64k / ~−1.1 s @128k**; 20/20 correctness; decode unaffected; C9
+  IPC wedges under the pattern → NCCL-only, C9 parked) + **C4 KVarN eager
+  decode-restore host-path** (the "indexer FSSS cub select ~3 %" profile
+  line was a MISATTRIBUTION — 671 cub kernels + 183 syncs/step-rank
+  selecting an empty set; host-mirror selection 19.4×; 300-trial
+  set-equality; profile-correction note added to the methodology section).
+- **M3 sizing sweep → DECIDED GO (2026-06-11, EP2 GPUs 5,6)**: the
+  "inversion at token_limit=64" was an emulated-FFN measurement artifact —
+  the real padding curve is FLAT and LL wins at every point (2.4–2.5×
+  steady c16, 2.06× at a full 64-token batch). Env delta staged
+  (`production_env_delta.yaml`: FORCE_COMM_METHOD + explicit
+  TOKEN_LIMIT=64 — unset would size the NVSHMEM heap to engine
+  max_num_tokens). **Topology precondition recorded: ADP + moe_tp_size=1
+  (`communication_factory.py:126`) — feeds the ADP-vs-TP call.**
+- **G2-absorb CLOSED PERMANENTLY (2026-06-11)**: the decisive
+  MoE-output-cosine gate FAILed every cell (mins 0.60–0.80, L45 mean
+  0.9695); f32-functional control refuted the near-tied-flip hypothesis;
+  second mechanism (fp4-requant + cancellation) fails even 8/8-routing
+  tokens. ~117 µs/tok floor irreducible. Moved to the killed list.
+- **H3b A/B → DEAD again (2026-06-11)**: set-equality OK, plain ON slower
+  everywhere (+1.2–4.1 µs), hoisted breakeven; the HISA-scale fix already
+  owns the width win. Moved to the killed list.
+- **input_scale remediation STAGED (2026-06-11)**:
+  `optrt-34fe7aaec-fixed-20260611011615` built + pushed to 001's registry,
+  **4/4 verified incl. the NONZERO indexer probe** (the hazard is fixed in
+  this image); ROLLOUT.md stages 002 transport, the DGD swap, the N1
+  NUMA-pin snippet, and post-roll checks. **Rollout = owner's decision.**
+- **MO1 router-slice validation (2026-06-10/11, Mac)**: the
+  generation-first slice already exists on `dynamo-prod-k8s` main
+  (`01359673f3`) but was never compiled (VM lacks protoc; deployed `.so`
+  predates it); `cargo check` now PASSES for the prod platform (dynamo-llm
+  + tests + the dynamo-py3 `.so` crate) with a fail-close
+  `completed_prefill` marker + gen-first param unit tests added
+  (Mac-local patch). Remaining: release `.so` build + the legacy-entrypoint
+  python activation gap. TTFT estimate ~12–17 ms @8k / ~20–27 ms @64k.
+- **Queued**: input_scale remediation ROLLOUT (owner's call; image staged);
+  the M3 production flip (env delta staged; gated on the ADP-vs-TP
+  topology call it now feeds); I2 GATE-B real-activation dump (unblocked —
+  fixed image on 001); MO1 release build + python activation; then N1
+  (rides the rollout manifest), M1, K1 PDL, H3a/H3c, P1. Parked: C9 (IPC
+  wedge under L1 overlap). Held: S2 (moot under WarpDecode+TP).
