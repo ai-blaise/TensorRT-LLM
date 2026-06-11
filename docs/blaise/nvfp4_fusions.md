@@ -2,13 +2,14 @@
 
 Decode on the NVFP4 target is overhead-bound, so removing standalone kernel
 launches and HBM round-trips on the per-layer elementwise+quant paths is a
-direct win. Five fusions land here:
+direct win. Six fusions land here:
 
 | # | Fusion | Op / file | Figure | Default |
 |---|--------|-----------|--------|---------|
 | 13 | add + RMSNorm + NVFP4 quant | `residual_add_norm.py` (torch.compile pattern) | −48…−54 % norm→quant sub-path (113–144 µs/step) | on |
 | 13b | shared-expert SwiGLU + FP4-output (decode-M guard lift) | `cute_dsl_custom_ops.py` / `gated_mlp.py` | ~100 µs/step + 58 act-quant launches | on (guard lifted `fd705a6f5`) |
 | 13c | lowrank-gate + NVFP4-quant single-launch epilogue (MoE input) | `cute_lowrank_gate.py` / `fused_lowrank_gate.py` | chain 7.04 → 4.19 µs/layer ⇒ −165 µs/tok | on (`68866e061`) |
+| 13d | dense-MLP gated-norm + NVFP4-quant handoff (swizzled-SF) | `cute_lowrank_gate.py` / `modeling_deepseekv3.py` | 4 → 3 kernels per dense-layer input; ~6–8 µs/tok | on (`TRTLLM_OPTRT_GATED_PREMLP_QUANT`, `8e44aeae1`) |
 | 14 | fused RoPE-cat-FP4 | `fusedRopeCatFp4Op.cpp` / `fusedRopeCatFp4.cu` | −3.2…−4.1 µs / F-layer (graphed) | on when shape matches |
 | 15 | KVarN-BDR fold | see `kvarn.md` | (capacity, not latency) | opt-in |
 
@@ -131,7 +132,44 @@ LINEAR-SF `Fp4QuantizedTensor` go straight into the MoE, which skips its own
   accuracy (optimization_candidates.md G2).
 - **Composes with:** #13 (different fusion site on the same layer: #13 is the
   post-AR residual+norm+quant, this is the gated-branch MoE input), WarpDecode
-  (consumes the `Fp4QuantizedTensor` natively).
+  (consumes the `Fp4QuantizedTensor` natively), #13d (the same kernel family
+  with the swizzled-SF epilogue for the dense-MLP consumer).
+
+## dense-MLP gated-norm + NVFP4-quant handoff (swizzled-SF)
+
+**Idea.** #13c gives the routed-MoE input a single-launch gate+quant whose
+SF output is LINEAR (the MoE permute path requires LINEAR). The dense-MLP
+layers (0–2) run the same lowrank gated-norm, but their `gate_up_proj` is a
+plain NVFP4 Linear whose quantized-activation path expects the **swizzled**
+(tiled) SF layout — so the gate output still paid a separate in-MLP
+`fp4_quantize` launch.
+
+**Fix (`8e44aeae1`).** A swizzled-SF epilogue variant of the cute
+lowrank-gate+quant kernel — new op `cute_lowrank_gate_quant_nvfp4_swizzled`,
+the SF store routed through the `computeSFIndex` tiled layout — feeds
+`gate_up_proj` a ready `Fp4QuantizedTensor`, replacing gate + in-MLP
+`fp4_quantize`: **4 → 3 kernels per dense-layer input chain**. Two
+alternatives were ruled out: (b)-direct (have the Linear consume LINEAR SF)
+is **dead by code** — `NVFP4LinearMethod` has no linear-SF activation path
+and cuBLASLt needs the tiled layout; (b)+interleave (LINEAR SF + a separate
+interleave launch) is launch-neutral.
+
+- **Files:** `tensorrt_llm/_torch/modules/cute_lowrank_gate.py` (the
+  swizzled epilogue + op), `tensorrt_llm/_torch/modules/fused_lowrank_gate.py`
+  (dispatch), `tensorrt_llm/_torch/models/modeling_deepseekv3.py` (the
+  dense-MLP handoff).
+- **Win:** ~2.0–2.7 µs/layer × 3 dense layers ≈ **6–8 µs/token** plus one
+  launch per layer — a launch-count / composability win (confirmed on the
+  composite re-profile: norm/rope/quant −7.7 µs vs the isolation leg).
+- **Enable:** on (`TRTLLM_OPTRT_GATED_PREMLP_QUANT=1` default; `0` restores
+  the unfused chain).
+- **Correctness:** y / fp4 codes / SF / **GEMM output all bit-exact vs the
+  unfused chain** at M ∈ {4,16} (block cosine 1.0) — the swizzled SF store
+  is layout-only; the quantization math is #13c's.
+- **Composes with:** #13c (LINEAR vs swizzled SF epilogue selected by the
+  consumer), B1 (the cuBLASLt-forced `gate_up_proj` consumes the tiled SF
+  natively), #13 (different site: #13 is post-AR, this is the dense-MLP
+  gated branch).
 
 ## fused RoPE-cat-FP4
 
@@ -190,6 +228,10 @@ the same kernel that produces the normed activation).
   `trtllm.fused_add_rms_norm_quant` with 0 remaining standalone `fp4_quantize`.
 - **shared-expert SwiGLU+FP4-out (#13b):** on at every m (the `_FP4OUT_MIN_M`
   guard was lifted in `fd705a6f5`).
+- **lowrank-gate+quant epilogue (#13c):** on (default impl of the MoE-input
+  gate+quant handoff).
+- **dense-MLP gate+quant handoff (#13d):** on
+  (`TRTLLM_OPTRT_GATED_PREMLP_QUANT=1` default; `0` = unfused chain).
 - **fused RoPE-cat-FP4 (#14):** on automatically when `_rope_cat_fuse_ok` is
   true for the model shape (DeepSeek-V3.2 NVFP4 indexer qualifies). No config;
   falls back transparently otherwise.
@@ -201,6 +243,8 @@ the same kernel that produces the normed activation).
 |--------|--------|--------|
 | add + RMSNorm + quant | fused vs unfused dequant | 7.06–7.13 % NVFP4 error (same), residual bit-identical, match_count=1 |
 | SwiGLU + FP4-out @ decode M | fused vs TRUE-f32 reference + OOB demo | cos 1.0, max_abs 0.0 at every m ∈ {1,4,16,64,128}; no fault on tight allocations |
+| lowrank-gate + quant epilogue (#13c) | y vs true-f32 ref; fp4+SF vs `trtllm.fp4_quantize` | y cos ≥ 0.9999971; codes+scales bit-exact; routing overlap 1.0; graph replay bit-exact |
+| dense-MLP gate+quant handoff (#13d) | fused vs unfused chain through the real `gate_up_proj` | y / fp4 / SF / GEMM output **bit-exact** at M ∈ {4,16} (block cosine 1.0) |
 | fused RoPE-cat-FP4 | vs standalone RoPE+cat+quant | same FP4 codes + swizzled SF |
 | KVarN-BDR fold | see kvarn.md | cos 0.992–1.0 (see kvarn.md) |
 

@@ -365,8 +365,11 @@ def _as_rank_tuple(ranks: Any) -> Optional[Tuple[int, ...]]:
 # the owner->peer cross-device copy at ~21-23 us for every per-layer payload
 # on B200 NVLink vs ~25-30 us + jitter for NCCL dist.broadcast on the CP
 # subgroup; at CP>=3 the serial fan-out saturates owner egress and NCCL wins.
-# The IPC path therefore engages only at cp_size == 2 and dist.broadcast
-# stays as the cp_size>2 / capture / oversize / setup-failure path.
+# The IPC path engages only at cp_size == 2 AND requires explicit opt-in
+# (TRTLLM_LAYERSPLIT_IPC_BROADCAST=1): the full credit-gated protocol lost
+# to NCCL end-to-end on the 2026-06-11 l1_overlap_bench (see
+# _maybe_setup_ipc_broadcast), so dist.broadcast is the default as well as
+# the cp_size>2 / capture / oversize / setup-failure path.
 _IPC_BROADCAST_ENV = "TRTLLM_LAYERSPLIT_IPC_BROADCAST"
 _IPC_SLOT_MB_ENV = "TRTLLM_LAYERSPLIT_IPC_SLOT_MB"
 _IPC_RING_DEPTH_ENV = "TRTLLM_LAYERSPLIT_IPC_RING_DEPTH"
@@ -377,9 +380,13 @@ _IPC_SLOT_MB_DEFAULT = 64
 _IPC_RING_DEPTH_DEFAULT = 2
 # cuda.h literals for the two stream-memop flags in use. Hardcoded so the
 # wrapper is independent of enum-namespace moves across cuda-python 12/13
-# (both bindings coerce plain ints).
+# (both bindings coerce plain ints). Per cuda.h, CU_STREAM_WAIT_VALUE_GEQ
+# is 0x0 — 0x1 is CU_STREAM_WAIT_VALUE_EQ. This constant shipped as 0x1
+# through r20, turning every protocol wait into an EQUALITY wait; combined
+# with the pinned-slot publish skew it deadlocked CP=2 the first time a
+# publish delivered a sequence past the awaited one (C9 wedge, 2026-06-11).
 _CU_STREAM_WRITE_VALUE_DEFAULT = 0x0
-_CU_STREAM_WAIT_VALUE_GEQ = 0x1
+_CU_STREAM_WAIT_VALUE_GEQ = 0x0
 
 
 def _cuda_driver() -> Optional[Any]:
@@ -471,11 +478,14 @@ class _LayerSplitIpcBroadcast:
       sequence ``s - (depth - 1)`` (ring-slot reuse credit), gather the
       active rows, one contiguous cross-device ``copy_`` into the peer's
       ring slot ``s % depth`` — the exact primitive the directive-7 bench
-      measured — then an 8-byte ``cuMemcpyAsync`` of ``s`` from pinned
-      host into the peer's data mailbox (the NVSHMEM put-with-signal
-      shape; stream memops reject IPC-imported addresses, and memcpy
-      completion semantics make the payload destination-visible before
-      the mailbox value lands).
+      measured — then publish ``s``: a fenced ``cuStreamWriteValue64`` of
+      ``s`` (an enqueue-time immediate) into a local device staging word
+      and an 8-byte ``cuMemcpyAsync`` staging -> peer data mailbox (the
+      NVSHMEM put-with-signal shape; stream memops reject IPC-imported
+      addresses, so the value rides an ordinary copy through the same
+      peer mapping the ring payload uses, and memcpy completion
+      semantics make the payload destination-visible before the mailbox
+      value lands).
     - Consumer: ``cuStreamWaitValue64(GEQ, s)`` on its local data mailbox,
       scatter ring slot ``s % depth`` into its own pool slot, then write
       the consume credit ``s`` into the producer's mailbox.
@@ -496,21 +506,12 @@ class _LayerSplitIpcBroadcast:
     """
 
     def __init__(self, driver: Any, ring: Any, mail: Any, peer_ring: Any,
-                 peer_mail: Any, pin: Any, depth: int,
-                 slot_bytes: int) -> None:
+                 peer_mail: Any, depth: int, slot_bytes: int) -> None:
         self._driver = driver
         self._ring = ring
         self._mail = mail
         self._peer_ring = peer_ring
         self._peer_mail = peer_mail
-        # Pinned-host staging for the outgoing mailbox values: pin[0] feeds
-        # the data-sequence publish, pin[1] the consume-credit publish.
-        # Reusing one slot per direction across iterations is benign: a
-        # publish copy that reads a NEWER (monotonic) value than enqueued
-        # only satisfies the peer's GEQ wait early when the matching
-        # payload copies are already stream-prior, and ring-slot reuse
-        # stays gated by the consume credit either way.
-        self._pin = pin
         self.depth = int(depth)
         self.slot_bytes = int(slot_bytes)
         # mail[0] = data sequence (written remotely by the peer producer),
@@ -519,8 +520,21 @@ class _LayerSplitIpcBroadcast:
         self._mail_credit_ptr = int(mail.data_ptr()) + 8
         self._peer_mail_data_ptr = int(peer_mail.data_ptr())
         self._peer_mail_credit_ptr = int(peer_mail.data_ptr()) + 8
-        self._pin_data_ptr = int(pin.data_ptr())
-        self._pin_credit_ptr = int(pin.data_ptr()) + 8
+        # Device-side staging for the outgoing mailbox values: word 0 feeds
+        # the data-sequence publish, word 1 the consume-credit publish. The
+        # publish writes the sequence into the staging word with a stream
+        # memop (the value is an enqueue-time immediate, materialized in
+        # STREAM order right before the 8-byte copy that delivers it), so
+        # the delivered value is exact no matter how far the host has run
+        # ahead. A reused pinned-host slot is NOT equivalent: the copy
+        # reads it at execution time, by which the host may have
+        # overwritten it for a later message — back-to-back publishes then
+        # collapse to the last value and skip sequences on the wire (the
+        # C9 CP=2 wedge).
+        self._seq_stage = torch.zeros(2, dtype=torch.int64,
+                                      device=ring.device)
+        self._seq_stage_data_ptr = int(self._seq_stage.data_ptr())
+        self._seq_stage_credit_ptr = self._seq_stage_data_ptr + 8
         # Host-side sequence counters. Monotonic, never reset; int64
         # mailboxes cannot wrap in any realistic deployment lifetime.
         self.out_seq = 0
@@ -544,15 +558,21 @@ class _LayerSplitIpcBroadcast:
     def producer_publish(self) -> None:
         """Publish ``out_seq`` to the peer's data mailbox.
 
-        An 8-byte pinned-host -> peer-device ``cuMemcpyAsync`` on the
-        caller's stream. Stream order supplies the fence: the payload copy
-        enqueued before this one completes destination-visible before the
-        mailbox value lands (memcpy completion semantics), so the peer's
-        GEQ wait observing ``out_seq`` implies the slot bytes are visible.
+        A fenced ``cuStreamWriteValue64`` of ``out_seq`` (an enqueue-time
+        immediate) into the local staging word, then an 8-byte
+        ``cuMemcpyAsync`` staging -> peer mailbox, both on the caller's
+        stream. The two-step shape is forced: stream memops reject
+        CUDA-IPC-imported addresses (CUDA_ERROR_INVALID_VALUE on B200),
+        so the value cannot be memop-written to the peer directly. Stream
+        order supplies the fence: the payload copy enqueued before this
+        pair completes destination-visible before the mailbox value lands
+        (memcpy completion semantics), so the peer's GEQ wait observing
+        ``out_seq`` implies the slot bytes are visible.
         """
-        self._pin[0] = self.out_seq
+        _cu_stream_write64(self._driver, self._seq_stage_data_ptr,
+                           self.out_seq)
         _cu_memcpy_async(self._driver, self._peer_mail_data_ptr,
-                         self._pin_data_ptr, 8)
+                         self._seq_stage_data_ptr, 8)
 
     def consumer_acquire(self, nbytes: int) -> Any:
         """Advance the consumer sequence and return the local ring slot view.
@@ -567,13 +587,15 @@ class _LayerSplitIpcBroadcast:
 
     def consumer_release(self) -> None:
         """Write the consume credit for ``in_seq`` into the producer's
-        mailbox. Enqueued after the scatter on the same stream, so stream
-        program order guarantees the scatter's reads of the ring slot
-        completed before the producer can observe the credit and overwrite
-        the slot."""
-        self._pin[1] = self.in_seq
+        mailbox (same staging-word publish shape as ``producer_publish``).
+        Enqueued after the scatter on the same stream, so stream program
+        order guarantees the scatter's reads of the ring slot completed
+        before the producer can observe the credit and overwrite the
+        slot."""
+        _cu_stream_write64(self._driver, self._seq_stage_credit_ptr,
+                           self.in_seq)
         _cu_memcpy_async(self._driver, self._peer_mail_credit_ptr,
-                         self._pin_credit_ptr, 8)
+                         self._seq_stage_credit_ptr, 8)
 
     def verify_roundtrip(self, group_rank: int) -> bool:
         """One full push in each direction through the real protocol.
@@ -719,13 +741,11 @@ def _setup_ipc_broadcast(cp_group: Any) -> Optional["_LayerSplitIpcBroadcast"]:
     if not all(votes):
         return None
 
-    pin = torch.zeros(2, dtype=torch.int64, pin_memory=True)
     channel = _LayerSplitIpcBroadcast(driver=driver,
                                       ring=ring,
                                       mail=mail,
                                       peer_ring=peer_ring,
                                       peer_mail=peer_mail,
-                                      pin=pin,
                                       depth=depth,
                                       slot_bytes=slot_bytes)
     verified = False
@@ -850,6 +870,13 @@ class LayerSplitRuntimeState:
     # keeps the NCCL dist.broadcast path unchanged.
     _ipc_broadcast: Optional[Any] = field(default=None, repr=False,
                                           init=False)
+    # L1: per-layer comm-stream events for the z.ai prefill dense-broadcast
+    # overlap. ``overlap_broadcast_readset`` records the event on the comm
+    # stream after the read-set dense(+scale) broadcast;
+    # ``consume_overlap_event`` pops it and makes the default stream wait
+    # just before the dense sparse-MLA read.
+    _overlap_dense_events: Dict[int, Any] = field(default_factory=dict,
+                                                  repr=False, init=False)
 
     def bind_cp_group(self,
                       cp_group: Any,
@@ -885,8 +912,13 @@ class LayerSplitRuntimeState:
 
         Gates (all leave ``_ipc_broadcast`` as None and the NCCL path
         intact): LayerSplit off, ``cp_size != 2`` (the directive-7 bench
-        showed NCCL wins the serial fan-out at CP>=3), the
-        ``TRTLLM_LAYERSPLIT_IPC_BROADCAST=0`` kill switch, no CUDA, no
+        showed NCCL wins the serial fan-out at CP>=3),
+        ``TRTLLM_LAYERSPLIT_IPC_BROADCAST`` unset or != 1 (the channel is
+        opt-in: the 2026-06-11 l1_overlap_bench measured the corrected
+        protocol at 159 ms vs 45 ms NCCL for the kv=8192 overlap_pipe
+        step — the depth-gated per-message memop waits serialize on the
+        ESCHED wake latency, so NCCL wins the e2e shape even though the
+        bare copy primitive benched faster), no CUDA, no
         ``torch.distributed``, or any rank of the group failing the
         collective handshake inside ``_setup_ipc_broadcast``.
         """
@@ -896,7 +928,7 @@ class LayerSplitRuntimeState:
             return
         if self.cp_group is None:
             return
-        if os.environ.get(_IPC_BROADCAST_ENV, "1") == "0":
+        if os.environ.get(_IPC_BROADCAST_ENV, "0") != "1":
             return
         if torch is None or not torch.cuda.is_available():
             return
@@ -1332,6 +1364,101 @@ class LayerSplitRuntimeState:
             flat.index_copy_(0, active_block_ids, chunk)
             # When we reshaped above, ``flat`` is a view of ``slot`` so
             # the index_copy_ already updated ``slot`` in place.
+        return True
+
+    def overlap_broadcast_readset(
+            self,
+            layer_idx: int,
+            cache_slots,
+            read_block_ids: Optional[Any],
+            cp_group: Optional[Any] = None) -> bool:
+        """L1: issue layer ``layer_idx``'s dense(+scale) READ-SET broadcast
+        on the comm stream so it hides behind the indexer scoring compute
+        that follows on the default stream (z.ai "Scaling Pain" Fig 4(b)).
+
+        At prefill the dense top-k union equals the read set (measured
+        union fraction 1.0 at 8k-64k kv on the CP2 worker shapes), so the
+        read-set payload is a byte-equivalent superset of every row the
+        dense sparse-MLA read consumes — and it is known BEFORE the
+        indexer runs (the L2-hoisted per-step read set), unlike the top-k
+        union. Moving the broadcast here removes (a) the per-layer
+        ``masked_select`` + ``unique`` host syncs of the union computation
+        (~52 ms / 61-layer step measured) and (b) the exposed broadcast
+        wait itself (~23 ms / step), at equal wire bytes.
+
+        Always routes through ``dist.broadcast`` (NCCL) and never the C9
+        IPC channel: the channel's pinned-mailbox slot reuse is only
+        stream-ordered when every channel op issues on ONE stream, and the
+        indexer-K broadcast stays on the default stream (a mixed-stream
+        IPC sequence wedges both ranks — reproduced on the L1 microbench).
+
+        Records a CUDA event after the scatter; the consumer MUST call
+        ``consume_overlap_event(layer_idx)`` before the dense read (the
+        read-before-ready contract). An un-consumed event is clobbered by
+        the next step's issue for the same layer (waiting on an elapsed
+        event is a no-op, so a skipped consume degrades gracefully).
+
+        Returns True iff the broadcast was issued and the event recorded;
+        on any False path the caller must keep the legacy sync top-k
+        broadcast in ``sparse_attn_predict``.
+        """
+        if not self.enabled or self.ownership is None:
+            return False
+        if self.cp_size <= 1 or cp_group is None:
+            return False
+        if read_block_ids is None or self.comm_stream is None:
+            return False
+        if torch is None or not torch.cuda.is_available():
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return False
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+        if read_block_ids.numel() == 0:
+            return False
+        slots = [slot for slot in cache_slots if slot is not None]
+        if not slots:
+            return False
+
+        src_rank = self.broadcast_src_rank(layer_idx)
+        ready = torch.cuda.Event()
+        ready.record()
+        with torch.cuda.stream(self.comm_stream):
+            # The gather may only read the owner pool after everything the
+            # default stream issued so far (this step's earlier writes and
+            # the indexer-K broadcast) — the same visibility point the
+            # legacy sync gather had.
+            self.comm_stream.wait_event(ready)
+            for slot in slots:
+                work = self._f8_byte_alias(slot)
+                send_buffer = work.index_select(0,
+                                                read_block_ids).contiguous()
+                dist.broadcast(send_buffer,
+                               src=src_rank,
+                               group=cp_group,
+                               async_op=False)
+                work.index_copy_(0, read_block_ids, send_buffer)
+            done = torch.cuda.Event()
+            done.record(self.comm_stream)
+        self._overlap_dense_events[layer_idx] = done
+        return True
+
+    def consume_overlap_event(self, layer_idx: int) -> bool:
+        """Have the current (default) stream wait on layer ``layer_idx``'s
+        in-flight overlapped dense broadcast (recorded by
+        ``overlap_broadcast_readset``). Returns True iff one was pending —
+        the caller must then SKIP the legacy sync top-k broadcast; False
+        means no overlap was issued and the legacy path must run.
+        """
+        event = self._overlap_dense_events.pop(layer_idx, None)
+        if event is None:
+            return False
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.current_stream().wait_event(event)
         return True
 
     @classmethod

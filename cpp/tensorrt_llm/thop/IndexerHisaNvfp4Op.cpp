@@ -260,12 +260,16 @@ void indexer_hisa_mask_scores(th::Tensor& candidateScores, th::Tensor const& top
     TORCH_CHECK(candidateScores.size(0) == topBlocks.size(0) && candidateScores.size(0) == prefixLens.size(0),
         "candidate_scores, top_blocks, and prefix_lens row counts must match");
     TORCH_CHECK(blockSize > 0, "block_size must be positive");
+    // The DeepGEMM paged MQA logits output is row-padded (stride(0) >
+    // size(1)); the kernel takes the row stride explicitly. Only the last dim
+    // must be dense.
+    TORCH_CHECK(candidateScores.stride(1) == 1, "candidate_scores last dim must be contiguous");
 
     auto stream = at::cuda::getCurrentCUDAStream(candidateScores.get_device());
     tk::invokeIndexerHisaMaskScores(candidateScores.data_ptr<float>(), topBlocks.data_ptr<int32_t>(),
         prefixLens.data_ptr<int32_t>(), static_cast<int32_t>(candidateScores.size(0)),
         static_cast<int32_t>(topBlocks.size(1)), static_cast<int32_t>(candidateScores.size(1)),
-        static_cast<int32_t>(blockSize), stream);
+        static_cast<int32_t>(blockSize), candidateScores.stride(0), stream);
 }
 
 th::Tensor indexer_hisa_remap_selected(th::Tensor const& selected, th::Tensor const& topBlocks,

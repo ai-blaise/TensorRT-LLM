@@ -11,7 +11,8 @@ at the production topology, while the HBM **bandwidth floor** for the same
 token's weight + KV reads is **20–40× lower**. Decode is therefore
 **fixed-overhead-bound**: the time is dominated by launch latency, per-step
 Python/host work, redundant d2h syncs, recomputation across steps, and the DSA
-Indexer (50–74 % of TPOT) — *not* by the memory roofline.
+Indexer (50–74 % of TPOT at campaign start; since driven to ≈ 1 % — see
+`indexer.md`) — *not* by the memory roofline.
 
 This is the central fact that motivates the whole campaign. Every win attacks
 overhead:
@@ -54,6 +55,35 @@ consistent second: more DP groups but TP2 is too narrow for the expert GEMMs.
 
 At the **c16 production concurrency target**, DP2/TP4 is the configuration all
 the kernel-level tok/s figures in the other docs are measured against.
+
+## The ADP-vs-TP decision now owns the MoE-a2a trade (M3 interaction)
+
+**Decision-relevant coupling (2026-06-11), recorded here because the
+production-topology call cannot be made without it:**
+
+- **EP a2a — any strategy, including the DeepEP low-latency flip decided GO
+  as `optimization_candidates.md` M3 (2.4–2.5× the per-layer a2a roundtrip
+  at steady c16, 2.06× at a full 64-token batch) — engages ONLY under
+  attention-DP with `moe_tp_size=1`.** The MoE comm factory returns **no
+  strategy at all** for plain-TP attention
+  (`tensorrt_llm/_torch/modules/fused_moe/communication/`
+  `communication_factory.py:126`: `(not enable_attention_dp) or dp_size==1
+  ⇒ None`; and `moe_tp_size != 1 ⇒ AllGather/ReduceScatter`, never a2a).
+- So the two production-topology candidates trade **different** wins:
+  - **ADP attention (+ pure-EP MoE)** unlocks M3's measured 2.4–2.5× a2a
+    win on EP comm — the eager 48.4 % share deflates 3.4× under graphs:
+    the **truly exposed a2a is 14–15 % of the step, and the flip's honest
+    step-level prize is a median −1.48–1.57 ms/step plus elimination of
+    the 3.7 ms-class normal-mode tail** (a2a-graphed sizing, 2026-06-11)
+    — but pays the ADP host collectives and 4× attention-weight reads.
+  - **Pure-TP attention (the WarpDecode+TP plan)** gets faster attention at
+    equal load and drops the ADP collectives (S2 moot) — but **has no a2a
+    path at all and forfeits M3 entirely**.
+
+Neither sub-win is reachable from the other topology; the ADP-vs-TP call
+must weigh them jointly. Full M3 evidence (sizing sweep, the refuted
+"inversion at 64", the staged env delta) is in
+[optimization_candidates.md](optimization_candidates.md) § M3.
 
 ## Disaggregated decode
 

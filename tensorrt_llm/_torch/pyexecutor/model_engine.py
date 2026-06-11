@@ -122,6 +122,26 @@ def _optrt_kvarn_delta_restore_enabled() -> bool:
 _OPTRT_KVARN_DELTA_RESTORE = _optrt_kvarn_delta_restore_enabled()
 
 
+def _optrt_kvarn_graphed_restore_enabled() -> bool:
+    """Whether the delta-restore fire replays a captured CUDA graph.
+
+    The eager fire on committed blocks is a ~500-launch storm (61 layers x
+    load_blocks + scatters + epoch ops, ~26 ms host measured at bs=16); the
+    graphed fire is one [n_layers, B] id upload + one replay (~10x). Rows
+    are padded by repeating a committed id of THAT layer -- restores of
+    already-restored committed blocks are idempotent rewrites of identical
+    bytes (the kvarn_restore_block_ids contract) -- so one bucketed graph
+    serves any per-layer id sets. Falls back to the eager loop whenever a
+    layer cannot supply a pad id, the set exceeds the largest bucket, or
+    capture is unavailable.
+    """
+    return os.environ.get("TRTLLM_OPTRT_KVARN_GRAPHED_RESTORE", "1") == "1"
+
+
+_OPTRT_KVARN_GRAPHED_RESTORE = _optrt_kvarn_graphed_restore_enabled()
+_KVARN_RESTORE_GRAPH_BUCKETS = (8, 32, 128)
+
+
 def _optrt_me_shape(value: object) -> object:
     if value is None:
         return None
@@ -845,22 +865,128 @@ class PyTorchModelEngine(ModelEngine):
         if not cand:
             return True
         cand = sorted(set(cand))
-        ids_dev_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
+        todos = []
         for module in self._kvarn_restore_modules:
             pool = mgr.get_kvarn_latent_pool(module.layer_idx)
-            if pool is None:
-                continue
-            todo = pool.stale_committed_host(cand)
-            if not todo:
+            todos.append(
+                (module, pool,
+                 pool.stale_committed_host(cand) if pool is not None else []))
+        if all(not todo for _, _, todo in todos):
+            return True
+        if (_OPTRT_KVARN_GRAPHED_RESTORE
+                and self._kvarn_graphed_restore(attn_metadata, todos)):
+            return True
+        ids_dev_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
+        for _, pool, todo in todos:
+            if pool is None or not todo:
                 continue
             tkey = tuple(todo)
-            ids_dev = ids_dev_cache.get(tkey)
-            if ids_dev is None:
-                ids_dev = torch.tensor(todo, dtype=torch.long,
-                                       device=pool.device)
-                ids_dev_cache[tkey] = ids_dev
-            module.kvarn_restore_block_ids(attn_metadata, ids_dev)
+            if tkey not in ids_dev_cache:
+                ids_dev_cache[tkey] = torch.tensor(todo, dtype=torch.long,
+                                                   device=pool.device)
+        for module, pool, todo in todos:
+            if pool is None or not todo:
+                continue
+            module.kvarn_restore_block_ids(attn_metadata,
+                                           ids_dev_cache[tuple(todo)])
             pool.mark_restored_host(todo)
+        return True
+
+    def _kvarn_graphed_restore(self, attn_metadata: AttentionMetadata,
+                               todos) -> bool:
+        """Fire the per-layer restore sets through one captured CUDA graph.
+
+        Per bucket size B, the graph runs every restore layer once over its
+        row of a persistent [n_layers, B] id buffer; a fire is one pinned
+        host fill + one H2D copy + one replay instead of the eager
+        per-layer launch storm. Rows shorter than B are padded by repeating
+        a COMMITTED id of that layer (an idempotent rewrite), so the same
+        graph replays for any per-layer sets. Returns False -- with no pool
+        or buffer state mutated beyond idempotent rewrites -- when a layer
+        cannot supply a pad id (no committed block yet), the largest bucket
+        is exceeded, or graph capture fails; the caller then runs the eager
+        loop.
+        """
+        import numpy as np
+
+        n_layers = len(todos)
+        bmax_needed = max(len(todo) for _, _, todo in todos)
+        bucket = next((b for b in _KVARN_RESTORE_GRAPH_BUCKETS
+                       if b >= bmax_needed), None)
+        if bucket is None:
+            return False
+        rows = []
+        for _, pool, todo in todos:
+            if pool is None:
+                return False
+            if todo:
+                row = todo + [todo[0]] * (bucket - len(todo))
+            else:
+                # Pad an all-empty row with a committed id: prefer one that
+                # is already restored (the rewrite is then byte-identical to
+                # the resident fp16); any committed id is still a correct --
+                # merely early -- restore of that block's record.
+                fresh = np.flatnonzero(
+                    pool.valid_host
+                    & (pool.restored_gen_host == pool.commit_gen_host))
+                if fresh.size:
+                    pad = int(fresh[0])
+                else:
+                    committed = np.flatnonzero(pool.valid_host)
+                    if committed.size == 0:
+                        return False
+                    pad = int(committed[0])
+                row = [pad] * bucket
+            rows.append(row)
+
+        bmax = _KVARN_RESTORE_GRAPH_BUCKETS[-1]
+        if not hasattr(self, "_kvarn_restore_graphs"):
+            self._kvarn_restore_graphs = {}
+        ids_host = getattr(self, "_kvarn_graph_ids_host", None)
+        if ids_host is None or ids_host.shape[0] != n_layers:
+            ids_host = torch.empty(n_layers, bmax, dtype=torch.long,
+                                   pin_memory=True)
+            self._kvarn_graph_ids_host = ids_host
+            self._kvarn_graph_ids_dev = torch.empty(
+                n_layers, bmax, dtype=torch.long, device=todos[0][1].device)
+            self._kvarn_restore_graphs = {}
+        ids_dev = self._kvarn_graph_ids_dev
+
+        ids_host[:, :bucket] = torch.as_tensor(rows, dtype=torch.long)
+        ids_dev[:, :bucket].copy_(ids_host[:, :bucket], non_blocking=True)
+
+        if bucket not in self._kvarn_restore_graphs:
+            try:
+                # Warmup executes this fire's restore for real (also primes
+                # allocator pools and lazy state); the capture pass records
+                # the identical op stream; the replay below re-runs it --
+                # all idempotent rewrites of the same committed bytes. If
+                # capture throws after the warmup ran, the eager fallback
+                # redoing this fire is likewise idempotent.
+                for i, (module, _, _) in enumerate(todos):
+                    module.kvarn_restore_block_ids(attn_metadata,
+                                                   ids_dev[i, :bucket])
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for i, (module, _, _) in enumerate(todos):
+                        module.kvarn_restore_block_ids(attn_metadata,
+                                                       ids_dev[i, :bucket])
+                self._kvarn_restore_graphs[bucket] = graph
+            except Exception:
+                logger.warning(
+                    "KVarN graphed restore capture failed; falling back to "
+                    "the eager per-layer restore loop.", exc_info=True)
+                # Memoize the failure so later fires skip straight to eager.
+                self._kvarn_restore_graphs[bucket] = None
+                return False
+        graph = self._kvarn_restore_graphs[bucket]
+        if graph is None:
+            return False
+        graph.replay()
+        for _, pool, todo in todos:
+            if todo:
+                pool.mark_restored_host(todo)
         return True
 
     def get_kv_cache_dtype_byte_size(self) -> float:

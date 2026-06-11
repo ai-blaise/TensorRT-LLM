@@ -715,6 +715,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 moe_output.copy_(megakernel_out)
                 return moe_output
 
+        # Phase-3 persistent megakernel hook (additive, env-gated, default
+        # OFF via TRTLLM_OPTRT_MOE_MEGAKERNEL_V2). Replaces the FC1+FC2
+        # kernel pair below with ONE persistent grid driven by an on-device
+        # work-item producer (moe_sort outputs read per invocation, so CUDA
+        # graphs captured at the bucket bound replay for any routing) and
+        # atomic-cursor scheduling. Same numerics as the explicit chain
+        # (phase-3 gates: valid-row intermediates bit-equal, output at the
+        # requant floor vs true f32). Requires fused finalize + tile 128.
+        _megakernel_v2_on = False
+        if self.use_fused_finalize and tile_size == 128:
+            from ...cute_dsl_kernels.blackwell.moe_as_dense_gemm.mega_persistent_moe import (
+                megakernel_v2_enabled, run_mega_persistent_moe_v2)
+            _megakernel_v2_on = megakernel_v2_enabled()
+
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
@@ -724,6 +738,54 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_num_experts=esp,
             tile_tokens_dim=tile_size,
         )
+
+        if _megakernel_v2_on:
+            logger.info_once(
+                "CuteDslFusedMoE: phase-3 persistent decode-MoE megakernel "
+                "ENABLED (TRTLLM_OPTRT_MOE_MEGAKERNEL_V2).",
+                key="cute_dsl_moe_megakernel_v2_on")
+            # Same aux-stream output memset the fused-finalize path uses (the
+            # megakernel finalize scatter-adds into moe_output).
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+            with torch.cuda.stream(
+                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=moe_output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=effective_top_k,
+                    ep_size=self.mapping.moe_ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+            run_mega_persistent_moe_v2(
+                x_q=x, x_sf=x_sf,
+                w13=weight_view.w3_w1_weight[0],
+                w13_sf=weight_view.fc1_weight_scale[0],
+                w2=weight_view.w2_weight[0],
+                w2_sf=weight_view.fc2_weight_scale[0],
+                alpha1=weight_view.fc1_global_scale[0],
+                alpha2=weight_view.fc2_global_scale[0],
+                fc2_input_scale=self.fc2_input_scale,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                token_final_scales=token_final_scales,
+                moe_output=moe_output,
+                hidden_size=self.hidden_size,
+                intermediate_size=weight_view.w2_weight[0].size(-1) * 2,
+                num_local_experts=esp,
+                top_k=effective_top_k,
+            )
+            return moe_output
 
         if self.use_fused_finalize:
             self.event_dict[EventType.Main].record()

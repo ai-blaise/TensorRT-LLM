@@ -579,38 +579,25 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         """Whether to capture separate CUDA graphs for short and long sequences.
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
 
-        The short-graph band caps the decode logits buffer width (the indexer
-        topk dispatch keys on it; see _indexer_logits_width in dsa.py): a
-        smaller short cap that still sits above the indexer-skip threshold
-        (index_topk) lets kv in (index_topk, seq_len_threshold] decodes run
-        the indexer on the cheaper insertion-launch instead of the radix/DSL
-        launch the static max_model_len width would force. When the operator
-        leaves seq_len_threshold unset it defaults to index_topk, which makes
-        the short band coincide with the skip band -> byte-identical to the
-        pre-r13 behavior (the indexer never runs in the short graph). Setting
-        seq_len_threshold above index_topk (e.g. to the production decode kv
-        ceiling, <= 12288 to hit the insertion launch) opts into the
-        width-correct topk win. The skip threshold itself is unaffected (it
-        keys on num_sparse_topk == index_topk in dsa.prepare).
+        The short band's value is the indexer skip: a graph captured with
+        warmup kv <= index_topk contains no indexer MQA/Top-K kernels at all
+        (dsa.prepare gates on num_sparse_topk), so every decode replaying it
+        skips the indexer entirely. seq_len_threshold therefore defaults to
+        index_topk so the short band coincides with the skip band.
+
+        Raising the threshold above index_topk only narrows the captured
+        decode-logits width for kv in (index_topk, threshold] (see
+        _indexer_logits_width in dsa.py) while losing the indexer-free
+        capture for kv <= index_topk. The width is not worth that trade:
+        no kernel cost or dispatch keys on it (B200 measurement 2026-06-11,
+        live kv 4608, B=4/16, fp16 logits + C++ Top-K, CUDA-graph replay:
+        scoring+Top-K flat ~15.4us from width 8192 to 132096, logits
+        bitwise-identical), so the former 8192 width-correct default was
+        reverted. Operators can still set seq_len_threshold explicitly to
+        trade the skip band for a narrower captured logits allocation.
         """
         if self.seq_len_threshold is None:
-            # Default to the width-correct optimal: the largest power-of-2 short
-            # band that still lands the decode Top-K on the cheaper insertion
-            # launch (bucket < _DSL_TOPK_MIN_COLS == 12288 in dsa.py). 8192 is
-            # that bucket. We only adopt it when it sits strictly ABOVE the
-            # indexer-skip threshold (index_topk), so the (index_topk, 8192]
-            # band is non-empty and the win is real; when index_topk >= 8192
-            # the short band would be empty (or collapse onto the skip band) so
-            # we fall back to index_topk -> byte-identical pre-r13 behavior and
-            # zero regression. The long graph keeps full max_model_len width
-            # (see _indexer_logits_width: any kv > hard_cap//2 collapses to
-            # hard_cap), so this never narrows the long-context path.
-            _WIDTH_CORRECT_SHORT_BAND = 8192
-            if (self.index_topk is not None
-                    and self.index_topk < _WIDTH_CORRECT_SHORT_BAND):
-                self.seq_len_threshold = _WIDTH_CORRECT_SHORT_BAND
-            else:
-                self.seq_len_threshold = self.index_topk
+            self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
 

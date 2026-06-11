@@ -54,8 +54,12 @@ void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* bl
     int32_t* candidatePageTable, int32_t numRows, int32_t blockTopK, int32_t pageTableStride, int32_t nextN,
     int32_t pagesPerHisaBlock, cudaStream_t stream = 0);
 
+// scoreStride0 is candidateScores' row stride in elements. The DeepGEMM paged
+// MQA logits output is row-padded (stride0 > candidateLen), so flat indexing
+// would drift the masked positions for every row > 0.
 void invokeIndexerHisaMaskScores(float* candidateScores, int32_t const* topBlocks, int32_t const* prefixLens,
-    int32_t numRows, int32_t blockTopK, int32_t candidateLen, int32_t blockSize, cudaStream_t stream = 0);
+    int32_t numRows, int32_t blockTopK, int32_t candidateLen, int32_t blockSize, int64_t scoreStride0,
+    cudaStream_t stream = 0);
 
 void invokeIndexerHisaRemapSelected(int32_t const* selected, int32_t const* topBlocks, int32_t const* prefixLens,
     int32_t* topkIndices, int32_t numRows, int32_t selectedTopK, int32_t indexTopK, int32_t blockTopK, int32_t blockSize,

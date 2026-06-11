@@ -20,6 +20,7 @@ never routed through KVarN.
 | 11 | BDR fold: amortized low-bit dequant-on-read | `mlaKernels.cu`, `kvarn_backend.py` | 71.7 us fill / 1.12 us steady (INT4 measured; k2 path same packed helper with qmax=3) | default on with KVarN |
 | 11b | Delta-restore (C2): O(batch) host-integer pre-replay restore | `model_engine.py`, `kvarn_backend.py` | host 48.8 → 0.3 ms/fire; 12.1 → 0.08 ms/step @ TP bs=16 | default on (`5bc2b2cb8`; `TRTLLM_OPTRT_KVARN_DELTA_RESTORE=0` escape) |
 | 11c | Stale-record-on-recycle invalidation | `dsa.py` (`DSACacheManager`), `kvarn_backend.py` (`invalidate_blocks`) | restore bit-equivalent to a never-recycled universe (cos 1.0, all 4 paths) | default on (`34fe7aaec`; `TRTLLM_KVARN_INVALIDATE_ON_FREE=0` escape) |
+| 11d | Eager decode-restore host-path (C4) | `dsa.py` (`_kvarn_step_cand_host`) | 13.3 → 0.69 ms/61-layer step (19.4×) steady; 17.0 → 1.7 ms churn | default on (`0a1504755`; auto-fallback to the device scan) |
 
 ---
 
@@ -145,10 +146,10 @@ should scale with **churn, not working-set**.
   (zero extra round-trip, the paper's s2 fold); LayerSplit (the KVarN pool is a
   cache pool that LayerSplit can own/broadcast per CP rank).
 
-## Decode-regime restore cost: host-gate + delta-restore (both shipped)
+## Decode-regime restore cost: host-gate + delta-restore + eager host-path (all shipped)
 
-Three follow-ups on the amortized-restore path, tracked in
-[optimization_candidates.md](optimization_candidates.md) as C1/C2/C2b:
+Four follow-ups on the amortized-restore path, tracked in
+[optimization_candidates.md](optimization_candidates.md) as C1/C2/C2b/C4:
 
 - **C1 — pre-replay host-gate (shipped `a1b13ea78`):** the pre-replay restore
   scan walked all 61 layer modules before every CUDA-graph replay, paying 3–4
@@ -190,6 +191,23 @@ Three follow-ups on the amortized-restore path, tracked in
   (`test_kvarn_k2v2.py`: free→reuse→commit→restore + fan-out). Cost: decode
   walk byte-identical; 1.46 ms once per request-free at the full 61-pool
   fan-out.
+- **C4 — eager decode-restore host-path (shipped DEFAULT-ON `0a1504755`):**
+  C1/C2 fixed the *pre-replay* path; the *eager* per-layer
+  `kvarn_restore_for_decode` itself still ran its candidate selection
+  on-device — boolean-mask indexing that launched **671 ATen cub kernels +
+  183 D2H syncs per step-rank** (61 layers × 3 `torch.nonzero`), ~1.24
+  ms/step of GPU compaction selecting an **EMPTY set** in steady state.
+  In the eager c16 decode profile this slice (~3 % of decode GPU) had been
+  **misattributed as "indexer FSSS cub select"**. Fix: host-mirror
+  selection (`_kvarn_step_cand_host`) — candidates from
+  `kvarn_host_block_table` + host kv_lens, memoized on the step key, numpy
+  filter via the same `valid`/`commit_gen` host mirrors the C2 delta walk
+  trusts. Empty ⇒ zero launches/syncs; non-empty ⇒ the existing restore
+  primitive; **any host-state inconsistency ⇒ unchanged device-scan
+  fallback**. Verification: set-equality vs an exact HEAD-path replica,
+  **300 randomized trials** (B 1/4/16, churn, duplicates, recycled epochs,
+  padding) = 0 failures. Win: standalone 61-layer step **13.3 → 0.69 ms
+  (19.4×) steady, 17.0 → 1.7 ms churn**.
 
 ## Enabling KVarN
 
@@ -258,6 +276,7 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/python/bench_kvarn_k2v2_micro.py \
 | Amortized / in-kernel restore | amortize vs full-restore | cos ≥ 1.0; per-step loads 36 → 8; recycle correct |
 | Delta-restore (C2) | 5-scenario lockstep equivalence vs full scan | all PASS; non-buffer state byte-exact; buffers 0 ulp vs reference |
 | Recycle invalidation (C2b) | restore vs never-recycled universe | bit-equivalent (cos 1.0) on all 4 restore paths; a–e suite worst cos 0.99964 (k2v2 floor) |
+| Eager host-path (C4) | selected-set equality vs an exact HEAD-path replica | 300 randomized trials (B 1/4/16, churn, duplicates, recycled epochs, padding), 0 failures; inconsistency ⇒ device-scan fallback |
 
 ## Composition with the rest of the campaign
 

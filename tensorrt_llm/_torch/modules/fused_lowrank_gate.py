@@ -19,7 +19,7 @@ sigmoid -> bf16, final mul in fp32 -> bf16) so outputs match at bf16 ulp level.
 """
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -403,11 +403,44 @@ def apply_fused_lowrank_gate_quant_nvfp4(
         flat, wd_f32, wu_t, quant_scale)
 
 
+def apply_fused_lowrank_gate_quant_nvfp4_swizzled(
+        flat: torch.Tensor, gate_down: torch.nn.Linear,
+        gate_up: torch.nn.Linear, quant_scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gate + NVFP4-quant with SWIZZLED block scales: (y, q, sf).
+
+    The dense-MLP (layer 0-2) handoff: the same single-launch cute kernel as
+    the MoE-input path, but the scales come out in the computeSFIndex layout
+    nvfp4_gemm consumers require, so the fp4 feeds gate_up_proj directly and
+    replaces the GatedMLP's standalone fp4_quantize launch. Callers must
+    check lowrank_gate_quant_nvfp4_swizzled_supported first; there is no
+    Triton fallback (the swizzled epilogue exists only in the cute kernel).
+    """
+    _, wu_t = get_lowrank_gate_weights(gate_down, gate_up)
+    wd_bf16 = _get_lowrank_gate_wd_bf16(gate_down)
+    return torch.ops.trtllm.cute_lowrank_gate_quant_nvfp4_swizzled(
+        flat, wd_bf16, wu_t, quant_scale)
+
+
 def lowrank_gate_supported(flat: torch.Tensor, rank: int) -> bool:
     return (HAS_TRITON and not _GATE_DISABLED and _GATE_IMPL != "eager"
             and flat.is_cuda and flat.dtype == torch.bfloat16
             and flat.shape[0] <= _GATE_MAX_FUSED_TOKENS and rank in (8, 16, 32,
                                                                      64))
+
+
+def lowrank_gate_quant_nvfp4_swizzled_supported(
+        flat: torch.Tensor, rank: int, gate_down: torch.nn.Linear,
+        quant_scale: Optional[torch.Tensor]) -> bool:
+    """Gate+NVFP4 epilogue with swizzled scales (cute kernel only)."""
+    if _GATE_IMPL != "cute":
+        return False
+    if not (lowrank_gate_supported(flat, rank) and flat.stride(-1) == 1):
+        return False
+    from .cute_lowrank_gate import cute_lowrank_gate_quant_supported
+    return (gate_down.weight.dtype == torch.bfloat16
+            and cute_lowrank_gate_quant_supported(flat, gate_down.weight,
+                                                  rank, quant_scale))
 
 
 def lowrank_gate_quant_nvfp4_supported(flat: torch.Tensor, rank: int) -> bool:

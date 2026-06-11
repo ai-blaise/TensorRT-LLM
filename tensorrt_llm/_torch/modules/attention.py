@@ -34,7 +34,7 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      maybe_compiled_copy_)
 from .fused_lowrank_gate import sigmoid_mul_supported
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
-from .multi_stream_utils import maybe_execute_in_parallel
+from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
@@ -1174,6 +1174,52 @@ def fp8_block_scaling_bmm_out(
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
 
+_gate_overlap_stream_singleton: Optional[torch.cuda.Stream] = None
+
+_GATE_OVERLAP_ENABLED = os.environ.get("TRTLLM_OPTRT_MLA_GATE_OVERLAP",
+                                       "1") != "0"
+
+
+def _gate_overlap_stream() -> torch.cuda.Stream:
+    """Process-wide side stream for the MLA output-gate GEMM.
+
+    The gate GEMM streams ~235MB of bf16 weights per layer and saturates DRAM
+    on its own, so it must not share a queue with the attention-internal aux
+    stream (whose small forked ops would stall behind it).
+    """
+    global _gate_overlap_stream_singleton
+    if _gate_overlap_stream_singleton is None:
+        _gate_overlap_stream_singleton = torch.cuda.Stream()
+    return _gate_overlap_stream_singleton
+
+
+def _gate_proj_chunked(gate_proj: Linear,
+                       hidden_states: torch.Tensor) -> torch.Tensor:
+    """Output-gate GEMM as two N-chunks, bit-exact vs the monolithic kernel.
+
+    The monolithic gate kernel co-runs poorly with the attention block's
+    GEMM/BMM kernels; two half-N kernels fit the gaps between them and hide
+    ~3us/layer more than one kernel (module A/B at M=4/16 under graph
+    replay). Both chunks stay on the serial-K nvjet family, so the result is
+    bit-exact against gate_proj(hidden_states) for every decode graph batch
+    size (verified M=1..64). gate_proj is bf16, bias-free, and unquantized by
+    construction, which is what makes the raw-weight mm legal.
+    """
+    weight = gate_proj.weight
+    n = weight.shape[0]
+    if (weight.dtype != hidden_states.dtype or hidden_states.dim() != 2
+            or n % 2):
+        return gate_proj(hidden_states)
+    half = n // 2
+    gate = torch.empty(hidden_states.shape[0],
+                       n,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+    torch.mm(hidden_states, weight[:half].t(), out=gate[:, :half])
+    torch.mm(hidden_states, weight[half:].t(), out=gate[:, half:])
+    return gate
+
+
 class MLA(nn.Module):
 
     def __init__(
@@ -1498,6 +1544,9 @@ class MLA(nn.Module):
 
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.gate_events = ([torch.cuda.Event(),
+                             torch.cuda.Event()]
+                            if self.gate_proj is not None else None)
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
@@ -3169,6 +3218,24 @@ class MLA(nn.Module):
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
+
+        # The output-gate GEMM reads only hidden_states and is consumed only
+        # by the sigmoid-mul after attention, yet it streams ~num_heads *
+        # v_head_dim * hidden bytes of bf16 weight per layer. Issue it on a
+        # dedicated side stream at attention entry so the weight read runs
+        # under the attention block instead of extending the critical path.
+        gate = None
+        gate_overlapped = (self.gate_proj is not None
+                           and _GATE_OVERLAP_ENABLED and do_multi_stream()
+                           and not torch.compiler.is_compiling())
+        if gate_overlapped:
+            gate_stream = _gate_overlap_stream()
+            self.gate_events[0].record()
+            with torch.cuda.stream(gate_stream):
+                self.gate_events[0].wait()
+                gate = _gate_proj_chunked(self.gate_proj, hidden_states)
+                self.gate_events[1].record()
+
         if self.register_to_config:
             if self.is_dsa:
                 proj_outputs = torch.ops.trtllm.mla_dsa_proj(
@@ -3197,7 +3264,10 @@ class MLA(nn.Module):
                               latent_cache_gen=latent_cache_gen)
 
         if self.gate_proj is not None:
-            gate = self.gate_proj(hidden_states)
+            if gate_overlapped:
+                self.gate_events[1].wait()
+            else:
+                gate = self.gate_proj(hidden_states)
             if sigmoid_mul_supported(attn_output, gate):
                 attn_output = torch.ops.trtllm.fused_sigmoid_mul(
                     attn_output, gate)

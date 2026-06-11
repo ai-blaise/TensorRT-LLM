@@ -43,10 +43,14 @@ native MoE backend when its runtime guards do not match.
   the ConfigurableMoE oversize **park/restore** fix: an oversize forward (the
   max_num_tokens warmup) used to destroy the comm strategy and pin the
   AllGather fallback for the process lifetime, silently evicting LL. Sizing
-  caveat for any LL deploy: per-layer roundtrip **45 µs at token_limit=16 vs
-  115 µs two-sided — but 225 µs at limit=64**; `TRTLLM_DEEP_EP_TOKEN_LIMIT`
-  must be per-rank concurrency, not max_batch_size (see
-  optimization_candidates.md M3).
+  (superseding the earlier "inverts at limit=64" caveat, which was an
+  emulated-FFN measurement artifact — REFUTED by the 2026-06-11 sweep): the
+  padding curve is **flat** and LL wins at every measured point (2.4–2.5×
+  at steady c16, 2.06× at a full 64-token batch); the decision is an
+  **explicit `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`** (unset would size the
+  NVSHMEM heap to engine max_num_tokens). LL requires ADP attention +
+  `moe_tp_size=1` — inert under plain TP (see optimization_candidates.md
+  M3, **DECIDED GO**).
 - **Honest rejected paths recorded** (do-not-redo): generic CuTeDSL grouped-GEMM
   (~0.34–0.50 ms, rejected), small-tile grouped-MoE (tiles < 128 fail the guard;
   tile-128 ~0.32–0.49 ms, rejected), CUTLASS FP4 GEMV floor (already slower than
