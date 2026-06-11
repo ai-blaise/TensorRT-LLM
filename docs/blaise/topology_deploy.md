@@ -71,8 +71,10 @@ production-topology call cannot be made without it:**
   ⇒ None`; and `moe_tp_size != 1 ⇒ AllGather/ReduceScatter`, never a2a).
 - So the two production-topology candidates trade **different** wins:
   - **ADP attention (+ pure-EP MoE)** unlocks M3's measured 2.4–2.5× a2a
-    win on EP comm ≈ 40 % of the decode step — but pays the ADP host
-    collectives and 4× attention-weight reads.
+    win on EP comm — **48.4 % of the eager step per the 2026-06-11
+    composite re-profile** (spin/skew-inflated under eager; re-measure
+    under graphs+overlap post-flip) — but pays the ADP host collectives
+    and 4× attention-weight reads.
   - **Pure-TP attention (the WarpDecode+TP plan)** gets faster attention at
     equal load and drops the ADP collectives (S2 moot) — but **has no a2a
     path at all and forfeits M3 entirely**.

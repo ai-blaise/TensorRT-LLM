@@ -6,13 +6,17 @@ to (the top-`index_topk` by indexer logit). On the DeepSeek-V3.2 NVFP4 decode
 path the Indexer **was ~50–74 % of TPOT at campaign start** — by far the
 biggest single lever — so this is where the campaign spent the most effort.
 That premise is now **spent**: after the wins below (plus fp16 logits and the
-C++ prod top-k routing), the fresh eager c16 GPU profile measures the Indexer
-at **≈ 1 % of the decode step (HISA ≈ 0.7 %)** — the previously-reported
-≈ 4 % included an "indexer FSSS cub select" slice (~3 %) that was a
-**misattribution**: those cub kernels were KVarN's eager decode-restore
-host-path, fixed in `0a1504755` (see the profile-correction note in
-[optimization_candidates.md](optimization_candidates.md)). See that doc for
-where the open levers moved (MoE/EP comm, proj GEMMs, glue).
+C++ prod top-k routing), the 2026-06-11 composite re-profile (fixed image,
+full stack default-on) measures the Indexer at **1.3 % of the decode step
+(−76.7 % vs the 06-10 baseline; HISA ≈ 0.7 %)** — and that 1.3 % already
+includes the ~280 µs/step of NEW real work the input_scale remediation
+restored (the old all-zero indexer projections cost nothing). The
+previously-reported ≈ 4 % included an "indexer FSSS cub select" slice (~3 %)
+that was a **misattribution**: those cub kernels were KVarN's eager
+decode-restore host-path, fixed in `0a1504755` (see the methodology section
+in [optimization_candidates.md](optimization_candidates.md)). See that doc
+for where the open levers moved (MoE a2a, expert-GEMM megakernel,
+dense-proj batching).
 
 The Indexer runs once per "F" (full-compute) layer. Its decode step is:
 
@@ -39,6 +43,16 @@ positions it selects), not by end-to-end text.
 | 5 | In-graph metadata / sync-free decode | `dsa.py` | −48 % TPOT (consolidated) | on |
 | 6 | Native C++ / CuTe-DSL top-k dispatch | `dsa.py`, `indexerTopK.cu`, `*_paged_mqa_logits.py` | C++ ~1.7× @ prod live-kv; DSL at kv ≥ 16k | auto by live kv_len |
 | 7 | fp16 indexer logits | `dsa.py`, `llm_args.py` (`indexer_logits_dtype`) | top-k −15…−22 % @ kv ≥ 33k; buffer halved | on (`auto` → fp16 on the DSL path) |
+
+> **HISA candidate-path correctness (2026-06-11):** two live
+> selection-corruption bugs in the HISA decode candidate pipeline —
+> pad-poisoning (−1-padded `top_blocks` aliasing page 0) and a row-padded
+> logits buffer indexed flat — were fixed in `31e0b5be7`; see the HISA
+> hazard section in
+> [optimization_candidates.md](optimization_candidates.md). Any HISA-path
+> **selection-quality** observation taken through pre-fix kernels is
+> suspect (timing observations stand). The AOT kernel parts land with the
+> next full-source image build; the python fallbacks are live.
 
 ---
 
@@ -70,9 +84,25 @@ short-circuited.
   declared width changes; the histogram scan was already length-bounded.
 - **Composes with:** the adaptive final-sort (next section) — width-correct
   cuts the *scan* domain, adaptive-sort cuts the *tie-break* domain; they stack.
-  `_DSL_TOPK_MIN_COLS` is now ONLY this helper's buffer-bucketing constant —
-  it is no longer a top-k dispatch gate (the width-override was removed in
-  `841f9874a`; dispatch is live-kv-only, see #6).
+  `_DSL_TOPK_MIN_COLS` was first demoted to a buffer-bucketing constant (the
+  width-override fell in `841f9874a`; dispatch is live-kv-only, see #6) and
+  then **removed dead in `8e44aeae1`** (the width-bucket helper survives only
+  as a graph-safety bound).
+
+> **Status (closed `8e44aeae1`):** the *width* side of this win is **spent**
+> — nothing in the decode scoring/top-k pipeline is width-dependent anymore
+> (the FP4 DSL scorer walks ceil(kv/block) per row with width as a runtime
+> stride; the C++ top-k walks live kv). Direct measurement at kv = 4 608:
+> pipeline p50 **15.39–15.42 µs for ALL widths {8k..132k}**, logits [0, kv)
+> bitwise identical — width-bucketing saves 0.0 µs (the 2.08–2.30× above was
+> real against the pre-`841f9874a` width-dependent pipeline). What still
+> matters is the **band capture**: graphs warmed at or below `index_topk`
+> capture the indexer-FREE path. The r16-era auto-default
+> `seq_len_threshold=8192` forfeited that (the short-band graph warmed at
+> 8191 → indexer kernels captured → ultra-short decodes paid ~15.4 µs × 61
+> layers ≈ 0.94 ms/step they used to skip) — `8e44aeae1` reverts the
+> auto-default to `index_topk` and keeps the explicit knob as an operator
+> escape hatch. See optimization_candidates.md I3.
 
 ## Adaptive per-row final-sort
 
