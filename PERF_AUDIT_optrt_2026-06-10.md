@@ -398,4 +398,20 @@ Built `optrt-7cb0d17b8ef2-cumsumfuse-…`, deployed via `render_dgd.sh --target-
 
 **Important methodology correction — the model is a non-deterministic, garbage-output perf testbed.** A first correctness probe showed garbage tokens (`底MSGVa.pp996981VVVV…`). This was a **red herring**: the validated baseline `0426` produces **equally garbage** output on the SAME prompts — on raw `/v1/completions` AND with the model's own chat template — and is **non-deterministic** across runs at temp 0 (RUN0≠RUN1≠RUN2; near-tie garbage logits → FP/batch noise flips greedy argmax). So this DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft model **cannot** be validated via output coherence — its text is garbage on baseline regardless of the fusion. The §8 "validation" only ever measured tok/s on `ignore_eos` filler, which is why this was never visible. Correctness for kernel changes here must be proven by **numerical unit test + throughput parity + no-error**, all of which #1 passes. (Coherent-output quality is out of scope for this perf testbed.)
 
-_[§9 perf A/B — `computeCumsumDevice` 58→0/iter, prep-trio time, cudaGraphLaunch delta — pending the in-flight cumsum-fuse kineto re-capture; baseline analyzer numbers already in hand: cumsum 417µs/iter, cudaGraphLaunch 2810µs.]_
+### #1 + #2 perf A/B (2026-06-12) — kineto re-capture, fused vs baseline
+
+Re-captured the kineto trace on the fused image (steady c16, same window). Analyzer (`.bench_runs_claude/analyze_trace.py`) over rank-0, baseline vs fused:
+
+| metric (per iter) | baseline `0426` | fused | delta |
+|---|---|---|---|
+| `computeCumsumDevice` launches | 58 | **0** | **eliminated** |
+| `moveIndiceDevice` signature | 9-arg | 12-arg `const*` | fused code live ✓ |
+| total kernel nodes / iter | 3429 | 3372 | **−57 (−1.7%)** |
+| tight-c16 tok/s/user | 51.6 | 51.9 | neutral (within noise) |
+| `cudaGraphLaunch` host | 2810 µs | 2953 µs | +143 µs = run-to-run variance |
+
+**What the A/B actually shows (honest read):**
+- **#1 works and is correct:** the standalone `computeCumsum` kernel is gone (58→0/iter), `moveIndice` carries the new signature, throughput is unchanged. The per-kernel *durations* can't be compared across captures — they include PDL `gridDependencySynchronize` wait time and vary run-to-run (the **unchanged** `computeCountAndIndiceDevice` "rose" 593→748 µs purely from cross-capture variance; `moveIndice`'s 135→627 µs is the absorbed cumsum work + that same variance, not a compute regression — throughput parity confirms no net GPU-time loss).
+- **#2 is falsified by measurement:** the fusion removes **1.7%** of the ~3429 graph nodes/iter. If `cudaGraphLaunch` scaled linearly that's ~48 µs of its 2.81 ms host cost — **below the ±150 µs measurement noise**. So a single per-layer kernel fusion does **not** measurably move the graph-launch host cost. Cutting that 2.81 ms requires removing a *large* fraction of the 3429 nodes (whole-layer megakernel fusion), not picking off individual prep kernels.
+
+**Net:** #1 is a clean, proven-correct, throughput-neutral simplification (−1.7% graph nodes, marginally helps c1 launch latency). It is **not** the big lever. The profile is unambiguous about where the real headroom is: the **a2a itself (2.06 ms/iter, ~24% of the step with comm+prep)** — exactly the lever Spencer's own composite flags. Attacking it means changing the NVLINK_TWO_SIDED all-to-all algorithm/overlap, a substantially larger project than per-kernel fusion, and is the recommended next focus. The quant storm (#3) and graph-launch cost (#2) are both architectural (norm+quant fusion; whole-layer megakernels), not drop-in wins.
