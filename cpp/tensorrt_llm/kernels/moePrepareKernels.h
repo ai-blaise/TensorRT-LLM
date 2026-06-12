@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +35,8 @@ namespace moe_prepare
 #define UNIT_PER_PIPELINE 128
 #define PIPELINE_PER_CTA 4
 #define CUMSUM_THREADS_PER_BLOCK 128
+// Upper bound on rankCount for the cumsum fused into moveIndiceDevice (per-CTA shared-memory scan).
+#define MAX_FUSED_CUMSUM_RANK_COUNT 64
 
 static constexpr int THREADS_PER_PIPELINE = UNIT_PER_PIPELINE;
 
@@ -79,9 +81,11 @@ void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* 
 
 void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int rankCount, cudaStream_t stream);
 
-void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, int* gatherSendIndice,
-    int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int rankId, int rankCount,
-    int maxTokenCountPerRank, cudaStream_t stream);
+// Computes the send/recv cumsums from the raw counts (fused, replaces a standalone computeCumsum launch)
+// and gathers the indice workspaces. sendCountsRaw/recvCountsRaw may not alias the cumsum outputs.
+void moveIndice(int const* sendCountsRaw, int const* recvCountsRaw, int* sendCountsCumsum, int* recvCountsCumsum,
+    int* sendIndice, int* gatherSendIndice, int* backwardIndice, int* gatherBackwardIndice, int* recvIndice,
+    int* gatherRecvIndice, int rankId, int rankCount, int maxTokenCountPerRank, cudaStream_t stream);
 
 void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int invalidExpertId,
     int epSize, cudaStream_t stream);

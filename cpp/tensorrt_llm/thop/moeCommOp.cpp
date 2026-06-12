@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -179,6 +179,11 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStati
     torch::Tensor sendRankCountCumSum = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
     torch::Tensor RecvRankCountCumSum = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
 
+    // Raw per-rank counts produced by computeCountAndIndice. Kept distinct from the cumsum outputs so the
+    // fused moveIndice (which scans raw -> cumsum in shared memory) has no read/write alias on the buffers.
+    torch::Tensor sendRankCountRaw = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
+    torch::Tensor recvRankCountRaw = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
+
     torch::Tensor gatherRecvRankIndices
         = torch::empty({maxTokenCountPerRank * epSize}, expertsIds.options().dtype(torch::kInt32));
     torch::Tensor recvRankIndices
@@ -211,19 +216,18 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStati
     auto stream = at::cuda::getCurrentCUDAStream();
 
     tensorrt_llm::kernels::moe_prepare::computeCountAndIndice(expertsIds.data_ptr<int>(),
-        sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
+        sendRankCountRaw.data_ptr<int>(), recvRankCountRaw.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
         backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), localExpertStaticsPtr,
         gatheredExpertStaticsPtr, workspace, tokenCount, maxTokenCountPerRank, topK, slotCount, expertCount, epRank,
         epSize, stream);
 
-    tensorrt_llm::kernels::moe_prepare::computeCumsum(
-        sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), epRank, epSize, stream);
-
-    tensorrt_llm::kernels::moe_prepare::moveIndice(sendRankCountCumSum.data_ptr<int>(),
-        RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(), gatherSendRankIndices.data_ptr<int>(),
-        backwardRecvRankIndices.data_ptr<int>(), gatherBackwardRecvRankIndices.data_ptr<int>(),
-        recvRankIndices.data_ptr<int>(), gatherRecvRankIndices.data_ptr<int>(), epRank, epSize, maxTokenCountPerRank,
-        stream);
+    // Fused: moveIndice scans the raw counts into the cumsum outputs and gathers the indices in one launch,
+    // absorbing the previously-separate computeCumsum kernel.
+    tensorrt_llm::kernels::moe_prepare::moveIndice(sendRankCountRaw.data_ptr<int>(), recvRankCountRaw.data_ptr<int>(),
+        sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
+        gatherSendRankIndices.data_ptr<int>(), backwardRecvRankIndices.data_ptr<int>(),
+        gatherBackwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(),
+        gatherRecvRankIndices.data_ptr<int>(), epRank, epSize, maxTokenCountPerRank, stream);
 
     return std::make_tuple(sendRankCountCumSum, gatherSendRankIndices, RecvRankCountCumSum, gatherRecvRankIndices,
         gatherBackwardRecvRankIndices, gatheredExpertStatics);

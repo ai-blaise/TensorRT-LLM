@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -223,20 +223,43 @@ __global__ void computeCountAndIndiceDevice(int* experts, int* sendCounts, int* 
     }
 }
 
-__global__ void moveIndiceDevice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, int* gatherSendIndice,
-    int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int maxTokenCountPerRank)
+__global__ void moveIndiceDevice(int const* sendCountsRaw, int const* recvCountsRaw, int* sendCountsCumsum,
+    int* recvCountsCumsum, int* sendIndice, int* gatherSendIndice, int* backwardIndice, int* gatherBackwardIndice,
+    int* recvIndice, int* gatherRecvIndice, int maxTokenCountPerRank, int rankCount)
 {
     int targetRankId = blockIdx.x;
+    // Each CTA redundantly scans the per-rank counts (rankCount <= MAX_FUSED_CUMSUM_RANK_COUNT) in shared
+    // memory instead of reading a precomputed cumsum, absorbing the standalone computeCumsumDevice launch.
+    __shared__ int sharedCumsum[MAX_FUSED_CUMSUM_RANK_COUNT];
+    int const* countsRaw = blockIdx.y == 0 ? sendCountsRaw : recvCountsRaw;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+#endif
+    if (threadIdx.x == 0)
+    {
+        int acc = 0;
+        for (int r = 0; r < rankCount; r++)
+        {
+            acc += countsRaw[r];
+            sharedCumsum[r] = acc;
+        }
+    }
+    __syncthreads();
+    if (targetRankId == 0 && threadIdx.x < rankCount)
+    {
+        // Publish the inclusive cumsum for downstream consumers (alltoall, combine, expert-id padding).
+        // Must happen before the PDL trigger so a dependent kernel's gridDependencySynchronize sees it.
+        (blockIdx.y == 0 ? sendCountsCumsum : recvCountsCumsum)[threadIdx.x] = sharedCumsum[threadIdx.x];
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+    int startIndex = targetRankId == 0 ? 0 : sharedCumsum[targetRankId - 1];
+    int endIndex = sharedCumsum[targetRankId];
+    int count = endIndex - startIndex;
     if (blockIdx.y == 0)
     {
         // sendIndice and backwardIndice CTA
-        int startIndex = targetRankId == 0 ? 0 : sendCountsCumsum[targetRankId - 1];
-        int endIndex = sendCountsCumsum[targetRankId];
-        int count = endIndex - startIndex;
         int* localSendIndice = sendIndice + targetRankId * maxTokenCountPerRank;
         int* localBackwardIndice = backwardIndice + targetRankId * maxTokenCountPerRank;
         for (int localIdx = threadIdx.x; localIdx < count; localIdx += blockDim.x)
@@ -248,9 +271,6 @@ __global__ void moveIndiceDevice(int* sendCountsCumsum, int* recvCountsCumsum, i
     else
     {
         // recvIndice CTA
-        int startIndex = targetRankId == 0 ? 0 : recvCountsCumsum[targetRankId - 1];
-        int endIndex = recvCountsCumsum[targetRankId];
-        int count = endIndex - startIndex;
         for (int localIdx = threadIdx.x; localIdx < count; localIdx += blockDim.x)
         {
             gatherRecvIndice[startIndex + localIdx] = startIndex + localIdx;
@@ -346,16 +366,18 @@ void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int
         recvCountsCumsum, rankId, rankCount);
 }
 
-void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, int* gatherSendIndice,
-    int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int rankId, int rankCount,
-    int maxTokenCountPerRank, cudaStream_t stream)
+void moveIndice(int const* sendCountsRaw, int const* recvCountsRaw, int* sendCountsCumsum, int* recvCountsCumsum,
+    int* sendIndice, int* gatherSendIndice, int* backwardIndice, int* gatherBackwardIndice, int* recvIndice,
+    int* gatherRecvIndice, int rankId, int rankCount, int maxTokenCountPerRank, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(rankCount <= MAX_FUSED_CUMSUM_RANK_COUNT,
+        "moveIndice fused cumsum supports rankCount <= %d, got %d", MAX_FUSED_CUMSUM_RANK_COUNT, rankCount);
     dim3 block(512);
     dim3 grid(rankCount, 2);
 
-    launchWithPdlWhenEnabled("moveIndice", moveIndiceDevice, grid, block, 0, stream, sendCountsCumsum, recvCountsCumsum,
-        sendIndice, gatherSendIndice, backwardIndice, gatherBackwardIndice, recvIndice, gatherRecvIndice,
-        maxTokenCountPerRank);
+    launchWithPdlWhenEnabled("moveIndice", moveIndiceDevice, grid, block, 0, stream, sendCountsRaw, recvCountsRaw,
+        sendCountsCumsum, recvCountsCumsum, sendIndice, gatherSendIndice, backwardIndice, gatherBackwardIndice,
+        recvIndice, gatherRecvIndice, maxTokenCountPerRank, rankCount);
 }
 
 void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int invalidExpertId,
