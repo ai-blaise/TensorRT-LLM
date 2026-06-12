@@ -177,12 +177,18 @@ data:
       use_cute_dsl_topk: true
       use_cute_dsl_paged_mqa_logits: true
       layersplit_enabled: false
-    speculative_config:
-      decoding_type: SMC
-      speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
-      gamma: 6
-      n_particles: 4
-      resample_threshold: 0.5
+    # SMC two-model drafting is OPT-IN (per docs/blaise: 'pending A/B win',
+    # known regression): the GLM draft runs single-rank and EAGER, so every
+    # decode step serializes behind ~300ms of python-dispatched draft GEMMs
+    # (measured 2.8 vs 46 tok/s/user with/without on 2026-06-12). It was
+    # inert before smc-sd (2634a162d) wired it, which is why this block
+    # looked harmless. Re-enable deliberately for SMC A/Bs only.
+    # speculative_config:
+    #   decoding_type: SMC
+    #   speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
+    #   gamma: 6
+    #   n_particles: 4
+    #   resample_threshold: 0.5
       draft_temperature: 0.7
       target_temperature: 1.0
       draft_attention_backend: triton
