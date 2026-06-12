@@ -28,7 +28,14 @@ use_cute_dsl_bf16_bmm: true
 max_batch_size: 64
 max_input_len: 131072
 max_seq_len: 132096
-max_num_tokens: 2048
+# 8192 (was 2048): the NextN/SMC drafter runs the DRAFT model's context pass
+# through this engine WITHOUT chunking (model_drafter.forward_draft_model ->
+# _prepare_tp_inputs asserts total_num_tokens <= max_num_tokens), so any
+# prompt > max_num_tokens fatally kills the decode engine (MPI worker exit,
+# zombie pod). 2048 only survived because the tight harness uses exactly
+# 2048-token prompts. Real fix = chunk the draft context pass; until then
+# this must be >= the largest expected ISL handled by drafting.
+max_num_tokens: 8192
 print_iter_log: false
 stream_interval: 50
 num_postprocess_workers: 8
