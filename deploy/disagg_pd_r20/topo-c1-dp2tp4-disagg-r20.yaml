@@ -125,7 +125,7 @@ data:
     max_batch_size: 64
     max_input_len: 131072
     max_seq_len: 132096
-    max_num_tokens: 2048
+    max_num_tokens: 8192
     print_iter_log: false
     stream_interval: 50
     num_postprocess_workers: 8
