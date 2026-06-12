@@ -334,3 +334,33 @@ Client: `.bench_runs_claude/e2e_sweep.py` (aiohttp streaming, per-request TTFT +
 **F-55 [V][HIGH][confirmation] FC2 N-tile 160 faults at decode autotune.** The pre-merge image (which still carried F-31's default-on 160 sweep) crashed decode warmup with `CUDA illegal memory access` inside autotune — independently confirming `e105fd7a1`'s SFB/partial-tile analysis at decode shapes (his report covered prefill M=1024). The F-31 env gate (`TRTLLM_OPTRT_FC2_NTILE_160=0`) mitigated without a rebuild; the merged branch has 160 fully removed.
 
 **Ops notes:** `render_dgd.sh` defaults `--target-node` to a4-us-001-rl9 — always pass the node; the curated overlay COPY list rotted (ImportError + stale-module TypeError) — use `Dockerfile.r20-overlay-fulltree` and verify by per-file content hash against the built image; the lab deployment was rolled back to the baseline image and verified at session end.
+
+---
+
+## 8. FINAL A/B (2026-06-12) — integrated branch validated e2e; +26-50% over baseline; root-cause chain closed
+
+**Stack:** fullsource image `optrt-19d82b488-fullsource-msgpack-0426` (merged HEAD: Spencer cycles + our 17 commits, matched C++/Python), config: `max_num_tokens: 8192` (decode), **SMC drafting OFF** (as Spencer's own perf numbers run). Full program green end-to-end: probes, tight harness, sweep, profiling.
+
+**Tight harness (Spencer's regime — uniform ~2055 ISL, OSL 512, C=16, his reference 39.98–40.28 tok/s/user):**
+**51.6 tok/s/user p50, 760 tok/s aggregate** — reproduced ×3 (51.58 / 51.66 / 51.86). **+28% over the documented cycles-era number.**
+
+**Full sweep (ISL 4161 / OSL 256) vs the June-8 baseline:**
+
+| C | tok/s/user base→new | aggregate base→new | TTFT p50 base→new |
+|---|---|---|---|
+| 1 | 42.6 → 39.7 | 44 → 41 | 610 → 651 ms |
+| 4 | 41.9 → **50.8** | 162 → 179 | 927 → 1309 ms |
+| 8 | 32.9 → **47.7** | 246 → 329 | 1290 → 1238 ms |
+| 16 | 34.0 → **46.5** | 454 → 547 | 1564 → 1627 ms |
+| 32 | 29.3 → **44.0** | 719 → **907** | 1682 → 1574 ms |
+
+Aggregate +26% at C=32; per-user +37–50% at C=8–32; TTFT comparable (better at high C). C=1 within variance of baseline. Decode GPUs sample near-idle under c16 (profiled rank parks in the request broadcast) — the stack remains **overhead-bound** per Spencer's composite; his a2a lever (4.3–4.7 ms/step) is the next headroom.
+
+**The full root-cause chain behind two days of "hangs" (F-54 final disposition):**
+1. **SMC drafting silently active** — `speculative_config` (SMC + GLM draft) ships ENABLED in the topo template and the live config; inert on June-8 Python, fully wired after `smc-sd` (`2634a162d`). The draft runs **single-rank + eager**: ~300 ms of python-dispatched draft GEMMs per decode step (py-spy: rank0 mid-`fp8_swap_ab_gemm`, peers parked; GPUs ~5%). Measured 2.7–2.9 vs 36–38 tok/s incl-prefill with the block present/absent on the SAME image. Template now ships it commented with rationale.
+2. **Drafter context pass is unchunked** — `prepare_draft_tokens` asserts `total_num_tokens <= max_num_tokens` and the assert **kills the MPI worker** (zombie pod, F-51). With decode `max_num_tokens: 2048`, any prompt >2048 was a one-request engine kill; the tight harness's 2048-token prompts ride exactly on the edge. Fixed to 8192 in decode.yaml AND the topo template (the render's inline copy silently reverted the first fix). Code follow-up: chunk the draft context pass; reject, never assert.
+3. **Template debt** ×3: inline decode config diverged from `decode.yaml`; orphaned SMC keys re-parented into `sparse_attention_config` on render (new-schema pydantic crashloop); `--target-node` defaults to the other cell node. All fixed/committed.
+4. Acquitted along the way: the quorum cherry-pick (identical crawl without it), C9 IPC (opt-in + parked), L1 overlap, our dsa/prefill changes, python↔binary skew (fullsource pairing changed nothing), dynamo version (byte-identical across images), MO1 core (his legacy-path port covers it).
+5. Infra fixes that made the loop workable: msgpack absent from the fullsource runtime stage (worker ImportError crashloop; one-layer patch + Dockerfile note pending); registry-vs-containerd image GC (the overnight ImagePullBackOff); crashloop/wall-cap bails + image-verified, name-guarded pod waits in the orchestration script.
+
+**Artifacts:** `/tmp/e2e_FINAL2.log` (full program), `/tmp/decode_rank2.speedscope` (c16 host profile), `/tmp/dmon_window.log` (GPU telemetry), `.bench_runs_claude/e2e_full_program.sh` + `e2e_sweep.py` (the harness).
