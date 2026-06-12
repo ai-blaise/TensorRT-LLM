@@ -175,9 +175,19 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
+        # TLLM_SPAWN_PYTHON_EXE: optional interpreter override for the
+        # MPI-spawned rank processes (mpi4py MPIPoolExecutor's python_exe).
+        # Lets a wrapper interpose on each RANK without touching the parent
+        # (e.g. `exec nsys profile ... real-python "$@"` for per-rank
+        # kernel/NVTX capture — MPI_Comm_spawn goes through the PMIx
+        # daemon, so profiler child-injection from the parent never reaches
+        # the ranks otherwise). Unset = exact previous behavior.
+        spawn_exe = os.environ.get("TLLM_SPAWN_PYTHON_EXE")
+        extra = {"python_exe": spawn_exe} if spawn_exe else {}
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
-                                        env=env)
+                                        env=env,
+                                        **extra)
 
     def __del__(self):
         self.shutdown_abort()
