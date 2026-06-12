@@ -364,3 +364,28 @@ Aggregate +26% at C=32; per-user +37–50% at C=8–32; TTFT comparable (better 
 5. Infra fixes that made the loop workable: msgpack absent from the fullsource runtime stage (worker ImportError crashloop; one-layer patch + Dockerfile note pending); registry-vs-containerd image GC (the overnight ImagePullBackOff); crashloop/wall-cap bails + image-verified, name-guarded pod waits in the orchestration script.
 
 **Artifacts:** `/tmp/e2e_FINAL2.log` (full program), `/tmp/decode_rank2.speedscope` (c16 host profile), `/tmp/dmon_window.log` (GPU telemetry), `.bench_runs_claude/e2e_full_program.sh` + `e2e_sweep.py` (the harness).
+
+## 9. Kineto profile (2026-06-12) — per-iteration breakdown + the three follow-up fixes
+
+**Capture:** built-in PyTorch/kineto hook (`TLLM_TORCH_PROFILE_TRACE` + `TLLM_PROFILE_START_STOP=3000-3120`), 4 rank traces at steady c16 (51.7–52.2 tok/s/user), `torch_trace-rank-{0..3}.json` (368 MB each) under `/var/lib/optrt-cache/nsys/`.
+
+**Steady-state per-iteration anatomy (c16, 120-iter window):** GPU 95.8% busy in-step (span 17.5 ms, busy-union 16.7 ms, kernel-sum 23.1 ms → ~28% cross-stream overlap). Top costs/iter:
+- **MoE comm + prep ~4.0 ms (24%)**: a2a 2.06 ms + prep trio 1.59 ms (`memsetExpertIds` 580 µs / `computeCountAndIndice` 590 µs / `cumsum` 420 µs, ~58 each = per-MoE-layer) + finalize 340 µs.
+- nvjet 64x8 swarm 2.77 ms (122 calls ~23 µs each — cuBLAS-internal GEMM tiling).
+- `quantize_with_block_size` 1.12 ms (392 launches, ~2.9 µs each — M=1 activation quant).
+- `cudaGraphLaunch` 2.81 ms/launch host (1/iter; hidden under GPU work at c16, caps c1 latency).
+- `cudaEventSynchronize` 2/iter ≈ 5.6 ms (pacing). aten glue ~2.9 ms/iter host.
+- Autotuner warmup warning: `nvfp4_gemm (1,3584)×(2112,3584)` no valid tactic.
+
+### The three fixes
+
+**#1 — Fuse the MoE prep trio (DONE, committed `e14dfc859`).** Of the three prep kernels, `computeCountAndIndice` is the irreducible comm kernel (sender/receiver blocks over the FIFO workspace, a cross-block barrier it can't share). The clean, **bit-exact** fusion is `computeCumsum` → `moveIndice`: `computeCumsumDevice` was a trivial 2-block cub `BlockScan` over the per-rank counts whose only consumer was `moveIndice` (and the downstream pad). Folded the inclusive scan into `moveIndiceDevice` — each CTA reads the raw per-rank counts (rankCount ≤ 64) and scans them in shared memory before its gather; CTA0 publishes the cumsum to the output buffers before the PDL trigger so a dependent grid's `gridDependencySynchronize` observes it. Raw counts now land in dedicated scratch buffers (no read/write alias with the cumsum outputs). Arithmetic identical; op signature + returned tensors unchanged → no Python/`register_fake` change. **Removes one kernel launch per MoE layer (~58/iter) from the captured CUDA graph.**
+
+  - `memsetExpertIds` (the third kernel) was *not* fused: it pads the recv expert-ids tail **after** the alltoall (the pad target is the alltoall's output buffer, allocated inside the comm op; the tail is stale until re-padded each step). Folding it would require the generic comm op to learn the expert-id field index + `invalidExpertId` and pad in its epilogue — invasive into a backend-shared op. Deferred with rationale.
+
+**#2 — `cudaGraphLaunch` host cost (2.81 ms/launch).** This is the host cost of replaying a graph with a very large node count; it is *hidden* under GPU work at c16 (95.8% busy) and only bites c1 latency. It is not a single kernel to fix — it falls out of node-count reduction. #1 removes ~58 nodes/iter from the captured graph; the post-#1 kineto re-capture quantifies the delta. _[A/B: pending re-profile]_
+
+**#3 — The quant storm (392 `quantize_with_block_size`/iter, 1.12 ms) — investigated, no safe drop-in.** This is **not** a batchable loop: the MoE input quant is a single `fp4_quantize` per layer (`fused_moe_wide_ep.py:523`); the 392 count is one activation-quant per fp4 GEMM (MLA projections, gate/up/down, indexer), i.e. the architectural floor. The only lever is **fusing the activation quant into the producing RMSNorm** — `trtllm::flashinfer_fused_add_rmsnorm_quant` exists, but (a) pulls a flashinfer runtime dependency the TRTLLM attention backend doesn't otherwise need, and (b) changes quant rounding, so it needs full e2e numeric revalidation on this custom NextN-graft model. Too risky for the validated baseline as a lab drop-in; flagged as a real headroom item, not landed.
+  - The autotuner hole (`nvfp4_gemm (1,3584)×(2112,3584)` no valid tactic) is **benign**: `AutoTuner.search_cache` returns the fallback `(runner[0], tactic=-1)` (`autotuner.py:440,1018`), which `NVFP4GemmUnifiedRunner` implements — warmup warning only, no crash, runs at 52 tok/s. Not worth a code change.
+
+_[§9 A/B numbers — prep-trio time, graph node count, cudaGraphLaunch cost, tight-c16 tok/s — pending the cumsum-fuse image re-profile.]_
