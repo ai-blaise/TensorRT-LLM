@@ -80,5 +80,9 @@ RUN set -eux; \
     rm -rf /tmp/tensorrt_llm_build_artifacts; \
     chown -R dynamo:0 "${SITE_PACKAGES}/tensorrt_llm" /opt/ai-blaise
 
+# The runtime base venv may lack msgpack (required by the TRT-LLM MPI worker bootstrap).
+# Install it here so the runtime image is self-sufficient rather than relying on a post-build patch layer.
+RUN /opt/dynamo/venv/bin/python3 -m pip install --no-cache-dir msgpack==1.1.1
+
 LABEL ai.blaise.optrt.fullsource="true"
 USER dynamo
