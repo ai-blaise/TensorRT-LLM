@@ -608,6 +608,9 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "sparse_mla_decode_kvarn_hot" in header.read_text()
     assert "sparse_mla_decode_kvarn_hot" in thop_source
     assert "kvarn_bits must be 2" in thop_source
+    assert "expectedBdrBytesPerBlock" in thop_source
+    assert "hotPacked.size(2) >= expectedBytes" in thop_source
+    assert "hot_packed record bytes are smaller than production BDR layout" in thop_source
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake.read_text()

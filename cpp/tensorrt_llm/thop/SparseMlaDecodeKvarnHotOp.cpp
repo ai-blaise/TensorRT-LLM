@@ -26,6 +26,7 @@ constexpr int64_t kHeadQ = 128;
 constexpr int64_t kDqk = 576;
 constexpr int64_t kDv = 512;
 constexpr int64_t kTokensPerBlock = 64;
+constexpr int64_t kKvarnBits = 2;
 constexpr int64_t kKvLoraRank = 512;
 constexpr int64_t kQkRopeHeadDim = 64;
 
@@ -34,6 +35,23 @@ int32_t checkedInt32(int64_t value, char const* name)
     TORCH_CHECK(value >= std::numeric_limits<int32_t>::min() && value <= std::numeric_limits<int32_t>::max(),
         name, " does not fit int32: ", value);
     return static_cast<int32_t>(value);
+}
+
+int64_t expectedBdrBytesPerBlock(int64_t tokensPerBlock, int64_t kvLoraRank, int64_t qkRopeHeadDim, int64_t kvarnBits)
+{
+    TORCH_CHECK(kvarnBits == kKvarnBits, "production sparse MLA KVarN-hot decode requires kvarn_bits=2");
+    TORCH_CHECK(kvLoraRank == kKvLoraRank, "production sparse MLA KVarN-hot decode requires kv_lora_rank=512");
+    TORCH_CHECK(qkRopeHeadDim == kQkRopeHeadDim,
+        "production sparse MLA KVarN-hot decode requires qk_rope_head_dim=64");
+    TORCH_CHECK(tokensPerBlock == kTokensPerBlock,
+        "production sparse MLA KVarN-hot decode requires tokens_per_block=64");
+    TORCH_CHECK(kvLoraRank % 128 == 0, "production sparse MLA KVarN-hot decode requires 128-wide BDR subblocks");
+
+    auto const numSubblocks = kvLoraRank / 128;
+    auto const ckvBytes = tokensPerBlock * kvLoraRank * kvarnBits / 8;
+    auto const scaleZpBytes = tokensPerBlock * 2 * numSubblocks * 2;
+    auto const peBytes = tokensPerBlock * qkRopeHeadDim;
+    return ckvBytes + scaleZpBytes + peBytes;
 }
 
 void checkCudaTensor(at::Tensor const& tensor, char const* name)
@@ -111,6 +129,10 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
         "production dense MLA KVarN-hot decode requires kv_lora_rank=512 and qk_rope_head_dim=64");
     TORCH_CHECK(layerIdx >= 0 && layerIdx < numLayers, "layer_idx out of range");
     TORCH_CHECK(hotCapacity > 0, "hot_packed hot capacity must be positive");
+    auto const expectedBytes = expectedBdrBytesPerBlock(tokensPerBlock, kvLoraRank, qkRopeHeadDim, kvarnBits);
+    TORCH_CHECK(hotPacked.size(2) >= expectedBytes,
+        "hot_packed record bytes are smaller than production BDR layout: got ", hotPacked.size(2),
+        ", expected at least ", expectedBytes);
     TORCH_CHECK(indices.size(0) == b && indices.size(1) == sQ, "indices batch/s_q dimensions must match q");
     TORCH_CHECK(rowStatus.size(0) == b * sQ, "row_status must have one entry per [batch, s_q] row");
     if (topkLength.has_value())

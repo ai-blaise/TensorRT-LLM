@@ -158,7 +158,10 @@ and the HiSparse absorption-generation branch now calls it through the typed
 descriptor before any NVFP4 or full-HBM path can run. It is not yet promoted:
 it uses a direct per-row/head kernel while the optimized FlashMLA-style split
 scheduler, CUDA smoke execution, E2E DSA/SMC/Moondream validation, and live
-B200 profiling are still pending.
+B200 profiling are still pending. The June 13 final sweep tightened the fused
+operator ABI guard so `hot_packed` records must be at least the production
+`kvarn_k2v2` BDR byte size before launch; a too-short hot record now fails in
+the C++ wrapper instead of allowing a CUDA out-of-record read.
 The dispatch keys generation sparse-MLA shape on `num_generations`, not total
 mixed-batch sequence count, and the coordinator slices generation request IDs
 before resolving hot host slots. That keeps mixed prefill+decode batches from
@@ -252,6 +255,9 @@ same ABI shape as the final serving path. The following are hard invariants:
   MLA append/commit path, and typed NIXL source reads must be ordered after the
   BDR record write. Marking a BDR record committed before the write is visible
   to the transfer source is a correctness bug.
+- Fused sparse MLA KVarN-hot decode must validate the production BDR ABI before
+  launch: every hot record must contain the full 2-bit C-KV, C-KV scale/zp, and
+  E4M3 RoPE payload for a 64-token, 512+64 latent block.
 - The miss-copy boundary must be explicit. CUDA kernels must not pretend that
   CPU pinned host KVarN storage is ordinary device memory. The production path
   dedupes and plans misses on device, then hands a compact miss schedule to a
@@ -1095,7 +1101,9 @@ Current branch status:
   pre-dequant pass;
 - added fused `trtllm::sparse_mla_decode_kvarn_hot` plus DSA absorption-
   generation dispatch wiring. Enabled HiSparse now routes through the typed
-  KVarN-hot descriptor before the NVFP4/full-HBM path can run;
+  KVarN-hot descriptor before the NVFP4/full-HBM path can run. The fused op
+  also checks the production BDR record byte size in the host wrapper before
+  launch, matching the standalone hot-reader guard;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;
