@@ -169,8 +169,24 @@ is structural.
 
 ### Implemented
 - **[x] Lever 2 #1 — `FIFO_DEPTH` 4→8** (`fusedMoeCommKernels.h:251`, commit `59e909469`).
-  Bit-exact; workspace auto-scales (+~148MB/rank @ ep4). At c16 ~tens of sends/peer >> depth 4, so
-  it binds. **A/B (throughput + correctness) pending the next rebuild.**
+  Bit-exact; workspace auto-scales (+~148MB/rank @ ep4).
+  **A/B RESULT (image `fifodepth8`, tight-c16): 51.97 / 52.05 tok/s/user, ~766 agg — NEUTRAL**
+  (baseline 51.6, cumsumfuse 52.08; all within ±0.5 noise). The credit-wait knob did NOT help:
+  the a2a's 2.08ms is real GPU transfer work, not credit-stall, at c16. Keep is optional (+148MB/rank
+  for no c16 gain; might bind at higher concurrency — trivial revert otherwise).
+
+### KEY EMPIRICAL FINDING (2026-06-13) — cheap levers are throughput-neutral; wins are structural
+**Two cheap optimizations now measured NEUTRAL at c16:** cumsum→moveIndice fusion (−0.4ms launches,
+§9) and FIFO_DEPTH 4→8 (−credit-latency). Combined with the bubble analysis (steady GPU **96.5%
+busy**), this is conclusive: the decode step is **robustly GPU-work-bound with cross-stream overlap
+that absorbs small per-kernel removals** (remove an overlapped kernel → the busy-union/critical-path
+is unchanged → throughput flat). **Implication for 1b:** the cumsum fusion (0.4ms, overlapped) was
+neutral, so the 1b quant fusion (~0.5ms) is **likely also throughput-neutral** unless the quant sits
+on the busy-union critical path — its graph-surgery risk is probably NOT worth a throughput bet
+(it still helps c1 latency + graph-node count). **The only changes that can move c16 throughput are
+those that cut a large chunk of the busy-union GPU work:** megakernel collapse of the dense GEMM/BMM
+swarm (~9ms, the biggest), or a structural a2a data/overlap redesign (postquant field reduction +
+combine-side-stream / dispatch↔FC1 pipelining). Those are the real (large) projects.
 
 ### Next (ranked, for the next rebuild cycles)
 1. **Validate FIFO_DEPTH=8** e2e (rebuild → deploy → tight-c16 A/B + numerical/throughput parity).
