@@ -675,6 +675,10 @@ Current branch status:
   safe-close boundary as existing KV receive sessions;
 - added layer-major destination-fragment construction for packed KVarN host
   writes, including bounds validation against the published host-slot capacity;
+- extended native transfer metadata/request construction so future HiSparse
+  writes can use distinct source and destination memory types
+  (`VRAM -> DRAM` or `DRAM -> DRAM`) instead of overloading uniform KV/AUX
+  descriptor assumptions;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered

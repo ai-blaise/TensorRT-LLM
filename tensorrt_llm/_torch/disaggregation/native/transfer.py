@@ -125,6 +125,7 @@ class ReadMeta:
 class WriteMetaType(Enum):
     KV = "KV"
     AUX = "AUX"
+    HISPARSE_HOST = "HISPARSE_HOST"
 
 
 @dataclass
@@ -138,7 +139,10 @@ class WriteMeta:
     src_ptrs: np.ndarray  # dtype=np.int64
     dst_ptrs: np.ndarray  # dtype=np.int64
     sizes: np.ndarray  # dtype=np.int64
+    src_device_id: Optional[int] = None
     dst_device_id: Optional[int] = None
+    src_memory_type: Optional[str] = None
+    dst_memory_type: Optional[str] = None
     slice_id: Optional[int] = None
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
@@ -428,6 +432,31 @@ class Sender(SenderBase):
                 dealers.clear()
 
     @staticmethod
+    def _infer_memory_type(meta_type: WriteMetaType) -> tuple[str, str]:
+        if meta_type == WriteMetaType.AUX:
+            return MemoryType.DRAM, MemoryType.DRAM
+        if meta_type == WriteMetaType.HISPARSE_HOST:
+            return MemoryType.VRAM, MemoryType.DRAM
+        return MemoryType.VRAM, MemoryType.VRAM
+
+    @staticmethod
+    def _is_vram_memory(mem_type: str) -> bool:
+        return mem_type == MemoryType.VRAM or str(mem_type).upper().endswith("VRAM")
+
+    @staticmethod
+    def _resolve_memory_device_id(
+        *,
+        mem_type: str,
+        explicit_device_id: Optional[int],
+        default_vram_device_id: int,
+    ) -> int:
+        if explicit_device_id is not None:
+            return int(explicit_device_id)
+        if Sender._is_vram_memory(mem_type):
+            return int(default_vram_device_id)
+        return 0
+
+    @staticmethod
     @nvtx_range("_make_agent_request")
     def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
@@ -438,25 +467,35 @@ class Sender(SenderBase):
                 f"{write_meta.sizes.size=}"
             )
         n = write_meta.src_ptrs.size
-        if write_meta.meta_type == WriteMetaType.AUX:
-            src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
-        else:
-            if write_meta.dst_device_id is None:
-                raise RuntimeError(
-                    f"_make_agent_request: dst_device_id is None for KV transfer "
-                    f"unique_rid={write_meta.unique_rid}"
-                )
-            src_dev, dst_dev, mem_type = device_id, write_meta.dst_device_id, MemoryType.VRAM
+        default_src_type, default_dst_type = Sender._infer_memory_type(
+            write_meta.meta_type)
+        src_mem_type = write_meta.src_memory_type or default_src_type
+        dst_mem_type = write_meta.dst_memory_type or default_dst_type
+        if (Sender._is_vram_memory(dst_mem_type)
+                and write_meta.dst_device_id is None):
+            raise RuntimeError(
+                f"_make_agent_request: dst_device_id is None for VRAM "
+                f"transfer unique_rid={write_meta.unique_rid}")
+        src_dev = Sender._resolve_memory_device_id(
+            mem_type=src_mem_type,
+            explicit_device_id=write_meta.src_device_id,
+            default_vram_device_id=device_id,
+        )
+        dst_dev = Sender._resolve_memory_device_id(
+            mem_type=dst_mem_type,
+            explicit_device_id=write_meta.dst_device_id,
+            default_vram_device_id=device_id,
+        )
 
         if n == 0:
-            src_memory_descs = MemoryDescs(mem_type, [])
-            dst_memory_descs = MemoryDescs(mem_type, [])
+            src_memory_descs = MemoryDescs(src_mem_type, [])
+            dst_memory_descs = MemoryDescs(dst_mem_type, [])
         else:
             src_memory_descs = MemoryDescs.from_arrays_uniform_device(
-                mem_type, write_meta.src_ptrs, write_meta.sizes, src_dev
+                src_mem_type, write_meta.src_ptrs, write_meta.sizes, src_dev
             )
             dst_memory_descs = MemoryDescs.from_arrays_uniform_device(
-                mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
+                dst_mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
             )
 
         # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
