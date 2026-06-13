@@ -46,6 +46,7 @@ class HiSparseSparseMlaKvarnHotDescriptor:
     stride_factor: int
     packed_bytes_per_block: int
     hot_capacity_blocks: int
+    step_id: int = -1
     kvarn_bits: int = 2
     kv_lora_rank: int = 512
     qk_rope_head_dim: int = 64
@@ -1007,6 +1008,7 @@ class OPTRTHiSparseCoordinator:
             stride_factor=int(stride_factor),
             packed_bytes_per_block=int(tier.packed_bytes_per_block),
             hot_capacity_blocks=int(tier.hot_device_capacity_blocks),
+            step_id=int(self.step_id),
             kvarn_bits=2,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,

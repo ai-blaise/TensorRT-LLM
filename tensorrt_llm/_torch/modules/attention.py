@@ -2692,6 +2692,8 @@ class MLA(nn.Module):
         def descriptor_is_current(descriptor) -> bool:
             if descriptor is None:
                 return False
+            if int(descriptor.step_id) != int(hisparse_coordinator.step_id):
+                return False
             if int(descriptor.layer_idx) != expected_layer_idx:
                 return False
             if int(descriptor.hot_indices.shape[0]) != int(num_tokens):

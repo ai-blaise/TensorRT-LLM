@@ -264,7 +264,9 @@ same ABI shape as the final serving path. The following are hard invariants:
   E4M3 RoPE payload for a 64-token, 512+64 latent block.
 - Sparse-MLA hot descriptors are layer-local. Reusing a descriptor across
   layers, rows, TopK widths, devices, or request steps is a stale-hot-slot
-  correctness bug.
+  correctness bug. The descriptor must carry the coordinator `step_id`, and the
+  fused dispatch must reject any descriptor whose step id does not match the
+  current coordinator step.
 - Per-row planning width is the smaller of TopK width and hot capacity. Hot
   tiers larger than TopK are valid configurations and must not be rejected by
   the native block-dedupe stage; the full hot capacity still remains available
@@ -1156,6 +1158,9 @@ Current branch status:
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;
+- the sparse MLA KVarN-hot descriptor now records the coordinator `step_id`,
+  and the fused attention dispatch rejects same-shape cached descriptors from
+  older request steps before they can consume stale hot-slot metadata;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 

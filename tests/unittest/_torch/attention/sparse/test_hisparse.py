@@ -275,6 +275,30 @@ def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
     assert desc.kv_lora_rank == 512
     assert desc.qk_rope_head_dim == 64
     assert desc.topk_length is None
+    assert desc.step_id == -1
+
+
+def test_hisparse_sparse_mla_descriptor_records_coordinator_step():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=126976,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2,
+                                       kvarn_bits=2)
+    coordinator.allocate_packed_tensors(device="cpu", host_pinned=False)
+    coordinator.reset_step()
+
+    desc = coordinator._make_sparse_mla_kvarn_hot_descriptor(  # noqa: SLF001
+        hot_indices=object(),
+        row_status=object(),
+        layer_idx=0,
+        index_topk=1024,
+        max_blocks_per_row=2,
+        stride_factor=64,
+    )
+
+    assert desc.step_id == coordinator.step_id
 
 
 def test_hisparse_request_allocation_commit_and_release():
@@ -685,6 +709,8 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "map_topk_to_hot_pool" in source
     assert "expected_layer_idx" in source
     assert "descriptor_is_current" in source
+    assert "descriptor.step_id" in source
+    assert "hisparse_coordinator.step_id" in source
     assert "int(descriptor.layer_idx) != expected_layer_idx" in source
     assert "descriptor.row_status.shape[0]" in source
     assert "descriptor.hot_indices.shape[1]" in source
