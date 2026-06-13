@@ -10,11 +10,16 @@ and PDL on. The FC2 N-tile defaults to 256 (a validated tile; see
 ``_resolve_default_fc2_n``).
 
 Why this is a *device* fusion and not a residency fusion: FC1 still TMA-stores
-``(c, sfc)`` to GMEM and FC2 still TMA-loads ``(a, sfa)`` from GMEM. On SM90+ the
-FC1->FC2 intermediate cannot be kept SMEM-resident without merging the two
-kernels' bodies into one ``@cute.kernel`` (unified SharedStorage + TMEM
-time-share + matched A-SMEM layout) -- the TMA-descriptor surgery the CuTe-DSL
-skill flags as prohibitively complex. The fusion win here is host-gap removal:
+``(c, sfc)`` to GMEM and FC2 still TMA-loads ``(a, sfa)`` from GMEM. Keeping the
+FC1->FC2 intermediate off GMEM in THIS two-launch artifact would require merging
+the two kernels' bodies into one ``@cute.kernel`` (the TMA-descriptor surgery the
+CuTe-DSL skill flags as complex). The shipped "phase 3" path
+(``mega_persistent_moe.run_mega_persistent_moe_v2``,
+``TRTLLM_OPTRT_MOE_MEGAKERNEL_V2``) achieves the on-chip intermediate WITHOUT
+merging bodies -- one persistent grid streams both stages' pipelines and routes
+the intermediate through the SMEM A-pipeline -- so prefer that for the residency
+win; this jit artifact is the device-fusion (host-gap) study. The fusion win
+here is host-gap removal:
 there is NO Python/host work between the two launches, so the two grid ramps
 collapse toward a single combined ramp. NOTE: the device fusion itself is
 timing-neutral on the prod decode shape (PDL already overlaps the FC1->FC2

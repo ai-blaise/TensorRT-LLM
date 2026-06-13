@@ -35,13 +35,23 @@ Two device paths are provided, selected by ``TRTLLM_OPTRT_MOE_MEGAKERNEL``:
   boundary); the earlier "N=160 decode win" was a mis-measurement (N=160 is
   numerically broken, cosine ~0.79 vs f32 -- see fused_moe_megakernel_jit.py).
 
-The fully SMEM-resident single-``@cute.kernel`` (no GMEM intermediate, no
-``tma_atom_a`` for the intermediate) is NOT shipped here: it requires merging the
-two kernels' bodies into one ``@cute.kernel`` with a unified ``SharedStorage``,
-TMEM time-share, and a matched A-SMEM layout (FC1 epilogue tile 128x64 swizzled
-vs FC2 ``a_smem_layout_staged``), i.e. the TMA-descriptor surgery the CuTe-DSL
-skill explicitly flags as prohibitively complex. See ``DESIGN-NOTES`` for the
-exact constraint (the Phase-1 crux) and the prototype assessment.
+The fully single-``@cute.kernel`` fused path ("phase 3") is NOT in THIS module,
+but it IS shipped (opt-in) in the sibling ``mega_persistent_moe.py`` as
+``run_mega_persistent_moe_v2`` (gated by ``TRTLLM_OPTRT_MOE_MEGAKERNEL_V2``,
+wired into ``fused_moe_cute_dsl.run_moe_nvfp4_impl``). It does NOT merge the two
+production kernels' epilogue/mainloop bodies (the TMA-descriptor surgery the
+CuTe-DSL skill flags as prohibitively complex); instead ONE persistent grid runs
+both stages' warp-specialized tcgen05/TMA pipelines as a stream of (stage,
+m_tile, n_blk) work items, with the FC1->FC2 dependency carried by a per-tile
+GMEM done-counter (red.release.gpu after FC1's TMA stores complete; ld.acquire
+spin before an FC2 item dispatches) and the intermediate ``(c_q, sfc)`` kept on
+the SMEM A-pipeline path (FC2's A loaded through FC1's gather-LDGSTS with identity
+row mapping + a LINEAR sf view). Work items are derived ON DEVICE from the
+moe_sort outputs each invocation (graph-replay-safe for any routing) and popped
+through a global atomic cursor; the done/cursor/exit buffer is self-reset by the
+last CTA out (no host fill node). At the prod decode shape this BEATS the op path
+in the concentrated band (~6% at ~16-24 distinct experts) and ties/loses as the
+distinct-expert count grows toward prefill-like dispersion.
 """
 from __future__ import annotations
 
