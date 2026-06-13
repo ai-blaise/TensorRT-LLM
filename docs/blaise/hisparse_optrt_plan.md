@@ -133,9 +133,9 @@ The branch now also has a native production-layout BDR hot-reader primitive,
 encoding, consumes row status, decodes packed `kvarn_k2v2` hot records through
 the C-KV low-bit bytes, scale/zp fields, and E4M3 RoPE payload, and returns a
 bf16 scratch tensor for kernel validation. This is a producer-load building
-block and CUDA smoke hook, not a serving path: the coordinator still fails
-closed until the same KVarN-hot reader is fused into sparse MLA. The June 13
-final sweep tightened this primitive to require `kvarn_bits=2`; there is no
+block and CUDA smoke hook, not a serving pre-dequant path; the fused sparse MLA
+candidate now uses the same reader helpers directly at producer load. The June
+13 final sweep tightened this primitive to require `kvarn_bits=2`; there is no
 4-bit KVarN-hot validation branch for the production HiSparse path.
 The BDR address decode, hot-index validation, 2-bit C-KV unpack, scale/zp
 application, and E4M3 RoPE byte read now live in
@@ -166,6 +166,14 @@ binding generation rows to context request IDs.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
+The June 13 continuation re-ran this non-disruptive compile for both
+`sparse_mla_decode_kvarn_hot.cu` and `hisparseKvarnHotRead.cu` with
+`/usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_100 -dc`; both produced
+objects under `/tmp/hisparse-nvcc-check` on `a4-us-002-rl9`. The same audit
+confirmed the live Dynamo deployment is running the NIXL/PYTHON transceiver
+configuration with `--connector none`; the explicit
+`TRTLLM_NIXL_KVCACHE_BACKEND=UCX` value is the NIXL plugin backend on the
+current GCP B200 lane, not the legacy/direct UCX cache transceiver.
 The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
 `mlaKernels.cu`: the paged MLA KVarN read launcher validated `kvarn_bits` but
 did not pass it into the CUDA kernel, which meant `kvarn_k2v2` could be read
@@ -1085,10 +1093,12 @@ Current branch status:
   low-bit scale/zp layout, reads the E4M3 RoPE payload, and rejects wrong
   row/status/index/layer layout. It is intentionally not wired as a serving
   pre-dequant pass;
-- tightened the enabled-startup readiness ladder so the branch reports the
-  exact remaining gap: native planner/copy ops, standalone BDR hot-reader
-  primitive, fused `sparse_mla_decode_kvarn_hot`, and final DSA dispatch
-  integration are separate fail-closed gates;
+- added fused `trtllm::sparse_mla_decode_kvarn_hot` plus DSA absorption-
+  generation dispatch wiring. Enabled HiSparse now routes through the typed
+  KVarN-hot descriptor before the NVFP4/full-HBM path can run;
+- the enabled-startup readiness ladder now checks native planner/copy ops,
+  the standalone BDR hot-reader primitive, and fused
+  `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1105,9 +1115,9 @@ Still pending before serving enablement:
   read can influence output;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
-- hot global-index output buffers for sparse MLA;
-- sparse MLA packed hot-pool read with BDR/on-read dequant, proven against the
-  existing production full-HBM KVarN path within KVarN tolerance;
+- runtime proof that the hot global-index output buffers and fused sparse MLA
+  packed hot-pool read match the existing production full-HBM KVarN path within
+  KVarN tolerance;
 - FSSS reuse-layer remap over layer-local hot slots.
 
 ### Gate 4: Production Optimization Hardening
