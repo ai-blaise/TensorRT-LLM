@@ -114,6 +114,12 @@ The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
 did not pass it into the CUDA kernel, which meant `kvarn_k2v2` could be read
 through the default 4-bit path. The launcher now forwards the validated bit
 width, so dense MLA KVarN readback uses the selected 2-bit production mode.
+The coordinator now also refuses to derive HiSparse host/hot tier sizes from
+the legacy Python/Sinkhorn `KVarNLatentPool` record. HiSparse tier derivation
+requires a production BDR layout descriptor (`bdr_ckv_lowbit_fp8_pe_v1`) and a
+matching source-pool layout; the current DSA side-pool advertises
+`legacy_sinkhorn_v1`, so enabled HiSparse fails closed before allocating
+misleading hot records.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
 row-status consumption, and live NIXL/cancel E2E proofs are not complete.
@@ -816,6 +822,11 @@ Current branch status:
   `hot_lru_tick`) whenever hot records are committed or cleared;
 - implemented invalidation that clears hot records when host records are
   invalidated or request slots are released;
+- added a production BDR KVarN layout descriptor and a source-layout gate:
+  `configure_from_kv_cache_manager()` now requires
+  `bdr_ckv_lowbit_fp8_pe_v1` source records before deriving HiSparse tier
+  sizes, and rejects the current `legacy_sinkhorn_v1` KVarN side-pool rather
+  than allocating host/hot buffers with the wrong ABI;
 - implemented production-shaped packed tensor allocation for host `uint8`
   KVarN records, device hot `uint8` KVarN records, host commit metadata, and
   device hot-slot metadata;
@@ -851,6 +862,9 @@ Still pending before serving enablement:
   `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission,
   including proof that the host tier is mapped/device-addressable on the B200
   deployment image;
+- migration or native adaptation of the dense-MLA KVarN source pool from
+  `legacy_sinkhorn_v1` to the production BDR HiSparse record layout
+  `bdr_ckv_lowbit_fp8_pe_v1`;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;

@@ -74,6 +74,72 @@ except ImportError:  # standalone / unit-test
 # ---------------------------------------------------------------------------
 
 _KVARN_PREFIX = "kvarn_"
+KVARN_LEGACY_SIDEPOOL_LAYOUT = "legacy_sinkhorn_v1"
+KVARN_BDR_HISPARSE_LAYOUT = "bdr_ckv_lowbit_fp8_pe_v1"
+
+
+@dataclass(frozen=True)
+class KVarNBDRLayout:
+    """Production BDR layout contract for dense-MLA HiSparse hot records.
+
+    This describes the C++ BDR helper in ``mlaKernels.cu`` rather than the
+    older Python/Sinkhorn side-pool record. C-KV is low-bit packed after the
+    block-diagonal Hadamard rotation, with per-token/sub-block fp16
+    ``{scale,zp}``; the RoPE component is carried as byte storage in the same
+    hot record until a fused low-bit PE path exists.
+    """
+
+    tokens_per_block: int
+    ckv_bits: int
+    requested_pe_bits: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    name: str = KVARN_BDR_HISPARSE_LAYOUT
+    bdr_order: int = 128
+    bytes_per_scale: int = 2
+    pe_storage_bytes_per_elem: int = 1
+
+    @property
+    def num_subblocks(self) -> int:
+        return self.kv_lora_rank // self.bdr_order
+
+    @property
+    def ckv_packed_bytes_per_token(self) -> int:
+        return self.kv_lora_rank * self.ckv_bits // 8
+
+    @property
+    def ckv_scale_zp_bytes_per_token(self) -> int:
+        return 2 * self.num_subblocks * self.bytes_per_scale
+
+    @property
+    def pe_payload_bytes_per_token(self) -> int:
+        return self.qk_rope_head_dim * self.pe_storage_bytes_per_elem
+
+    @property
+    def pe_storage_bits(self) -> int:
+        return 8 * self.pe_storage_bytes_per_elem
+
+    @property
+    def packed_bytes_per_token(self) -> int:
+        return (self.ckv_packed_bytes_per_token +
+                self.ckv_scale_zp_bytes_per_token +
+                self.pe_payload_bytes_per_token)
+
+    @property
+    def packed_bytes_per_block(self) -> int:
+        return self.tokens_per_block * self.packed_bytes_per_token
+
+    @property
+    def field_offsets(self) -> dict[str, tuple[int, int]]:
+        ckv_q = self.tokens_per_block * self.ckv_packed_bytes_per_token
+        ckv_scale_zp = (
+            self.tokens_per_block * self.ckv_scale_zp_bytes_per_token)
+        pe = self.tokens_per_block * self.pe_payload_bytes_per_token
+        return {
+            "ckv_q": (0, ckv_q),
+            "ckv_scale_zp": (ckv_q, ckv_q + ckv_scale_zp),
+            "pe_byte": (ckv_q + ckv_scale_zp, ckv_q + ckv_scale_zp + pe),
+        }
 
 
 @dataclass(frozen=True)
@@ -113,6 +179,30 @@ class KVarNConfig:
 
     def bits_per_elem(self, group: int) -> float:
         return self.packed_bytes(group) * 8 / (group * self.latent_dim)
+
+    def hisparse_bdr_layout(self, group: int) -> KVarNBDRLayout:
+        """Return the production BDR hot-record layout for HiSparse.
+
+        This is intentionally separate from :meth:`packed_bytes`, which still
+        describes the Python/Sinkhorn side-pool used by the amortized restore
+        path. HiSparse sparse-MLA hot reads must use this BDR contract or fail
+        closed before allocating host/hot tiers.
+        """
+        if self.ckv_bits not in (2, 4):
+            raise ValueError(
+                "HiSparse dense MLA BDR hot records support ckv_bits 2 or 4, "
+                f"got {self.ckv_bits}.")
+        if self.kv_lora_rank % 128 != 0:
+            raise ValueError(
+                "HiSparse dense MLA BDR hot records require kv_lora_rank to "
+                f"be divisible by 128, got {self.kv_lora_rank}.")
+        return KVarNBDRLayout(
+            tokens_per_block=int(group),
+            ckv_bits=int(self.ckv_bits),
+            requested_pe_bits=int(self.pe_bits),
+            kv_lora_rank=int(self.kv_lora_rank),
+            qk_rope_head_dim=int(self.qk_rope_head_dim),
+        )
 
 
 def is_kvarn_dtype(mla_latent_kv_dtype) -> bool:
@@ -183,6 +273,7 @@ class KVarNLatentPool:
         self.cfg = cfg
         self.device = device
         self._layout = self._compute_layout(group, cfg)
+        self.storage_layout_name = KVARN_LEGACY_SIDEPOOL_LAYOUT
         self.bytes_per_block = self._layout["total_bytes"]
         # Flat uint8 store. One alloc/layer; same shape contract as indexer-K.
         self.store = torch.zeros((num_blocks, self.bytes_per_block),

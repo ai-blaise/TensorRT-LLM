@@ -22,7 +22,8 @@ from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
     OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
-    KVarNLatentPool, kvarn_latent_bytes_per_token, resolve_kvarn_config)
+    KVarNLatentPool, KVARN_LEGACY_SIDEPOOL_LAYOUT,
+    kvarn_latent_bytes_per_token, resolve_kvarn_config)
 
 
 def _layersplit_compute_active_block_ids(metadata):
@@ -5594,6 +5595,7 @@ class DSACacheManager(KVCacheManager):
             getattr(sparse_attn_config, "mla_latent_kv_amortize", False)
             or os.environ.get("TRTLLM_KVARN_AMORTIZE", "") in ("1", "true", "True"))
         self.kvarn_latent_pool_per_layer = []
+        self.kvarn_hisparse_source_layout = None
         if self.kvarn_cfg is not None:
             # The KVarN side-pool mirrors the dense MLA KV pool, not the
             # Indexer-K pool.  Build it on the primary KV device; the
@@ -5609,6 +5611,7 @@ class DSACacheManager(KVCacheManager):
                                 self.kvarn_cfg, dev)
                 for _ in range(self.num_local_layers)
             ]
+            self.kvarn_hisparse_source_layout = KVARN_LEGACY_SIDEPOOL_LAYOUT
             logger.info(
                 "KVarN MLA-latent backend ENABLED (%s): group=%d, "
                 "%d B/block, %.3f bits/elem, side-pool %d blocks x %d layers "

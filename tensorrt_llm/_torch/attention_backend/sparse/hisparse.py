@@ -37,6 +37,8 @@ class HiSparsePackedTierDescriptor:
     hot_device_capacity_blocks: int
     request_slot_capacity: int
     max_blocks_per_request: int
+    packed_layout: str = "manual"
+    kvarn_bits: int = 0
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,8 @@ class OPTRTHiSparseCoordinator:
         hot_device_capacity_blocks: int,
         request_slot_capacity: Optional[int] = None,
         max_blocks_per_request: Optional[int] = None,
+        packed_layout: str = "manual",
+        kvarn_bits: int = 0,
     ) -> HiSparsePackedTierDescriptor:
         """Install packed KVarN host/hot tier metadata.
 
@@ -251,6 +255,8 @@ class OPTRTHiSparseCoordinator:
             hot_device_capacity_blocks=int(hot_device_capacity_blocks),
             request_slot_capacity=int(values["request_slot_capacity"]),
             max_blocks_per_request=int(values["max_blocks_per_request"]),
+            packed_layout=str(packed_layout),
+            kvarn_bits=int(kvarn_bits),
         )
         self._free_host_slots = list(
             range(self._tier.logical_host_capacity_blocks))
@@ -278,7 +284,23 @@ class OPTRTHiSparseCoordinator:
         if kvarn_cfg is None:
             raise RuntimeError(
                 "HiSparse packed tiers require dense MLA KVarN to be selected.")
+        layout_builder = getattr(kvarn_cfg, "hisparse_bdr_layout", None)
+        if not callable(layout_builder):
+            raise NotImplementedError(
+                "HiSparse requires a production dense-MLA KVarN BDR layout "
+                "descriptor. The legacy Python/Sinkhorn side-pool byte layout "
+                "must not be used as a sparse-MLA hot-read ABI.")
         tokens_per_block = int(getattr(kv_cache_manager, "tokens_per_block"))
+        layout = layout_builder(tokens_per_block)
+        source_layout = getattr(kv_cache_manager,
+                                "kvarn_hisparse_source_layout", None)
+        if source_layout != getattr(layout, "name", None):
+            raise NotImplementedError(
+                "HiSparse requires production BDR KVarN source records before "
+                "host/hot tiers can be allocated. Current source layout is "
+                f"{source_layout!r}, required {getattr(layout, 'name', None)!r}. "
+                "Migrate/adapt KVarNLatentPool output to the BDR layout before "
+                "enabling sparse MLA hot reads.")
         num_layers = int(getattr(kv_cache_manager, "num_local_layers"))
         num_blocks = getattr(kv_cache_manager, "num_blocks", None)
         if num_blocks is None:
@@ -299,7 +321,7 @@ class OPTRTHiSparseCoordinator:
         return self.configure_packed_tiers(
             num_layers=num_layers,
             tokens_per_block=tokens_per_block,
-            packed_bytes_per_block=kvarn_cfg.packed_bytes(tokens_per_block),
+            packed_bytes_per_block=int(layout.packed_bytes_per_block),
             logical_host_capacity_blocks=max(num_blocks,
                                              max_batch_size
                                              * hot_blocks_per_req
@@ -307,6 +329,8 @@ class OPTRTHiSparseCoordinator:
             hot_device_capacity_blocks=hot_blocks_per_req,
             request_slot_capacity=max_batch_size,
             max_blocks_per_request=max_blocks_per_seq,
+            packed_layout=getattr(layout, "name", "unknown"),
+            kvarn_bits=getattr(layout, "ckv_bits", 0),
         )
 
     def allocate_packed_tensors(

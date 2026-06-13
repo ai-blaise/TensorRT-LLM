@@ -13,6 +13,8 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSATrtllmAttention
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
+    KVARN_BDR_HISPARSE_LAYOUT,
+    KVARN_LEGACY_SIDEPOOL_LAYOUT,
     KVarNLatentPool,
     parse_kvarn_dtype,
 )
@@ -62,6 +64,30 @@ def test_kvarn_k2v2_config_is_dense_mla_only():
     assert sparse_cfg.mla_latent_kv_amortize is True
 
 
+def test_kvarn_k2v2_hisparse_bdr_layout_is_not_legacy_sidepool():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+
+    layout = cfg.hisparse_bdr_layout(group=64)
+
+    assert layout.name == KVARN_BDR_HISPARSE_LAYOUT
+    assert layout.ckv_bits == 2
+    assert layout.requested_pe_bits == 2
+    assert layout.pe_storage_bits == 8
+    assert layout.num_subblocks == 4
+    assert layout.ckv_packed_bytes_per_token == 128
+    assert layout.ckv_scale_zp_bytes_per_token == 16
+    assert layout.pe_payload_bytes_per_token == 64
+    assert layout.packed_bytes_per_block == 64 * (128 + 16 + 64)
+    assert layout.field_offsets == {
+        "ckv_q": (0, 8192),
+        "ckv_scale_zp": (8192, 9216),
+        "pe_byte": (9216, 13312),
+    }
+    assert layout.packed_bytes_per_block != cfg.packed_bytes(64)
+
+
 def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
     torch.manual_seed(20260606)
     group = 64
@@ -69,6 +95,7 @@ def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
         "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
     )
     pool = KVarNLatentPool(num_blocks=4, group=group, cfg=cfg, device=torch.device("cpu"))
+    assert pool.storage_layout_name == KVARN_LEGACY_SIDEPOOL_LAYOUT
 
     # Smooth-ish latent data gives a deterministic fidelity floor without making
     # this CPU test spend time on large random outliers.

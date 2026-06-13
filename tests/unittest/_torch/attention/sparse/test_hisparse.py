@@ -4,6 +4,8 @@ import pytest
 
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
     OPTRTHiSparseCoordinator)
+from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
+    KVARN_BDR_HISPARSE_LAYOUT, KVARN_LEGACY_SIDEPOOL_LAYOUT)
 
 
 def _cfg(enabled=False):
@@ -320,8 +322,13 @@ def test_hisparse_request_reservation_is_idempotent_for_published_slots():
 
 def test_hisparse_configure_from_kv_cache_manager_uses_kvarn_shape():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
+    layout = SimpleNamespace(name=KVARN_BDR_HISPARSE_LAYOUT,
+                             packed_bytes_per_block=13312,
+                             ckv_bits=2)
     coordinator.kv_cache_manager = SimpleNamespace(
-        kvarn_cfg=SimpleNamespace(packed_bytes=lambda tokens_per_block: 3072),
+        kvarn_cfg=SimpleNamespace(
+            hisparse_bdr_layout=lambda tokens_per_block: layout),
+        kvarn_hisparse_source_layout=KVARN_BDR_HISPARSE_LAYOUT,
         tokens_per_block=64,
         num_local_layers=3,
         blocks_in_primary_pool=16,
@@ -332,11 +339,32 @@ def test_hisparse_configure_from_kv_cache_manager_uses_kvarn_shape():
 
     assert tier.num_layers == 3
     assert tier.tokens_per_block == 64
-    assert tier.packed_bytes_per_block == 3072
+    assert tier.packed_bytes_per_block == 13312
+    assert tier.packed_layout == KVARN_BDR_HISPARSE_LAYOUT
+    assert tier.kvarn_bits == 2
     assert tier.hot_device_capacity_blocks == 2
     assert tier.logical_host_capacity_blocks == 64
     assert tier.request_slot_capacity == 4
     assert tier.max_blocks_per_request == 16
+
+
+def test_hisparse_configure_from_kv_cache_manager_rejects_legacy_kvarn_layout():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    layout = SimpleNamespace(name=KVARN_BDR_HISPARSE_LAYOUT,
+                             packed_bytes_per_block=13312,
+                             ckv_bits=2)
+    coordinator.kv_cache_manager = SimpleNamespace(
+        kvarn_cfg=SimpleNamespace(
+            hisparse_bdr_layout=lambda tokens_per_block: layout),
+        kvarn_hisparse_source_layout=KVARN_LEGACY_SIDEPOOL_LAYOUT,
+        tokens_per_block=64,
+        num_local_layers=3,
+        blocks_in_primary_pool=16,
+        max_batch_size=4,
+    )
+
+    with pytest.raises(NotImplementedError, match="production BDR KVarN"):
+        coordinator.configure_from_kv_cache_manager()
 
 
 def test_hisparse_allocate_packed_tensors_shapes_and_initializers():

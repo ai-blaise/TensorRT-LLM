@@ -250,6 +250,19 @@ the system integration point for `mla_latent_kv_dtype`; the C++ helper is the
 fused-kernel building block for eliminating the staging copy when the host is
 available for full CUDA validation.
 
+HiSparse uses a stricter layout contract than the current Python side-pool.
+`KVarNConfig.packed_bytes(group)` still describes the legacy
+`legacy_sinkhorn_v1` side-pool record used by amortized restore. The production
+HiSparse hot-read target is the BDR descriptor
+`bdr_ckv_lowbit_fp8_pe_v1`, exposed by `KVarNConfig.hisparse_bdr_layout()`.
+For `kvarn_k2v2` with 64-token blocks, that record is 13,312 bytes:
+8,192 B low-bit C-KV, 1,024 B C-KV scale/zero-point metadata, and 4,096 B RoPE
+byte payload. The descriptor records both the requested `v2` PE setting and the
+current 8-bit PE storage used by this BDR hot-record contract. HiSparse must
+not feed the legacy side-pool record into a BDR sparse-MLA hot-read kernel;
+current code fails closed until the source pool is migrated or adapted to the
+BDR layout.
+
 ### Focused validation commands
 
 CPU-only shape/config validation (safe on protected hosts):
