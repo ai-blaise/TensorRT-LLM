@@ -269,6 +269,10 @@ same ABI shape as the final serving path. The following are hard invariants:
   tiers larger than TopK are valid configurations and must not be rejected by
   the native block-dedupe stage; the full hot capacity still remains available
   to the LRU/hit/miss planner.
+- The hot planner counts unique missing `(host_slot, commit_gen)` pairs per
+  row. Duplicate references to the same committed block in a row must reuse the
+  first planned hot slot instead of consuming another victim or false-failing
+  capacity checks.
 - The miss-copy boundary must be explicit. CUDA kernels must not pretend that
   CPU pinned host KVarN storage is ordinary device memory. The production path
   dedupes and plans misses on device, then hands a compact miss schedule to a
@@ -1108,6 +1112,8 @@ Current branch status:
   submission, post-copy metadata commit, and hot global-index construction;
 - the TopK-to-block stage now plans at `min(index_topk, hot_capacity)` so
   feasible oversized hot-tier configurations do not fail before LRU planning;
+- the native hot planner's capacity pre-check now matches its slot-selection
+  pass by counting duplicate missing host/commit pairs once per row;
 - added `trtllm::hisparse_read_kvarn_hot_bdr`, a native production BDR
   hot-read primitive for CUDA validation. It consumes packed hot KVarN records
   plus hot global indices and row status, dequants C-KV through the configured

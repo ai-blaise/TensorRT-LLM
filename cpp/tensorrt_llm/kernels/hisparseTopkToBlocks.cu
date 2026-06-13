@@ -360,6 +360,17 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
             }
             if (!hit)
             {
+                for (int32_t prev = 0; prev < i; ++prev)
+                {
+                    if (hostSlots[rowOffset + prev] == hostSlot && commitGens[rowOffset + prev] == commitGen)
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (!hit)
+            {
                 ++requiredMisses;
             }
         }

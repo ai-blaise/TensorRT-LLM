@@ -646,6 +646,18 @@ def test_hisparse_native_mapping_allows_hot_capacity_larger_than_topk_source_con
     assert "index_topk=index_topk" in source
 
 
+def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():
+    root = Path(__file__).resolve().parents[5]
+    kernel = root / "cpp/tensorrt_llm/kernels/hisparseTopkToBlocks.cu"
+
+    source = kernel.read_text()
+    assert "int32_t requiredMisses = 0" in source
+    assert "for (int32_t prev = 0; prev < i; ++prev)" in source
+    assert "hostSlots[rowOffset + prev] == hostSlot" in source
+    assert "commitGens[rowOffset + prev] == commitGen" in source
+    assert "++requiredMisses" in source
+
+
 def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     root = Path(__file__).resolve().parents[5]
     attention = root / "tensorrt_llm/_torch/modules/attention.py"
