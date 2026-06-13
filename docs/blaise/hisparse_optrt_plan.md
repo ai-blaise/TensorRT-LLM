@@ -449,14 +449,18 @@ row shapes: B in graph buckets, next_n in {1, 2, 3, 4, 1 + gamma}
 
 ## KVarN Integration
 
-Current KVarN can restore committed dense MLA blocks into the FP16 main pool
-before decode. HiSparse should move the production serving path to two packed
-tiers:
+Current KVarN-only serving can restore committed dense MLA blocks into the main
+decode pool before attention. That existing path is a baseline and compatibility
+reference, not the HiSparse implementation target. HiSparse must move committed
+production serving blocks to two packed tiers:
 
 1. cold host tier: packed KVarN records for full committed blocks;
-2. hot device tier: packed KVarN records for selected committed blocks, plus
-   the already-required resident FP16 sink/tail blocks that have not been
-   committed yet.
+2. hot device tier: packed BDR/KVarN records for selected committed blocks.
+
+Live sink/tail tokens that are not yet committed full blocks remain the normal
+production append/sink responsibility and must be handled explicitly by the
+sparse MLA ABI. They are not a HiSparse FP16 hot tier, not an oracle, and not a
+staging substitute for committed cold blocks.
 
 The optimized target is:
 
@@ -467,8 +471,9 @@ The optimized target is:
   layout. It must not accidentally consume the older Python/Sinkhorn
   `KVarNLatentPool` record shape unless that record shape has first been
   intentionally migrated or adapted into the production BDR ABI;
-- `commit_gen` and `restored_gen` remain block-id keyed;
-- `KVarNLatentPool.invalidate_blocks()` is called for host and hot tiers when
+- `commit_gen` and hot residency generations remain block-id keyed;
+- `KVarNBDRSourcePool.invalidate_blocks()` is called for HiSparse BDR source
+  records, and legacy `KVarNLatentPool` invalidation remains separate, when
   `free_resources()` or `rewind_kv_cache()` recycles a block id.
 
 Implementation sequence:
@@ -669,7 +674,9 @@ Correctness tests:
 - HISA candidate selection unchanged.
 - sparse MLA output within KVarN quant tolerance versus the existing production
   full-HBM KVarN path.
-- KVarN full restore vs HiSparse hot restore block equivalence.
+- production full-HBM KVarN decode path vs HiSparse packed-hot block
+  equivalence within KVarN tolerance. Any full-restore baseline is external to
+  the enabled HiSparse serving path.
 - independent offline references may be used only as test fixtures; no FP16
   block-hot oracle path may be wired into the coordinator, transceiver, kernel
   ABI, or deployment config.
@@ -999,9 +1006,10 @@ Current branch status:
   safe-close boundary as existing KV receive sessions;
 - added layer-major destination-fragment construction for packed KVarN host
   writes, including bounds validation against the published host-slot capacity;
-- added source-fragment construction from the production dense-MLA
-  `KVarNLatentPool.store` byte records, with fail-closed rejection of
-  uncommitted sink/tail blocks;
+- added source-fragment construction from committed production
+  `KVarNBDRSourcePool` byte records, with fail-closed rejection if the
+  HiSparse source layout is still the legacy Python/Sinkhorn side pool or if
+  requested records have not been committed by the native writer;
 - added sender-side validation that aligns source packed KVarN block fragments
   with request-relative destination host slots for dense KV-cache pool pairs,
   skipping indexer, block-scale, and non-attention pools;
@@ -1122,9 +1130,11 @@ Promotion requires:
 6. The Python `KVarNLatentPool` layout still documents and materializes the
    earlier Sinkhorn-style record shape, while the production dense-MLA BDR path
    in `mlaKernels.cu` uses low-bit packed C-KV plus per-token/sub-block scale
-   and zero point. HiSparse serving must either migrate the side-pool source to
-   that production BDR layout or insert an explicit native conversion before
-   any hot-read kernel is enabled.
+   and zero point. The branch now allocates a separate
+   `KVarNBDRSourcePool` for HiSparse source records and rejects legacy side-pool
+   pointers at the host-write boundary. The remaining required work is to wire
+   the native dense-MLA BDR writer to that pool before any hot-read kernel is
+   enabled.
 
 ## Immediate Execution Plan
 
