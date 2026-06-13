@@ -415,3 +415,39 @@ Re-captured the kineto trace on the fused image (steady c16, same window). Analy
 - **#2 is falsified by measurement:** the fusion removes **1.7%** of the ~3429 graph nodes/iter. If `cudaGraphLaunch` scaled linearly that's ~48 µs of its 2.81 ms host cost — **below the ±150 µs measurement noise**. So a single per-layer kernel fusion does **not** measurably move the graph-launch host cost. Cutting that 2.81 ms requires removing a *large* fraction of the 3429 nodes (whole-layer megakernel fusion), not picking off individual prep kernels.
 
 **Net:** #1 is a clean, proven-correct, throughput-neutral simplification (−1.7% graph nodes, marginally helps c1 launch latency). It is **not** the big lever. The profile is unambiguous about where the real headroom is: the **a2a itself (2.06 ms/iter, ~24% of the step with comm+prep)** — exactly the lever Spencer's own composite flags. Attacking it means changing the NVLINK_TWO_SIDED all-to-all algorithm/overlap, a substantially larger project than per-kernel fusion, and is the recommended next focus. The quant storm (#3) and graph-launch cost (#2) are both architectural (norm+quant fusion; whole-layer megakernels), not drop-in wins.
+
+## 10. Full-trace lever enumeration (2026-06-13) — every big win, ranked
+
+In-depth breakdown of the whole decode step (analyzer `.bench_runs_claude/analyze_trace_full.py` over the fused trace = current best stack; per-iter at steady c16, ~19.8 ms/step). **Headline: at c16 the GPU is ~100% busy across the step** (kernel-sum 23.9 ms vs span 19.8 ms = only 1.21× overlap ⇒ busy-union ≈ span). So **throughput wins must cut GPU kernel time**; the big host costs overlap GPU work and only bound c1 latency.
+
+**GPU time by subsystem (per-iter):**
+
+| subsystem | µs/iter | %GPU | launches/iter |
+|---|---|---|---|
+| **all matmuls (split below)** | ~14240 | 59.5% | ~1336 |
+| MoE a2a + comm-prep | 4037 | 16.9% | 290 |
+| elementwise / copy / cast | 1833 | 7.7% | 1073 |
+| indexer / HISA | 1599 | 6.7% | 263 |
+| quant (act→fp4) | 1094 | 4.6% | 392 |
+| reduce / collectives | 434 | 1.8% | 91 |
+| attention / MLA (fmha) | 411 | 1.7% | 122 |
+| MoE expert grouped GEMM | 218 | 0.9% | 58 |
+
+**Matmuls split (the 59.5%):** nvjet dense FP4 swarm (MLA projections + 3 dense-MLP layers + shared experts) ≈ **6.46 ms** (~315 calls, 14–23 µs each); MLA absorb BMMs (`bmm_E2m1`/bf16) ≈ **2.39 ms**; cute_dsl dense-gemm-persistent 855 µs; indexer low-rank gate 760 µs; MoE expert block-scaled FP4 GEMM (`cutlass3x…ue4m3xf4`) 1.31 ms.
+
+**Ranked levers (GPU-time = throughput, c16):**
+
+| # | Lever | µs/iter | Nature | Win potential | Confidence | Difficulty |
+|---|---|---|---|---|---|---|
+| **1** | **Dense GEMM swarm (nvjet, ~315 small-M FP4 GEMMs)** | **~6460** | M=16 decode; memory-/launch-bound, not compute-bound | **HIGH** — mem-bound floor for all dense weights (≈7.6 GB/iter @ ~8 TB/s) is **~0.95 ms**; measured 6.46 ms ⇒ ~5–6× gap | **needs ncu SOL%** to confirm recoverable vs near-SOL | hard |
+| 2 | MoE a2a (dispatch+combine) | ~2080 | NVLINK_TWO_SIDED comm | HIGH (Spencer's flagged lever) | confident | hard |
+| 3 | MLA absorb BMMs (FP4 `bmm`) | ~2390 | M=16 batched matmul | MED | needs ncu | hard |
+| 4 | elementwise/copy glue (1073 launches) | 1833 | many tiny copies/casts | MED (fuse / eliminate `aten::copy_`/`to`) | med | med |
+| 5 | indexer top-k + routing (`topKPerRowDecode` 753, `deepseek_topk` 275, routing 215) | ~1240 | sparse selection | MED | needs ncu | med |
+| 6 | quant storm (392 act-quants) | 1094 | one act-quant per fp4 GEMM | MED (norm+quant fusion) | confident (architectural) | med-hard |
+| 7 | MoE comm-prep (`computeCountAndIndice` 748 + `memsetExpertIds` 584; cumsum already fused) | ~1330 | comm prep | LOW-MED (memset foldable ~0.6 ms) | confident | med |
+| 8 | indexer low-rank gate GEMM | 760 | gate matmul | LOW (Spencer's B2-class already shipped) | confident | hard |
+
+**c1-latency levers (host; overlapped at c16, so NOT throughput levers):** `cudaEventSynchronize` 5.13 ms/iter (2×, step-boundary pacing), `cudaGraphLaunch` 2.95 ms/iter (needs whole-layer node reduction — see §9 #2), aten glue `copy_`/`to`/`index` ≈ 2.7 ms/iter.
+
+**Recommended order of attack:** (1) **ncu-confirm the dense GEMM swarm** — it's 27% of the step and the floor analysis says ~5–6× headroom *if* it's launch/occupancy-bound at M=16 (better small-M tactic, grouped/fused projections, or cuda_core for the tiny-M ones). This is the single biggest potential win and the decisive next measurement. (2) the **a2a** (2.08 ms, known lever). (3) the **elementwise/quant glue** (1.8 + 1.1 ms — fusable). The GEMM-efficiency question gates everything: if ncu shows the GEMMs are near memory-SOL, the swarm is irreducible and the a2a becomes #1; if they're launch/occupancy-bound, the GEMM swarm is the headline win. Method caveat: kineto gives time, not SOL% — confirm via a standalone FP4-GEMM microbench under ncu (clean, non-disruptive in the buildtools container) before committing to lever #1.
