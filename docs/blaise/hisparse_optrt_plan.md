@@ -210,7 +210,13 @@ metadata commit, hot-index construction, second-pass hit reuse, overflow
 fail-closed behavior, unadmitted-row rejection, and uncommitted-block
 rejection. It passed on B200 GPU 7 both in the exact-clean buildtools image and
 inside the newest local deployment runtime image while loading the mounted
-`libth_hisparse_smoke.so`.
+`libth_hisparse_smoke.so`. The tiny
+`deploy/disagg_pd_r20/build_hisparse_thop_proof_image.sh` proof image then
+copied that exact branch-built library and script into the deployment runtime
+base and reran the same CUDA smoke with no thop bind mount; image-internal
+native-op loading also passed on B200 GPU 7. This is still narrower than a full
+serving wheel: it proves runtime ABI/device-addressable host access for the
+branch-built HiSparse thops, not DSA serving import from `libth_common.so`.
 The repo-level pytest harness still requires the full Python bindings, so the
 proof script intentionally bypassed `tests/unittest/conftest.py` while
 executing the same native ops and tensor contracts.
@@ -1161,15 +1167,18 @@ Still pending before serving enablement:
   overflow rejection, unadmitted-row rejection, and uncommitted-block
   rejection. The same planner/copy smoke also passes inside the newest local
   deployment runtime image when that image loads the mounted exact-clean
-  `libth_hisparse_smoke.so`;
-- branch-built deployment image/wheel proof is still pending: the current
-  deployment-runtime smoke proves ABI/runtime compatibility and mapped-host
-  access, but the image does not yet contain the `op-trt-hisparse` library
-  internally as the DSA serving path would load it;
-- mounted deployment-runtime proof that
+  `libth_hisparse_smoke.so`, and inside a tiny proof image that contains the
+  same branch-built library internally at `/opt/ai-blaise/hisparse`;
+- full branch-built deployment image/wheel proof is still pending: the current
+  proof image contains `libth_hisparse_smoke.so` internally and proves
+  ABI/runtime compatibility plus mapped-host access, but it does not yet prove
+  that the full `op-trt-hisparse` `libth_common.so` and Python package are
+  installed in the serving image exactly as DSA will import them;
+- deployment-runtime proof that
   `trtllm::hisparse_submit_packed_kvarn_copy_schedule` sees the production
-  host tier as mapped/device-addressable on B200 is complete. If a later
-  branch-built image/runtime cannot use the mapped-host kernel path, replace
+  host tier as mapped/device-addressable on B200 is complete for the exact
+  branch-built thop library, both mounted and image-internal. If a later full
+  branch-built serving image cannot use the mapped-host kernel path, replace
   only the bridge with a copy-engine implementation that consumes the same
   compact device schedule without Python materialization or synchronous host
   readback;
@@ -1638,25 +1647,27 @@ Promotion requires:
 The next implementation work should continue from the current fail-closed
 production ABI:
 
-1. Promote the native planner/copy proof from mounted-library deployment smoke
-   to a branch-built deployment image/wheel:
+1. Promote the native planner/copy proof from thop-proof image to a full
+   branch-built deployment image/wheel:
    - `th_hisparse_smoke` now compiles and loads the thops/kernels for
      top-k-to-block dedupe, request-table resolve, resident-block classify,
      hot-slot plan, compact miss schedule, mapped pinned-host copy bridge,
      post-copy commit, hot-index build, BDR writer, hot reader, sparse MLA
      hot decode, and resident padding;
    - `blaise_perf/hisparse/native_planner_copy_smoke.py` now passes on B200
-     through the exact-clean buildtools image and through the newest local
-     deployment runtime image with the exact-clean library mounted in. It
-     covers overflow, unadmitted rows, uncommitted/stale commit generations,
-     duplicate selected blocks, resident sink/tail bypass, hit/miss/LRU,
-     copy-status propagation, mapped pinned-host copy, metadata commit, and
-     hot-index construction;
-   - next, build or install the `op-trt-hisparse` wheel/library into the
-     deployment image itself and rerun the same script without mounting the
-     thop library. If that branch-built image cannot use the mapped-host
-     kernel path, replace only the copy bridge with a copy-engine variant that
-     consumes the same compact device schedule without host sync.
+     through the exact-clean buildtools image, through the newest local
+     deployment runtime image with the exact-clean library mounted in, and
+     through a tiny deployment-runtime proof image that contains the
+     branch-built library internally. It covers overflow, unadmitted rows,
+     uncommitted/stale commit generations, duplicate selected blocks, resident
+     sink/tail bypass, hit/miss/LRU, copy-status propagation, mapped
+     pinned-host copy, metadata commit, and hot-index construction;
+   - next, build or install the full `op-trt-hisparse` `libth_common.so` and
+     Python package into the deployment image itself and rerun the same script
+     through the normal serving import/library path. If that full branch-built
+     image cannot use the mapped-host kernel path, replace only the copy bridge
+     with a copy-engine variant that consumes the same compact device schedule
+     without host sync.
 2. Lock the production KVarN hot-record layout:
    - make `kvarn_k2v2` the dense MLA HiSparse source of truth;
    - align host/hot packed records with the production BDR layout used by
