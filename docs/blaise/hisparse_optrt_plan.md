@@ -217,6 +217,15 @@ base and reran the same CUDA smoke with no thop bind mount; image-internal
 native-op loading also passed on B200 GPU 7. This is still narrower than a full
 serving wheel: it proves runtime ABI/device-addressable host access for the
 branch-built HiSparse thops, not DSA serving import from `libth_common.so`.
+The same planner/copy smoke also passes when loading the cached branch-built
+`libth_common.so` directly: first mounted into the buildtools image, then
+mounted into the deployment runtime image, and finally copied into a tiny
+deployment-runtime proof image together with its required native siblings
+(`libtensorrt_llm.so`, `libpg_utils.so`, and the decoder-attention shared
+libraries). That image-internal `libth_common.so` proof closes the native
+library dependency gap that first appeared as a missing `libtensorrt_llm.so`;
+the remaining packaging gap is installing the full branch Python package plus
+`libth_common.so` into site-packages exactly as serving imports it.
 The repo-level pytest harness still requires the full Python bindings, so the
 proof script intentionally bypassed `tests/unittest/conftest.py` while
 executing the same native ops and tensor contracts.
@@ -395,6 +404,27 @@ Runtime/test boundary:
   be a first runtime-reachable candidate if it consumes packed `kvarn_k2v2`
   records, row status, and explicit sink/tail descriptors.
 - A pre-dequant "correctness" kernel or FP16 block-hot path cannot be a serving candidate.
+
+June 13 final sweep result:
+
+- The current runtime-reachable HiSparse code is still fail-closed until the
+  full production chain is present. The remaining "fallback" references in the
+  HiSparse path are prohibitions, error messages, or test/benchmark boundaries,
+  not alternate serving implementations.
+- The only acceptable first serving candidate is the target model's production
+  dense-MLA/DSA path with packed `kvarn_k2v2` BDR hot records, native
+  planner/copy, explicit sink/tail normal-KV resident reads, NIXL direct
+  host-write admission, row-status propagation, and LayerSplit/request-pinning
+  composition. A microkernel that uses this exact ABI may be slow initially,
+  but it is still the production path; an FP16, NVFP4, full-HBM, or synthetic
+  block-hot kernel is not.
+- The branch now has native-op smoke proof for the production-shaped CUDA
+  planner/copy chain and for `libth_common.so` loaded both mounted and
+  image-internal with its native siblings. The remaining proof is serving
+  packaging: install the full branch Python package and `libth_common.so` in
+  the deployment image site-packages exactly as DSA imports them, then run the
+  same production-ABI smoke through that path before any readiness guard is
+  relaxed.
 
 CUDA API note: NVIDIA documents `cudaMemcpyBatchAsync()` as a host API over
 host-visible source pointer, destination pointer, and size arrays, and documents
@@ -1169,19 +1199,24 @@ Still pending before serving enablement:
   deployment runtime image when that image loads the mounted exact-clean
   `libth_hisparse_smoke.so`, and inside a tiny proof image that contains the
   same branch-built library internally at `/opt/ai-blaise/hisparse`;
+- cached branch-built `libth_common.so` native-op proof is complete: the same
+  planner/copy smoke passes with `libth_common.so` mounted into buildtools,
+  mounted into the deployment runtime image, and copied image-internal with
+  `libtensorrt_llm.so`, `libpg_utils.so`, and decoder-attention shared-library
+  siblings;
 - full branch-built deployment image/wheel proof is still pending: the current
-  proof image contains `libth_hisparse_smoke.so` internally and proves
-  ABI/runtime compatibility plus mapped-host access, but it does not yet prove
-  that the full `op-trt-hisparse` `libth_common.so` and Python package are
-  installed in the serving image exactly as DSA will import them;
+  proof images prove ABI/runtime compatibility, mapped-host access, and
+  `libth_common.so` dependency closure, but they do not yet prove that the full
+  `op-trt-hisparse` Python package and `libth_common.so` are installed in the
+  serving image's site-packages exactly as DSA will import them;
 - deployment-runtime proof that
   `trtllm::hisparse_submit_packed_kvarn_copy_schedule` sees the production
-  host tier as mapped/device-addressable on B200 is complete for the exact
-  branch-built thop library, both mounted and image-internal. If a later full
-  branch-built serving image cannot use the mapped-host kernel path, replace
-  only the bridge with a copy-engine implementation that consumes the same
-  compact device schedule without Python materialization or synchronous host
-  readback;
+  host tier as mapped/device-addressable on B200 is complete for both the
+  narrow exact branch-built thop library and cached branch-built
+  `libth_common.so`, mounted and image-internal. If a later full branch-built
+  serving image cannot use the mapped-host kernel path, replace only the bridge
+  with a copy-engine implementation that consumes the same compact device
+  schedule without Python materialization or synchronous host readback;
 - B200 compile/live validation of `torch.ops.trtllm.mla_bdr_write_kvarn_record`
   is complete at the native-op level through `th_hisparse_smoke`: the writer
   fills the production BDR byte layout, supports byte-strided records, and the
@@ -1662,12 +1697,15 @@ production ABI:
      uncommitted/stale commit generations, duplicate selected blocks, resident
      sink/tail bypass, hit/miss/LRU, copy-status propagation, mapped
      pinned-host copy, metadata commit, and hot-index construction;
-   - next, build or install the full `op-trt-hisparse` `libth_common.so` and
-     Python package into the deployment image itself and rerun the same script
-     through the normal serving import/library path. If that full branch-built
-     image cannot use the mapped-host kernel path, replace only the copy bridge
-     with a copy-engine variant that consumes the same compact device schedule
-     without host sync.
+   - cached branch-built `libth_common.so` now passes the same smoke when
+     mounted into buildtools, mounted into the deployment runtime, and copied
+     image-internal with its required native siblings. The next proof is the
+     actual serving package layout: build or install the full `op-trt-hisparse`
+     Python package and `libth_common.so` into the deployment image's
+     site-packages, then rerun the script through the normal serving
+     import/library path. If that full branch-built image cannot use the
+     mapped-host kernel path, replace only the copy bridge with a copy-engine
+     variant that consumes the same compact device schedule without host sync.
 2. Lock the production KVarN hot-record layout:
    - make `kvarn_k2v2` the dense MLA HiSparse source of truth;
    - align host/hot packed records with the production BDR layout used by
@@ -1685,10 +1723,11 @@ production ABI:
      level;
    - consume hot packed KVarN records directly through hot global indices,
      decoding `(hot_slot, token_offset)` into production BDR field addresses;
-   - add BDR/on-read dequant in the sparse MLA producer load path, including
-     2-bit C-KV unpack, byte-addressed scale/zp apply, inverse BDR readback to
-     the original dense MLA latent frame, and RoPE payload read without an
-     intermediate dense/FP16 hot staging pass;
+   - keep BDR/on-read dequant in the sparse MLA producer load path as the only
+     serving read mode: 2-bit C-KV unpack, byte-addressed scale/zp apply,
+     inverse BDR readback to the original dense MLA latent frame, and RoPE
+     payload read must happen without an intermediate dense/FP16 hot staging
+     pass;
    - include the shared `hisparseKvarnBdrRead.cuh` helper layer for hot-index
      decode and BDR field reads so the validation op and serving producer path
      share one production layout implementation;
