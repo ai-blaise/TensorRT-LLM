@@ -116,6 +116,55 @@ class HiSparseHostTierMeta:
             device=data.get("device", "cpu"),
         )
 
+    def entry_indices(self, entry_name: str) -> list[int]:
+        """Return layer-major entry indices for a named HiSparse host tensor."""
+        prefix = f"{entry_name}.layer"
+        indices = [
+            idx for idx, name in enumerate(self.names)
+            if str(name).startswith(prefix)
+        ]
+        if not indices and entry_name == "host_packed" and self.num_layers > 0:
+            indices = list(range(int(self.num_layers)))
+        if len(indices) != int(self.num_layers):
+            raise ValueError(
+                f"HiSparse host meta expected {self.num_layers} entries for "
+                f"{entry_name}, found {len(indices)}.")
+        return indices
+
+    def destination_fragments(
+        self,
+        entry_name: str,
+        host_slots: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build layer-major DRAM destination pointers for host-slot writes."""
+        slots = np.asarray(host_slots, dtype=np.int64)
+        if slots.ndim != 1:
+            raise ValueError(
+                "HiSparse host-slot fragments require a 1D host slot vector.")
+        if slots.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        if self.host_slots > 0 and (
+                int(slots.min()) < 0 or int(slots.max()) >= int(self.host_slots)):
+            raise ValueError(
+                f"HiSparse host slot out of range for host_slots={self.host_slots}: "
+                f"min={int(slots.min())}, max={int(slots.max())}.")
+        ptr_parts = []
+        size_parts = []
+        for entry_idx in self.entry_indices(entry_name):
+            item_size = int(self.item_sizes[entry_idx])
+            ptr_parts.append(self.ptrs[entry_idx] + slots * item_size)
+            size_parts.append(
+                np.full(slots.size, item_size, dtype=np.int64))
+        return (np.concatenate(ptr_parts).astype(np.int64, copy=False),
+                np.concatenate(size_parts).astype(np.int64, copy=False))
+
+    def packed_destination_fragments(
+        self,
+        host_slots: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self.destination_fragments("host_packed", host_slots)
+
 
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 

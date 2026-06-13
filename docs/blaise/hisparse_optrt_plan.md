@@ -673,12 +673,16 @@ Current branch status:
   `hisparse_host_slots` publication in receiver request metadata;
 - wired receive-session cleanup so HiSparse host rows are released on the same
   safe-close boundary as existing KV receive sessions;
+- added layer-major destination-fragment construction for packed KVarN host
+  writes, including bounds validation against the published host-slot capacity;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
   with NIXL as a separate `DRAM` registration group;
-- intentionally did not append HiSparse host fragments to `WriteMetaType.KV`,
-  because that path still constructs uniform `VRAM` transfer requests.
+- sender-side HiSparse destination validation now runs when receiver host slots
+  are present, but the fragments are intentionally not appended to
+  `WriteMetaType.KV`, because that path still constructs uniform `VRAM`
+  transfer requests.
 
 Still pending before serving enablement:
 

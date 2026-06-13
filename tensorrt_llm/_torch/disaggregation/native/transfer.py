@@ -708,6 +708,21 @@ class Sender(SenderBase):
             src_meta.item_sizes.astype(np.int64, copy=False),
         )
 
+    @staticmethod
+    def _collect_hisparse_host_dst_frags(
+        peer_ri: RankInfo,
+        req_info: RecvReqInfo,
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        if req_info.hisparse_host_slots is None:
+            return None
+        dst_meta = peer_ri.hisparse_host_meta
+        if dst_meta is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires host-tier metadata on the "
+                "receiver; refusing to send packed KVarN blocks without "
+                "published DRAM destinations.")
+        return dst_meta.packed_destination_fragments(req_info.hisparse_host_slots)
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -844,6 +859,12 @@ class Sender(SenderBase):
             src_frags = np.concatenate([src_frags, s_src])
             dst_frags = np.concatenate([dst_frags, s_dst])
             kv_sizes = np.concatenate([kv_sizes, s_sizes])
+        if Sender._collect_hisparse_host_dst_frags(peer_ri,
+                                                   req_info) is not None:
+            # Destination descriptors are validated here, but not appended to
+            # the VRAM KV write. HiSparse host writes need a separate DRAM
+            # WriteMeta once the prefill packed-KVarN source writer exists.
+            pass
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
