@@ -162,6 +162,41 @@ orchestrator** (both `.so` run on GPU 7 with identical seeded inputs).
   CZS/IKP-gated). This optimization does not touch the production ABI/BDR layout and
   does not flip any readiness gate.
 
+## Phase-3 — FlashMLA-style hot-read rewrite (21.6×, verified; major step, not the finish line)
+
+The Gate-4 rewrite (user-directed). The hot-read is MLA decode attention over the
+selected tokens = two GEMMs with on-read KVarN-BDR dequant. The kernel was
+restructured FlashMLA-style: the serial-1024 `blockReduceSum`-per-entry score
+reduction replaced by a parallel warp-tiled reduction + online softmax, with
+head-group occupancy tuning (split target 304 for B16) and the per-block C-KV
+base dequant shared 8× across heads. (`sparse_mla_decode_kvarn_hot.{cu,h}`.)
+
+- **6.39 → 0.295 ms/row (21.6×) at B16**, independently re-verified by the
+  orchestrator on GPU 7 (102.10 → **4.72 ms/call**, cos **0.999999**); 271–296
+  µs/**row** across all buckets. Correctness: dense-ref 0.999999, smoke PASS
+  (committed-hot + resident sink/tail + fail-closed), no regression. Production
+  ABI/BDR frozen; readiness gate stays false.
+- **Honest gap (per-row ≠ per-step):** 295 µs/**row** is the headline, but per
+  **call** at B16 is 4.72 ms → ×61 layers ≈ 288 ms/step, still above the ~20 ms
+  c16 budget. The kernel is now **dequant-bound** — the inverse-Hadamard-128
+  dominates (~67M FMA/block vs ~26M for score+V); B16 is also occupancy-limited
+  (only 16 rows). Closing the rest needs **tensor-core Hadamard dequant**
+  (numerically delicate vs the fp32 reference) — the verified ceiling for a
+  math-faithful scalar-dequant kernel. This is a major step toward A/B-viability
+  (74× under the original 348 ms/call), not the finish line.
+
+## Companion track — KVarN-GQA packed decode (24.7×, bit-identical)
+
+Run in parallel (separate worktree/GPU): the SMC-SD GQA-KVarN dense packed-decode
+kernel (`kvarnGqaKernels.cu`) was **1470 → 59.5 µs (24.7×)**, **bit-identical**
+(`ref_max_abs` unchanged vs an independent torch reference over the dequant
+readable pool, gate atol 7.5e-2 → >100× margin), CUDA-graph-safe — by killing the
+per-(token,dim) shared-mem `atomicAdd` + double-K-dequant (M1), algebraic
+scale-factoring out of the hot loops (M2), and SMEM code-plane staging (M3); plus
+256-tok 7.6×. ABI + `kvarn_gqa_backend_ready()=false` untouched. Sparse top-k only
+1.22× (scattered tokens resist code-plane staging — follow-up). Distinct from the
+dense-MLA HiSparse path.
+
 ## Audit provenance
 
 Orchestrator independently: (a) derived the 208 B/token constant from source and

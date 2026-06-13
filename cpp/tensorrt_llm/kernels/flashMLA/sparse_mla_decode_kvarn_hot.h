@@ -78,6 +78,15 @@ struct SparseMlaDecodeKvarnHotParams
     int64_t strideOB;
     int64_t strideOSQ;
     int64_t strideOHQ;
+
+    // Internal split-K scratch (set by invokeSparseMlaDecodeKvarnHot only; the thop
+    // wrapper value-initializes these to zero/nullptr). When numSplits > 1 the decode
+    // kernel writes per-split partial flash state (acc/max/denom) here and a combine
+    // kernel reduces it into out/lse. Not part of the frozen op ABI.
+    float* partialAcc;     // [rows][hQ][numSplits][dV]
+    float* partialMax;     // [rows][hQ][numSplits]
+    float* partialDenom;   // [rows][hQ][numSplits]
+    int32_t numSplits;
 };
 
 void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, cudaStream_t stream);

@@ -31,31 +31,34 @@ constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr int32_t kResidentKvPoolBf16 = 0;
 constexpr int32_t kResidentKvPoolFp16 = 1;
 
+// Head-grouped flash decode: grid is (rows, headGroups, splits). Each block owns
+// kHeadsPerBlock query heads of one row and a contiguous slice of that row's selected
+// tokens (split-K). It streams its token slice in tiles of kTileTokens, dequantizes
+// each tile's K/V latent ONCE into a shared bf16 tile (shared across all heads in the
+// block, removing the per-head redundant inverse-Hadamard dequant), and runs
+// online-softmax flash attention per head. With numSplits==1 it finalizes directly to
+// out/lse; with numSplits>1 it writes per-split partial flash state to scratch and the
+// combine kernel reduces.
+constexpr int32_t kHeadsPerBlock = 16;
+constexpr int32_t kHeadGroups = kHeadQ / kHeadsPerBlock;
+constexpr int32_t kTileTokens = 32;
+constexpr int32_t kThreadsPerHead = kThreads / kHeadsPerBlock;
+constexpr int32_t kMaxSplits = 16;
+
 __device__ __forceinline__ float bf16ToFloat(void const* ptr, int64_t offset)
 {
     auto const* q = reinterpret_cast<__nv_bfloat16 const*>(ptr);
     return __bfloat162float(q[offset]);
 }
 
-// Cooperatively dequant one token's C-KV base values (pre-Hadamard) into shared.
-// base[d] is exactly readHisparseKvarnK2v2PackedCkvValue(...,d) for d in [0,kvLoraRank);
-// caching it removes the kBdrOrder-fold redundant 2-bit unpack that the per-dim
-// readHisparseKvarnK2v2BdrLatentValue path otherwise repeats for every output dim
-// sharing a 128-subblock. Caller must __syncthreads() before reading the cache.
-__device__ __forceinline__ void buildCkvBaseCache(uint8_t const* record,
-    HiSparseKvarnK2v2BdrLayout const& layout, int32_t tokenOffset, float* base)
+__device__ __forceinline__ void writeBf16(void* ptr, int64_t offset, float value)
 {
-    uint8_t const* tokenPacked = record + static_cast<int64_t>(tokenOffset) * layout.ckvBytesPerToken;
-    uint8_t const* tokenScaleZpBytes
-        = record + layout.ckvBytesPerBlock + static_cast<int64_t>(tokenOffset) * layout.scaleZpBytesPerToken;
-    for (int32_t d = static_cast<int32_t>(threadIdx.x); d < layout.kvLoraRank; d += static_cast<int32_t>(blockDim.x))
-    {
-        base[d] = readHisparseKvarnK2v2PackedCkvValue(tokenPacked, tokenScaleZpBytes, d);
-    }
+    auto* out = reinterpret_cast<__nv_bfloat16*>(ptr);
+    out[offset] = __float2bfloat16_rn(value);
 }
 
-// Inverse-Hadamard-128 of one C-KV dim from the shared base cache. Bit-identical
-// to readHisparseKvarnK2v2PackedCkvOriginalValue: same base[j], same ascending-j
+// Inverse-Hadamard-128 of one C-KV dim from a per-token base cache. Bit-identical
+// to readHisparseKvarnK2v2PackedCkvOriginalValue: same base[j], ascending-j
 // accumulation order, same signs, same final scale.
 __device__ __forceinline__ float ckvHadamardFromCache(float const* base, int32_t dim)
 {
@@ -72,29 +75,6 @@ __device__ __forceinline__ float ckvHadamardFromCache(float const* base, int32_t
         acc += parity ? -value : value;
     }
     return acc * kInvSqrtHadamard128;
-}
-
-// Latent value for one dim using the cached C-KV base (dim < kvLoraRank) or the
-// uncached RoPE fp8 path (dim >= kvLoraRank). Returns the same bf16-rounded float
-// as readHisparseKvarnK2v2BdrLatentValue.
-__device__ __forceinline__ float cachedLatentValue(uint8_t const* record,
-    HiSparseKvarnK2v2BdrLayout const& layout, float const* base, int32_t tokenOffset, int32_t dim)
-{
-    if (dim < layout.kvLoraRank)
-    {
-        return __bfloat162float(__float2bfloat16_rn(ckvHadamardFromCache(base, dim)));
-    }
-    uint8_t const* peBytes
-        = record + layout.ckvBytesPerBlock + layout.scaleZpBytesPerBlock;
-    int32_t const peDim = dim - layout.kvLoraRank;
-    uint8_t const byte = peBytes[static_cast<int64_t>(tokenOffset) * layout.qkRopeHeadDim + peDim];
-    return __bfloat162float(__float2bfloat16_rn(readHisparseFp8E4m3Byte(byte)));
-}
-
-__device__ __forceinline__ void writeBf16(void* ptr, int64_t offset, float value)
-{
-    auto* out = reinterpret_cast<__nv_bfloat16*>(ptr);
-    out[offset] = __float2bfloat16_rn(value);
 }
 
 __device__ __forceinline__ float readResidentLatentValue(
@@ -206,35 +186,74 @@ __device__ __forceinline__ HiSparseResidentTokenAddress decodeResidentTokenAddre
     return address;
 }
 
-__device__ __forceinline__ float blockReduceSum(float value, float* scratch)
+struct HiSparseSelectedToken
 {
-    scratch[threadIdx.x] = value;
-    __syncthreads();
-    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    uint8_t status;
+    bool active;
+    bool isHot;
+    uint8_t const* record;
+    int32_t tokenOffset;
+    int64_t residentGlobalToken;
+};
+
+__device__ __forceinline__ HiSparseSelectedToken resolveSelectedToken(
+    SparseMlaDecodeKvarnHotParams const& params, int32_t row, int32_t batch, int32_t s, int32_t k, int64_t indexBase)
+{
+    HiSparseSelectedToken r{kHotReadOk, false, false, nullptr, 0, -1};
+    int32_t const hotIndex = params.indices[indexBase + k];
+    if (hotIndex < 0)
     {
-        if (threadIdx.x < stride)
+        int32_t requestToken = -1;
+        uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
+        if (tokenStatus != kHotReadOk)
         {
-            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+            r.status = tokenStatus;
+            return r;
         }
-        __syncthreads();
+        if (requestToken < 0)
+        {
+            r.active = false;
+            return r;
+        }
+        r.active = true;
+        HiSparseResidentTokenAddress const addr = decodeResidentTokenAddress(params, row, requestToken);
+        if (addr.status != kHotReadOk)
+        {
+            r.status = addr.status;
+            return r;
+        }
+        r.isHot = false;
+        r.residentGlobalToken = addr.globalToken;
+        return r;
     }
-    return scratch[0];
+    r.active = true;
+    HiSparseKvarnHotAddress const addr = decodeHisparseKvarnHotIndex(
+        hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
+    if (addr.status != kHotReadOk)
+    {
+        r.status = addr.status;
+        return r;
+    }
+    r.isHot = true;
+    r.record = params.hotPacked + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
+        + static_cast<int64_t>(addr.hotSlot) * params.strideHotSlot;
+    r.tokenOffset = addr.tokenOffset;
+    return r;
 }
 
-__global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams params)
+__global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams params)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x);
-    int32_t const head = static_cast<int32_t>(blockIdx.y);
+    int32_t const headGroup = static_cast<int32_t>(blockIdx.y);
+    int32_t const splitIdx = static_cast<int32_t>(blockIdx.z);
     int32_t const totalRows = params.b * params.sQ;
-    if (row >= totalRows || head >= params.hQ)
+    int32_t const numSplits = params.numSplits;
+    if (row >= totalRows || headGroup >= kHeadGroups || splitIdx >= numSplits)
     {
         return;
     }
-
-    extern __shared__ float shared[];
-    float* scores = shared;
-    float* reduce = scores + params.topK;
-    float* ckvBase = reduce + kThreads; // kvLoraRank floats: per-token dequantized C-KV base cache
+    int32_t const headBase = headGroup * kHeadsPerBlock;
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
 
     int32_t const batch = row / params.sQ;
     int32_t const s = row - batch * params.sQ;
@@ -243,277 +262,379 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
     HiSparseKvarnK2v2BdrLayout const layout = makeHisparseKvarnK2v2BdrLayout(
         params.tokensPerBlock, params.kvLoraRank, params.qkRopeHeadDim);
 
+    int64_t const indexBase = static_cast<int64_t>(batch) * params.strideIndicesB
+        + static_cast<int64_t>(s) * params.strideIndicesSQ;
+    int64_t const qRowBase = static_cast<int64_t>(batch) * params.strideQB + static_cast<int64_t>(s) * params.strideQSQ;
+    int64_t const outRowBase
+        = static_cast<int64_t>(batch) * params.strideOB + static_cast<int64_t>(s) * params.strideOSQ;
+    int64_t const lseRowBase
+        = static_cast<int64_t>(batch) * params.strideLseB + static_cast<int64_t>(s) * params.strideLseSQ;
+
+    bool const splitMode = numSplits > 1;
+
+    // Token range for this split: contiguous tile-aligned slices of [0, rowTopK).
+    int32_t kStart = 0;
+    int32_t kEnd = rowTopK;
+    if (splitMode)
+    {
+        int32_t const tilesTotal = (rowTopK + kTileTokens - 1) / kTileTokens;
+        int32_t const tilesPerSplit = (tilesTotal + numSplits - 1) / numSplits;
+        kStart = splitIdx * tilesPerSplit * kTileTokens;
+        kEnd = min(rowTopK, kStart + tilesPerSplit * kTileTokens);
+        if (kStart >= kEnd)
+        {
+            kStart = 0;
+            kEnd = 0; // empty split: contributes -inf max / 0 denom
+        }
+    }
+
+    extern __shared__ float smem[];
+    __nv_bfloat16* kTile = reinterpret_cast<__nv_bfloat16*>(smem);
+    float* baseCache = reinterpret_cast<float*>(kTile + static_cast<int64_t>(kTileTokens) * kDqk);
+    float* acc = baseCache + kKvLoraRank;
+    float* runMax = acc + static_cast<int64_t>(kHeadsPerBlock) * kDv;
+    float* runDenom = runMax + kHeadsPerBlock;
+    float* tileScore = runDenom + kHeadsPerBlock;
+    __shared__ int32_t tileStatusAgg;
     __shared__ int32_t rowCode;
-    __shared__ float rowMax;
-    __shared__ float rowDenom;
-    if (threadIdx.x == 0)
+
+    if (tid == 0)
     {
         rowCode = params.rowStatus[row] == 0 ? kHotReadOk : kHotReadUpstreamInvalid;
         if (rowCode == kHotReadOk && (rowTopK < 0 || rowTopK > params.topK))
         {
             rowCode = kHotReadBadTopKLength;
         }
-        rowMax = kNegInf;
-        rowDenom = 0.0F;
+        tileStatusAgg = kHotReadOk;
+    }
+    for (int32_t i = tid; i < kHeadsPerBlock * kDv; i += kThreads)
+    {
+        acc[i] = 0.0F;
+    }
+    for (int32_t h = tid; h < kHeadsPerBlock; h += kThreads)
+    {
+        runMax[h] = kNegInf;
+        runDenom[h] = 0.0F;
     }
     __syncthreads();
 
-    int64_t const qBase = static_cast<int64_t>(batch) * params.strideQB
-        + static_cast<int64_t>(s) * params.strideQSQ + static_cast<int64_t>(head) * params.strideQHQ;
-    int64_t const indexBase = static_cast<int64_t>(batch) * params.strideIndicesB
-        + static_cast<int64_t>(s) * params.strideIndicesSQ;
-
-    for (int32_t k = 0; k < params.topK; ++k)
+    // Per-thread Q register cache: each thread serves one head (headLocal, fixed by
+    // tid) and owns Q dims {laneH, laneH+kThreadsPerHead, ...}. Loading Q once here
+    // (vs re-reading from GMEM for every token of every tile) removes the dominant
+    // redundant Q traffic; values are byte-identical.
+    int32_t const headLocalTop = tid / kThreadsPerHead;
+    int32_t const laneHTop = tid % kThreadsPerHead;
+    int32_t const headTop = headBase + headLocalTop;
+    constexpr int32_t kQRegPerThread = (kDqk + kThreadsPerHead - 1) / kThreadsPerHead;
+    float qReg[kQRegPerThread];
+    if (rowCode == kHotReadOk)
     {
-        float scorePart = 0.0F;
-        bool activeToken = false;
-        if (rowCode == kHotReadOk && k < rowTopK)
+        int64_t const qBaseTop = qRowBase + static_cast<int64_t>(headTop) * params.strideQHQ;
+#pragma unroll
+        for (int32_t r = 0; r < kQRegPerThread; ++r)
         {
-            int32_t const hotIndex = params.indices[indexBase + k];
-            if (hotIndex < 0)
+            int32_t const d = laneHTop + r * kThreadsPerHead;
+            qReg[r] = (d < kDqk) ? bf16ToFloat(params.q, qBaseTop + d) : 0.0F;
+        }
+        for (int32_t tileStart = kStart; tileStart < kEnd; tileStart += kTileTokens)
+        {
+            int32_t const tileLen = min(kTileTokens, kEnd - tileStart);
+
+            // --- (1) dequant this tile's K/V latent ONCE into kTile ---
+            for (int32_t tt = 0; tt < tileLen; ++tt)
             {
-                int32_t requestToken = -1;
-                uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
-                if (tokenStatus != kHotReadOk)
+                int32_t const k = tileStart + tt;
+                HiSparseSelectedToken st = resolveSelectedToken(params, row, batch, s, k, indexBase);
+                if (st.status != kHotReadOk && tid == 0)
                 {
-                    atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(tokenStatus));
+                    atomicCAS(&tileStatusAgg, kHotReadOk, static_cast<int32_t>(st.status));
                 }
-                else if (requestToken >= 0)
+                bool const buildHot = (st.status == kHotReadOk) && st.active && st.isHot;
+                if (buildHot)
                 {
-                    activeToken = true;
-                    HiSparseResidentTokenAddress const residentAddress
-                        = decodeResidentTokenAddress(params, row, requestToken);
-                    if (residentAddress.status != kHotReadOk)
+                    uint8_t const* tokenPacked
+                        = st.record + static_cast<int64_t>(st.tokenOffset) * layout.ckvBytesPerToken;
+                    uint8_t const* tokenScaleZpBytes = st.record + layout.ckvBytesPerBlock
+                        + static_cast<int64_t>(st.tokenOffset) * layout.scaleZpBytesPerToken;
+                    for (int32_t d = tid; d < layout.kvLoraRank; d += kThreads)
                     {
-                        atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+                        baseCache[d] = readHisparseKvarnK2v2PackedCkvValue(tokenPacked, tokenScaleZpBytes, d);
                     }
-                    else
+                    __syncthreads();
+                    uint8_t const* peBytes = st.record + layout.ckvBytesPerBlock + layout.scaleZpBytesPerBlock;
+                    for (int32_t d = tid; d < kDqk; d += kThreads)
                     {
-                        for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                        float val;
+                        if (d < layout.kvLoraRank)
                         {
-                            float const qVal = bf16ToFloat(params.q, qBase + dim);
-                            float const kVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
-                            scorePart += qVal * kVal;
+                            val = ckvHadamardFromCache(baseCache, d);
                         }
+                        else
+                        {
+                            uint8_t const byte = peBytes[static_cast<int64_t>(st.tokenOffset) * layout.qkRopeHeadDim
+                                + (d - layout.kvLoraRank)];
+                            val = readHisparseFp8E4m3Byte(byte);
+                        }
+                        kTile[static_cast<int64_t>(tt) * kDqk + d] = __float2bfloat16_rn(val);
                     }
+                    __syncthreads();
                 }
-            }
-            else
-            {
-                activeToken = true;
-                HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-                    hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-                if (address.status != kHotReadOk)
+                else if (st.status == kHotReadOk && st.active && !st.isHot)
                 {
-                    atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(address.status));
+                    for (int32_t d = tid; d < kDqk; d += kThreads)
+                    {
+                        float const val = readResidentLatentValue(params, st.residentGlobalToken, d);
+                        kTile[static_cast<int64_t>(tt) * kDqk + d] = __float2bfloat16_rn(val);
+                    }
+                    __syncthreads();
                 }
                 else
                 {
-                    uint8_t const* record = params.hotPacked
-                        + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
-                        + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
-                    // This (hotIndex>=0, status==Ok) branch is block-uniform, so every
-                    // thread reaches the cache build and its barrier.
-                    buildCkvBaseCache(record, layout, address.tokenOffset, ckvBase);
-                    __syncthreads();
-                    for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                    for (int32_t d = tid; d < kDqk; d += kThreads)
                     {
-                        float const qVal = bf16ToFloat(params.q, qBase + dim);
-                        float const kVal = cachedLatentValue(record, layout, ckvBase, address.tokenOffset, dim);
-                        scorePart += qVal * kVal;
+                        kTile[static_cast<int64_t>(tt) * kDqk + d] = __float2bfloat16_rn(0.0F);
+                    }
+                    __syncthreads();
+                }
+            }
+
+            // --- (2) per-head scores + online-softmax update ---
+            int32_t const headLocal = headLocalTop;
+            int32_t const laneH = laneHTop;
+
+            for (int32_t tt = 0; tt < tileLen; ++tt)
+            {
+                int32_t const k = tileStart + tt;
+                int32_t const hotIndex = params.indices[indexBase + k];
+                bool active;
+                if (hotIndex < 0)
+                {
+                    int32_t requestToken = -1;
+                    uint8_t const ts = readRequestTopkToken(params, batch, s, k, requestToken);
+                    active = (ts == kHotReadOk) && (requestToken >= 0);
+                }
+                else
+                {
+                    active = true;
+                }
+                float part = 0.0F;
+                __nv_bfloat16 const* kt = kTile + static_cast<int64_t>(tt) * kDqk;
+#pragma unroll
+                for (int32_t r = 0; r < kQRegPerThread; ++r)
+                {
+                    int32_t const d = laneH + r * kThreadsPerHead;
+                    if (d < kDqk)
+                    {
+                        part += qReg[r] * __bfloat162float(kt[d]);
                     }
                 }
+#pragma unroll
+                for (int32_t off = kThreadsPerHead / 2; off > 0; off >>= 1)
+                {
+                    part += __shfl_down_sync(0xffffffffu, part, off, kThreadsPerHead);
+                }
+                if (laneH == 0)
+                {
+                    tileScore[headLocal * kTileTokens + tt] = active ? (part * params.smScale) : kNegInf;
+                }
             }
+            __syncthreads();
+
+            float tileMax = kNegInf;
+            for (int32_t tt = 0; tt < tileLen; ++tt)
+            {
+                tileMax = fmaxf(tileMax, tileScore[headLocal * kTileTokens + tt]);
+            }
+            float const prevMax = runMax[headLocal];
+            float const prevDenom = runDenom[headLocal];
+            float const newMax = fmaxf(prevMax, tileMax);
+            float const correction = (prevMax == kNegInf) ? 0.0F : expf(prevMax - newMax);
+            for (int32_t d = laneH; d < kDv; d += kThreadsPerHead)
+            {
+                float a = acc[headLocal * kDv + d] * correction;
+                for (int32_t tt = 0; tt < tileLen; ++tt)
+                {
+                    float const sc = tileScore[headLocal * kTileTokens + tt];
+                    if (sc == kNegInf)
+                    {
+                        continue;
+                    }
+                    float const w = expf(sc - newMax);
+                    a += w * __bfloat162float(kTile[static_cast<int64_t>(tt) * kDqk + d]);
+                }
+                acc[headLocal * kDv + d] = a;
+            }
+            if (laneH == 0)
+            {
+                float tileDenom = 0.0F;
+                for (int32_t tt = 0; tt < tileLen; ++tt)
+                {
+                    float const sc = tileScore[headLocal * kTileTokens + tt];
+                    if (sc == kNegInf)
+                    {
+                        continue;
+                    }
+                    tileDenom += expf(sc - newMax);
+                }
+                runDenom[headLocal] = prevDenom * correction + tileDenom;
+                runMax[headLocal] = newMax;
+            }
+            __syncthreads();
         }
-        float const score = blockReduceSum(scorePart, reduce) * params.smScale;
-        if (threadIdx.x == 0)
-        {
-            scores[k] = (rowCode == kHotReadOk && k < rowTopK && activeToken) ? score : kNegInf;
-        }
-        __syncthreads();
     }
 
-    if (threadIdx.x == 0)
+    if (tid == 0 && rowCode == kHotReadOk && tileStatusAgg != kHotReadOk)
     {
-        if (rowCode == kHotReadOk)
-        {
-            float maxVal = params.attnSink == nullptr ? kNegInf : params.attnSink[head];
-            for (int32_t k = 0; k < rowTopK; ++k)
-            {
-                maxVal = fmaxf(maxVal, scores[k]);
-            }
-            float denom = params.attnSink == nullptr ? 0.0F : expf(params.attnSink[head] - maxVal);
-            for (int32_t k = 0; k < rowTopK; ++k)
-            {
-                if (scores[k] == kNegInf)
-                {
-                    scores[k] = 0.0F;
-                    continue;
-                }
-                float const weight = expf(scores[k] - maxVal);
-                scores[k] = weight;
-                denom += weight;
-            }
-            float const invDenom = denom > 0.0F ? 1.0F / denom : 0.0F;
-            for (int32_t k = 0; k < rowTopK; ++k)
-            {
-                scores[k] *= invDenom;
-            }
-            rowMax = maxVal;
-            rowDenom = denom;
-        }
+        rowCode = tileStatusAgg;
     }
     __syncthreads();
 
-    int64_t const outBase = static_cast<int64_t>(batch) * params.strideOB
-        + static_cast<int64_t>(s) * params.strideOSQ + static_cast<int64_t>(head) * params.strideOHQ;
+    int32_t const headLocalF = tid / kThreadsPerHead;
+    int32_t const laneF = tid % kThreadsPerHead;
+    int32_t const headF = headBase + headLocalF;
+
+    // --- split-mode: write partial flash state to scratch; combine kernel finalizes ---
+    if (splitMode)
+    {
+        int64_t const partBase
+            = ((static_cast<int64_t>(row) * params.hQ + headF) * numSplits + splitIdx);
+        // a failed row marks all its partials as empty (-inf/0) so combine yields zero.
+        bool const failed = (rowCode != kHotReadOk);
+        float const m = failed ? kNegInf : runMax[headLocalF];
+        float const d = failed ? 0.0F : runDenom[headLocalF];
+        float* pacc = params.partialAcc + partBase * kDv;
+        for (int32_t dd = laneF; dd < kDv; dd += kThreadsPerHead)
+        {
+            pacc[dd] = failed ? 0.0F : acc[headLocalF * kDv + dd];
+        }
+        if (laneF == 0)
+        {
+            params.partialMax[partBase] = m;
+            params.partialDenom[partBase] = d;
+        }
+        return;
+    }
+
+    // --- single-split: finalize directly ---
+    int64_t const outBase = outRowBase + static_cast<int64_t>(headF) * params.strideOHQ;
     if (rowCode != kHotReadOk)
     {
-        for (int32_t dim = threadIdx.x; dim < params.dV; dim += blockDim.x)
+        for (int32_t d = laneF; d < kDv; d += kThreadsPerHead)
         {
-            writeBf16(params.out, outBase + dim, 0.0F);
+            writeBf16(params.out, outBase + d, 0.0F);
         }
-        if (threadIdx.x == 0)
+        if (laneF == 0)
         {
-            params.lse[static_cast<int64_t>(batch) * params.strideLseB + static_cast<int64_t>(s) * params.strideLseSQ
-                + head] = kNegInf;
-        }
-        return;
-    }
-
-    __shared__ int32_t valueCode;
-    if (threadIdx.x == 0)
-    {
-        valueCode = kHotReadOk;
-    }
-    __syncthreads();
-
-    for (int32_t k = threadIdx.x; k < rowTopK; k += blockDim.x)
-    {
-        int32_t const hotIndex = params.indices[indexBase + k];
-        if (hotIndex < 0)
-        {
-            int32_t requestToken = -1;
-            uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
-            if (tokenStatus != kHotReadOk)
-            {
-                atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(tokenStatus));
-            }
-            else if (requestToken >= 0)
-            {
-                HiSparseResidentTokenAddress const residentAddress
-                    = decodeResidentTokenAddress(params, row, requestToken);
-                if (residentAddress.status != kHotReadOk)
-                {
-                    atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
-                }
-            }
-        }
-        else
-        {
-            HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-                hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-            if (address.status != kHotReadOk)
-            {
-                atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(address.status));
-            }
-        }
-    }
-    __syncthreads();
-
-    if (valueCode != kHotReadOk)
-    {
-        for (int32_t dim = threadIdx.x; dim < params.dV; dim += blockDim.x)
-        {
-            writeBf16(params.out, outBase + dim, 0.0F);
-        }
-        if (threadIdx.x == 0)
-        {
-            params.lse[static_cast<int64_t>(batch) * params.strideLseB + static_cast<int64_t>(s) * params.strideLseSQ
-                + head] = kNegInf;
+            params.lse[lseRowBase + headF] = kNegInf;
         }
         return;
     }
 
-    // V phase: accumulate out[dim] = sum_k scores[k] * V[k,dim] in k-ascending
-    // order (bit-identical to the original per-dim inner loop). Token-major so the
-    // C-KV base cache is dequantized once per token and shared by all V dims,
-    // removing the kBdrOrder-fold redundant unpack. dV == kvLoraRank so every V dim
-    // is a C-KV (Hadamard) dim; each thread owns dims {tid, tid+blockDim}.
-    int32_t const dim0 = static_cast<int32_t>(threadIdx.x);
-    int32_t const dim1 = dim0 + static_cast<int32_t>(blockDim.x);
-    float acc0 = 0.0F;
-    float acc1 = 0.0F;
-    for (int32_t k = 0; k < rowTopK; ++k)
+    float const sinkVal = params.attnSink == nullptr ? kNegInf : params.attnSink[headF];
+    float const mF = runMax[headLocalF];
+    float finalMax = (sinkVal != kNegInf) ? fmaxf(mF, sinkVal) : mF;
+    float denom = runDenom[headLocalF];
+    if (finalMax != mF)
     {
-        float const weight = scores[k];
-        bool const skip = (weight == kNegInf);
-        int32_t const hotIndex = skip ? 0 : params.indices[indexBase + k];
-        // Block-uniform decision: this token's V comes from the cached hot path,
-        // the direct resident path, or is skipped. All threads agree, so the
-        // cache-build barrier below is reached by the whole block.
-        bool const cachedHot = (!skip) && (hotIndex >= 0);
-        uint8_t const* record = nullptr;
-        int32_t hotTokenOffset = 0;
-        int64_t residentGlobalToken = -1;
-        if (cachedHot)
-        {
-            HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-                hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-            record = params.hotPacked + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
-                + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
-            hotTokenOffset = address.tokenOffset;
-            buildCkvBaseCache(record, layout, hotTokenOffset, ckvBase);
-        }
-        else if (!skip)
-        {
-            int32_t requestToken = -1;
-            uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
-            if (tokenStatus == kHotReadOk && requestToken >= 0)
-            {
-                HiSparseResidentTokenAddress const residentAddress
-                    = decodeResidentTokenAddress(params, row, requestToken);
-                if (residentAddress.status == kHotReadOk)
-                {
-                    residentGlobalToken = residentAddress.globalToken;
-                }
-            }
-        }
-        if (cachedHot)
-        {
-            __syncthreads();
-            acc0 += weight * cachedLatentValue(record, layout, ckvBase, hotTokenOffset, dim0);
-            if (dim1 < params.dV)
-            {
-                acc1 += weight * cachedLatentValue(record, layout, ckvBase, hotTokenOffset, dim1);
-            }
-            __syncthreads(); // guard ckvBase before the next token rebuilds it
-        }
-        else if (!skip && residentGlobalToken >= 0)
-        {
-            acc0 += weight * readResidentLatentValue(params, residentGlobalToken, dim0);
-            if (dim1 < params.dV)
-            {
-                acc1 += weight * readResidentLatentValue(params, residentGlobalToken, dim1);
-            }
-        }
+        float const corr = (mF == kNegInf) ? 0.0F : expf(mF - finalMax);
+        denom = denom * corr;
     }
-    writeBf16(params.out, outBase + dim0, acc0);
-    if (dim1 < params.dV)
+    if (sinkVal != kNegInf)
     {
-        writeBf16(params.out, outBase + dim1, acc1);
+        denom += expf(sinkVal - finalMax);
     }
-    if (threadIdx.x == 0)
+    float const accScale = (finalMax == mF) ? 1.0F : ((mF == kNegInf) ? 0.0F : expf(mF - finalMax));
+    float const invDenom = denom > 0.0F ? 1.0F / denom : 0.0F;
+    for (int32_t d = laneF; d < kDv; d += kThreadsPerHead)
     {
-        params.lse[static_cast<int64_t>(batch) * params.strideLseB + static_cast<int64_t>(s) * params.strideLseSQ
-            + head] = logf(rowDenom) + rowMax;
+        float const a = acc[headLocalF * kDv + d] * accScale;
+        writeBf16(params.out, outBase + d, a * invDenom);
+    }
+    if (laneF == 0)
+    {
+        params.lse[lseRowBase + headF] = (denom > 0.0F) ? (logf(denom) + finalMax) : kNegInf;
+    }
+}
+
+// Combine partial flash states across splits into final out/lse, per (row, head).
+// One block per (row, head); 128 threads cooperate over kDv dims.
+__global__ __launch_bounds__(128) void sparseMlaDecodeKvarnHotCombineKernel(SparseMlaDecodeKvarnHotParams params)
+{
+    int32_t const row = static_cast<int32_t>(blockIdx.x);
+    int32_t const head = static_cast<int32_t>(blockIdx.y);
+    int32_t const totalRows = params.b * params.sQ;
+    if (row >= totalRows || head >= params.hQ)
+    {
+        return;
+    }
+    int32_t const numSplits = params.numSplits;
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
+
+    int32_t const batch = row / params.sQ;
+    int32_t const s = row - batch * params.sQ;
+    int64_t const outBase = static_cast<int64_t>(batch) * params.strideOB
+        + static_cast<int64_t>(s) * params.strideOSQ + static_cast<int64_t>(head) * params.strideOHQ;
+    int64_t const lseOff = static_cast<int64_t>(batch) * params.strideLseB
+        + static_cast<int64_t>(s) * params.strideLseSQ + head;
+
+    int64_t const partRowHead = (static_cast<int64_t>(row) * params.hQ + head) * numSplits;
+
+    // global max over splits + optional sink
+    __shared__ float sMax;
+    __shared__ float sDenom;
+    float const sinkVal = params.attnSink == nullptr ? kNegInf : params.attnSink[head];
+    if (tid == 0)
+    {
+        float gmax = sinkVal;
+        for (int32_t sp = 0; sp < numSplits; ++sp)
+        {
+            gmax = fmaxf(gmax, params.partialMax[partRowHead + sp]);
+        }
+        float gden = (sinkVal != kNegInf && gmax != kNegInf) ? expf(sinkVal - gmax) : 0.0F;
+        for (int32_t sp = 0; sp < numSplits; ++sp)
+        {
+            float const m = params.partialMax[partRowHead + sp];
+            if (m == kNegInf)
+            {
+                continue;
+            }
+            gden += params.partialDenom[partRowHead + sp] * expf(m - gmax);
+        }
+        sMax = gmax;
+        sDenom = gden;
+    }
+    __syncthreads();
+
+    float const gmax = sMax;
+    float const gden = sDenom;
+    float const invDenom = gden > 0.0F ? 1.0F / gden : 0.0F;
+
+    for (int32_t d = tid; d < kDv; d += 128)
+    {
+        float o = 0.0F;
+        for (int32_t sp = 0; sp < numSplits; ++sp)
+        {
+            float const m = params.partialMax[partRowHead + sp];
+            if (m == kNegInf)
+            {
+                continue;
+            }
+            float const scale = expf(m - gmax);
+            o += params.partialAcc[(partRowHead + sp) * kDv + d] * scale;
+        }
+        writeBf16(params.out, outBase + d, o * invDenom);
+    }
+    if (tid == 0)
+    {
+        params.lse[lseOff] = (gden > 0.0F) ? (logf(gden) + gmax) : kNegInf;
     }
 }
 
 } // namespace
 
-void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, cudaStream_t stream)
+void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& paramsIn, cudaStream_t stream)
 {
+    SparseMlaDecodeKvarnHotParams params = paramsIn;
     if (params.hQ != kHeadQ || params.dQk != kDqk || params.dV != kDv || params.tokensPerBlock != kTokensPerBlock
         || params.kvLoraRank != kKvLoraRank || params.qkRopeHeadDim != kQkRopeHeadDim || params.kvarnBits != 2)
     {
@@ -524,8 +645,7 @@ void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, 
     {
         throw std::runtime_error("sparse MLA KVarN-hot decode requires positive batch, s_q, topk, layers, and hot capacity");
     }
-    if (params.residentKvPool != nullptr
-        && params.residentKvPoolDtype != kResidentKvPoolBf16
+    if (params.residentKvPool != nullptr && params.residentKvPoolDtype != kResidentKvPoolBf16
         && params.residentKvPoolDtype != kResidentKvPoolFp16)
     {
         throw std::runtime_error("sparse MLA KVarN-hot decode requires resident KV pool dtype bf16 or fp16");
@@ -534,14 +654,75 @@ void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, 
     {
         throw std::runtime_error("sparse MLA KVarN-hot decode currently supports topk <= 2048");
     }
-    size_t const sharedBytes
-        = static_cast<size_t>(params.topK + kThreads + params.kvLoraRank) * sizeof(float);
-    dim3 const grid(params.b * params.sQ, params.hQ, 1);
+
+    int32_t const totalRows = params.b * params.sQ;
+    // adaptive split-K: add token-range splits when (rows * headGroups) under-fills the
+    // GPU, so few-row decode batches keep all SMs busy without redundant dequant.
+    int32_t const baseBlocks = totalRows * kHeadGroups;
+    int32_t const tilesTotal = (params.topK + kTileTokens - 1) / kTileTokens;
+    constexpr int32_t kTargetBlocks = 304; // ~2x SM count on B200
+    int32_t numSplits = (baseBlocks >= kTargetBlocks) ? 1 : ((kTargetBlocks + baseBlocks - 1) / baseBlocks);
+    numSplits = min(numSplits, min(kMaxSplits, max(1, tilesTotal)));
+    if (numSplits < 1)
+    {
+        numSplits = 1;
+    }
+    params.numSplits = numSplits;
+
+    size_t const sharedBytes = static_cast<size_t>(kTileTokens) * kDqk * sizeof(__nv_bfloat16)
+        + static_cast<size_t>(kKvLoraRank) * sizeof(float)
+        + static_cast<size_t>(kHeadsPerBlock) * kDv * sizeof(float)
+        + static_cast<size_t>(2 * kHeadsPerBlock) * sizeof(float)
+        + static_cast<size_t>(kHeadsPerBlock) * kTileTokens * sizeof(float);
+
+    static bool attrSet = false;
+    if (!attrSet)
+    {
+        cudaFuncSetAttribute(
+            sparseMlaDecodeKvarnHotKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sharedBytes));
+        attrSet = true;
+    }
+
+    float* partialAcc = nullptr;
+    float* partialMax = nullptr;
+    float* partialDenom = nullptr;
+    if (numSplits > 1)
+    {
+        size_t const nRowHeadSplit = static_cast<size_t>(totalRows) * params.hQ * numSplits;
+        cudaMallocAsync(reinterpret_cast<void**>(&partialAcc), nRowHeadSplit * kDv * sizeof(float), stream);
+        cudaMallocAsync(reinterpret_cast<void**>(&partialMax), nRowHeadSplit * sizeof(float), stream);
+        cudaMallocAsync(reinterpret_cast<void**>(&partialDenom), nRowHeadSplit * sizeof(float), stream);
+        params.partialAcc = partialAcc;
+        params.partialMax = partialMax;
+        params.partialDenom = partialDenom;
+    }
+
+    dim3 const grid(totalRows, kHeadGroups, numSplits);
     sparseMlaDecodeKvarnHotKernel<<<grid, kThreads, sharedBytes, stream>>>(params);
-    auto const err = cudaGetLastError();
+    auto err = cudaGetLastError();
     if (err != cudaSuccess)
     {
+        if (partialAcc != nullptr)
+        {
+            cudaFreeAsync(partialAcc, stream);
+            cudaFreeAsync(partialMax, stream);
+            cudaFreeAsync(partialDenom, stream);
+        }
         throw std::runtime_error("sparse MLA KVarN-hot decode kernel launch failed");
+    }
+
+    if (numSplits > 1)
+    {
+        dim3 const cgrid(totalRows, params.hQ, 1);
+        sparseMlaDecodeKvarnHotCombineKernel<<<cgrid, 128, 0, stream>>>(params);
+        err = cudaGetLastError();
+        cudaFreeAsync(partialAcc, stream);
+        cudaFreeAsync(partialMax, stream);
+        cudaFreeAsync(partialDenom, stream);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error("sparse MLA KVarN-hot decode combine kernel launch failed");
+        }
     }
 }
 
