@@ -633,6 +633,19 @@ def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
     assert "hisparse_submit_packed_kvarn_copy_schedule" in fake.read_text()
 
 
+def test_hisparse_native_mapping_allows_hot_capacity_larger_than_topk_source_contract():
+    root = Path(__file__).resolve().parents[5]
+    hisparse = root / "tensorrt_llm/_torch/attention_backend/sparse/hisparse.py"
+
+    source = hisparse.read_text()
+    assert "index_topk = int(topk_indices.shape[1])" in source
+    assert "min(int(tier.hot_device_capacity_blocks)," in source
+    assert "index_topk)" in source
+    assert "positive TopK width " in source
+    assert "and hot capacity." in source
+    assert "index_topk=index_topk" in source
+
+
 def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     root = Path(__file__).resolve().parents[5]
     attention = root / "tensorrt_llm/_torch/modules/attention.py"

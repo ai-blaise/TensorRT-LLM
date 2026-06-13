@@ -265,6 +265,10 @@ same ABI shape as the final serving path. The following are hard invariants:
 - Sparse-MLA hot descriptors are layer-local. Reusing a descriptor across
   layers, rows, TopK widths, devices, or request steps is a stale-hot-slot
   correctness bug.
+- Per-row planning width is the smaller of TopK width and hot capacity. Hot
+  tiers larger than TopK are valid configurations and must not be rejected by
+  the native block-dedupe stage; the full hot capacity still remains available
+  to the LRU/hit/miss planner.
 - The miss-copy boundary must be explicit. CUDA kernels must not pretend that
   CPU pinned host KVarN storage is ordinary device memory. The production path
   dedupes and plans misses on device, then hands a compact miss schedule to a
@@ -1102,6 +1106,8 @@ Current branch status:
   the native chain through device TopK block dedupe, request-table resolution,
   hot-slot planning, compact miss scheduling, mapped packed KVarN copy
   submission, post-copy metadata commit, and hot global-index construction;
+- the TopK-to-block stage now plans at `min(index_topk, hot_capacity)` so
+  feasible oversized hot-tier configurations do not fail before LRU planning;
 - added `trtllm::hisparse_read_kvarn_hot_bdr`, a native production BDR
   hot-read primitive for CUDA validation. It consumes packed hot KVarN records
   plus hot global indices and row status, dequants C-KV through the configured

@@ -1764,7 +1764,13 @@ class OPTRTHiSparseCoordinator:
         row_request_ids = request_id_tensor.index_select(
             0, req_idx.to(device=topk_indices.device, dtype=torch.int64))
 
-        max_blocks_per_row = int(tier.hot_device_capacity_blocks)
+        index_topk = int(topk_indices.shape[1])
+        max_blocks_per_row = min(int(tier.hot_device_capacity_blocks),
+                                 index_topk)
+        if max_blocks_per_row <= 0:
+            raise RuntimeError(
+                "HiSparse native orchestration requires positive TopK width "
+                "and hot capacity.")
         blocks, block_counts, _overflow = (
             torch.ops.trtllm.hisparse_topk_to_block_positions(
                 topk_indices,
@@ -1843,7 +1849,7 @@ class OPTRTHiSparseCoordinator:
             hot_indices=hot_indices,
             row_status=build_status,
             layer_idx=layer_idx,
-            index_topk=int(topk_indices.shape[1]),
+            index_topk=index_topk,
             max_blocks_per_row=max_blocks_per_row,
             stride_factor=stride_factor,
         )
