@@ -235,6 +235,13 @@ serving-layout library, and then runs the native planner/copy smoke without an
 explicit `--library` path. This narrows the remaining fullsource gap to any
 branch-built generated bindings/plugin artifacts that are not present in the
 cached native proof build.
+The committed serving-layout proof now passes on B200 GPU 7:
+`localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-c6143d16492f-hisparse-serving-import-proof-20260613T130103Z`
+was built from source SHA `c6143d16492f4dde16375eb28f68e43298e10d7e`, imported
+`tensorrt_llm` from `/opt/dynamo/venv/lib/python3.12/site-packages`, loaded
+`/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs/libth_common.so`
+through the normal package loader, and completed
+`native_planner_copy_smoke.py` without an explicit `--library` path.
 The repo-level pytest harness still requires the full Python bindings, so the
 proof script intentionally bypassed `tests/unittest/conftest.py` while
 executing the same native ops and tensor contracts.
@@ -1218,13 +1225,12 @@ Still pending before serving enablement:
   `libth_common.so` dependency closure, but they do not yet prove that the full
   `op-trt-hisparse` Python package and `libth_common.so` are installed in the
   serving image's site-packages exactly as DSA will import them;
-- serving-layout import proof is staged through
-  `build_hisparse_serving_import_proof_image.sh`: it overlays branch Python
-  into deployment-runtime site-packages and requires normal `import
-  tensorrt_llm` to load `tensorrt_llm/libs/libth_common.so` before the native
-  smoke runs. Passing this gate proves the package loader boundary, while the
-  heavier fullsource image remains required if branch-generated bindings or
-  plugin libraries change;
+- serving-layout import proof is complete for commit
+  `c6143d16492f4dde16375eb28f68e43298e10d7e`: the proof image overlays branch
+  Python into deployment-runtime site-packages, normal `import tensorrt_llm`
+  loads `tensorrt_llm/libs/libth_common.so`, and the native smoke runs without
+  `--library`. The heavier fullsource image remains required if
+  branch-generated bindings or plugin libraries change;
 - deployment-runtime proof that
   `trtllm::hisparse_submit_packed_kvarn_copy_schedule` sees the production
   host tier as mapped/device-addressable on B200 is complete for both the
@@ -1715,12 +1721,14 @@ production ABI:
      pinned-host copy, metadata commit, and hot-index construction;
    - cached branch-built `libth_common.so` now passes the same smoke when
      mounted into buildtools, mounted into the deployment runtime, and copied
-     image-internal with its required native siblings. The next proof is the
-     actual serving package layout: run
-     `build_hisparse_serving_import_proof_image.sh --run-smoke` so normal
-     `import tensorrt_llm` loads `site-packages/tensorrt_llm/libs/libth_common.so`
-     and then reruns the native planner/copy smoke without `--library`; after
-     that, build or install the full `op-trt-hisparse` image/wheel when
+     image-internal with its required native siblings;
+   - serving package-loader proof is now complete: the committed
+     `build_hisparse_serving_import_proof_image.sh --run-smoke` image imports
+     branch Python from deployment-runtime site-packages, loads
+     `site-packages/tensorrt_llm/libs/libth_common.so` through the normal
+     TensorRT-LLM package loader, and reruns the native planner/copy smoke
+     without `--library`;
+   - next, build or install the full `op-trt-hisparse` image/wheel when
      branch-generated bindings or plugin artifacts must be proven too. If that
      full branch-built image cannot use the mapped-host kernel path, replace
      only the copy bridge with a copy-engine variant that consumes the same
