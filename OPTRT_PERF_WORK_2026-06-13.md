@@ -1,4 +1,31 @@
-# op-trt perf work — Lever 1 (glue/quant fusion) + Lever 2 (MoE a2a)
+# op-trt perf work
+
+## ★ RECALIBRATION (2026-06-13) — read `docs/blaise/optimization_candidates.md` FIRST
+That doc is Spencer's living, MEASURED lever plan. My session's cumsum-fusion / FIFO_DEPTH /
+1b / dense-megakernel work largely **re-derived already-shipped levers**: B1 (cuBLASLt forced
+for the NVFP4 proj GEMMs, `TRTLLM_MLA_PROJ_NVFP4_BACKENDS`), B2 (gate AT-SOL + output-gate
+overlap `833ecf794`, −0.55ms), G2 (gated-norm→NVFP4-quant handoff for MoE input + dense-MLP,
+`TRTLLM_OPTRT_GATED_PREMLP_QUANT`), I5 (indexer wk+wp fused). That's WHY my dense-GEMM
+megakernel came back negative (cuBLASLt already optimal, gate AT-SOL) and my cheap fusions
+were neutral.
+
+**The genuinely OPEN wins (Spencer's table, ranked) — the real targets:**
+| # | Lever | Win | How | Status this session |
+|---|---|---|---|---|
+| **M3** | MoE EP comm → **DeepEP low-latency** | **−1.48–1.57 ms/step + kills 3.7ms tail** (DECIDED GO) | `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY` + `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`; precond ADP+`moe_tp_size=1` (✓ our decode) | **needs DeepEP-built image** (fullsource had `BUILD_DEEP_EP=OFF`) → **agent building it** |
+| **Expert-GEMM megakernel** | routed FC1→FC2 chain (**7.2ms, 23%**) | single-CTA persistent megakernel, phases 1-2 validated, phase 3 in flight | **agent on phase 3** (`fused_moe_megakernel` single-kernel mode) |
+| **MO1** | generation-first / write-mode handoff | TTFT ~12-27ms | `transceiver_runtime: PYTHON` **already ON** in our config | captured (verify the open write-mode gate) |
+| **N1** | NUMA-pin decode workers | 0.3-1ms + jitter | numactl `--cpunodebind=1 --membind=1` (decode GPUs = NUMA **node 1**, LIVE-VERIFIED: pod holds bus C4-CC = node 1) | staged `m3_deploy.sh` (apply with M3) |
+| input_scale | indexer-NVFP4 zeros hazard | correctness | ≥`5bc2b2cb8` | our op-trt HEAD lineage has it (not exposed) |
+
+**Current actions (2026-06-13):** (1) agent building a **DeepEP-enabled fullsource image** for M3;
+(2) agent advancing the **expert-GEMM megakernel** (phase 3); (3) `m3_deploy.sh` stages the M3 env
+flip + N1 numactl (apply atomically with the DeepEP image, A/B vs current); (4) deploy currently on
+`fifodepth8` (neutral — revert to `0426` or roll forward to the M3 image). No git remote push.
+
+---
+
+# Lever 1 (glue/quant fusion) + Lever 2 (MoE a2a) — original session notes (mostly re-derivations, see recalibration above)
 
 Working notes for the two tractable levers chosen after the 2026-06-13 full-trace
 profile (ranked enumeration in `PERF_AUDIT_optrt_2026-06-10.md` §10/§10.1).
