@@ -1,0 +1,52 @@
+########## HOT=8 (distinct experts -> tiles) ##########
+[routing] hot=8  distinct_experts=8  num_non_exiting_tiles=8 (FC1 items=8x32, FC2 items=8x56)
+[numerics] cosine(phase3, op) = 0.999992   rel_l2_err = 4.0052e-03
+[numerics] GATE cos>=0.98: PASS
+[timing]   op-mode  : median=43.53us  min=43.33us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=42.25us  min=41.31us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -1.28us/call  speedup=1.030x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.15us min=6.15us (shared by both; reported for context)
+########## HOT=12 (distinct experts -> tiles) ##########
+[routing] hot=12  distinct_experts=12  num_non_exiting_tiles=12 (FC1 items=12x32, FC2 items=12x56)
+[numerics] cosine(phase3, op) = 0.999992   rel_l2_err = 4.1267e-03
+[numerics] GATE cos>=0.98: PASS
+[timing]   op-mode  : median=60.26us  min=58.51us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=60.08us  min=59.98us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -0.18us/call  speedup=1.003x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.15us min=6.15us (shared by both; reported for context)
+########## HOT=16 (distinct experts -> tiles) ##########
+[routing] hot=16  distinct_experts=16  num_non_exiting_tiles=16 (FC1 items=16x32, FC2 items=16x56)
+[numerics] cosine(phase3, op) = 0.999994   rel_l2_err = 3.5054e-03
+[numerics] GATE cos>=0.98: PASS
+[timing]   op-mode  : median=78.20us  min=75.53us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=73.85us  min=70.02us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -4.35us/call  speedup=1.059x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.16us min=6.16us (shared by both; reported for context)
+########## HOT=24 (distinct experts -> tiles) ##########
+[routing] hot=24  distinct_experts=24  num_non_exiting_tiles=24 (FC1 items=24x32, FC2 items=24x56)
+[numerics] cosine(phase3, op) = 0.999997   rel_l2_err = 2.5070e-03
+[numerics] GATE cos>=0.98: PASS
+[graph-replay] after 64 replays: cosine(phase3_replayed, op) = 0.999997  -> PASS  (validates on-device producer + self-reset survive replay)
+[timing]   op-mode  : median=110.87us  min=106.00us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=104.69us  min=100.09us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -6.18us/call  speedup=1.059x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.16us min=6.15us (shared by both; reported for context)
+########## HOT=32 (distinct experts -> tiles) ##########
+[routing] hot=32  distinct_experts=32  num_non_exiting_tiles=32 (FC1 items=32x32, FC2 items=32x56)
+[numerics] cosine(phase3, op) = 0.999997   rel_l2_err = 2.2274e-03
+[numerics] GATE cos>=0.98: PASS
+[graph-replay] after 64 replays: cosine(phase3_replayed, op) = 0.999998  -> PASS  (validates on-device producer + self-reset survive replay)
+[timing]   op-mode  : median=137.54us  min=130.95us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=137.13us  min=130.31us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -0.41us/call  speedup=1.003x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.69us min=6.62us (shared by both; reported for context)
+########## HOT=48 (distinct experts -> tiles) ##########
+[routing] hot=48  distinct_experts=45  num_non_exiting_tiles=45 (FC1 items=45x32, FC2 items=45x56)
+[numerics] cosine(phase3, op) = 0.999998   rel_l2_err = 1.8014e-03
+[numerics] GATE cos>=0.98: PASS
+[graph-replay] after 64 replays: cosine(phase3_replayed, op) = 0.999998  -> PASS  (validates on-device producer + self-reset survive replay)
+[timing]   op-mode  : median=189.21us  min=179.52us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=188.14us  min=187.21us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -1.07us/call  speedup=1.006x (phase-3 FASTER)
+[timing] moe_sort alone: median=8.20us min=6.16us (shared by both; reported for context)
+SWEEP_DONE

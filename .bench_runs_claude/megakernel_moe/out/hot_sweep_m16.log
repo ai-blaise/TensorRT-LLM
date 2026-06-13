@@ -1,0 +1,39 @@
+########## HOT=0 ##########
+DEVICE: NVIDIA B200 cc=(10, 0)
+shape: ntok=16 top_k=8 (rows~128) H=7168 I=2048 E=128 (local=128)
+[routing] hot=uniform  distinct_experts=87  num_non_exiting_tiles=87 (FC1 items=87x32, FC2 items=87x56)
+[numerics] op_norm=6.9045e+05 p3_norm=6.9045e+05
+[numerics] cosine(phase3, op) = 0.999999   rel_l2_err = 1.1941e-03
+[numerics] op has_nan=False p3 has_nan=False
+[numerics] GATE cos>=0.98: PASS
+[timing] GEMM-chain only (moe_sort + alloc hoisted out, output zeroed each call):
+[timing]   op-mode  : median=351.79us  min=333.94us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=360.04us  min=356.36us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = +8.25us/call  speedup=0.977x (phase-3 slower)
+[timing] moe_sort alone: median=8.21us min=8.21us (shared by both; reported for context)
+########## HOT=6 ##########
+DEVICE: NVIDIA B200 cc=(10, 0)
+shape: ntok=16 top_k=8 (rows~128) H=7168 I=2048 E=128 (local=128)
+[routing] hot=6  distinct_experts=87  num_non_exiting_tiles=87 (FC1 items=87x32, FC2 items=87x56)
+[numerics] op_norm=6.9045e+05 p3_norm=6.9045e+05
+[numerics] cosine(phase3, op) = 0.999999   rel_l2_err = 1.1532e-03
+[numerics] op has_nan=False p3 has_nan=False
+[numerics] GATE cos>=0.98: PASS
+[timing] GEMM-chain only (moe_sort + alloc hoisted out, output zeroed each call):
+[timing]   op-mode  : median=350.61us  min=333.41us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=361.37us  min=356.70us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = +10.76us/call  speedup=0.970x (phase-3 slower)
+[timing] moe_sort alone: median=8.21us min=8.20us (shared by both; reported for context)
+########## HOT=16 ##########
+DEVICE: NVIDIA B200 cc=(10, 0)
+shape: ntok=16 top_k=8 (rows~128) H=7168 I=2048 E=128 (local=128)
+[routing] hot=16  distinct_experts=16  num_non_exiting_tiles=16 (FC1 items=16x32, FC2 items=16x56)
+[numerics] op_norm=7.0044e+05 p3_norm=7.0043e+05
+[numerics] cosine(phase3, op) = 0.999993   rel_l2_err = 3.8797e-03
+[numerics] op has_nan=False p3 has_nan=False
+[numerics] GATE cos>=0.98: PASS
+[timing] GEMM-chain only (moe_sort + alloc hoisted out, output zeroed each call):
+[timing]   op-mode  : median=75.48us  min=75.43us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=70.39us  min=69.63us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -5.09us/call  speedup=1.072x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.16us min=6.16us (shared by both; reported for context)

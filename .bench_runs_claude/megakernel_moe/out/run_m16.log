@@ -1,0 +1,16 @@
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc17
+==============================================================================
+DEVICE: NVIDIA B200 cc=(10, 0)
+shape: ntok=16 top_k=8 (rows~128) H=7168 I=2048 E=128 (local=128)
+==============================================================================
+[numerics] op_norm=6.9045e+05 p3_norm=6.9045e+05
+[numerics] cosine(phase3, op) = 0.999999   rel_l2_err = 1.2464e-03
+[numerics] op has_nan=False p3 has_nan=False
+[numerics] GATE cos>=0.98: PASS
+------------------------------------------------------------------------------
+[timing] GEMM-chain only (moe_sort + alloc hoisted out, output zeroed each call):
+[timing]   op-mode  : median=351.99us  min=334.25us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=360.05us  min=345.03us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = +8.05us/call  speedup=0.978x (phase-3 slower)
+[timing] moe_sort alone: median=8.21us min=6.43us (shared by both; reported for context)
+==============================================================================
