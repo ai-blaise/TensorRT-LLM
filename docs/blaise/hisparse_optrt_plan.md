@@ -292,6 +292,11 @@ same ABI shape as the final serving path. The following are hard invariants:
 - Sparse MLA KVarN-hot consumption has the same packed-layout requirement, and
   its `stride_factor` must cover every layer's token range. Otherwise hot
   global indices can decode into the wrong hot slot or layer.
+- Fused sparse MLA must fail closed at producer load too: scoring validates
+  decoded hot indices before key producer loads, and the value phase performs a
+  row-wide hot-index preflight before any value producer load touches
+  `hot_packed`. An unexpected value-phase invalidation writes zero output plus
+  `-inf` LSE instead of dereferencing a stale slot.
 - Compact copy schedules must fail closed. Any impossible compact row id means
   the schedule is corrupt and no row in that batch may publish hot metadata.
 
@@ -1146,6 +1151,8 @@ Current branch status:
   have non-overlapping slot and layer strides before copy submission;
 - tightened the fused sparse MLA KVarN-hot wrapper so hot tier strides cannot
   alias packed records/layers and `stride_factor` covers every layer token range;
+- tightened the fused sparse MLA CUDA kernel so the value phase runs a
+  row-wide hot-index preflight and fails closed before any stale hot-slot read;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;

@@ -604,6 +604,12 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "hisparseKvarnBdrRead.cuh" in kernel_source
     assert "readHisparseKvarnK2v2BdrLatentValue" in kernel_source
     assert "decodeHisparseKvarnHotIndex" in kernel_source
+    assert "atomicCAS(&rowCode" in kernel_source
+    assert "__shared__ int32_t valueCode" in kernel_source
+    assert "atomicCAS(&valueCode" in kernel_source
+    assert "if (valueCode != kHotReadOk)" in kernel_source
+    assert "writeBf16(params.out, outBase + dim, 0.0F)" in kernel_source
+    assert "head] = kNegInf" in kernel_source
     assert "kvarn_k2v2" in kernel_source
     assert "sparse_mla_decode_kvarn_hot" in header.read_text()
     assert "sparse_mla_decode_kvarn_hot" in thop_source

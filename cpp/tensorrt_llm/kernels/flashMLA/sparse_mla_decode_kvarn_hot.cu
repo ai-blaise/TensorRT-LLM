@@ -106,10 +106,7 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
                 hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
             if (address.status != kHotReadOk)
             {
-                if (threadIdx.x == 0)
-                {
-                    rowCode = static_cast<int32_t>(address.status);
-                }
+                atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(address.status));
             }
             else
             {
@@ -162,6 +159,39 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
     int64_t const outBase = static_cast<int64_t>(batch) * params.strideOB
         + static_cast<int64_t>(s) * params.strideOSQ + static_cast<int64_t>(head) * params.strideOHQ;
     if (rowCode != kHotReadOk)
+    {
+        for (int32_t dim = threadIdx.x; dim < params.dV; dim += blockDim.x)
+        {
+            writeBf16(params.out, outBase + dim, 0.0F);
+        }
+        if (threadIdx.x == 0)
+        {
+            params.lse[static_cast<int64_t>(batch) * params.strideLseB + static_cast<int64_t>(s) * params.strideLseSQ
+                + head] = kNegInf;
+        }
+        return;
+    }
+
+    __shared__ int32_t valueCode;
+    if (threadIdx.x == 0)
+    {
+        valueCode = kHotReadOk;
+    }
+    __syncthreads();
+
+    for (int32_t k = threadIdx.x; k < rowTopK; k += blockDim.x)
+    {
+        int32_t const hotIndex = params.indices[indexBase + k];
+        HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
+            hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
+        if (address.status != kHotReadOk)
+        {
+            atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(address.status));
+        }
+    }
+    __syncthreads();
+
+    if (valueCode != kHotReadOk)
     {
         for (int32_t dim = threadIdx.x; dim < params.dV; dim += blockDim.x)
         {
