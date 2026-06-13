@@ -220,6 +220,14 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::hisparse_swap_in_packed_kvarn")
+    def _(host_packed, hot_packed, host_slots, hot_slots, layer_idx,
+          packed_bytes_per_block):
+        # In-place host-pinned packed KVarN -> hot device packed KVarN copy.
+        del host_packed, hot_packed, host_slots, hot_slots, layer_idx
+        del packed_bytes_per_block
+        pass
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.

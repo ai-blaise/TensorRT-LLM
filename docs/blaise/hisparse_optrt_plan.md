@@ -76,9 +76,10 @@ coverage before marking host records committed. Admission is explicit: a
 request cannot be marked HiSparse-ready unless all reserved prompt host blocks
 are committed and no host writes are pending. Host-to-hot planning is also
 explicit: the coordinator may plan packed KVarN miss copies, but it does not
-publish hot residency until the planned native copy is committed. Startup and
+publish hot residency until the planned native copy is accepted. A strict
+native thop now exists for packed KVarN host-to-hot copies, but startup and
 runtime mapping still intentionally reject `hisparse_enabled=true` before
-serving because the SM100 host-to-hot kernel, sparse MLA hot-pool read path,
+serving because CUDA-side top-k-to-block planning, sparse MLA hot-pool reading,
 BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete. This is
 the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, or direct-to-host-off substitute.
@@ -676,6 +677,11 @@ Current branch status:
   future native packed KVarN copy succeeds;
 - added `HiSparseSwapInPlan` and pointer helpers that produce parallel host
   DRAM pointers, hot HBM pointers, and byte sizes for packed KVarN miss blocks;
+- added `trtllm::hisparse_swap_in_packed_kvarn`, a strict native thop that
+  copies only packed `uint8` KVarN records from pinned host memory into the hot
+  CUDA tier, coalescing consecutive slot runs when both tiers are compact;
+- added coordinator `execute_swap_in_plan()` so native copy acceptance and hot
+  metadata publication are sequenced through one production-shaped path;
 - added request-relative token-position planning that dedupes top-k tokens into
   paged block positions without changing Indexer/HISA scoring;
 - synchronized device hot metadata (`hot_host_slot`, `hot_commit_gen`, and
@@ -698,8 +704,8 @@ Still pending before serving enablement:
 - live E2E proof that the host-write completion handoff marks host `valid` and
   `commit_gen` only after typed HiSparse host writes succeed for the relevant
   layer/block coverage;
-- native SM100 host-to-hot packed record copy kernel registration as
-  `trtllm::hisparse_swap_in_packed_kvarn`;
+- VM compile and live validation of the native
+  `trtllm::hisparse_swap_in_packed_kvarn` packed-copy op;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
@@ -728,14 +734,15 @@ Current branch status:
 - runtime mapping requires configured packed tiers, allocated tensors,
   admission-compatible request ids, and the native
   `trtllm::hisparse_swap_in_packed_kvarn` op before it can proceed;
-- if the native op or sparse MLA hot-pool read path is absent, mapping raises
-  rather than falling back to the full-HBM transform.
+- if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
+  absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
 - CUDA-side row/top-k-to-block planner that consumes graph-safe tensors without
   Python-side token extraction;
-- native packed KVarN host-to-hot copy and hot metadata update;
+- live validation and microbenchmarking of native packed KVarN host-to-hot
+  copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;
 - sparse MLA packed hot-pool read with BDR/on-read dequant;
 - FSSS reuse-layer remap over layer-local hot slots.

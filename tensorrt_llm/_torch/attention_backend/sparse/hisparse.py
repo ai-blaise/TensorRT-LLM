@@ -188,8 +188,9 @@ class OPTRTHiSparseCoordinator:
                 "yet. This remains fail-closed for serving.")
         raise NotImplementedError(
             "HiSparse packed tiers are configured, but the production packed "
-            "KVarN swap-in kernel and sparse MLA hot-pool read path are not "
-            "complete. This remains fail-closed for serving.")
+            "KVarN swap-in planner and sparse MLA hot-pool read path are not "
+            "complete and live-validated. This remains fail-closed for "
+            "serving.")
 
     def reset_step(self) -> None:
         self.step_id += 1
@@ -535,6 +536,45 @@ class OPTRTHiSparseCoordinator:
             require_admitted=require_admitted,
         )
         return self.swap_in_plan_for_selection(selection)
+
+    def execute_swap_in_plan(
+        self,
+        plan: HiSparseSwapInPlan,
+    ) -> HiSparseHotSelection:
+        """Run native packed-KVarN swap-in and publish hot metadata.
+
+        This is not a fallback path: it requires the registered native thop and
+        copies only packed KVarN records from the NIXL-writable host tier into
+        the device hot tier. The caller is responsible for creating the plan
+        from production request-relative TopK metadata.
+        """
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        selection = plan.selection
+        if not plan.has_misses:
+            return self.commit_hot_selection(selection)
+        if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_swap_in_packed_kvarn"):
+            raise NotImplementedError(
+                "trtllm::hisparse_swap_in_packed_kvarn is not registered with "
+                "a CUDA kernel. Cannot execute HiSparse packed KVarN swap-in.")
+        import torch
+
+        host_slots = torch.as_tensor(selection.miss_host_slots,
+                                     dtype=torch.long,
+                                     device="cpu")
+        hot_slots = torch.as_tensor(selection.miss_hot_slots,
+                                    dtype=torch.long,
+                                    device="cpu")
+        torch.ops.trtllm.hisparse_swap_in_packed_kvarn(
+            tensors.host_packed,
+            tensors.hot_packed,
+            host_slots,
+            hot_slots,
+            int(selection.layer_idx),
+            int(tier.packed_bytes_per_block),
+        )
+        return self.commit_hot_selection(selection)
 
     def _require_tensors(self) -> HiSparsePackedTierTensors:
         if self._tensors is None:
