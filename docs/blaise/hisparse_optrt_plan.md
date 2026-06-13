@@ -63,7 +63,16 @@ outside the HiSparse coordinator/transceiver path, but there is no FP16
 block-hot oracle in the serving implementation, runtime fallback, config mode,
 or deployment candidate.
 
-Current branch posture after the June 13 final correctness sweep: the branch
+Serving acceptance is binary: if `hisparse_enabled=true` can answer a request
+before dense-MLA KVarN BDR source writes, typed NIXL direct-to-host, native
+device-side hot planning, stream-ordered packed host-to-hot copy, post-copy hot
+metadata commit, and sparse MLA KVarN-hot BDR/on-read dequant are all wired and
+live-proven together, that is a correctness bug. A partial component may exist
+only as a fail-closed production-ABI scaffold or as an offline test fixture
+that is unreachable from the coordinator, transceiver, kernel ABI, deployment
+config, and runtime fallback policy.
+
+Current branch posture after the June 13 final thoroughness/correctness sweep: the branch
 has a production-shaped, fail-closed partial implementation, not a deployable
 HiSparse serving candidate. The config validation, packed KVarN tier
 allocation, host metadata publication, NIXL DRAM registration, request
@@ -147,6 +156,11 @@ The full implementation must remain production-architecture-first. Partial code
 may exist only when it is behind fail-closed startup/mapping guards and has the
 same ABI shape as the final serving path. The following are hard invariants:
 
+- Enabled serving is not allowed until the full production chain is present:
+  Indexer/HISA top-k -> native block dedupe -> request-table resolve -> hot
+  plan -> compact miss schedule -> stream-ordered packed KVarN host-to-hot copy
+  -> post-copy metadata commit -> hot-index build -> sparse MLA KVarN-hot
+  BDR/on-read dequant. Relaxing only part of this chain is a regression.
 - Dense MLA cold and hot storage is packed KVarN `kvarn_k2v2`, not FP16 and not
   an FP16 staging tier.
 - The Indexer/HISA path stays device-resident FP4/HISA.
@@ -174,6 +188,14 @@ same ABI shape as the final serving path. The following are hard invariants:
 - MORI-IO remains an A/B candidate only; the gate path is NIXL write-mode/direct
   host writes.
 - Promotion requires live VM proof and A/B data, not just unit tests.
+- Request-table publication, host-write commit coverage, row status, and hot
+  residency must be generation-checked. A recycled request id, recycled block
+  id, rejected speculative branch, failed write, or stale commit generation
+  must be unselectable before sparse MLA sees the row.
+- The native BDR source writer must be current-stream ordered with the dense
+  MLA append/commit path, and typed NIXL source reads must be ordered after the
+  BDR record write. Marking a BDR record committed before the write is visible
+  to the transfer source is a correctness bug.
 - The miss-copy boundary must be explicit. CUDA kernels must not pretend that
   CPU pinned host KVarN storage is ordinary device memory. The production path
   dedupes and plans misses on device, then hands a compact miss schedule to a
@@ -960,6 +982,10 @@ Current branch status:
 
 Still pending before serving enablement:
 
+- the startup/mapping guard must remain closed until the sparse MLA KVarN-hot
+  reader is wired in the same production chain as the native planner/copy
+  stages. Removing the guard before that point would create a hidden fallback
+  to full-HBM or NVFP4 sparse MLA behavior;
 - sparse MLA KVarN-hot read ABI that consumes the constructed hot global
   indices against packed KVarN hot storage instead of the full dense pool;
 - a `sparse_mla_decode_kvarn_hot` implementation, or an equivalent explicit
@@ -1086,12 +1112,40 @@ Deliverables:
 - Moondream pin preservation;
 - no draft rejected-token host pollution.
 
+Current branch status:
+
+- the base custom stack already has LayerSplit owner-local allocation,
+  owner/peer metadata, and dense/indexer/HISA scratch routing outside HiSparse;
+- HiSparse request ids are threaded through model-engine attention metadata and
+  are keyed to `disagg_request_id` when available, so the planner can share the
+  same request identity as the NIXL admission path;
+- HiSparse itself remains fail-closed before SMC-SD or Moondream decode can
+  consume host/hot records, so no speculative branch can accidentally use an
+  incomplete HiSparse serving path today.
+
+Still pending before serving enablement:
+
+- prove LayerSplit owner-local prefill writes the exact production BDR records
+  for the layers owned by each CP rank, while preserving global layer metadata
+  for decode-side host slots;
+- prove CP1 decode first; if decode CP is later enabled, either implement
+  owner-side hot swap-in plus peer broadcast explicitly or reject that config;
+- map every SMC-SD/MTP speculative row back to the base request host table and
+  prove accepted target tokens, rejected draft tokens, and rollback cleanup
+  update host/hot state correctly;
+- prove Moondream pinning and request pinning stay bound to the same
+  `disagg_request_id`, `ctx_dp_rank`, and `ctx_info_endpoint` through
+  direct-to-host writes, cancellation, and cleanup.
+
 ### Gate 7: A/B And Promotion
 
 Promotion candidate:
 
 ```yaml
 sparse_attention_config:
+  mla_latent_kv_dtype: kvarn_k2v2
+  indexer_k_dtype: fp4
+  indexer_mode: indexcache-hisa
   hisparse_enabled: true
   hisparse_mode: dense_mla_kvarn
   hisparse_direct_to_host: true
@@ -1101,7 +1155,16 @@ sparse_attention_config:
   hisparse_host_to_device_ratio: 8
   hisparse_min_seq_len: 65536
   hisparse_fail_closed: true
+cache_transceiver_config:
+  backend: NIXL
+transceiver_runtime: PYTHON
+kv_cache_config:
+  enable_block_reuse: false
 ```
+
+No promotion manifest may enable HELIX fallback, direct-to-host-off behavior,
+legacy KVarN source records for HiSparse, NVFP4 sparse MLA under HiSparse, or a
+full-working-set dense-MLA restore path for committed cold blocks.
 
 A/B matrix:
 
@@ -1186,6 +1249,9 @@ production ABI:
      any row can read hot storage;
    - keep sink/tail resident policy separate from committed packed blocks;
    - remove any need for full-working-set restore of committed cold blocks.
+   - do not introduce an FP16 block-hot oracle, an NVFP4 sparse-MLA
+     compatibility mode, or any executable serving placeholder while wiring
+     this path. Reference comparisons stay outside serving code.
 4. Prove and harden NIXL direct-to-host on live B200 VMs:
    - decode publishes writable host-pinned slots;
    - prefill writes exact packed KVarN records into those slots;
