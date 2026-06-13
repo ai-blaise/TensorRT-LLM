@@ -226,6 +226,15 @@ libraries). That image-internal `libth_common.so` proof closes the native
 library dependency gap that first appeared as a missing `libtensorrt_llm.so`;
 the remaining packaging gap is installing the full branch Python package plus
 `libth_common.so` into site-packages exactly as serving imports it.
+`deploy/disagg_pd_r20/build_hisparse_serving_import_proof_image.sh` is the
+next low-cost gate for that packaging boundary: it overlays the current branch
+`tensorrt_llm` package into deployment-runtime site-packages, places the
+branch-built `libth_common.so` under `tensorrt_llm/libs`, imports
+`tensorrt_llm` normally, asserts that the normal package loader used that
+serving-layout library, and then runs the native planner/copy smoke without an
+explicit `--library` path. This narrows the remaining fullsource gap to any
+branch-built generated bindings/plugin artifacts that are not present in the
+cached native proof build.
 The repo-level pytest harness still requires the full Python bindings, so the
 proof script intentionally bypassed `tests/unittest/conftest.py` while
 executing the same native ops and tensor contracts.
@@ -1209,6 +1218,13 @@ Still pending before serving enablement:
   `libth_common.so` dependency closure, but they do not yet prove that the full
   `op-trt-hisparse` Python package and `libth_common.so` are installed in the
   serving image's site-packages exactly as DSA will import them;
+- serving-layout import proof is staged through
+  `build_hisparse_serving_import_proof_image.sh`: it overlays branch Python
+  into deployment-runtime site-packages and requires normal `import
+  tensorrt_llm` to load `tensorrt_llm/libs/libth_common.so` before the native
+  smoke runs. Passing this gate proves the package loader boundary, while the
+  heavier fullsource image remains required if branch-generated bindings or
+  plugin libraries change;
 - deployment-runtime proof that
   `trtllm::hisparse_submit_packed_kvarn_copy_schedule` sees the production
   host tier as mapped/device-addressable on B200 is complete for both the
@@ -1700,12 +1716,15 @@ production ABI:
    - cached branch-built `libth_common.so` now passes the same smoke when
      mounted into buildtools, mounted into the deployment runtime, and copied
      image-internal with its required native siblings. The next proof is the
-     actual serving package layout: build or install the full `op-trt-hisparse`
-     Python package and `libth_common.so` into the deployment image's
-     site-packages, then rerun the script through the normal serving
-     import/library path. If that full branch-built image cannot use the
-     mapped-host kernel path, replace only the copy bridge with a copy-engine
-     variant that consumes the same compact device schedule without host sync.
+     actual serving package layout: run
+     `build_hisparse_serving_import_proof_image.sh --run-smoke` so normal
+     `import tensorrt_llm` loads `site-packages/tensorrt_llm/libs/libth_common.so`
+     and then reruns the native planner/copy smoke without `--library`; after
+     that, build or install the full `op-trt-hisparse` image/wheel when
+     branch-generated bindings or plugin artifacts must be proven too. If that
+     full branch-built image cannot use the mapped-host kernel path, replace
+     only the copy bridge with a copy-engine variant that consumes the same
+     compact device schedule without host sync.
 2. Lock the production KVarN hot-record layout:
    - make `kvarn_k2v2` the dense MLA HiSparse source of truth;
    - align host/hot packed records with the production BDR layout used by

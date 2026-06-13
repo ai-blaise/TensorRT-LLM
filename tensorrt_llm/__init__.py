@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import platform
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
@@ -103,6 +104,35 @@ _setup_vendored_triton_kernels()
 # cannot be found for the public PyTorch, raising errors like:
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
+
+
+def _preload_th_common_for_python_imports() -> None:
+    """Load torch custom classes before importing Python modules that probe them."""
+
+    project_dir = Path(__file__).parent.absolute()
+    if platform.system() == "Windows":
+        th_common_lib = project_dir / "libs" / "th_common.dll"
+    else:
+        th_common_lib = project_dir / "libs" / "libth_common.so"
+    try:
+        expected = th_common_lib.resolve()
+        loaded = {
+            Path(str(path)).resolve()
+            for path in torch.classes.loaded_libraries
+        }
+        if expected not in loaded:
+            torch.classes.load_library(str(th_common_lib))
+    except Exception as e:
+        msg = (
+            "\nFATAL: Decoding operators failed to load before TensorRT-LLM "
+            "Python module import. This may be caused by an incompatibility "
+            "between PyTorch and TensorRT-LLM. Please rebuild and install "
+            "TensorRT-LLM."
+        )
+        raise ImportError(str(e) + msg)
+
+
+_preload_th_common_for_python_imports()
 
 import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.functional as functional
