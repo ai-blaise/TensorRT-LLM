@@ -450,6 +450,16 @@ against NIXL source reads, live NIXL/cancel E2E proof, CUDA graph lifecycle
 proof, and profiling. This is the correct failure mode: no manifest should get
 an implicit full-HBM, FP16-staging, Python TopK extraction, or
 direct-to-host-off substitute.
+The June 13 cancellation audit also hardened the receiver side of that live
+NIXL gate: if an `RxSession` is already `ERROR` or `CANCELLED`, a late
+`KV_AGENT_RESULT SUCCESS` from a transferring task now finishes the pending
+HiSparse host write and fails the task without recording commit coverage,
+marking host blocks valid, or admitting the request. This prevents the
+transient "cancelled but admitted" state before the eventual force-release
+cleanup. The behavior was verified in the deployment-runtime proof image by
+overlaying the patched `transfer.py` onto the installed package and running a
+synthetic cancelled-session host-write scenario; it printed
+`late-success cancel guard passed`.
 
 The final June 13 thoroughness sweep did not identify an accepted runtime
 fallback or serving oracle in the HiSparse path. Remaining references to
@@ -1771,6 +1781,10 @@ Current branch status:
   treated as processable while KV/HiSparse writes are still `TRANSFERRING`, and
   `RxSession.close()` refuses to release HiSparse host rows until those writes
   reach a terminal state;
+- hardened terminal receive result handling so late `KV_AGENT_RESULT SUCCESS`
+  messages after `ERROR`/`CANCELLED` finish the pending host-write counter but
+  do not record HiSparse commit coverage, mark host blocks valid, or admit the
+  request;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -1791,7 +1805,10 @@ Still pending before serving enablement:
 - live decode-admission validation that proves request-visible host slots are
   committed before sparse MLA can select them;
 - live cancel/abort testing that proves host slots remain pinned until
-  in-flight DRAM writes finish;
+  in-flight DRAM writes finish across the full multi-rank NIXL path. The
+  receiver-side late-success/admission guard is implemented and runtime-proven
+  in a synthetic installed-package scenario, but the multi-rank E2E cancel
+  proof is still required;
 - E2E proof that NIXL writes land directly in decode host slots before decode
   admits the request.
 

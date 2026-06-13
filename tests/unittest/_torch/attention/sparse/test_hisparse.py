@@ -1,6 +1,8 @@
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -928,6 +930,73 @@ def test_hisparse_nixl_write_mode_host_transfer_source_contract():
     assert "coordinator.mark_host_write_committed" in source
     assert "coordinator.finish_host_write(task._unique_rid)" in source
     assert "coordinator.mark_request_admitted" in source
+
+
+def test_hisparse_rx_session_discards_late_success_after_terminal_cancel():
+    from tensorrt_llm._torch.disaggregation.base.transfer import (
+        KVSlice,
+        SessionStatus,
+    )
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        AgentResult,
+        KVRecvTask,
+        RxSession,
+        TaskStatus,
+    )
+
+    coordinator = OPTRTHiSparseCoordinator(_cfg(enabled=True))
+    state = coordinator.configure_packed_tiers(
+        num_layers=2,
+        tokens_per_block=64,
+        packed_bytes_per_block=2048,
+        logical_host_capacity_blocks=4,
+        hot_device_capacity_blocks=2,
+    )
+    del state
+    request_state = coordinator.reserve_request(req_pool_idx=44,
+                                                num_prompt_blocks=1)
+    coordinator.begin_host_write(44)
+
+    task = KVRecvTask(
+        unique_rid=44,
+        kv_slice=KVSlice(),
+        slice_id=0,
+        params=SimpleNamespace(),
+        aux_slot=None,
+    )
+    task.expected_transfers = 1
+    task.status = TaskStatus.TRANSFERRING
+    task.hisparse_host_slots = np.asarray([0], dtype=np.int64)
+    task.hisparse_pending_write_started = True
+
+    session = object.__new__(RxSession)
+    session.lock = threading.Lock()
+    session._kv_tasks = [task]
+    session._receiver = SimpleNamespace(_hisparse_coordinator=coordinator)
+    session._terminal_status = SessionStatus.CANCELLED
+    session.request_id = 44
+    session._closed = True
+    session._base_args = SimpleNamespace(
+        params=SimpleNamespace(disagg_request_id=44, ctx_request_id=None))
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.SUCCESS,
+        hisparse_commit_layer_indices=np.asarray([0, 1], dtype=np.int64),
+        hisparse_commit_block_positions=np.asarray([0, 0], dtype=np.int64),
+    )
+
+    assert task.status == TaskStatus.ERROR
+    assert task.is_done
+    assert task.hisparse_pending_write_started is False
+    assert task.hisparse_commit_layer_parts == []
+    assert task.hisparse_commit_block_parts == []
+    assert request_state.pending_writes == 0
+    assert request_state.admitted is False
+    assert coordinator.host_block_committed(44, 0) is False
+    assert coordinator.request_ready_for_admission(44) is False
 
 
 def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():

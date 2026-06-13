@@ -2120,6 +2120,21 @@ class RxSession(RxSessionBase):
                 f"Sender/receiver slice count mismatch."
             )
             task = self._kv_tasks[sender_slice_id]
+            terminal_status = self._terminal_status
+            if terminal_status in (SessionStatus.ERROR,
+                                   SessionStatus.CANCELLED):
+                # A transferring task may complete after cancellation/error.
+                # Do not publish HiSparse host commits or admission for a
+                # request that the receiver has already made terminal.
+                self._finish_hisparse_host_write(task)
+                if not task.is_done:
+                    task.fail(
+                        RuntimeError(
+                            f"RxSession {self.disagg_request_id} is already "
+                            f"{terminal_status.value}; discarding late "
+                            f"KV_AGENT_RESULT {status.value} for "
+                            f"slice={sender_slice_id}."))
+                return
             if status == AgentResult.SUCCESS:
                 try:
                     self._record_hisparse_commit_coverage(
