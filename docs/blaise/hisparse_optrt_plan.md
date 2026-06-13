@@ -79,9 +79,9 @@ only as a fail-closed production-ABI scaffold or as an offline test fixture
 that is unreachable from the coordinator, transceiver, kernel ABI, deployment
 config, and runtime fallback policy.
 
-Current branch posture after the June 13 final thoroughness/correctness sweep: the branch
-has a production-shaped, fail-closed partial implementation, not a deployable
-HiSparse serving candidate. The config validation, packed KVarN tier
+Current branch posture after the June 13 final thoroughness/correctness sweep:
+the branch has a production-shaped, fail-closed partial implementation, not a
+deployable HiSparse serving candidate. The config validation, packed KVarN tier
 allocation, host metadata publication, NIXL DRAM registration, request
 host-slot sideband, packed KVarN source/destination fragment derivation, typed
 `HISPARSE_HOST` write submission, decode admission state, and two-stage
@@ -134,7 +134,9 @@ encoding, consumes row status, decodes packed `kvarn_k2v2` hot records through
 the C-KV low-bit bytes, scale/zp fields, and E4M3 RoPE payload, and returns a
 bf16 scratch tensor for kernel validation. This is a producer-load building
 block and CUDA smoke hook, not a serving path: the coordinator still fails
-closed until the same KVarN-hot reader is fused into sparse MLA.
+closed until the same KVarN-hot reader is fused into sparse MLA. The June 13
+final sweep tightened this primitive to require `kvarn_bits=2`; there is no
+4-bit KVarN-hot validation branch for the production HiSparse path.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
@@ -1078,10 +1080,10 @@ Still pending before serving enablement:
   useful scheduler/combine reference, but its `kv [num_pages,64,1,288]` plus
   `kv_scales [num_pages,64,1,36]` layout is not the production KVarN-hot ABI;
 - BDR/on-read dequant for packed hot KVarN records at the sparse MLA producer
-  load point, using the configured `kvarn_bits` and production field offsets.
-  The native standalone hot-reader primitive proves that address/dequant logic,
-  but promotion still requires fusing it into sparse MLA rather than launching
-  a separate dense scratch prepass;
+  load point, using `kvarn_bits=2` and production field offsets. The native
+  standalone hot-reader primitive proves that address/dequant logic for the
+  target BDR layout, but promotion still requires fusing it into sparse MLA
+  rather than launching a separate dense scratch prepass;
 - final row-status propagation into the sparse MLA hot-read stage so rows with
   resolve/plan/copy/commit/build errors cannot be consumed;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
@@ -1336,6 +1338,9 @@ production ABI:
    - add BDR/on-read dequant in the sparse MLA producer load path, including
      2-bit C-KV unpack, scale/zp apply, and RoPE payload read without an
      intermediate dense/FP16 hot staging pass;
+   - base the first executable serving implementation on the target model's
+     production dense-MLA/DSA path and production BDR record layout, not on an
+     intermediate correctness-only path;
    - propagate resolve/plan/copy/commit/build row status into attention before
      any row can read hot storage;
    - keep sink/tail resident policy separate from committed packed blocks and

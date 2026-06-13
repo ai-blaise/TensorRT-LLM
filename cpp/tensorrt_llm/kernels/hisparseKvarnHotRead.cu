@@ -48,7 +48,7 @@ template <int BITS>
 __device__ __forceinline__ float readLowBitKvarnValue(
     uint8_t const* tokenPacked, __half const* tokenScaleZp, int dim)
 {
-    static_assert(BITS == 2 || BITS == 4, "HiSparse KVarN hot reader supports 2-bit or 4-bit C-KV");
+    static_assert(BITS == 2, "HiSparse KVarN hot reader is production-gated to kvarn_k2v2");
     constexpr int kValuesPerByte = 8 / BITS;
     constexpr int kMask = (1 << BITS) - 1;
     int const byteIdx = dim / kValuesPerByte;
@@ -75,7 +75,7 @@ __global__ void hisparseReadKvarnHotBdrKernel(uint8_t const* __restrict__ hotPac
     int32_t hotCapacity, int64_t hotLayerStride, int64_t hotSlotStride, int64_t hotRecordStride, int32_t layerIdx,
     int32_t tokensPerBlock, int32_t kvLoraRank, int32_t qkRopeHeadDim)
 {
-    static_assert(BITS == 2 || BITS == 4, "HiSparse KVarN hot reader supports 2-bit or 4-bit C-KV");
+    static_assert(BITS == 2, "HiSparse KVarN hot reader is production-gated to kvarn_k2v2");
     int32_t const row = static_cast<int32_t>(blockIdx.x);
     if (row >= numRows)
     {
@@ -195,21 +195,12 @@ void invokeHisparseReadKvarnHotBdr(uint8_t const* hotPacked, int32_t const* hotI
     check(tokensPerBlock == 64, "hisparse_read_kvarn_hot_bdr production path requires tpb=64");
     check(kvLoraRank == 512, "hisparse_read_kvarn_hot_bdr production path requires kv_lora_rank=512");
     check(qkRopeHeadDim == 64, "hisparse_read_kvarn_hot_bdr production path requires qk_rope_head_dim=64");
-    check(kvarnBits == 2 || kvarnBits == 4, "hisparse_read_kvarn_hot_bdr supports kvarn_bits=2 or 4");
+    check(kvarnBits == 2, "hisparse_read_kvarn_hot_bdr production path requires kvarn_bits=2");
 
     constexpr int32_t kThreads = 256;
-    if (kvarnBits == 2)
-    {
-        hisparseReadKvarnHotBdrKernel<2><<<numRows, kThreads, 0, stream>>>(hotPacked, hotIndices, topkLength,
-            inputRowStatus, latentOut, outputRowStatus, numRows, indexTopK, numLayers, hotCapacity, hotLayerStride,
-            hotSlotStride, hotRecordStride, layerIdx, tokensPerBlock, kvLoraRank, qkRopeHeadDim);
-    }
-    else
-    {
-        hisparseReadKvarnHotBdrKernel<4><<<numRows, kThreads, 0, stream>>>(hotPacked, hotIndices, topkLength,
-            inputRowStatus, latentOut, outputRowStatus, numRows, indexTopK, numLayers, hotCapacity, hotLayerStride,
-            hotSlotStride, hotRecordStride, layerIdx, tokensPerBlock, kvLoraRank, qkRopeHeadDim);
-    }
+    hisparseReadKvarnHotBdrKernel<2><<<numRows, kThreads, 0, stream>>>(hotPacked, hotIndices, topkLength,
+        inputRowStatus, latentOut, outputRowStatus, numRows, indexTopK, numLayers, hotCapacity, hotLayerStride,
+        hotSlotStride, hotRecordStride, layerIdx, tokensPerBlock, kvLoraRank, qkRopeHeadDim);
     checkCuda(cudaGetLastError(), "hisparse_read_kvarn_hot_bdr kernel launch failed");
 }
 

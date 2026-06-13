@@ -551,7 +551,8 @@ def test_hisparse_kvarn_hot_bdr_reader_is_registered_in_sources():
     thop_source = thop.read_text()
     assert "readLowBitKvarnValue" in kernel_source
     assert "readFp8E4m3Byte" in kernel_source
-    assert "kvarnBits == 2 || kvarnBits == 4" in kernel_source
+    assert "kvarnBits == 2" in kernel_source
+    assert "kvarnBits == 2 || kvarnBits == 4" not in kernel_source
     assert "tokensPerBlock == 64" in kernel_source
     assert "kvLoraRank == 512" in thop_source
     assert "qkRopeHeadDim == 64" in thop_source

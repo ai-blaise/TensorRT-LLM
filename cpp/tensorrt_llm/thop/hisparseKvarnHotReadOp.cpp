@@ -27,7 +27,7 @@ namespace
 
 int64_t expectedBdrBytesPerBlock(int64_t tokensPerBlock, int64_t kvLoraRank, int64_t qkRopeHeadDim, int64_t kvarnBits)
 {
-    TORCH_CHECK(kvarnBits == 2 || kvarnBits == 4, "kvarn_bits must be 2 or 4");
+    TORCH_CHECK(kvarnBits == 2, "production HiSparse KVarN-hot reader requires kvarn_bits=2");
     TORCH_CHECK(kvLoraRank == 512, "production HiSparse KVarN-hot reader requires kv_lora_rank=512");
     TORCH_CHECK(qkRopeHeadDim == 64, "production HiSparse KVarN-hot reader requires qk_rope_head_dim=64");
     TORCH_CHECK(tokensPerBlock == 64, "production HiSparse KVarN-hot reader requires tokens_per_block=64");
