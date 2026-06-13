@@ -52,6 +52,15 @@ But adapt it around OP-TRT's custom contracts:
 6. SMC-SD/Moondream decode must not reuse host slots before speculative cleanup;
 7. no silent fallback to non-custom paths is allowed.
 
+The full implementation path must be based on the target model's production
+architecture from the first executable serving path. That means dense MLA
+`kvarn_k2v2` cold/hot storage, FP4 Indexer K + HISA scoring, sparse MLA with
+BDR/on-read dequant, NIXL generation-first direct-to-host, and the r20
+LayerSplit/SMC/Moondream wiring. Do not implement FP16 host/hot tiers in
+serving code. Independent tests may allocate reference tensors outside the
+HiSparse coordinator/transceiver path, but those references are not an
+implementation phase, runtime fallback, config mode, or deployment candidate.
+
 ## Relevant SGLang Facts
 
 SGLang HiSparse is decode-side hierarchical memory for DSA/DSv4 models. The
@@ -66,7 +75,8 @@ Implementation details worth preserving:
   capacity. `alloc_logical_only()` is used by direct-to-host transfer.
 - `HiSparseCoordinator` owns request-to-host rows, request hot buffers,
   `full_to_hisparse_device_index_mapping`, LRU slots, raw top-k capture buffer,
-  graph-safe output buffers, staging queues, eager backup stream, and cleanup.
+  graph-safe output buffers, request-admission queues, eager backup stream, and
+  cleanup.
 - `swap_in_selected_pages()` launches one CUDA kernel per layer and returns
   device locations for attention.
 - The CUDA kernel has a short-sequence fast path, newest-token reserved slot,
@@ -90,6 +100,13 @@ Current production r20 already enables:
 - CuTe/C++ top-k and paged MQA logits;
 - WarpDecode forced on decode;
 - SMC-SD with GLM draft path.
+
+Target-model assumption for this branch: the serving path is the current
+production DSA/dense-MLA target path, with `index_topk=1024`,
+`tokens_per_block=64`, FP4 Indexer K/HISA, dense MLA latent KVarN
+`kvarn_k2v2`, sparse MLA decode, NIXL Python/native generation-first handoff,
+LayerSplit owner-local prefill, and TP4/EP4 decode. Draft-model GQA KVarN is a
+separate fail-closed path and should not determine the first HiSparse design.
 
 The clean OP-TRT insertion point is in
 `DSATrtllmAttention.sparse_attn_predict()` after `Indexer.forward()` has filled
@@ -131,7 +148,6 @@ The coordinator owns:
   - `num_real_rows`;
   - optional `miss_count`, `hit_count`, and debug counters;
 - lifecycle:
-  - staging admission;
   - direct-to-host admission;
   - eager backup after decode;
   - abort/retract cleanup;
@@ -188,8 +204,8 @@ Validation:
 
 ## Host Pool Layout
 
-Use a dense-MLA host pool parallel to KVarN side-pool format, not a plain fp16
-pool as the optimized end state.
+Use a dense-MLA host pool parallel to KVarN side-pool format. The serving path
+must never allocate a plain FP16 host/hot tier for committed blocks.
 
 For each local layer and physical block:
 
@@ -209,9 +225,10 @@ Tail/sink policy:
 - once full, it is committed to KVarN host storage and invalidates any stale
   hot/restored epoch.
 
-Bring-up can include an explicit non-production `hisparse_host_format=fp16`
-oracle to compare byte-for-byte against sparse MLA. Production should target
-packed KVarN host storage plus BDR/on-read dequant.
+Correctness comparisons may use offline reference buffers or the existing
+full-HBM production KVarN path, but no `hisparse_host_format=fp16` serving mode
+should be added. Production targets packed KVarN host storage plus BDR/on-read
+dequant.
 
 ## Swap-In Kernel
 
@@ -278,12 +295,14 @@ row shapes: B in graph buckets, next_n in {1, 2, 3, 4, 1 + gamma}
 
 ## KVarN Integration
 
-Current KVarN restores committed dense MLA blocks into the fp16 main pool before
-decode. HiSparse should change this into two tiers:
+Current KVarN can restore committed dense MLA blocks into the FP16 main pool
+before decode. HiSparse should move the production serving path to two packed
+tiers:
 
 1. cold host tier: packed KVarN records for full committed blocks;
-2. hot device tier: packed KVarN records or restored fp16 blocks for selected
-   blocks.
+2. hot device tier: packed KVarN records for selected committed blocks, plus
+   the already-required resident FP16 sink/tail blocks that have not been
+   committed yet.
 
 The optimized target is:
 
@@ -296,13 +315,11 @@ The optimized target is:
 
 Implementation sequence:
 
-1. Phase A oracle: host/hot fp16 block copy, sparse MLA output equivalence.
-2. Phase B packed KVarN host/hot copy, explicit dequant into hot fp16 before
-   sparse MLA.
-3. Phase C packed KVarN hot read with BDR/on-read dequant, no fp16 staging for
-   committed blocks.
-
-Only Phase C should be considered optimized.
+1. Install production packed host/hot KVarN allocation and metadata first.
+2. Implement packed KVarN host-to-hot swap-in and hot global-index mapping.
+3. Make sparse MLA consume the hot packed KVarN view through BDR/on-read dequant.
+4. Keep external FP16/KVarN references in tests only; do not add a serving
+   staging path that dequants committed cold blocks into a hot FP16 pool.
 
 ## Indexer And HISA Integration
 
@@ -398,8 +415,9 @@ OP-TRT changes:
 Fallback policy:
 
 - Direct-to-host failure should fail closed for production.
-- A staging path can exist as a debug mode, but must require
-  `hisparse_allow_staging_debug=true`.
+- No staging/debug fallback should exist in the serving path. Unit tests may
+  inject synthetic host-pool contents directly, but deployment config should
+  expose only the production NIXL direct-to-host path.
 
 ## SMC-SD And Moondream Decode
 
@@ -462,11 +480,11 @@ Unit tests:
 - host slot allocation and cleanup restore all counters;
 - direct-to-host admission does not allocate full GPU KV;
 - short sequence preload maps exact token offsets;
-- long sequence hit/miss/LRU against a naive oracle;
+- long sequence hit/miss/LRU against a pure reference model of the hot-block
+  state machine;
 - newest-token reserved slot;
 - duplicate top-k tokens and duplicate blocks;
 - padded CUDA graph rows via `num_real_rows`;
-- abort while staging;
 - abort while NIXL write is transferring;
 - request recycle invalidates KVarN host/hot records;
 - FSSS S layers reuse scoring but still map per-layer hot slots.
@@ -475,9 +493,11 @@ Correctness tests:
 
 - Indexer selected SET unchanged with HiSparse off/on.
 - HISA candidate selection unchanged.
-- sparse MLA output equal to no-HiSparse fp16 oracle in Phase A.
-- sparse MLA output within KVarN quant tolerance in Phase B/C.
+- sparse MLA output within KVarN quant tolerance versus the existing production
+  full-HBM KVarN path.
 - KVarN full restore vs HiSparse hot restore block equivalence.
+- optional offline FP16 references prove numerical ceilings, but are not wired
+  into the coordinator, transceiver, or deployment config.
 - LayerSplit TP2xCP2 prefill to TP4/CP1 decode E2E.
 - generation-first NIXL direct-to-host E2E.
 - streaming cancel/cleanup E2E.
@@ -499,8 +519,8 @@ Performance tests:
 - end-to-end:
   - target concurrency 16;
   - input lengths 1k to 128k;
-  - compare full-HBM sparse attention, KVarN only, HiSparse fp16 oracle,
-    HiSparse packed KVarN, and HiSparse direct-to-host.
+  - compare full-HBM sparse attention, production KVarN only, HiSparse packed
+    KVarN, and HiSparse packed KVarN with direct-to-host.
 
 ## Implementation Phases
 
@@ -527,34 +547,37 @@ Deliverables:
 - no-op disabled path;
 - fail-closed startup validation.
 
-### Phase 2: FP16 Oracle Hot Buffer
+### Phase 2: Production Packed KVarN Cold/Hot Tiers
 
 Deliverables:
 
-- block-level host fp16 pool;
-- block-level hot fp16 pool;
-- Python/torch naive swap-in oracle;
-- C++/CUDA swap-in kernel for fp16 block copy;
-- sparse MLA consumes hot global indices;
-- unit tests prove equivalence.
+- host-pinned packed KVarN cold pool for committed dense MLA blocks;
+- hot device packed KVarN pool for selected committed blocks;
+- resident sink/tail policy for the uncommitted FP16 blocks already required by
+  dense MLA KVarN;
+- host/hot `valid`, `commit_gen`, request epoch, and recycle invalidation;
+- sparse-attention metadata exposes hot block tables without changing Indexer
+  scoring.
 
-### Phase 3: KVarN Host/Hot Path
-
-Deliverables:
-
-- host packed KVarN block storage;
-- hot packed KVarN block storage;
-- explicit dequant-to-hot-fp16 transitional path;
-- KVarN record invalidation on free/rewind;
-- packed host/hot tests.
-
-### Phase 4: BDR/On-Read Optimized Path
+### Phase 3: Swap-In Kernel And Sparse MLA Hook
 
 Deliverables:
 
-- sparse MLA hot read supports packed KVarN records;
-- BDR fold/on-read dequant;
-- no full-working-set fp16 restore for committed cold blocks;
+- SM100 block-level swap-in kernel over packed KVarN records;
+- block dedupe from local top-k token positions;
+- hit/miss/LRU/newest-slot updates with graph-safe buffers;
+- hot global-index output consumed by sparse MLA;
+- BDR/on-read dequant for hot packed KVarN records;
+- FSSS reuse layers reuse scoring but rerun per-layer hot-slot mapping when hot
+  residency is layer-local.
+
+### Phase 4: Production Optimization Hardening
+
+Deliverables:
+
+- precompiled SM100 variants for the production buckets;
+- no full-working-set FP16 restore for committed cold blocks;
+- hit/miss telemetry, hot-buffer pressure counters, and request cleanup counters;
 - performance proof that KVarN+HiSparse beats KVarN-only at long context and
   concurrency 16.
 
@@ -610,7 +633,7 @@ A/B matrix:
 - host/device ratio: 5, 8, 10;
 - NIXL plugin: LIBFABRIC, UCX;
 - direct-to-host on/off;
-- KVarN packed on-read vs explicit hot fp16 restore;
+- packed KVarN hot-pool ABI and BDR/on-read kernel variants only;
 - TP4 vs alternate TP/EP settings;
 - `free_gpu_memory_fraction` decode sweep;
 - SMC on/off;
@@ -643,12 +666,12 @@ Promotion requires:
 
 ## First Code Change To Make
 
-Start with Phase 1 and Phase 2 only:
+Start with Phase 1 and the production Phase 2 skeleton:
 
 1. add config fields and validation;
 2. add coordinator skeleton and disabled no-op path;
-3. implement fp16 block-hot oracle;
+3. allocate packed KVarN cold/hot metadata and fail closed until the hot read
+   path is complete;
 4. hook `sparse_attn_predict()` so local top-k maps through the coordinator;
-5. prove output equivalence before touching KVarN/NIXL.
-
-That gives a correctness rail before optimizing the hot path.
+5. validate against external references and the existing production KVarN path,
+   without adding an intermediate serving fallback.
