@@ -2170,3 +2170,162 @@ production ABI:
      NIXL direct-to-host, and MORI-IO only as an A/B candidate;
    - require no correctness regression, no fallback logs, no leaked pins/slots,
      and tokens/second/user improvement on the long-context target.
+
+
+## Plan Review and Recommended Changes — External Audit (2026-06-13)
+
+This section is an independent senior review appended after a direct re-read of
+the SGLang HiSparse blog and guide, the SGLang implementation (`hisparse.cuh`
+swap-in kernel, `hisparse_coordinator.py`, `allocator/hisparse.py`,
+`hisparse_memory_pool.py`, `deepseek_dsa.py`, `jit_kernel/hisparse.py`,
+`dsa_backend.py`), our own Indexer ([indexer.md](indexer.md)), and this branch's
+plan plus its 319-file / +67k-line implementation. The branch's **correctness
+posture is excellent** and is not the subject of these notes: fail-closed
+everywhere, ABI-faithful packed-KVarN tiers, generation-checked recycle, the
+NIXL cancel-race / late-success guards, no silent fallback, production-shape-only
+serving data. The recommendations correct the plan's **objective framing**,
+re-order **when the first measurement happens**, and add two optimizations and
+one advantage the plan currently omits. No code change is recommended yet — see
+Recommendation 4.
+
+### 1. State the true objective: HiSparse is a capacity/concurrency lever, not a c16-TPOT lever
+
+HiSparse is, by construction, a decode-side **capacity** optimization: it shrinks
+per-request device KV so a decode instance can hold **more concurrent requests
+(or longer contexts) in the same HBM**. SGLang's published results are a
+throughput-vs-concurrency curve (≈3× at 256 concurrent, up to ≈5× long-context),
+and the blog states plainly that at **low concurrency HiSparse ADDS overhead**
+because the miss I/O outweighs the memory saving. The win is aggregate throughput
+/ a higher concurrency-and-context ceiling — not lower per-user TPOT at a fixed
+small batch.
+
+This plan's stated success metric is "tokens/second/user improvement at
+concurrency 16 for long context" (Gates 4/7), while Open Risk 5 concedes
+"HiSparse benefits appear mostly under high concurrency." Those statements are in
+direct tension and the plan never reconciles them. **At c16 — the campaign's
+after-first-token latency regime — HiSparse cannot be expected to improve
+tok/s/user; if anything the swap-in miss DMA on the decode critical path makes it
+slightly worse.** Measuring success at c16 sets up a benchmark HiSparse fails by
+construction.
+
+Recommended change to the objective:
+
+- The win HiSparse delivers here is a **higher concurrent-long-context ceiling at
+  iso-HBM** (equivalently, longer max context at fixed concurrency), stacked on
+  the ~3–5× capacity KVarN already buys. The A/B's **primary axis must be
+  concurrency swept UP** (16 → 64 → 128 → 256) at long context, with the headline
+  metric being *sustained tok/s/user and the max concurrency before the
+  KVarN-only baseline OOMs or throttles* — i.e. the SGLang curve. **c16 is the
+  floor case**, where the bar is "no meaningful TPOT regression," not "a win."
+- HiSparse and the c16 tok/s/user hill-climb (MoE a2a, megakernel, dense-proj)
+  are **orthogonal**: one lowers per-step latency at fixed batch, the other
+  raises the batch/context ceiling. HiSparse must be scored on the capacity axis
+  and must **not** be charged against the c16-TPOT target in
+  [optimization_candidates.md](optimization_candidates.md).
+
+### 2. Quantify the target before more hardening — the plan currently has no number
+
+The plan fixes operating parameters (`hot_blocks_per_req=64`,
+`host_to_device_ratio=8`, `min_seq_len=65536`) but states **no expected-win
+magnitude anywhere** — no per-request HBM saved, no concurrency-ceiling lift, no
+target tok/s. Compute it first; it is a paper exercise that decides whether the
+remaining (large) hardening investment is justified.
+
+Back-of-envelope (confirm the constants against the live config):
+
+```text
+dense MLA latent   = 512 (C-KV) + 64 (RoPE) = 576 elem/token/layer
+kvarn_k2v2 packed  ≈ 2-bit C-KV + scale/zp + E4M3 RoPE ≈ ~165–200 B/token/layer
+                     (vs bf16 latent 1152 B/token/layer)
+per request @128k  ≈ 128k tok × ~11 KB/tok (61 layers) ≈ ~1.4 GB device KV
+hot buffer (64 blk × 64 tok = 4096 tok) ≈ ~45 MB device; remainder on host
+  => per-request DEVICE KV ~1.4 GB -> ~45 MB  (~30× at 128k)
+```
+
+If that ~30× holds, HiSparse raises the concurrent-128k ceiling by ~30× wherever
+decode is HBM-KV-bound. **That is the number the plan should target and the A/B
+should confirm — and it is precisely the number that is invisible at c16.**
+
+### 3. The KVarN-hot design is a genuine ADVANTAGE over SGLang — claim it
+
+The plan treats packed-`kvarn_k2v2` hot storage purely as an ABI-compatibility
+constraint paid for with a bespoke on-read-dequant kernel. It is also a real win:
+SGLang keeps **bf16/fp8** in the hot buffer (1152 B/token), we keep **~2.3-bit
+KVarN** (~165–200 B/token) — **~6–7× denser**. At an equal hot-HBM budget that is
+~6–7× more tokens kept hot, i.e. a **dramatically lower critical-path miss rate**
+than a same-size bf16 hot buffer (or the same hit rate at ~1/7 the HBM). The
+bespoke kernel's cost buys a structurally lower miss rate; state it as a design
+win and let it inform sizing (a smaller `hot_blocks_per_req` may already match
+SGLang's hit rate).
+
+### 4. Front-load a cheap capacity-signal gate BEFORE the remaining live-proof hardening
+
+The branch has paid for extensive build/packaging/serving-import/native-op proofs
+but has **zero measured numbers** — no swap-in µs, no hot-kernel latency (only
+ptxas register counts + zero-spill), no block fan-out, no capacity curve — and
+the readiness probe stays false pending a long tail of live-DSA/NIXL proofs
+(Gates 2–7). Given Recommendation 1 (the objective itself is at risk of being
+mis-set), this ordering is backwards: it hardens a subsystem before establishing
+that it wins. Insert a **measurement gate between Gate 3 and Gate 4** that needs
+no live DGD and uses ops that already smoke-pass:
+
+- **(a) Block fan-out, offline.** On real long-context traces (the SGLang
+  miss-count benchmark is the template: DeepSeek-V3.2, top-k=1024/2048,
+  LongBench-style), measure the number of **distinct 64-token blocks** touched by
+  the 1024 selected tokens per step, plus cross-step block churn. This is the
+  decisive number the block-granular (vs SGLang token-granular) choice rests on:
+  it sets the real miss rate, validates or resizes `hot_blocks_per_req`, and
+  bounds host→device traffic. Worst case (scattered top-k) is 1024 distinct
+  blocks = 64× token amplification; realistic (recency+sink clustering) is far
+  lower — but it is currently UNMEASURED.
+- **(b) Swap-in + hot-read microbench at the production buckets.** The swap-in and
+  `sparse_mla_decode_kvarn_hot` kernels compile and smoke-pass — bench them now
+  (SM100, index_topk=1024, tokens_per_block=64, hot_blocks {32,64,96,128},
+  B∈{16,32,64}) for per-step µs and miss-DMA bytes. No serving wheel required.
+- **(c) The capacity math of Recommendation 2.**
+
+These three are days of work, need no live deployment, and either green-light or
+save the much larger Gate 4–7 hardening + optimization spend.
+
+### 5. Overlap the miss DMA with compute — the one optimization that helps at c16
+
+The reason HiSparse costs latency at low concurrency is that the host→device
+**miss DMA sits on the decode critical path**. SGLang's own #1 future-work item
+is "better overlap." This plan submits misses "in stream order" on the current
+stream (Gate 2/3) — i.e. **not overlapped with compute** — and a re-read found no
+prefetch/overlap design anywhere. This is the single most impactful performance
+change and the one that could make HiSparse ~neutral (not negative) at c16:
+
+- The selection (top-k) is known **before** attention, and across F-layers it is
+  stationary (FSSS reuse). The miss set can therefore be computed early and the
+  miss DMA issued on a **dedicated copy stream and prefetched** behind the current
+  layer's attention + MoE compute. Our decode step is **MoE-bound (~75%; a2a
+  ~48% of the eager step)** — a large window in which to hide a few-MB/layer
+  host→hot copy. Done right the miss DMA is fully hidden and HiSparse's c16 cost
+  approaches zero, leaving only its capacity upside.
+- The eager *backup* already uses a dedicated stream (good, matches SGLang); the
+  miss *copy* should too. Fix that asymmetry. The stack's existing overlap
+  machinery (LayerSplit prefill overlap, the MLA gate side-stream, the
+  shared-expert aux stream) is the precedent.
+- Make compute/copy overlap an explicit Gate-4 design goal with an IKP/NSys
+  overlap-fraction proof, not an unstated implementation detail.
+
+### 6. `min_seq_len=65536` confirms the niche — make it explicit
+
+The ≥64k gate correctly avoids short-context overhead, but it also means HiSparse
+only ever engages for very-long-context requests. Combined with Recommendation 1,
+the regime where HiSparse both engages and pays off is "**many concurrent
+≥64k-context requests**" — high-concurrency-long-context, precisely the regime
+the c16 metric does not exercise. The gate's own logic is further evidence the
+c16 framing should be replaced by the concurrency-swept capacity framing.
+
+### What NOT to change
+
+The fail-closed promotion ladder, the packed-KVarN ABI faithfulness, the
+generation-checked recycle/cancel guards, the no-silent-fallback rule, the
+production-architecture-first / no-FP16-oracle-in-serving discipline, and the
+CZS/IKP/NSys proof obligations are all correct and should stay. The bespoke
+KVarN-hot kernel (vs reusing the NVFP4 layout) is the right call. These
+recommendations are additive: fix the objective framing, quantify the target,
+measure before hardening, overlap the miss DMA, and claim the KVarN density
+advantage.
