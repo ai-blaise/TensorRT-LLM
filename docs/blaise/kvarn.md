@@ -261,11 +261,16 @@ byte payload. The descriptor records both the requested `v2` PE setting and the
 current 8-bit PE storage used by this BDR hot-record contract. HiSparse must
 not feed the legacy side-pool record into a BDR sparse-MLA hot-read kernel;
 current code allocates a separate `KVarNBDRSourcePool` for HiSparse-enabled
-runs and fails closed until a native BDR writer fills that pool and
-`sparse_mla_decode_kvarn_hot` consumes it. The writer-facing DSA hooks are
-`kvarn_bdr_record_destination_fragments()` for layer-major writable BDR record
-destinations and `mark_kvarn_bdr_records_committed()` for post-write commit
-publication.
+runs. `torch.ops.trtllm.mla_bdr_write_kvarn_record` is the native block writer:
+it consumes the production dense MLA latent block view, writes low-bit C-KV,
+C-KV scale/zp, and the 8-bit RoPE payload into the BDR source pool, and the DSA
+commit walk populates that pool alongside the legacy restore side-pool. The
+writer-facing DSA hooks remain `kvarn_bdr_record_destination_fragments()` for
+layer-major writable BDR record destinations and
+`mark_kvarn_bdr_records_committed()` for post-write commit publication. The
+serving guard still remains closed until this writer is compiled/proven on B200,
+its stream ordering against NIXL source reads is validated, and
+`sparse_mla_decode_kvarn_hot` consumes the records directly.
 
 ### Focused validation commands
 

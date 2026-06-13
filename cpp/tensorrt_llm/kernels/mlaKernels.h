@@ -157,6 +157,13 @@ template <typename T>
 void invokeMLABdrQuantizeLatent(
     T const* ckv_in, uint8_t* data, void* scale_pool, int num_tokens, int dckv, int bits, cudaStream_t stream);
 
+// Write one full dense-MLA latent block into the production HiSparse BDR record
+// layout: low-bit C-KV, fp16 C-KV scale/zp, and byte-stored RoPE payload.
+template <typename T>
+void invokeMLABdrWriteKvarnRecord(T const* latent_block, int64_t latent_token_stride, int64_t latent_dim_stride,
+    uint8_t* bdr_records, int64_t bdr_record_stride, int block_id, int tokens_per_block, int kv_lora_rank,
+    int qk_rope_head_dim, int bits, cudaStream_t stream);
+
 template <typename T, typename TCache>
 void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_scale_cache, T* q_ptr,
     T* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,

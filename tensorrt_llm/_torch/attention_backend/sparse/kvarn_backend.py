@@ -202,6 +202,36 @@ class KVarNBDRSourcePool:
         self.valid_host[bid] = True
         self.commit_gen_host[bid] += 1
 
+    def store_block_from_latent(self, block_id: int,
+                                latent_block: torch.Tensor) -> None:
+        """Native production writer for one full dense-MLA BDR record.
+
+        ``latent_block`` is the paged-cache block view
+        ``[tokens_per_block, kv_lora_rank + qk_rope_head_dim]``. The registered
+        CUDA op writes the production BDR record directly into ``self.store``:
+        low-bit C-KV, fp16 C-KV scale/zp, and the current byte-stored RoPE
+        payload. No Python quantization path is provided here.
+        """
+        bid = int(block_id)
+        if bid < 0 or bid >= self.num_blocks:
+            raise ValueError(
+                f"KVarN BDR source block id out of range: {bid}; "
+                f"num_blocks={self.num_blocks}.")
+        if not torch.is_tensor(latent_block) or not latent_block.is_cuda:
+            raise RuntimeError(
+                "HiSparse BDR source records must be written from a CUDA "
+                "latent block by the native BDR writer.")
+        op = getattr(torch.ops.trtllm, "mla_bdr_write_kvarn_record", None)
+        if op is None:
+            raise RuntimeError(
+                "HiSparse BDR source records require "
+                "torch.ops.trtllm.mla_bdr_write_kvarn_record.")
+        op(latent_block, self.store, bid, int(self.layout.ckv_bits),
+           int(self.layout.kv_lora_rank), int(self.layout.qk_rope_head_dim))
+        # The serving guard remains closed until B200 validation proves NIXL
+        # source reads are ordered behind this current-stream writer.
+        self.mark_record_committed(bid)
+
     def commit_record_bytes(self, block_id: int, record_bytes: torch.Tensor) -> None:
         """Test helper: install one already-packed BDR record and commit it."""
         bid = int(block_id)

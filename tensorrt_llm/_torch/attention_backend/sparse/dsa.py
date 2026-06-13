@@ -5148,6 +5148,10 @@ class DSATrtllmAttention(TrtllmAttention):
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
         if pool is None:
             return
+        bdr_pool = None
+        if (getattr(mgr, "kvarn_hisparse_source_layout", None) ==
+                KVARN_BDR_HISPARSE_LAYOUT):
+            bdr_pool = mgr.get_kvarn_hisparse_bdr_pool(self.layer_idx)
         bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime  # host, per (all) seqs
         lo, hi = self._kvarn_seq_range(metadata, is_generation)
@@ -5156,13 +5160,22 @@ class DSATrtllmAttention(TrtllmAttention):
             n_full = klen // tpb            # number of FULL blocks for this seq
             for b in range(sink_blocks, n_full):
                 block_id = int(bt[i, b])
-                if block_id < 0 or bool(pool.valid[block_id]):
+                if block_id < 0:
                     continue
-                _, ckv, k_pe = self._kvarn_latent_block_view(mgr, metadata,
-                                                             block_id)
-                mgr.kvarn_store_block(self.layer_idx, block_id,
-                                      ckv.to(torch.float16),
-                                      k_pe.to(torch.float16))
+                legacy_committed = bool(pool.valid[block_id])
+                bdr_committed = (bdr_pool is None
+                                 or bool(bdr_pool.valid_host[block_id]))
+                if legacy_committed and bdr_committed:
+                    continue
+                blk, ckv, k_pe = self._kvarn_latent_block_view(mgr, metadata,
+                                                               block_id)
+                if not legacy_committed:
+                    mgr.kvarn_store_block(self.layer_idx, block_id,
+                                          ckv.to(torch.float16),
+                                          k_pe.to(torch.float16))
+                if bdr_pool is not None and not bdr_committed:
+                    mgr.kvarn_store_hisparse_bdr_block(
+                        self.layer_idx, block_id, blk)
 
     def kvarn_restore_for_decode(self, metadata):
         """Reconstruct committed blocks into the main-pool fp16 slot so the C++
@@ -6138,6 +6151,13 @@ class DSACacheManager(KVCacheManager):
         pool = self.get_kvarn_latent_pool(layer_idx)
         if pool is not None:
             pool.store_block(int(block_id), ckv, k_pe)
+
+    def kvarn_store_hisparse_bdr_block(self, layer_idx: int, block_id: int,
+                                       latent_block) -> None:
+        """Native-write one full latent block into the HiSparse BDR source pool."""
+        pool = self.get_kvarn_hisparse_bdr_pool(layer_idx)
+        if pool is not None:
+            pool.store_block_from_latent(int(block_id), latent_block)
 
     def kvarn_load_block(self, layer_idx: int, block_id: int):
         """Reconstruct (ckv, k_pe) fp16 for one committed block, else None."""

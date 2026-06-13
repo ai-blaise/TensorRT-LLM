@@ -122,13 +122,22 @@ production-shaped BDR source pool per local layer and marks that as the
 HiSparse source layout; the legacy side-pool remains only for amortized
 restore. The direct-to-host fragment API has the same guard and will not
 publish legacy side-pool pointers as HiSparse host-write sources.
+The branch now also registers `torch.ops.trtllm.mla_bdr_write_kvarn_record` and
+calls it from the full-block KVarN commit walk when the HiSparse BDR source pool
+is active. That native writer consumes the production paged latent block view
+and fills C-KV low-bit bytes, C-KV scale/zp bytes, and the current 8-bit RoPE
+payload in `KVarNBDRSourcePool`. Blocks that were already committed to the
+legacy side-pool are backfilled into the BDR source pool instead of being
+skipped.
 The dense MLA decode branch also fails closed when a HiSparse coordinator is
 enabled, so an accidentally relaxed planner guard cannot route KVarN-hot
 indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
 path.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
-row-status consumption, and live NIXL/cancel E2E proofs are not complete.
+row-status consumption, B200 compile/proof of the native BDR writer, writer
+stream ordering against NIXL source reads, and live NIXL/cancel E2E proofs are
+not complete.
 This is the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
 
@@ -844,6 +853,13 @@ Current branch status:
   HiSparse-enabled runs. It owns BDR byte-record storage, destination/source
   fragments, commit generations, and recycle invalidation, but deliberately
   does not add a Python FP16-to-BDR serving writer;
+- added `torch.ops.trtllm.mla_bdr_write_kvarn_record`, a native production BDR
+  writer that consumes the paged dense MLA latent block view and fills the
+  `KVarNBDRSourcePool` record with low-bit C-KV, C-KV scale/zp, and the current
+  8-bit RoPE payload;
+- wired the KVarN full-block commit walk to populate the BDR source pool when
+  the HiSparse BDR layout is active, including the backfill case where the
+  legacy side-pool record was already valid but the BDR source record was not;
 - added DSA writer-facing hooks:
   `kvarn_bdr_record_destination_fragments()` returns layer-major writable BDR
   record destinations for the native writer, and
@@ -890,11 +906,11 @@ Still pending before serving enablement:
   `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission,
   including proof that the host tier is mapped/device-addressable on the B200
   deployment image;
-- native dense-MLA BDR writer integration that consumes
-  `kvarn_bdr_record_destination_fragments()` at block commit time, fills
-  `KVarNBDRSourcePool` records, calls `mark_kvarn_bdr_records_committed()` only
-  after the native write succeeds, and keeps the legacy `KVarNLatentPool`
-  restore path separate until it can be retired;
+- B200 compile/live validation of `torch.ops.trtllm.mla_bdr_write_kvarn_record`
+  and proof that its current-stream writes are ordered before any NIXL source
+  read. The commit walk now fills `KVarNBDRSourcePool` records beside the legacy
+  restore side-pool, but promotion still requires the stream-order proof and
+  end-to-end validation;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;
@@ -1132,9 +1148,10 @@ Promotion requires:
    in `mlaKernels.cu` uses low-bit packed C-KV plus per-token/sub-block scale
    and zero point. The branch now allocates a separate
    `KVarNBDRSourcePool` for HiSparse source records and rejects legacy side-pool
-   pointers at the host-write boundary. The remaining required work is to wire
-   the native dense-MLA BDR writer to that pool before any hot-read kernel is
-   enabled.
+   pointers at the host-write boundary. The native writer is now wired to that
+   pool at full-block commit time; the remaining required work is B200
+   compile/proof, stream-order validation against NIXL source reads, and the
+   sparse MLA KVarN-hot reader.
 
 ## Immediate Execution Plan
 
@@ -1155,6 +1172,9 @@ production ABI:
    - make `kvarn_k2v2` the dense MLA HiSparse source of truth;
    - align host/hot packed records with the production BDR layout used by
      `mlaKernels.cu`, including the now-fixed 2-bit read path;
+   - compile/prove `torch.ops.trtllm.mla_bdr_write_kvarn_record` on B200 and
+     verify its C-KV, scale/zp, and RoPE byte fields match the documented
+     `KVarNBDRLayout`;
    - reject any serving configuration that would feed the legacy
      Python/Sinkhorn `KVarNLatentPool` record layout directly into a BDR
      sparse MLA hot-read kernel.

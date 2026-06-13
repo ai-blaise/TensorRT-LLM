@@ -8,6 +8,7 @@ SMC-SD decode path depends on when ``mla_latent_kv_dtype='kvarn_k2v2'``.
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -323,6 +324,60 @@ class _FakeLocalKVarNMetadata:
         self.kv_cache_manager = mgr
 
 
+class _FakeCommitPool:
+    def __init__(self, valid=False):
+        self.valid = torch.zeros(4, dtype=torch.bool)
+        self.valid[1] = bool(valid)
+        self.store_calls = []
+
+    def store_block(self, block_id, ckv, k_pe):
+        self.store_calls.append(
+            (int(block_id), tuple(ckv.shape), tuple(k_pe.shape)))
+        self.valid[int(block_id)] = True
+
+
+class _FakeBDRCommitPool:
+    def __init__(self, valid=False):
+        self.valid_host = np.zeros(4, dtype=bool)
+        self.valid_host[1] = bool(valid)
+
+
+class _FakeDualKVarNManager:
+    kvarn_enabled = True
+    tokens_per_block = 64
+    kvarn_amortize_restore = False
+    kvarn_hisparse_source_layout = KVARN_BDR_HISPARSE_LAYOUT
+    kvarn_cfg = SimpleNamespace(sink_tokens=0, kv_lora_rank=2)
+
+    def __init__(self, *, legacy_valid=False, bdr_valid=False):
+        self.pool = _FakeCommitPool(valid=legacy_valid)
+        self.bdr_pool = _FakeBDRCommitPool(valid=bdr_valid)
+        self.buf = torch.zeros(4, 1, 64, 1, 3, dtype=torch.float16)
+        self.bdr_store_calls = []
+
+    def get_kvarn_latent_pool(self, layer_idx):
+        assert layer_idx == 2
+        return self.pool
+
+    def get_kvarn_hisparse_bdr_pool(self, layer_idx):
+        assert layer_idx == 2
+        return self.bdr_pool
+
+    def get_buffers(self, layer_idx, kv_layout="NHD"):
+        assert layer_idx == 2
+        assert kv_layout == "NHD"
+        return self.buf
+
+    def kvarn_store_block(self, layer_idx, block_id, ckv, k_pe):
+        assert layer_idx == 2
+        self.pool.store_block(block_id, ckv, k_pe)
+
+    def kvarn_store_hisparse_bdr_block(self, layer_idx, block_id, latent_block):
+        assert layer_idx == 2
+        self.bdr_store_calls.append((int(block_id), tuple(latent_block.shape)))
+        self.bdr_pool.valid_host[int(block_id)] = True
+
+
 def test_kvarn_restore_writes_local_layer_main_pool(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     mgr = _FakeLocalKVarNManager()
@@ -337,6 +392,35 @@ def test_kvarn_restore_writes_local_layer_main_pool(monkeypatch):
     assert torch.equal(mgr.buf[1, 0, :, 0, :2], mgr.pool.ckv[0])
     assert torch.equal(mgr.buf[1, 0, :, 0, 2:], mgr.pool.kpe[0])
     assert mgr.pool.restored_marked == [1]
+
+
+def test_kvarn_commit_full_blocks_populates_bdr_pool_when_legacy_already_valid():
+    metadata = _FakeLocalKVarNMetadata(
+        _FakeDualKVarNManager(legacy_valid=True, bdr_valid=False))
+    attn = DSATrtllmAttention.__new__(DSATrtllmAttention)
+    attn.layer_idx = 2
+
+    DSATrtllmAttention.kvarn_commit_full_blocks(
+        attn, metadata, is_generation=False)
+
+    mgr = metadata.kv_cache_manager
+    assert mgr.pool.store_calls == []
+    assert mgr.bdr_store_calls == [(1, (64, 3))]
+    assert bool(mgr.bdr_pool.valid_host[1])
+
+
+def test_kvarn_commit_full_blocks_writes_legacy_and_bdr_records():
+    metadata = _FakeLocalKVarNMetadata(
+        _FakeDualKVarNManager(legacy_valid=False, bdr_valid=False))
+    attn = DSATrtllmAttention.__new__(DSATrtllmAttention)
+    attn.layer_idx = 2
+
+    DSATrtllmAttention.kvarn_commit_full_blocks(
+        attn, metadata, is_generation=False)
+
+    mgr = metadata.kv_cache_manager
+    assert mgr.pool.store_calls == [(1, (64, 2), (64, 1))]
+    assert mgr.bdr_store_calls == [(1, (64, 3))]
 
 
 def _smooth_latent(group: int, cfg, seed: int):
