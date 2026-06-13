@@ -64,10 +64,13 @@ implementation phase, runtime fallback, config mode, or deployment candidate.
 ## Relevant SGLang Facts
 
 SGLang HiSparse is decode-side hierarchical memory for DSA/DSv4 models. The
-guide states that prefill is transparent, decode keeps only a small hot device
-buffer, and the complete KV lives in CPU pinned memory. In PD mode, prefill
-writes KV directly to decode host memory via RDMA. For DeepSeek V4, SGLang
-writes only C4 KV to host and keeps the indexer/C128 path device-to-device.
+guide states that prefill model execution is transparent, decode keeps only a
+small hot device buffer, and the complete KV lives in CPU pinned memory. In PD
+mode, prefill writes KV directly to decode host memory via RDMA. For DeepSeek
+V4, SGLang writes only C4 KV to host and keeps the indexer/C128 path
+device-to-device. In OP-TRT, "prefill transparent" means no target-model compute
+detour: the prefill transceiver still has to expose/write NIXL host descriptors
+for the production packed KVarN host tier.
 
 Implementation details worth preserving:
 
@@ -176,7 +179,7 @@ also reduces LRU pressure because many top-k tokens share a block.
 Add these fields under `sparse_attention_config`:
 
 ```yaml
-hisparse_enabled: false
+hisparse_enabled: false  # schema default while gated; promotion candidate sets true
 hisparse_mode: dense_mla_kvarn
 hisparse_direct_to_host: true
 hisparse_indexer_host_tier: false
@@ -199,8 +202,14 @@ Validation:
   HiSparse-aware reuse adapter is implemented.
 - direct-to-host requires `cache_transceiver_config.backend=NIXL` and
   `transceiver_runtime=PYTHON`.
+- `hisparse_enabled=true` production manifests must set
+  `hisparse_direct_to_host=true`; completed-prefill/full-HBM variants are
+  separate baselines, not an enabled-HiSparse fallback.
 - if HiSparse setup fails and `hisparse_fail_closed=true`, startup should fail
   rather than silently using full-HBM sparse attention.
+- startup validation should reject FP16 host/hot serving tiers, direct-to-host
+  disabled with HiSparse enabled, Indexer K KVarN selection, or any staging
+  fallback marker in production manifests.
 
 ## Host Pool Layout
 
@@ -632,7 +641,8 @@ A/B matrix:
 - hot blocks/request: 32, 64, 96, 128;
 - host/device ratio: 5, 8, 10;
 - NIXL plugin: LIBFABRIC, UCX;
-- direct-to-host on/off;
+- direct-to-host on for every HiSparse candidate; completed-prefill/full-HBM
+  paths may be measured as separate baselines, not runtime fallbacks;
 - packed KVarN hot-pool ABI and BDR/on-read kernel variants only;
 - TP4 vs alternate TP/EP settings;
 - `free_gpu_memory_fraction` decode sweep;
@@ -643,6 +653,8 @@ Promotion requires:
 
 - no correctness regression;
 - no fallback logs;
+- startup logs prove the packed KVarN HiSparse production path, NIXL
+  direct-to-host, BDR/on-read dequant, and Indexer K device residency are active;
 - no leaked request pins;
 - no leaked host/hot blocks;
 - no NIXL mid-write free;
