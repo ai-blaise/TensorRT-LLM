@@ -1447,13 +1447,13 @@ class OPTRTHiSparseCoordinator:
                 "before the native packed KVarN copy bridge; no Python schedule "
                 "materialization or synchronous host readback is allowed.")
         if not self._torch_cuda_op_registered(
-                "trtllm::hisparse_swap_in_packed_kvarn"):
+                "trtllm::hisparse_submit_packed_kvarn_copy_schedule"):
             raise NotImplementedError(
-                "trtllm::hisparse_swap_in_packed_kvarn is not registered with "
-                "a CUDA kernel. "
-                "HiSparse must copy packed KVarN miss blocks from NIXL-writable "
-                "host tiers into the hot device tier before sparse MLA reads "
-                "them; no FP16 staging path or full-HBM fallback is allowed.")
+                "trtllm::hisparse_submit_packed_kvarn_copy_schedule is not "
+                "registered with a CUDA kernel. HiSparse must consume compact "
+                "device miss schedules and submit stream-ordered packed KVarN "
+                "host-to-hot copies before sparse MLA reads the hot tier; the "
+                "CPU-slot-vector swap helper is not a serving-ready copy bridge.")
         if not self._torch_cuda_op_registered(
                 "trtllm::hisparse_commit_hot_slots"):
             raise NotImplementedError(

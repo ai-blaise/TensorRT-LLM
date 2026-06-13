@@ -740,8 +740,9 @@ Current branch status:
   paged block positions without changing Indexer/HISA scoring;
 - added `trtllm::hisparse_topk_to_block_positions`, a native CUDA shared-memory
   hash dedupe primitive that maps request-relative TopK tokens to unique
-  request-relative block positions and emits device overflow flags without a
-  host sync;
+  request-relative block positions, emits device overflow flags without a host
+  sync, and marks overflowed rows with an invalid block count so downstream
+  native status checks reject clipped hot sets fail-closed;
 - added `trtllm::hisparse_resolve_blocks_to_host_slots`, a native CUDA request
   table resolver that consumes row request ids, block rows/counts, device
   request ids, block-to-host-slot rows, commit generations, and admission flags
@@ -785,7 +786,7 @@ Still pending before serving enablement:
   `commit_gen` only after typed HiSparse host writes succeed for the relevant
   layer/block coverage;
 - VM compile and live validation of the native
-  `trtllm::hisparse_swap_in_packed_kvarn` packed-copy op;
+  `trtllm::hisparse_swap_in_packed_kvarn` CPU-schedule packed-copy helper;
 - VM compile and live validation of the native
   `trtllm::hisparse_topk_to_block_positions` planner primitive;
 - VM compile and live validation of the native
@@ -798,8 +799,9 @@ Still pending before serving enablement:
   `trtllm::hisparse_commit_hot_slots` post-copy metadata commit op;
 - VM compile and live validation of the native
   `trtllm::hisparse_build_hot_indices` hot global-index builder;
-- implementation and VM proof of the native device-plan-to-copy bridge between
-  `hisparse_plan_hot_slots` and packed KVarN host-to-hot copy submission;
+- implementation and VM proof of the native device-plan-to-copy bridge,
+  `trtllm::hisparse_submit_packed_kvarn_copy_schedule`, between
+  `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;
@@ -837,7 +839,7 @@ Current branch status:
   `trtllm::hisparse_resolve_blocks_to_host_slots`,
   `trtllm::hisparse_plan_hot_slots`,
   `trtllm::hisparse_compact_miss_schedule`,
-  `trtllm::hisparse_swap_in_packed_kvarn`,
+  `trtllm::hisparse_submit_packed_kvarn_copy_schedule`,
   `trtllm::hisparse_commit_hot_slots`, and
   `trtllm::hisparse_build_hot_indices` ops before it can proceed;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is

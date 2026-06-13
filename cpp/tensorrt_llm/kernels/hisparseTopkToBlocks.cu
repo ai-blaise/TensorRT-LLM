@@ -148,6 +148,7 @@ __global__ void hisparseTopkToBlockPositionsKernel(int32_t const* __restrict__ t
 
     int32_t const count = *selectedCount;
     int32_t const clippedCount = count < maxBlocksPerRow ? count : maxBlocksPerRow;
+    uint8_t const didOverflow = static_cast<uint8_t>((*overflow != 0) || (count > maxBlocksPerRow));
     int32_t* rowBlocks = blockPositions + static_cast<int64_t>(row) * maxBlocksPerRow;
     for (int32_t i = threadIdx.x; i < maxBlocksPerRow; i += blockDim.x)
     {
@@ -155,8 +156,11 @@ __global__ void hisparseTopkToBlockPositionsKernel(int32_t const* __restrict__ t
     }
     if (threadIdx.x == 0)
     {
-        blockCounts[row] = clippedCount;
-        overflowFlags[row] = static_cast<uint8_t>((*overflow != 0) || (count > maxBlocksPerRow));
+        // Propagate overflow through the existing native status path. The
+        // resolver treats counts wider than max_blocks_per_row as invalid, so
+        // an enabled HiSparse path cannot silently serve a clipped hot set.
+        blockCounts[row] = didOverflow ? maxBlocksPerRow + 1 : clippedCount;
+        overflowFlags[row] = didOverflow;
     }
 }
 
