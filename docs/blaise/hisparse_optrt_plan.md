@@ -163,7 +163,11 @@ the 512-wide latent value output. It also consumes the `explicit_sink_tail_v1`
 resident-read sentinel: committed blocks read packed-hot BDR records, while
 sink/tail hits resolve the original request-relative TopK token through the
 live normal decode block table and read bf16/fp16 latent K/V from the resident
-normal-KV pool. This is a real KVarN-hot producer-load path, and the HiSparse
+normal-KV pool. Because the native resident classifier is block-major, the
+descriptor and op wrapper now require resident `sink_tokens` to be an exact
+multiple of `tokens_per_block`; partial sink blocks fail closed instead of
+being truncated into `sink_tokens // tokens_per_block`. This is a real
+KVarN-hot producer-load path, and the HiSparse
 absorption-generation branch now calls it through the typed descriptor before
 any NVFP4 or full-HBM path can run. It is not yet promoted: the new
 `torch.ops.trtllm.hisparse_sparse_mla_resident_v1_ready()` readiness surface
@@ -1222,8 +1226,11 @@ Current branch status:
   complete set when provided: row kv-lens, row request indices, row request
   ids, normal-KV pool view, normal-KV block table, original request-relative
   TopK token positions, tail block positions, tail token counts, tail validity,
-  and sink token/block counts. The production attention call passes these
-  fields from the descriptor into the op. The CUDA kernel now uses the
+  and sink token/block counts. Sink tokens must be block-aligned because the
+  planner classifies resident ownership per selected block; partial sink blocks
+  remain fail-closed until a per-token resident classifier exists. The
+  production attention call passes these fields from the descriptor into the op.
+  The CUDA kernel now uses the
   resident-read sentinel to select resident normal-KV reads for sink/tail hits;
   the separate readiness op remains false until live runtime proof is complete;
 - the native planner ABI now has `trtllm::hisparse_classify_resident_blocks`,
@@ -1532,7 +1539,9 @@ production ABI:
      resident-token ABI before flipping the resident-v1 readiness op:
      - descriptor policy string/version:
        `explicit_sink_tail_v1`;
-     - per-row sink coverage derived from `sink_tokens / tokens_per_block`;
+     - per-row sink coverage derived from block-aligned
+       `sink_tokens / tokens_per_block`; partial sink blocks fail closed rather
+       than being truncated by integer division;
      - per-row tail block position/validity derived from the generation
        `kv_lens` visible to DSA metadata;
      - source references to the normal resident decode KV path for valid

@@ -386,6 +386,35 @@ def test_hisparse_resident_token_descriptor_derives_sink_tail_geometry():
     assert desc.tail_valid.tolist() == [True, False, False, True]
 
 
+def test_hisparse_resident_token_descriptor_rejects_partial_sink_block():
+    coordinator = OPTRTHiSparseCoordinator(
+        _cfg(),
+        kv_cache_manager=SimpleNamespace(kvarn_cfg=SimpleNamespace(
+            sink_tokens=96)))
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=126976,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2,
+                                       kvarn_bits=2)
+    metadata = SimpleNamespace(
+        kv_lens_cuda_runtime=torch.tensor([130], dtype=torch.int32),
+        num_contexts=0,
+        num_generations=1,
+        _cached_pool_view=torch.empty((32, 1, 576), dtype=torch.bfloat16),
+        _cached_block_table_gen=torch.arange(4,
+                                             dtype=torch.int32).view(1, 4),
+    )
+
+    with pytest.raises(NotImplementedError, match="block-aligned"):
+        coordinator._make_resident_token_descriptor(  # noqa: SLF001
+            metadata=metadata,
+            req_idx=torch.tensor([0], dtype=torch.int64),
+            row_request_ids=torch.tensor([7001], dtype=torch.int64),
+            is_generation=True,
+        )
+
+
 def test_hisparse_sparse_mla_descriptor_records_coordinator_step():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
     coordinator.configure_packed_tiers(num_layers=1,
@@ -778,6 +807,7 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "checkResidentTokenAbi" in thop_source
     assert "hisparse_sparse_mla_resident_v1_ready" in thop_source
     assert "return false" in thop_source
+    assert "resident_sink_tokens must be a multiple of tokens_per_block" in thop_source
     assert "explicit_sink_tail_v1 requires resident_kv_lens" in thop_source
     assert "and request_topk_indices" in thop_source
     assert "request_topk_indices must be int32" in thop_source

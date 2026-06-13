@@ -154,6 +154,9 @@ void checkResidentTokenAbi(at::Tensor const& q, at::Tensor const& indices, int64
     TORCH_CHECK(residentTailValid->dim() == 1 && residentTailValid->size(0) == rows,
         "resident_tail_valid must have shape [batch * s_q]");
     TORCH_CHECK(residentSinkTokens >= 0 && residentSinkBlocks >= 0, "resident sink counts must be non-negative");
+    TORCH_CHECK(residentSinkTokens % tokensPerBlock == 0,
+        "resident_sink_tokens must be a multiple of tokens_per_block for explicit_sink_tail_v1 because "
+        "resident sink/tail ownership is classified per selected block");
     TORCH_CHECK(residentSinkBlocks == residentSinkTokens / tokensPerBlock,
         "resident_sink_blocks must equal resident_sink_tokens / tokens_per_block for explicit_sink_tail_v1");
 }

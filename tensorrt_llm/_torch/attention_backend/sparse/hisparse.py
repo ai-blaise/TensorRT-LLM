@@ -1163,6 +1163,13 @@ class OPTRTHiSparseCoordinator:
         tail_token_count = (row_kv_lens % tokens_per_block).to(torch.int32)
         tail_valid = tail_token_count.ne(0)
         sink_tokens = self._resident_sink_tokens()
+        if sink_tokens % tokens_per_block != 0:
+            raise NotImplementedError(
+                "HiSparse explicit_sink_tail_v1 requires resident sink_tokens "
+                "to be block-aligned. The native planner classifies resident "
+                "sink/tail ownership per selected block, so partial sink "
+                f"blocks are fail-closed for now: sink_tokens={sink_tokens}, "
+                f"tokens_per_block={tokens_per_block}.")
         sink_blocks = sink_tokens // tokens_per_block
 
         return HiSparseResidentTokenDescriptor(
