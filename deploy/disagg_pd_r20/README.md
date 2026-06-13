@@ -3,7 +3,7 @@
 Disaggregated prefill/decode Dynamo deploy for the production STARTING topology,
 with the custom pieces toggled ON.
 
-## Topology (single 8xB200 node, a4-us-002-rl9 / k3s)
+## Topology (single 8xB200 node, a4-us-001-rl9 / k3s)
 
 | Worker   | GPUs  | Parallelism            | Custom piece ON                              |
 |----------|-------|------------------------|----------------------------------------------|
@@ -14,7 +14,7 @@ with the custom pieces toggled ON.
 This is 1P x 4GPU + 1D x 4GPU disaggregated serving with real LayerSplit on
 prefill (`TP2 x CP2`) and non-CP decode (`TP4 x CP1`).
 
-## Why node 002 (k3s)
+## Why node 001 (k3s)
 
 The disaggregated P/D artifact is the `DynamoGraphDeployment` CRD
 (`nvidia.com/v1alpha1`), which is k3s-native and is the pre-A/B artifact for
@@ -22,6 +22,10 @@ the NIXL + LayerSplit + request-pinning gate. The r20 DGD now carries the SMC-SD
 GLM draft decode config; standalone aggregated SMC launch paths are not the
 production gate, and generic/GQA KVarN remains fail-closed until its readiness
 guard is promoted.
+
+Current operational constraint: do not use `a4-us-002-rl9`. All active r20
+preflight, build, cache, and deployment work in this lane targets
+`a4-us-001-rl9` unless the operator explicitly changes that constraint later.
 
 ## Image
 
@@ -49,8 +53,8 @@ envsubst '$UNIFIED_IMAGE' < topo-c1-dp2tp4-disagg-r20.yaml | \
   KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
 ```
 
-`hf-token-secret` (namespace `dynamo-system`) and a `/models` host directory must
-exist on a4-us-002-rl9.
+`hf-token-secret` (namespace `dynamo-system`) and a `/models` host directory
+must exist on `a4-us-001-rl9`.
 
 ## Fast iteration path
 
@@ -224,21 +228,11 @@ deploy/disagg_pd_r20/fast_iterate.sh \
   --deploy
 ```
 
-Build and warm an isolated canary DGD on the second B200 VM:
-
-```bash
-deploy/disagg_pd_r20/fast_iterate.sh \
-  --vm 34.106.191.132 \
-  --base-image local/dynamo-trtllm-optrt-custom:<nixl-layer-split-gate-base> \
-  --target-node a4-us-002-rl9 \
-  --dgd-name topo-c1-dp2tp4-disagg-r20-canary \
-  --tag-suffix canary \
-  --deploy
-```
-
-The canary name rewrites both the `DynamoGraphDeployment` and ConfigMap names,
-so it can coexist with the main DGD when there are enough free GPUs. Keep the
-main DGD untouched while a production workload is active.
+The previous isolated-canary recipe for `a4-us-002-rl9` is intentionally not
+documented here because that node is out of rotation for this run. Use the
+non-mutating preflight helpers on `a4-us-001-rl9` first, and only run a second
+DGD if the operator confirms there is enough free GPU capacity on an allowed
+node.
 
 ## Persistent caches
 

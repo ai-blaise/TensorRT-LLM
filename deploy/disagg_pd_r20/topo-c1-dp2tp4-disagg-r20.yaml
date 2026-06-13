@@ -10,8 +10,8 @@
 #       SMC-SD + DeepEP-LL ON (GLM draft with bf16 draft KV; DeepEP low-latency MoE comm)
 #   * 1 Frontend (KV router) -- dynamo.frontend, http :8000
 #
-# Target node: set TARGET_NODE before envsubst. The 001 VM is the canary/build
-# lane before this manifest is rolled onto the more-validated 002 live path.
+# Target node: set TARGET_NODE before envsubst. Current operational constraint:
+# use a4-us-001-rl9 only; do not apply this manifest to a4-us-002-rl9.
 # The disaggregated prefill/decode artifact is this DynamoGraphDeployment CRD
 # (nvidia.com/v1alpha1), which is k3s-native and is the pre-A/B gate for NIXL,
 # LayerSplit owner-local handoff, request pinning, WarpDecode, and dense KVarN.
@@ -20,7 +20,7 @@
 # Parameterized as ${UNIFIED_IMAGE}; confirm the image tag with the build agent
 # before apply.
 # Substitute at deploy time, e.g.:
-#   TARGET_NODE=a4-us-002-rl9 \
+#   TARGET_NODE=a4-us-001-rl9 \
 #   UNIFIED_IMAGE=localhost:5000/local/dynamo-trtllm-optrt-custom:<nixl-layer-split-gate-tag> \
 #     envsubst < topo-c1-dp2tp4-disagg-r20.yaml | \
 #     KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f -
