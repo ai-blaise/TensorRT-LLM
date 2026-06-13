@@ -127,6 +127,26 @@ work and do NOT idle the GPU. Conclusion REINFORCED: throughput is gated by GPU 
 wins must cut kernels (structural/megakernel) or fuse (1b). The 620µs idle is small
 kernel-to-kernel scheduling gaps (launch-overhead, → fewer kernels = megakernel territory).
 
+## All-spots dig (2026-06-13) — status of every profile spot
+
+| spot | µs/iter | dug verdict | action |
+|---|---|---|---|
+| Dense GEMM swarm | 6460 | at-floor (~14µs/GEMM, all backends; microbench §10.1) | **megakernel** (parked, structural) |
+| MLA absorb BMMs | 2390 | same small-M FP4 kernel class as dense GEMMs → same fixed floor | megakernel (parked) |
+| MoE a2a | 2080 | latency-bound on FIFO handshake | **FIFO_DEPTH 4→8 DONE** (`59e909469`, building); structural pipelining parked |
+| elementwise/copy glue | 1833 | host-overlapped at c16 (GPU 96.5% busy) → won't move throughput; latent_cache cat NOT removable (verified) | deprioritized (c1/graph only) |
+| indexer top-k + routing | 1240 | `use_cute_dsl_topk` already on; Spencer-optimized | at-floor (parked) |
+| quant storm | 1094 | ~60% norm-adjacent | **1b foundation DONE** (`9295cf895`, inert); wiring next |
+| memsetExpertIds | 584 | per-layer recv-tail pad; launch-bound, grid already SM-wide | folds into a2a payload only (structural) |
+| GPU idle / bubble | 620 | steady 96.5% busy — NO recoverable bubble (gap_analysis) | n/a — confirms kernel-bound |
+
+**Honest conclusion of the dig:** the stack is genuinely well-optimized (Spencer's work). The big spots
+(GEMM 6.5ms, BMMs 2.4ms, a2a-structural) are all **at their kernel-class floor → megakernel/comm-pipeline
+projects**, not config wins. The implementable wins are **FIFO_DEPTH** (building, A/B pending) and **1b**
+(foundation landed inert; the forward+graph wiring is the focused next step, ~0.5ms). The glue is
+host-overlapped (no throughput impact at 96.5% GPU-busy). No quick breadth of wins exists — the headroom
+is structural.
+
 ## Findings log
 - 2026-06-13: 3 parallel investigations complete (glue / quant / a2a). Crux confirmed:
   fused norm+quant op exists & wired, just disabled for V3.2 (1b = enablement). a2a is
