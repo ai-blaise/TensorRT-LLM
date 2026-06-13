@@ -22,8 +22,9 @@ from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
     OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
-    KVarNLatentPool, KVARN_BDR_HISPARSE_LAYOUT, KVARN_LEGACY_SIDEPOOL_LAYOUT,
-    kvarn_latent_bytes_per_token, resolve_kvarn_config)
+    KVarNBDRSourcePool, KVarNLatentPool, KVARN_BDR_HISPARSE_LAYOUT,
+    KVARN_LEGACY_SIDEPOOL_LAYOUT, kvarn_latent_bytes_per_token,
+    resolve_kvarn_config)
 
 
 def _layersplit_compute_active_block_ids(metadata):
@@ -5595,6 +5596,7 @@ class DSACacheManager(KVCacheManager):
             getattr(sparse_attn_config, "mla_latent_kv_amortize", False)
             or os.environ.get("TRTLLM_KVARN_AMORTIZE", "") in ("1", "true", "True"))
         self.kvarn_latent_pool_per_layer = []
+        self.kvarn_hisparse_bdr_pool_per_layer = []
         self.kvarn_hisparse_source_layout = None
         if self.kvarn_cfg is not None:
             # The KVarN side-pool mirrors the dense MLA KV pool, not the
@@ -5612,6 +5614,25 @@ class DSACacheManager(KVCacheManager):
                 for _ in range(self.num_local_layers)
             ]
             self.kvarn_hisparse_source_layout = KVARN_LEGACY_SIDEPOOL_LAYOUT
+            if bool(getattr(sparse_attn_config, "hisparse_enabled", False)):
+                hisparse_layout = self.kvarn_cfg.hisparse_bdr_layout(
+                    self.tokens_per_block)
+                self.kvarn_hisparse_bdr_pool_per_layer = [
+                    KVarNBDRSourcePool(self.num_blocks, hisparse_layout, dev)
+                    for _ in range(self.num_local_layers)
+                ]
+                self.kvarn_hisparse_source_layout = (
+                    KVARN_BDR_HISPARSE_LAYOUT)
+                logger.info(
+                    "HiSparse KVarN BDR source pool allocated (%s): group=%d, "
+                    "%d B/block, %d blocks x %d layers = %.2f GiB. Native "
+                    "BDR writer and sparse MLA hot reader remain required "
+                    "before serving can be enabled.",
+                    hisparse_layout.name, self.tokens_per_block,
+                    hisparse_layout.packed_bytes_per_block, self.num_blocks,
+                    self.num_local_layers,
+                    hisparse_layout.packed_bytes_per_block * self.num_blocks
+                    * self.num_local_layers / 2**30)
             logger.info(
                 "KVarN MLA-latent backend ENABLED (%s): group=%d, "
                 "%d B/block, %.3f bits/elem, side-pool %d blocks x %d layers "
@@ -6101,6 +6122,16 @@ class DSACacheManager(KVCacheManager):
             return None
         return self.kvarn_latent_pool_per_layer[layer_offset]
 
+    def get_kvarn_hisparse_bdr_pool(self, layer_idx: int) -> "KVarNBDRSourcePool":
+        """Production BDR source pool for a local dense-MLA HiSparse layer."""
+        pools = getattr(self, "kvarn_hisparse_bdr_pool_per_layer", None)
+        if not pools:
+            return None
+        layer_offset = self.layer_offsets.get(layer_idx)
+        if layer_offset is None:
+            return None
+        return pools[layer_offset]
+
     def kvarn_store_block(self, layer_idx: int, block_id: int,
                           ckv, k_pe) -> None:
         """Quantize+commit one full fp16 latent block into the side-pool."""
@@ -6131,7 +6162,7 @@ class DSACacheManager(KVCacheManager):
         ptr_parts = []
         size_parts = []
         for layer_idx in layer_indices:
-            pool = self.get_kvarn_latent_pool(int(layer_idx))
+            pool = self.get_kvarn_hisparse_bdr_pool(int(layer_idx))
             if pool is None:
                 raise RuntimeError(
                     "HiSparse direct-to-host cannot source non-local KVarN "
@@ -6179,10 +6210,17 @@ class DSACacheManager(KVCacheManager):
         ids = [b for b in block_ids if 0 <= b < self.num_blocks]
         if not ids:
             return
-        pools = self.kvarn_latent_pool_per_layer
-        dev_ids = torch.as_tensor(ids, dtype=torch.long,
-                                  device=pools[0].device)
+        pools = list(self.kvarn_latent_pool_per_layer)
+        pools.extend(getattr(self, "kvarn_hisparse_bdr_pool_per_layer", []))
+        if not pools:
+            return
+        dev_ids_by_device = {}
         for pool in pools:
+            device = getattr(pool, "device", None)
+            if device not in dev_ids_by_device:
+                dev_ids_by_device[device] = torch.as_tensor(
+                    ids, dtype=torch.long, device=device)
+            dev_ids = dev_ids_by_device[device]
             pool.invalidate_blocks(ids, dev_ids)
 
     def free_resources(self, request, pin_on_release: bool = False):

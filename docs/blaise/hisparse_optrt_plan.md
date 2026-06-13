@@ -114,13 +114,14 @@ The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
 did not pass it into the CUDA kernel, which meant `kvarn_k2v2` could be read
 through the default 4-bit path. The launcher now forwards the validated bit
 width, so dense MLA KVarN readback uses the selected 2-bit production mode.
-The coordinator now also refuses to derive HiSparse host/hot tier sizes from
-the legacy Python/Sinkhorn `KVarNLatentPool` record. HiSparse tier derivation
-requires a production BDR layout descriptor (`bdr_ckv_lowbit_fp8_pe_v1`) and a
-matching source-pool layout; the current DSA side-pool advertises
-`legacy_sinkhorn_v1`, so enabled HiSparse fails closed before allocating
-misleading hot records. The direct-to-host fragment API has the same guard and
-will not publish legacy side-pool pointers as HiSparse host-write sources.
+The coordinator refuses to derive HiSparse host/hot tier sizes from the legacy
+Python/Sinkhorn `KVarNLatentPool` record. HiSparse tier derivation requires a
+production BDR layout descriptor (`bdr_ckv_lowbit_fp8_pe_v1`) and a matching
+source-pool layout. When `hisparse_enabled=true`, DSA now allocates a separate
+production-shaped BDR source pool per local layer and marks that as the
+HiSparse source layout; the legacy side-pool remains only for amortized
+restore. The direct-to-host fragment API has the same guard and will not
+publish legacy side-pool pointers as HiSparse host-write sources.
 The dense MLA decode branch also fails closed when a HiSparse coordinator is
 enabled, so an accidentally relaxed planner guard cannot route KVarN-hot
 indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
@@ -832,6 +833,10 @@ Current branch status:
   `bdr_ckv_lowbit_fp8_pe_v1` source records before deriving HiSparse tier
   sizes, and rejects the current `legacy_sinkhorn_v1` KVarN side-pool rather
   than allocating host/hot buffers with the wrong ABI;
+- added a production-shaped `KVarNBDRSourcePool` and DSA allocation path for
+  HiSparse-enabled runs. It owns BDR byte-record storage, destination/source
+  fragments, commit generations, and recycle invalidation, but deliberately
+  does not add a Python FP16-to-BDR serving writer;
 - guarded `kvarn_packed_source_fragments()` with the same production-layout
   requirement so NIXL direct-to-host cannot transfer legacy KVarN records into
   the HiSparse host tier;
@@ -873,9 +878,10 @@ Still pending before serving enablement:
   `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission,
   including proof that the host tier is mapped/device-addressable on the B200
   deployment image;
-- migration or native adaptation of the dense-MLA KVarN source pool from
-  `legacy_sinkhorn_v1` to the production BDR HiSparse record layout
-  `bdr_ckv_lowbit_fp8_pe_v1`;
+- native dense-MLA BDR writer integration that fills `KVarNBDRSourcePool`
+  records at block commit time, marks commit generations only after the native
+  write succeeds, and keeps the legacy `KVarNLatentPool` restore path separate
+  until it can be retired;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;

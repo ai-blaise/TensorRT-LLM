@@ -260,8 +260,9 @@ For `kvarn_k2v2` with 64-token blocks, that record is 13,312 bytes:
 byte payload. The descriptor records both the requested `v2` PE setting and the
 current 8-bit PE storage used by this BDR hot-record contract. HiSparse must
 not feed the legacy side-pool record into a BDR sparse-MLA hot-read kernel;
-current code fails closed until the source pool is migrated or adapted to the
-BDR layout.
+current code allocates a separate `KVarNBDRSourcePool` for HiSparse-enabled
+runs and fails closed until a native BDR writer fills that pool and
+`sparse_mla_decode_kvarn_hot` consumes it.
 
 ### Focused validation commands
 

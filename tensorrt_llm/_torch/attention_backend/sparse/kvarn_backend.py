@@ -142,6 +142,114 @@ class KVarNBDRLayout:
         }
 
 
+class KVarNBDRSourcePool:
+    """Production-shaped BDR KVarN records for HiSparse direct-to-host.
+
+    The writer for this pool must be the native BDR path. This class owns the
+    storage, commit metadata, pointer fragments, and recycle invalidation; it
+    deliberately does not offer an FP16-to-BDR Python quantization serving path.
+    Tests may inject already-packed bytes through ``commit_record_bytes``.
+    """
+
+    storage_layout_name = KVARN_BDR_HISPARSE_LAYOUT
+
+    def __init__(self, num_blocks: int, layout: KVarNBDRLayout,
+                 device: torch.device):
+        self.num_blocks = int(num_blocks)
+        self.layout = layout
+        self.group = int(layout.tokens_per_block)
+        self.device = device
+        self.bytes_per_block = int(layout.packed_bytes_per_block)
+        self.store = torch.zeros((self.num_blocks, self.bytes_per_block),
+                                 dtype=torch.uint8, device=device)
+        self.valid = torch.zeros((self.num_blocks,), dtype=torch.bool,
+                                 device=device)
+        self.commit_gen = torch.zeros((self.num_blocks,), dtype=torch.int64,
+                                      device=device)
+        self.valid_host = np.zeros((self.num_blocks,), dtype=bool)
+        self.commit_gen_host = np.zeros((self.num_blocks,), dtype=np.int64)
+
+    def _validate_block_ids(self, block_ids) -> np.ndarray:
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.ndim != 1:
+            raise ValueError("KVarN BDR source fragments require 1D block ids.")
+        if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= self.num_blocks):
+            raise ValueError(
+                f"KVarN BDR source block id out of range: "
+                f"min={int(ids.min())}, max={int(ids.max())}, "
+                f"num_blocks={self.num_blocks}.")
+        return ids
+
+    def record_destination_fragments(self, block_ids) -> tuple[np.ndarray, np.ndarray]:
+        """Return writable BDR-record destinations for the native writer."""
+        ids = self._validate_block_ids(block_ids)
+        if ids.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        ptrs = int(self.store.data_ptr()) + ids * self.bytes_per_block
+        sizes = np.full(ids.size, self.bytes_per_block, dtype=np.int64)
+        return ptrs.astype(np.int64, copy=False), sizes
+
+    def mark_record_committed(self, block_id: int) -> None:
+        """Publish a native-written BDR record as committed."""
+        bid = int(block_id)
+        if bid < 0 or bid >= self.num_blocks:
+            raise ValueError(
+                f"KVarN BDR source block id out of range: {bid}; "
+                f"num_blocks={self.num_blocks}.")
+        self.valid[bid] = True
+        self.commit_gen[bid] += 1
+        self.valid_host[bid] = True
+        self.commit_gen_host[bid] += 1
+
+    def commit_record_bytes(self, block_id: int, record_bytes: torch.Tensor) -> None:
+        """Test helper: install one already-packed BDR record and commit it."""
+        bid = int(block_id)
+        if bid < 0 or bid >= self.num_blocks:
+            raise ValueError(
+                f"KVarN BDR source block id out of range: {bid}; "
+                f"num_blocks={self.num_blocks}.")
+        if record_bytes.dtype != torch.uint8:
+            raise TypeError("KVarN BDR record bytes must be torch.uint8.")
+        flat = record_bytes.reshape(-1)
+        if int(flat.numel()) != self.bytes_per_block:
+            raise ValueError(
+                "KVarN BDR record byte count mismatch: "
+                f"got {int(flat.numel())}, expected {self.bytes_per_block}.")
+        self.store[bid].copy_(flat.to(device=self.device, dtype=torch.uint8))
+        self.mark_record_committed(bid)
+
+    def packed_source_fragments(self, block_ids) -> tuple[np.ndarray, np.ndarray]:
+        """Return source pointers for committed production BDR records."""
+        ids = self._validate_block_ids(block_ids)
+        if ids.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        uncommitted = ids[~self.valid_host[ids]]
+        if uncommitted.size:
+            sample = ", ".join(str(int(x)) for x in uncommitted[:8])
+            raise RuntimeError(
+                "HiSparse direct-to-host requires committed production BDR "
+                f"KVarN records; uncommitted block id(s): {sample}.")
+        ptrs = int(self.store.data_ptr()) + ids * self.bytes_per_block
+        sizes = np.full(ids.size, self.bytes_per_block, dtype=np.int64)
+        return ptrs.astype(np.int64, copy=False), sizes
+
+    def invalidate_blocks(self, block_ids, dev_ids=None) -> None:
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.size == 0:
+            return
+        live = ids[self.valid_host[ids]]
+        if live.size:
+            self.valid_host[live] = False
+        if dev_ids is None:
+            if live.size == 0:
+                return
+            dev_ids = torch.as_tensor(live, dtype=torch.long,
+                                      device=self.device)
+        self.valid[dev_ids] = False
+
+
 @dataclass(frozen=True)
 class KVarNConfig:
     """KVarN MLA-latent backend preset.

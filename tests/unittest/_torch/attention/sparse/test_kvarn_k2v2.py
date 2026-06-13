@@ -15,6 +15,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import DSATrtllmAttention
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
     KVARN_BDR_HISPARSE_LAYOUT,
     KVARN_LEGACY_SIDEPOOL_LAYOUT,
+    KVarNBDRSourcePool,
     KVarNLatentPool,
     parse_kvarn_dtype,
 )
@@ -88,6 +89,39 @@ def test_kvarn_k2v2_hisparse_bdr_layout_is_not_legacy_sidepool():
     assert layout.packed_bytes_per_block != cfg.packed_bytes(64)
 
 
+def test_kvarn_bdr_source_pool_fragments_and_recycle_cpu():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    layout = cfg.hisparse_bdr_layout(group=64)
+    pool = KVarNBDRSourcePool(num_blocks=4, layout=layout,
+                              device=torch.device("cpu"))
+
+    assert pool.storage_layout_name == KVARN_BDR_HISPARSE_LAYOUT
+    assert pool.bytes_per_block == 13312
+    dst_ptrs, dst_sizes = pool.record_destination_fragments([2])
+    assert dst_ptrs.tolist() == [pool.store.data_ptr() +
+                                 2 * pool.bytes_per_block]
+    assert dst_sizes.tolist() == [pool.bytes_per_block]
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        pool.packed_source_fragments([2])
+
+    record = torch.arange(pool.bytes_per_block,
+                          dtype=torch.int64).remainder(256).to(torch.uint8)
+    pool.commit_record_bytes(2, record)
+    assert bool(pool.valid[2])
+    assert int(pool.commit_gen[2]) == 1
+    src_ptrs, src_sizes = pool.packed_source_fragments([2])
+    assert src_ptrs.tolist() == dst_ptrs.tolist()
+    assert src_sizes.tolist() == dst_sizes.tolist()
+
+    pool.invalidate_blocks([2])
+    assert not bool(pool.valid[2])
+    assert not bool(pool.valid_host[2])
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        pool.packed_source_fragments([2])
+
+
 def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
     torch.manual_seed(20260606)
     group = 64
@@ -136,6 +170,30 @@ def test_hisparse_direct_to_host_rejects_legacy_kvarn_source_layout():
 
     with pytest.raises(NotImplementedError, match=KVARN_BDR_HISPARSE_LAYOUT):
         DSACacheManager.kvarn_packed_source_fragments(mgr, [0], [0])
+
+
+def test_hisparse_direct_to_host_uses_bdr_source_pool():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNBDRSourcePool(num_blocks=4,
+                              layout=cfg.hisparse_bdr_layout(group=64),
+                              device=torch.device("cpu"))
+    pool.commit_record_bytes(1, torch.ones(pool.bytes_per_block,
+                                           dtype=torch.uint8))
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = [object()]
+    mgr.kvarn_hisparse_bdr_pool_per_layer = [pool]
+    mgr.kvarn_hisparse_source_layout = KVARN_BDR_HISPARSE_LAYOUT
+    mgr.layer_offsets = {5: 0}
+
+    ptrs, sizes = DSACacheManager.kvarn_packed_source_fragments(
+        mgr, [5], [1])
+
+    assert ptrs.tolist() == [pool.store.data_ptr() + pool.bytes_per_block]
+    assert sizes.tolist() == [pool.bytes_per_block]
 
 
 class _FakeNonLocalKVarNManager:
