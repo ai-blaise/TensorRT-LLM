@@ -999,6 +999,72 @@ def test_hisparse_rx_session_discards_late_success_after_terminal_cancel():
     assert coordinator.request_ready_for_admission(44) is False
 
 
+def test_hisparse_rx_cancel_clears_init_pending_write_before_dispatch_start():
+    from tensorrt_llm._torch.disaggregation.base.transfer import (
+        KVSlice,
+        SessionStatus,
+    )
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        KVRecvTask,
+        RxSession,
+        TaskStatus,
+    )
+
+    coordinator = OPTRTHiSparseCoordinator(_cfg(enabled=True))
+    coordinator.configure_packed_tiers(num_layers=2,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=2048,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2)
+    request_state = coordinator.reserve_request(req_pool_idx=55,
+                                                num_prompt_blocks=1)
+    coordinator.begin_host_write(55)
+
+    task = KVRecvTask(
+        unique_rid=55,
+        kv_slice=KVSlice(),
+        slice_id=0,
+        params=SimpleNamespace(),
+        aux_slot=None,
+    )
+    task.expected_transfers = 1
+    task.status = TaskStatus.INIT
+    task.hisparse_host_slots = np.asarray([0], dtype=np.int64)
+    task.hisparse_pending_write_started = True
+
+    cancel_messages = []
+
+    def send_cancel(unique_rid, endpoints):
+        cancel_messages.append((unique_rid, tuple(sorted(endpoints))))
+
+    session = object.__new__(RxSession)
+    session.lock = threading.Lock()
+    session._kv_tasks = [task]
+    session._receiver = SimpleNamespace(
+        _hisparse_coordinator=coordinator,
+        send_cancel_to_senders=send_cancel,
+    )
+    session._terminal_status = None
+    session.request_id = 55
+    session._closed = True
+    session._sender_endpoints = {"tcp://sender0"}
+    session._base_args = SimpleNamespace(
+        params=SimpleNamespace(disagg_request_id=55, ctx_request_id=None))
+
+    session.cancel()
+
+    assert session._terminal_status == SessionStatus.CANCELLED
+    assert task.status == TaskStatus.ERROR
+    assert task.is_done
+    assert task.hisparse_pending_write_started is False
+    assert request_state.pending_writes == 0
+    assert request_state.admitted is False
+    assert coordinator.host_block_committed(55, 0) is False
+    assert cancel_messages == [(55, ("tcp://sender0", ))]
+    assert session.mark_transferring(0) is False
+    assert task.status == TaskStatus.ERROR
+
+
 def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():
     root = Path(__file__).resolve().parents[5]
     kernel = root / "cpp/tensorrt_llm/kernels/hisparseTopkToBlocks.cu"

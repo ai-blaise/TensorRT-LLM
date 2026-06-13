@@ -1863,11 +1863,18 @@ class Receiver(ReceiverBase):
                 f"dispatch_task: RxSession {task._unique_rid} not found; "
                 "session may have been closed before dispatch"
             )
-        session.mark_transferring(task.slice_id)
         # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
         session._sender_endpoints.update(
             peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks
         )
+        if not session.mark_transferring(task.slice_id):
+            logger.debug(
+                "Receiver.dispatch_task: request %s slice=%s became terminal "
+                "before transfer dispatch; not sending REQUEST_DATA.",
+                task._unique_rid,
+                task.slice_id,
+            )
+            return
         for rank in peer_overlap.ranks:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
@@ -2086,9 +2093,24 @@ class RxSession(RxSessionBase):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
-    def mark_transferring(self, slice_id: int):
+    def mark_transferring(self, slice_id: int) -> bool:
         with self.lock:
-            self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
+            task = self._kv_tasks[slice_id]
+            terminal_status = self._terminal_status
+            if terminal_status in (SessionStatus.ERROR,
+                                   SessionStatus.CANCELLED):
+                self._finish_hisparse_host_write(task)
+                if not task.is_done:
+                    task.fail(
+                        RuntimeError(
+                            f"RxSession {self.disagg_request_id} is already "
+                            f"{terminal_status.value}; not starting "
+                            f"slice={slice_id}."))
+                return False
+            if task.is_done:
+                return False
+            task.status = TaskStatus.TRANSFERRING
+            return True
 
     def receive(self, slice: KVSlice) -> None:
         params = self._base_args.params
@@ -2335,6 +2357,7 @@ class RxSession(RxSessionBase):
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
             for task in self._kv_tasks:
                 if task.status == TaskStatus.INIT:
+                    self._finish_hisparse_host_write(task)
                     task.fail(exc)
         # Send outside the lock to avoid holding it during I/O.
         self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)

@@ -460,6 +460,14 @@ cleanup. The behavior was verified in the deployment-runtime proof image by
 overlaying the patched `transfer.py` onto the installed package and running a
 synthetic cancelled-session host-write scenario; it printed
 `late-success cancel guard passed`.
+The same audit then closed the dispatch-window race where a generation-side
+cancel can arrive after HiSparse host slots are reserved but before
+`Receiver.dispatch_task()` marks the receive task as transferring. INIT tasks
+now finish their pending HiSparse host-write counter during cancel, sender
+endpoints are captured before the transfer state transition, and
+`mark_transferring()` returns false instead of resurrecting a terminal or
+already-failed task. The installed-package proof image was rerun with both
+cancel scenarios and printed `rx cancel race guards passed`.
 
 The final June 13 thoroughness sweep did not identify an accepted runtime
 fallback or serving oracle in the HiSparse path. Remaining references to
@@ -1785,6 +1793,9 @@ Current branch status:
   messages after `ERROR`/`CANCELLED` finish the pending host-write counter but
   do not record HiSparse commit coverage, mark host blocks valid, or admit the
   request;
+- hardened the INIT-before-dispatch cancellation window so a task whose
+  HiSparse host slots were reserved cannot be failed by cancel and then
+  resurrected as `TRANSFERRING` by `Receiver.dispatch_task()`;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -1806,9 +1817,9 @@ Still pending before serving enablement:
   committed before sparse MLA can select them;
 - live cancel/abort testing that proves host slots remain pinned until
   in-flight DRAM writes finish across the full multi-rank NIXL path. The
-  receiver-side late-success/admission guard is implemented and runtime-proven
-  in a synthetic installed-package scenario, but the multi-rank E2E cancel
-  proof is still required;
+  receiver-side late-success/admission guard and INIT-before-dispatch cancel
+  guard are implemented and runtime-proven in synthetic installed-package
+  scenarios, but the multi-rank E2E cancel proof is still required;
 - E2E proof that NIXL writes land directly in decode host slots before decode
   admits the request.
 
