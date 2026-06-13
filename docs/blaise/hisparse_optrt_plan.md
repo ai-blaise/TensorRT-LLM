@@ -54,14 +54,16 @@ But adapt it around OP-TRT's custom contracts:
 7. no silent fallback to non-custom paths is allowed.
 
 The full implementation path must be based on the target model's production
-architecture from the first executable serving path. That means dense MLA
-`kvarn_k2v2` cold/hot storage, FP4 Indexer K + HISA scoring, sparse MLA with
-BDR/on-read dequant, NIXL generation-first direct-to-host, and the r20
-LayerSplit/SMC/Moondream wiring. Do not implement FP16 host/hot tiers in
-serving code. Independent test fixtures may compare against reference tensors
-outside the HiSparse coordinator/transceiver path, but there is no FP16
-block-hot oracle in the serving implementation, runtime fallback, config mode,
-or deployment candidate.
+architecture from the first runtime-reachable HiSparse serving candidate. That
+means dense MLA `kvarn_k2v2` cold/hot storage, FP4 Indexer K + HISA scoring,
+sparse MLA with BDR/on-read dequant, NIXL generation-first direct-to-host, and
+the r20 LayerSplit/SMC/Moondream wiring. Do not implement FP16 host/hot tiers
+in serving code. Independent test fixtures may compare against reference
+tensors outside the HiSparse coordinator/transceiver path, but there is no
+FP16 block-hot oracle in the serving implementation, runtime fallback, config
+mode, or deployment candidate. A path is considered runtime-reachable if it can
+be selected by a manifest, config flag, coordinator branch, transceiver branch,
+attention dispatch, or kernel ABI used by a serving request.
 
 The startup/mapping guard is intentionally granular: enabled HiSparse first
 requires the native planner/copy ops, then the production BDR hot-reader
@@ -214,6 +216,13 @@ NIXL source reads, and live NIXL/cancel E2E proofs are not complete.
 This is the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
 
+The final June 13 thoroughness sweep did not identify an accepted runtime
+fallback or serving oracle in the HiSparse path. Remaining references to
+full-HBM, FP16, or independent references are test/baseline boundaries only:
+they may be used to measure correctness from outside serving, but they must not
+be wired into the coordinator, transceiver, attention dispatch, kernel ABI, or
+deployment configuration as an executable alternative.
+
 ## Final Correctness Sweep
 
 The full implementation must remain production-architecture-first. Partial code
@@ -302,6 +311,27 @@ same ABI shape as the final serving path. The following are hard invariants:
   `-inf` LSE instead of dereferencing a stale slot.
 - Compact copy schedules must fail closed. Any impossible compact row id means
   the schedule is corrupt and no row in that batch may publish hot metadata.
+
+Runtime/test boundary:
+
+- Runtime-reachable HiSparse code may only use production-shaped data:
+  `kvarn_k2v2` BDR records for committed dense MLA blocks, the live normal KV
+  path for resident sink/tail tokens, FP4/HISA Indexer state, NIXL direct
+  host-write metadata, and native row-status propagation.
+- Tests may allocate synthetic tensors only to exercise the production ABI.
+  A synthetic tensor must have the same byte layout, strides, status semantics,
+  and launch contract as the serving path. Synthetic FP16 hot pools, naive
+  token loaders, or all-hot correctness shortcuts cannot be called from DSA,
+  the coordinator, the transceiver, or deployment manifests.
+- Baselines may compare against the existing production full-HBM KVarN path,
+  but that comparison path remains external to enabled HiSparse. It cannot be
+  offered as a fallback after a HiSparse readiness, row-status, copy, or
+  resident-token failure.
+- A microkernel is acceptable only if it is a real producer-load implementation
+  of the production layout. A slower direct per-row/head sparse MLA kernel can
+  be a first runtime-reachable candidate if it consumes packed `kvarn_k2v2`
+  records, row status, and explicit sink/tail descriptors.
+- A pre-dequant "correctness" kernel or FP16 block-hot path cannot be a serving candidate.
 
 CUDA API note: NVIDIA documents `cudaMemcpyBatchAsync()` as a host API over
 host-visible source pointer, destination pointer, and size arrays, and documents
@@ -1439,13 +1469,25 @@ production ABI:
    - include the shared `hisparseKvarnBdrRead.cuh` helper layer for hot-index
      decode and BDR field reads so the validation op and serving producer path
      share one production layout implementation;
-   - base the first executable serving implementation on the target model's
-     production dense-MLA/DSA path and production BDR record layout, not on an
-     intermediate correctness-only path;
+   - base the first runtime-reachable serving implementation on the target
+     model's production dense-MLA/DSA path and production BDR record layout,
+     not on an intermediate correctness-only path;
    - propagate resolve/plan/copy/commit/build row status into attention before
      any row can read hot storage;
-   - keep sink/tail resident policy separate from committed packed blocks and
-     represent that policy explicitly in the kernel ABI;
+   - implement the explicit sink/tail resident-token ABI before relaxing the
+     final readiness guard:
+     - descriptor policy string/version:
+       `explicit_sink_tail_v1`;
+     - per-row sink coverage derived from `sink_tokens / tokens_per_block`;
+     - per-row tail block position/validity derived from the generation
+       `kv_lens` visible to DSA metadata;
+     - source references to the normal resident decode KV path for valid
+       sink/tail hits, not copies through an FP16 hot tier;
+     - row/token status that distinguishes committed-hot hits, resident
+       sink/tail hits, uncommitted invalid hits, and stale-planner failures;
+     - fused producer-load consumption that selects packed-hot BDR reads for
+       committed blocks and resident normal-KV reads for sink/tail tokens
+       before any row can emit output;
    - remove any need for full-working-set restore of committed cold blocks;
    - do not introduce an FP16 block-hot oracle, an NVFP4 sparse-MLA
      compatibility mode, or any executable serving placeholder while wiring
