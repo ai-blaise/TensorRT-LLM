@@ -492,6 +492,27 @@ def test_hisparse_request_table_native_publisher_is_registered_in_sources():
     assert "hisparse_publish_request_table_slots" in fake.read_text()
 
 
+def test_hisparse_kvarn_hot_bdr_reader_is_registered_in_sources():
+    root = Path(__file__).resolve().parents[5]
+    kernel = root / "cpp/tensorrt_llm/kernels/hisparseKvarnHotRead.cu"
+    header = root / "cpp/tensorrt_llm/kernels/hisparseKvarnHotRead.h"
+    thop = root / "cpp/tensorrt_llm/thop/hisparseKvarnHotReadOp.cpp"
+    cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
+    fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
+
+    kernel_source = kernel.read_text()
+    thop_source = thop.read_text()
+    assert "readLowBitKvarnValue" in kernel_source
+    assert "readFp8E4m3Byte" in kernel_source
+    assert "kvarnBits == 2 || kvarnBits == 4" in kernel_source
+    assert "tokensPerBlock == 64" in kernel_source
+    assert "kvLoraRank == 512" in thop_source
+    assert "qkRopeHeadDim == 64" in thop_source
+    assert "hisparse_read_kvarn_hot_bdr" in header.read_text()
+    assert "hisparseKvarnHotReadOp.cpp" in cmake.read_text()
+    assert "hisparse_read_kvarn_hot_bdr" in fake.read_text()
+
+
 def test_hisparse_request_table_slots_are_stable_and_reused():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
     coordinator.configure_packed_tiers(num_layers=1,

@@ -321,6 +321,17 @@ def _register_fake():
                 topk_indices.new_empty((topk_indices.shape[0], ),
                                        dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::hisparse_read_kvarn_hot_bdr")
+    def _(hot_packed, hot_indices, topk_length, row_status, layer_idx,
+          tokens_per_block, kvarn_bits, kv_lora_rank, qk_rope_head_dim):
+        del hot_packed, topk_length, layer_idx, tokens_per_block
+        del kvarn_bits
+        latent_dim = kv_lora_rank + qk_rope_head_dim
+        return (hot_indices.new_empty(
+            (hot_indices.shape[0], hot_indices.shape[1], latent_dim),
+            dtype=torch.bfloat16),
+                row_status.new_empty(row_status.shape))
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.

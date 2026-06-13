@@ -100,6 +100,7 @@ add_library(
   mlaBdrKvarnOp.cpp
   hisparseRequestTableOp.cpp
   hisparseSwapInPackedKvarnOp.cpp
+  hisparseKvarnHotReadOp.cpp
   hisparseTopkToBlocksOp.cpp
   kvarnGqaOp.cpp
   IndexerTopKOp.cpp
