@@ -1321,11 +1321,19 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        send_failed_without_session = False
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
-                self._save_peer_req_info(info)
-                return
+                if info.unique_rid in self._pre_cancelled_rids:
+                    send_failed_without_session = True
+                else:
+                    self._save_peer_req_info(info)
+                    return
+        if session is None:
+            if send_failed_without_session:
+                self._send_failed_result_to_receiver(info)
+            return
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)

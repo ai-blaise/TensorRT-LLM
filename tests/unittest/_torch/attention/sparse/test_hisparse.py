@@ -1065,6 +1065,43 @@ def test_hisparse_rx_cancel_clears_init_pending_write_before_dispatch_start():
     assert task.status == TaskStatus.ERROR
 
 
+def test_hisparse_sender_pre_cancelled_request_data_sends_failed_result():
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        MessageType,
+        RecvReqInfo,
+        Sender,
+    )
+
+    info = RecvReqInfo(
+        sender_req_id=66,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[np.asarray([1], dtype=np.int64)],
+        unique_rid=66,
+        slice_id=0,
+        hisparse_host_slots=np.asarray([0], dtype=np.int64),
+    )
+    saved = []
+    failed = []
+    sender = object.__new__(Sender)
+    sender._shutdown = True
+    sender._sessions_lock = threading.Lock()
+    sender._sessions = {}
+    sender._pre_cancelled_rids = {66}
+    sender._save_peer_req_info = saved.append
+    sender._send_failed_result_to_receiver = failed.append
+
+    sender._respond_with_kv(
+        b"decode0",
+        [MessageType.REQUEST_DATA, info.to_bytes()],
+    )
+
+    assert saved == []
+    assert len(failed) == 1
+    assert failed[0].unique_rid == 66
+    assert failed[0].hisparse_host_slots.tolist() == [0]
+
+
 def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():
     root = Path(__file__).resolve().parents[5]
     kernel = root / "cpp/tensorrt_llm/kernels/hisparseTopkToBlocks.cu"

@@ -468,6 +468,13 @@ endpoints are captured before the transfer state transition, and
 `mark_transferring()` returns false instead of resurrecting a terminal or
 already-failed task. The installed-package proof image was rerun with both
 cancel scenarios and printed `rx cancel race guards passed`.
+The sender side now mirrors that liveness behavior for requests cancelled
+before a context-side `TxSession` exists: if a late `REQUEST_DATA` arrives for
+a rid already present in `_pre_cancelled_rids`, `_respond_with_kv()` sends a
+failed `KV_AGENT_RESULT` instead of saving the peer request for future work.
+The installed-package proof image was rerun across the receiver late-success
+case, receiver INIT-before-dispatch case, and sender pre-cancelled
+`REQUEST_DATA` case; it printed `nixl cancel liveness guards passed`.
 
 The final June 13 thoroughness sweep did not identify an accepted runtime
 fallback or serving oracle in the HiSparse path. Remaining references to
@@ -1796,6 +1803,9 @@ Current branch status:
 - hardened the INIT-before-dispatch cancellation window so a task whose
   HiSparse host slots were reserved cannot be failed by cancel and then
   resurrected as `TRANSFERRING` by `Receiver.dispatch_task()`;
+- hardened sender-side pre-cancel handling so a late `REQUEST_DATA` for a rid
+  already cancelled before `TxSession` creation returns failed status instead
+  of being saved as stale peer request metadata;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -1818,8 +1828,9 @@ Still pending before serving enablement:
 - live cancel/abort testing that proves host slots remain pinned until
   in-flight DRAM writes finish across the full multi-rank NIXL path. The
   receiver-side late-success/admission guard and INIT-before-dispatch cancel
-  guard are implemented and runtime-proven in synthetic installed-package
-  scenarios, but the multi-rank E2E cancel proof is still required;
+  guard, plus the sender-side pre-cancelled `REQUEST_DATA` guard, are
+  implemented and runtime-proven in synthetic installed-package scenarios, but
+  the multi-rank E2E cancel proof is still required;
 - E2E proof that NIXL writes land directly in decode host slots before decode
   admits the request.
 
