@@ -81,6 +81,68 @@ void checkOptionalContiguous(std::optional<at::Tensor> const& tensor, char const
     }
 }
 
+bool anyResidentTensor(std::optional<at::Tensor> const& residentKvLens, std::optional<at::Tensor> const& residentReqIdx,
+    std::optional<at::Tensor> const& residentRequestIds, std::optional<at::Tensor> const& residentBlockTable,
+    std::optional<at::Tensor> const& residentTailBlockPos, std::optional<at::Tensor> const& residentTailTokenCount,
+    std::optional<at::Tensor> const& residentTailValid)
+{
+    return residentKvLens.has_value() || residentReqIdx.has_value() || residentRequestIds.has_value()
+        || residentBlockTable.has_value() || residentTailBlockPos.has_value() || residentTailTokenCount.has_value()
+        || residentTailValid.has_value();
+}
+
+void checkResidentTokenAbi(at::Tensor const& q, int64_t rows, int64_t tokensPerBlock, int64_t residentSinkTokens,
+    int64_t residentSinkBlocks, std::optional<at::Tensor> const& residentKvLens,
+    std::optional<at::Tensor> const& residentReqIdx, std::optional<at::Tensor> const& residentRequestIds,
+    std::optional<at::Tensor> const& residentBlockTable, std::optional<at::Tensor> const& residentTailBlockPos,
+    std::optional<at::Tensor> const& residentTailTokenCount, std::optional<at::Tensor> const& residentTailValid)
+{
+    auto const present = anyResidentTensor(residentKvLens, residentReqIdx, residentRequestIds, residentBlockTable,
+        residentTailBlockPos, residentTailTokenCount, residentTailValid);
+    if (!present)
+    {
+        TORCH_CHECK(residentSinkTokens == 0 && residentSinkBlocks == 0,
+            "resident sink counts require the complete explicit_sink_tail_v1 tensor ABI");
+        return;
+    }
+    TORCH_CHECK(residentKvLens.has_value() && residentReqIdx.has_value() && residentRequestIds.has_value()
+            && residentBlockTable.has_value() && residentTailBlockPos.has_value()
+            && residentTailTokenCount.has_value() && residentTailValid.has_value(),
+        "explicit_sink_tail_v1 requires resident_kv_lens, resident_req_idx, resident_request_ids, "
+        "resident_block_table, resident_tail_block_pos, resident_tail_token_count, and resident_tail_valid");
+    checkSameDevice(q, *residentKvLens, "resident_kv_lens");
+    checkSameDevice(q, *residentReqIdx, "resident_req_idx");
+    checkSameDevice(q, *residentRequestIds, "resident_request_ids");
+    checkSameDevice(q, *residentBlockTable, "resident_block_table");
+    checkSameDevice(q, *residentTailBlockPos, "resident_tail_block_pos");
+    checkSameDevice(q, *residentTailTokenCount, "resident_tail_token_count");
+    checkSameDevice(q, *residentTailValid, "resident_tail_valid");
+    TORCH_CHECK(residentKvLens->scalar_type() == at::ScalarType::Long, "resident_kv_lens must be int64");
+    TORCH_CHECK(residentReqIdx->scalar_type() == at::ScalarType::Long, "resident_req_idx must be int64");
+    TORCH_CHECK(residentRequestIds->scalar_type() == at::ScalarType::Long, "resident_request_ids must be int64");
+    TORCH_CHECK(residentBlockTable->scalar_type() == at::ScalarType::Int, "resident_block_table must be int32");
+    TORCH_CHECK(residentTailBlockPos->scalar_type() == at::ScalarType::Int, "resident_tail_block_pos must be int32");
+    TORCH_CHECK(
+        residentTailTokenCount->scalar_type() == at::ScalarType::Int, "resident_tail_token_count must be int32");
+    TORCH_CHECK(residentTailValid->scalar_type() == at::ScalarType::Bool, "resident_tail_valid must be bool");
+    TORCH_CHECK(residentKvLens->dim() == 1 && residentKvLens->size(0) == rows,
+        "resident_kv_lens must have shape [batch * s_q]");
+    TORCH_CHECK(residentReqIdx->dim() == 1 && residentReqIdx->size(0) == rows,
+        "resident_req_idx must have shape [batch * s_q]");
+    TORCH_CHECK(residentRequestIds->dim() == 1 && residentRequestIds->size(0) == rows,
+        "resident_request_ids must have shape [batch * s_q]");
+    TORCH_CHECK(residentBlockTable->dim() == 2, "resident_block_table must have shape [seqs, blocks]");
+    TORCH_CHECK(residentTailBlockPos->dim() == 1 && residentTailBlockPos->size(0) == rows,
+        "resident_tail_block_pos must have shape [batch * s_q]");
+    TORCH_CHECK(residentTailTokenCount->dim() == 1 && residentTailTokenCount->size(0) == rows,
+        "resident_tail_token_count must have shape [batch * s_q]");
+    TORCH_CHECK(residentTailValid->dim() == 1 && residentTailValid->size(0) == rows,
+        "resident_tail_valid must have shape [batch * s_q]");
+    TORCH_CHECK(residentSinkTokens >= 0 && residentSinkBlocks >= 0, "resident sink counts must be non-negative");
+    TORCH_CHECK(residentSinkBlocks == residentSinkTokens / tokensPerBlock,
+        "resident_sink_blocks must equal resident_sink_tokens / tokens_per_block for explicit_sink_tail_v1");
+}
+
 void checkHotPackedStrides(at::Tensor const& hotPacked, int64_t expectedBytes)
 {
     TORCH_CHECK(hotPacked.stride(2) == 1, "hot_packed records must be byte-contiguous");
@@ -98,7 +160,10 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     th::Tensor const& hotPacked, th::Tensor const& indices, th::Tensor const& rowStatus,
     std::optional<th::Tensor> const& topkLength, std::optional<th::Tensor> const& attnSink, int64_t layerIdx,
     int64_t tokensPerBlock, int64_t strideFactor, int64_t kvarnBits, int64_t kvLoraRank, int64_t qkRopeHeadDim,
-    double smScale)
+    double smScale, std::optional<th::Tensor> const& residentKvLens, std::optional<th::Tensor> const& residentReqIdx,
+    std::optional<th::Tensor> const& residentRequestIds, std::optional<th::Tensor> const& residentBlockTable,
+    std::optional<th::Tensor> const& residentTailBlockPos, std::optional<th::Tensor> const& residentTailTokenCount,
+    std::optional<th::Tensor> const& residentTailValid, int64_t residentSinkTokens, int64_t residentSinkBlocks)
 {
     checkCudaTensor(q, "q");
     checkSameDevice(q, hotPacked, "hot_packed");
@@ -158,6 +223,9 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     {
         TORCH_CHECK(attnSink->dim() == 1 && attnSink->size(0) == hQ, "attn_sink must be [h_q]");
     }
+    checkResidentTokenAbi(q, b * sQ, tokensPerBlock, residentSinkTokens, residentSinkBlocks, residentKvLens,
+        residentReqIdx, residentRequestIds, residentBlockTable, residentTailBlockPos, residentTailTokenCount,
+        residentTailValid);
 
     TORCH_CHECK(q.stride(3) == 1, "q last dimension must be contiguous");
     checkHotPackedStrides(hotPacked, expectedBytes);
@@ -165,6 +233,13 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     TORCH_CHECK(rowStatus.is_contiguous(), "row_status must be contiguous");
     checkOptionalContiguous(topkLength, "topk_length");
     checkOptionalContiguous(attnSink, "attn_sink");
+    checkOptionalContiguous(residentKvLens, "resident_kv_lens");
+    checkOptionalContiguous(residentReqIdx, "resident_req_idx");
+    checkOptionalContiguous(residentRequestIds, "resident_request_ids");
+    checkOptionalContiguous(residentBlockTable, "resident_block_table");
+    checkOptionalContiguous(residentTailBlockPos, "resident_tail_block_pos");
+    checkOptionalContiguous(residentTailTokenCount, "resident_tail_token_count");
+    checkOptionalContiguous(residentTailValid, "resident_tail_valid");
 
     c10::cuda::CUDAGuard deviceGuard(q.device());
     auto out = th::empty({b, sQ, hQ, kDv}, q.options());
@@ -178,6 +253,22 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     params.indices = reinterpret_cast<int32_t*>(indices.data_ptr());
     params.rowStatus = reinterpret_cast<uint8_t*>(rowStatus.data_ptr());
     params.topkLength = topkLength.has_value() ? reinterpret_cast<int32_t*>(topkLength->data_ptr()) : nullptr;
+    params.residentKvLens
+        = residentKvLens.has_value() ? reinterpret_cast<int64_t*>(residentKvLens->data_ptr()) : nullptr;
+    params.residentReqIdx
+        = residentReqIdx.has_value() ? reinterpret_cast<int64_t*>(residentReqIdx->data_ptr()) : nullptr;
+    params.residentRequestIds
+        = residentRequestIds.has_value() ? reinterpret_cast<int64_t*>(residentRequestIds->data_ptr()) : nullptr;
+    params.residentBlockTable
+        = residentBlockTable.has_value() ? reinterpret_cast<int32_t*>(residentBlockTable->data_ptr()) : nullptr;
+    params.residentTailBlockPos = residentTailBlockPos.has_value()
+        ? reinterpret_cast<int32_t*>(residentTailBlockPos->data_ptr())
+        : nullptr;
+    params.residentTailTokenCount = residentTailTokenCount.has_value()
+        ? reinterpret_cast<int32_t*>(residentTailTokenCount->data_ptr())
+        : nullptr;
+    params.residentTailValid
+        = residentTailValid.has_value() ? reinterpret_cast<bool*>(residentTailValid->data_ptr()) : nullptr;
     params.attnSink = attnSink.has_value() ? reinterpret_cast<float*>(attnSink->data_ptr()) : nullptr;
     params.lse = reinterpret_cast<float*>(lse.data_ptr());
     params.out = out.data_ptr();
@@ -190,6 +281,9 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     params.hotCapacity = checkedInt32(hotCapacity, "hot_capacity");
     params.topK = checkedInt32(topK, "topk");
     params.topkLengthSize = topkLength.has_value() ? checkedInt32(topkLength->size(0), "topk_length.size(0)") : 0;
+    params.residentRows = residentKvLens.has_value() ? checkedInt32(residentKvLens->size(0), "resident_rows") : 0;
+    params.residentSinkTokens = checkedInt32(residentSinkTokens, "resident_sink_tokens");
+    params.residentSinkBlocks = checkedInt32(residentSinkBlocks, "resident_sink_blocks");
     params.layerIdx = checkedInt32(layerIdx, "layer_idx");
     params.tokensPerBlock = checkedInt32(tokensPerBlock, "tokens_per_block");
     params.strideFactor = checkedInt32(strideFactor, "stride_factor");
@@ -205,6 +299,8 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     params.strideHotRecord = hotPacked.size(2);
     params.strideIndicesB = indices.stride(0);
     params.strideIndicesSQ = indices.stride(1);
+    params.strideResidentBlockTableB = residentBlockTable.has_value() ? residentBlockTable->stride(0) : 0;
+    params.strideResidentBlockTableBlock = residentBlockTable.has_value() ? residentBlockTable->stride(1) : 0;
     params.strideLseB = lse.stride(0);
     params.strideLseSQ = lse.stride(1);
     params.strideOB = out.stride(0);
@@ -225,7 +321,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "sparse_mla_decode_kvarn_hot(Tensor q, Tensor hot_packed, Tensor indices, Tensor row_status, "
         "Tensor? topk_length=None, Tensor? attn_sink=None, int layer_idx=0, int tokens_per_block=64, "
         "int stride_factor=64, int kvarn_bits=2, int kv_lora_rank=512, int qk_rope_head_dim=64, "
-        "float sm_scale=1.) -> (Tensor, Tensor, Tensor, Tensor)");
+        "float sm_scale=1., Tensor? resident_kv_lens=None, Tensor? resident_req_idx=None, "
+        "Tensor? resident_request_ids=None, Tensor? resident_block_table=None, "
+        "Tensor? resident_tail_block_pos=None, Tensor? resident_tail_token_count=None, "
+        "Tensor? resident_tail_valid=None, int resident_sink_tokens=0, int resident_sink_blocks=0) "
+        "-> (Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

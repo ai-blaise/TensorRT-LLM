@@ -724,12 +724,23 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "hotPacked.size(2) >= expectedBytes" in thop_source
     assert "hot_packed record bytes are smaller than production BDR layout" in thop_source
     assert "checkHotPackedStrides" in thop_source
+    assert "checkResidentTokenAbi" in thop_source
+    assert "explicit_sink_tail_v1 requires resident_kv_lens" in thop_source
+    assert "resident_tail_valid must be bool" in thop_source
+    assert "resident_sink_blocks must equal resident_sink_tokens" in thop_source
+    assert "resident_block_table must have shape [seqs, blocks]" in thop_source
+    assert "resident_kv_lens=None" in thop_source
     assert "prevent overlapping hot records" in thop_source
     assert "prevent overlapping layers" in thop_source
     assert "stride_factor must cover all layer token ranges" in thop_source
+    assert "residentKvLens" in header.read_text()
+    assert "residentTailTokenCount" in header.read_text()
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
-    assert "sparse_mla_decode_kvarn_hot" in fake.read_text()
+    fake_source = fake.read_text()
+    assert "sparse_mla_decode_kvarn_hot" in fake_source
+    assert "resident_kv_lens=None" in fake_source
+    assert "resident_tail_valid=None" in fake_source
 
 
 def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
@@ -802,6 +813,11 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "resident.row_kv_lens.shape[0]" in source
     assert "resident.block_table.device" in source
     assert "resident.tail_token_count.device" in source
+    assert "resident.row_req_idx" in source
+    assert "resident.row_request_ids" in source
+    assert "resident.tail_block_pos" in source
+    assert "resident.tail_valid" in source
+    assert "resident.sink_blocks" in source
     assert "assert_resident_token_policy_ready" in hisparse.read_text()
     assert "HiSparseResidentTokenDescriptor" in hisparse.read_text()
     assert "torch.ops.trtllm.sparse_mla_decode_kvarn_hot" in source

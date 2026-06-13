@@ -1201,6 +1201,14 @@ Current branch status:
   count, and tail validity. The fused attention dispatch rejects same-shape
   cached descriptors from older request steps or descriptors missing matching
   resident-token metadata before they can consume stale hot-slot state;
+- the `trtllm::sparse_mla_decode_kvarn_hot` native op schema now accepts the
+  same `explicit_sink_tail_v1` resident-token tensors and validates them as a
+  complete set when provided: row kv-lens, row request indices, row request
+  ids, normal-KV block table, tail block positions, tail token counts, tail
+  validity, and sink token/block counts. The production attention call passes
+  these fields from the descriptor into the op. The kernel still fails closed
+  at the readiness guard until the CUDA producer-load path actually selects
+  resident normal-KV reads for sink/tail hits;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1215,7 +1223,7 @@ Still pending before serving enablement:
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
-- implement fused sparse MLA consumption of the explicit sink/tail
+- implement CUDA producer-load consumption of the explicit sink/tail
   resident-token ABI so top-k hits on live resident tokens are served through
   the normal decode KV path rather than invalidating rows or being modeled as
   committed packed KVarN blocks;

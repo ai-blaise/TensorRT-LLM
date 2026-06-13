@@ -2782,6 +2782,7 @@ class MLA(nn.Module):
         q_concat = q_concat.view([num_seqs, s_q, padding, head_dim])
         indices = descriptor.hot_indices.reshape(num_seqs, s_q,
                                                  -1).contiguous()
+        resident = descriptor.resident_tokens
 
         out = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
             q_concat,
@@ -2797,6 +2798,15 @@ class MLA(nn.Module):
             descriptor.kv_lora_rank,
             descriptor.qk_rope_head_dim,
             self.softmax_scale,
+            resident.row_kv_lens,
+            resident.row_req_idx,
+            resident.row_request_ids,
+            resident.block_table,
+            resident.tail_block_pos,
+            resident.tail_token_count,
+            resident.tail_valid,
+            resident.sink_tokens,
+            resident.sink_blocks,
         )[0]
         out = out.view([num_tokens, padding, self.kv_lora_rank])
         out = out[:, :self.num_heads_tp_cp, :]

@@ -22,6 +22,13 @@ struct SparseMlaDecodeKvarnHotParams
     int32_t* indices;
     uint8_t* rowStatus;
     int32_t* topkLength;
+    int64_t* residentKvLens;
+    int64_t* residentReqIdx;
+    int64_t* residentRequestIds;
+    int32_t* residentBlockTable;
+    int32_t* residentTailBlockPos;
+    int32_t* residentTailTokenCount;
+    bool* residentTailValid;
     float* attnSink;
     float* lse;
     void* out;
@@ -35,6 +42,9 @@ struct SparseMlaDecodeKvarnHotParams
     int32_t hotCapacity;
     int32_t topK;
     int32_t topkLengthSize;
+    int32_t residentRows;
+    int32_t residentSinkTokens;
+    int32_t residentSinkBlocks;
     int32_t layerIdx;
     int32_t tokensPerBlock;
     int32_t strideFactor;
@@ -51,6 +61,8 @@ struct SparseMlaDecodeKvarnHotParams
     int64_t strideHotRecord;
     int64_t strideIndicesB;
     int64_t strideIndicesSQ;
+    int64_t strideResidentBlockTableB;
+    int64_t strideResidentBlockTableBlock;
     int64_t strideLseB;
     int64_t strideLseSQ;
     int64_t strideOB;
