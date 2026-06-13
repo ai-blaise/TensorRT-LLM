@@ -99,6 +99,13 @@ __global__ void hisparseSubmitPackedKvarnCopyScheduleKernel(uint8_t const* __res
     int32_t const row = compactRowIds[copyIdx];
     if (row < 0 || row >= numRows)
     {
+        // A compact schedule with an impossible row id has no safe owner row to
+        // mark. Fail the whole row-status vector so the commit stage cannot
+        // publish hot metadata for copies that may not have happened.
+        for (int32_t statusRow = threadIdx.x; statusRow < numRows; statusRow += blockDim.x)
+        {
+            rowStatus[statusRow] = kCopyInvalidRow;
+        }
         return;
     }
     if (rowStatus[row] != kCopyOk)

@@ -616,6 +616,23 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "sparse_mla_decode_kvarn_hot" in fake.read_text()
 
 
+def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
+    root = Path(__file__).resolve().parents[5]
+    thop = root / "cpp/tensorrt_llm/thop/hisparseSwapInPackedKvarnOp.cpp"
+    cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
+    fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
+
+    source = thop.read_text()
+    assert "hisparse_submit_packed_kvarn_copy_schedule" in source
+    assert "compactRowIds" in source
+    assert "row < 0 || row >= numRows" in source
+    assert "statusRow < numRows" in source
+    assert "rowStatus[statusRow] = kCopyInvalidRow" in source
+    assert "commit stage cannot" in source
+    assert "hisparseSwapInPackedKvarnOp.cpp" in cmake.read_text()
+    assert "hisparse_submit_packed_kvarn_copy_schedule" in fake.read_text()
+
+
 def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     root = Path(__file__).resolve().parents[5]
     attention = root / "tensorrt_llm/_torch/modules/attention.py"

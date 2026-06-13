@@ -274,6 +274,8 @@ same ABI shape as the final serving path. The following are hard invariants:
   serving paths. The current bridge is a mapped pinned-host kernel path; a
   future copy-engine variant may replace it only if it consumes the same compact
   device schedule without host synchronization.
+- Compact copy schedules must fail closed. Any impossible compact row id means
+  the schedule is corrupt and no row in that batch may publish hot metadata.
 
 CUDA API note: NVIDIA documents `cudaMemcpyBatchAsync()` as a host API over
 host-visible source pointer, destination pointer, and size arrays, and documents
@@ -1113,6 +1115,9 @@ Current branch status:
   launch, matching the standalone hot-reader guard. The attention dispatch
   refuses to reuse a cached descriptor unless it matches the current local
   layer, row count, row-status count, TopK width, and devices;
+- tightened the schedule-driven packed KVarN copy bridge so a compact schedule
+  with an invalid row id marks every row invalid, preventing post-copy hot
+  metadata publication after a skipped miss copy;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;
