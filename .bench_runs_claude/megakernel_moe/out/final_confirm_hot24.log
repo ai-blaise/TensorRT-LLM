@@ -1,0 +1,12 @@
+DEVICE: NVIDIA B200 cc=(10, 0)
+[routing] hot=24  distinct_experts=24  num_non_exiting_tiles=24 (FC1 items=24x32, FC2 items=24x56)
+[numerics] op_norm=6.8885e+05 p3_norm=6.8886e+05
+[numerics] cosine(phase3, op) = 0.999997   rel_l2_err = 2.6302e-03
+[numerics] op has_nan=False p3 has_nan=False
+[numerics] GATE cos>=0.98: PASS
+[graph-replay] after 64 replays: cosine(phase3_replayed, op) = 0.999996  -> PASS  (validates on-device producer + self-reset survive replay)
+[timing] GEMM-chain only (moe_sort + alloc hoisted out, output zeroed each call):
+[timing]   op-mode  : median=110.87us  min=106.00us  (FC1 op + FC2 op, GMEM intermediate)
+[timing]   phase-3  : median=104.66us  min=98.51us  (1 persistent grid, SMEM intermediate)
+[timing]   delta(p3 - op) = -6.21us/call  speedup=1.059x (phase-3 FASTER)
+[timing] moe_sort alone: median=6.16us min=6.15us (shared by both; reported for context)
