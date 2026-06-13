@@ -1217,6 +1217,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # same lifecycle as the HISA slots above.
         self._layersplit_step_read_set = None
         self.hisparse_coordinator = None
+        self.hisparse_request_ids = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size

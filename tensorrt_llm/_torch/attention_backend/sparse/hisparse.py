@@ -112,6 +112,24 @@ class HiSparseHotSelection:
     hot_slots: Tuple[int, ...]
     hits: int
     misses: int
+    host_commit_gens: Tuple[int, ...] = ()
+    miss_block_positions: Tuple[int, ...] = ()
+    miss_host_slots: Tuple[int, ...] = ()
+    miss_hot_slots: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class HiSparseSwapInPlan:
+    """Native swap-in ABI for packed dense-MLA KVarN miss blocks."""
+
+    selection: HiSparseHotSelection
+    host_ptrs: "np.ndarray"
+    hot_ptrs: "np.ndarray"
+    sizes: "np.ndarray"
+
+    @property
+    def has_misses(self) -> bool:
+        return bool(self.selection.miss_host_slots)
 
 
 class OPTRTHiSparseCoordinator:
@@ -440,6 +458,84 @@ class OPTRTHiSparseCoordinator:
         return (np.array(ptrs, dtype=np.int64),
                 np.array(sizes, dtype=np.int64))
 
+    def hot_packed_ptrs_for_slots(
+        self,
+        *,
+        layer_idx: int,
+        hot_slots: Iterable[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return device packed-KVarN destinations for layer-local hot slots."""
+        import numpy as np
+
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        layer_idx = int(layer_idx)
+        if layer_idx < 0 or layer_idx >= tier.num_layers:
+            raise IndexError(
+                f"layer_idx {layer_idx} outside configured HiSparse layer "
+                f"range [0, {tier.num_layers}).")
+        base_ptr = self._tensor_data_ptr(tensors.hot_packed)
+        layer_base = (
+            base_ptr +
+            layer_idx * tier.hot_device_capacity_blocks
+            * tier.packed_bytes_per_block)
+        ptrs = []
+        sizes = []
+        for hot_slot in hot_slots:
+            hot_slot = int(hot_slot)
+            if hot_slot < 0 or hot_slot >= tier.hot_device_capacity_blocks:
+                raise IndexError(
+                    f"hot_slot {hot_slot} outside configured HiSparse hot "
+                    f"slot range [0, {tier.hot_device_capacity_blocks}).")
+            ptrs.append(layer_base + hot_slot * tier.packed_bytes_per_block)
+            sizes.append(tier.packed_bytes_per_block)
+        return (np.array(ptrs, dtype=np.int64),
+                np.array(sizes, dtype=np.int64))
+
+    def swap_in_plan_for_selection(
+        self,
+        selection: HiSparseHotSelection,
+    ) -> HiSparseSwapInPlan:
+        """Build the native packed-KVarN copy plan for selection misses only."""
+        host_ptrs, host_sizes = self.host_packed_ptrs_for_blocks(
+            layer_idx=selection.layer_idx,
+            req_pool_idx=selection.req_pool_idx,
+            block_positions=selection.miss_block_positions,
+        )
+        hot_ptrs, hot_sizes = self.hot_packed_ptrs_for_slots(
+            layer_idx=selection.layer_idx,
+            hot_slots=selection.miss_hot_slots,
+        )
+        if host_sizes.tolist() != hot_sizes.tolist():
+            raise RuntimeError(
+                "HiSparse host/hot packed block sizes diverged while building "
+                "the swap-in plan.")
+        return HiSparseSwapInPlan(selection=selection,
+                                  host_ptrs=host_ptrs,
+                                  hot_ptrs=hot_ptrs,
+                                  sizes=host_sizes)
+
+    def plan_swap_in_for_token_positions(
+        self,
+        *,
+        layer_idx: int,
+        req_pool_idx: int,
+        token_positions: Iterable[int],
+        require_admitted: bool = True,
+    ) -> HiSparseSwapInPlan:
+        """Plan packed-KVarN hot residency for request-relative token indices."""
+        tier = self._require_configured()
+        block_positions = tuple(
+            int(token_position) // tier.tokens_per_block
+            for token_position in token_positions)
+        selection = self.plan_hot_blocks(
+            layer_idx=layer_idx,
+            req_pool_idx=req_pool_idx,
+            block_positions=block_positions,
+            require_admitted=require_admitted,
+        )
+        return self.swap_in_plan_for_selection(selection)
+
     def _require_tensors(self) -> HiSparsePackedTierTensors:
         if self._tensors is None:
             raise RuntimeError(
@@ -500,6 +596,19 @@ class OPTRTHiSparseCoordinator:
         if "float16" in dtype or "bfloat16" in dtype:
             return 2
         return 1
+
+    @staticmethod
+    def _torch_cuda_op_registered(qualified_name: str) -> bool:
+        try:
+            torch_mod = __import__("torch")
+        except ImportError:
+            return False
+        try:
+            return bool(
+                torch_mod._C._dispatch_has_kernel_for_dispatch_key(
+                    qualified_name, "CUDA"))
+        except RuntimeError:
+            return False
 
     def _require_configured(self) -> HiSparsePackedTierDescriptor:
         if self._tier is None:
@@ -742,7 +851,7 @@ class OPTRTHiSparseCoordinator:
         for records in self._hot_records_by_layer.values():
             for hot in records:
                 if hot.host_slot in released_set:
-                    hot.clear()
+                    self._clear_hot_record(hot)
         for host_slot in released_slots:
             self._host_records.pop(host_slot, None)
         self._free_host_slots.extend(released_slots)
@@ -767,7 +876,7 @@ class OPTRTHiSparseCoordinator:
         for records in self._hot_records_by_layer.values():
             for hot in records:
                 if hot.host_slot in released_host_slots:
-                    hot.clear()
+                    self._clear_hot_record(hot)
 
     def _write_host_commit_metadata(
         self,
@@ -798,6 +907,22 @@ class OPTRTHiSparseCoordinator:
             # objects, and serving remains fail-closed until kernels are wired.
             return
 
+    def _write_hot_metadata(self, hot: HiSparseHotBlockRecord) -> None:
+        tensors = self._tensors
+        if tensors is None:
+            return
+        host_slot = -1 if hot.host_slot is None else int(hot.host_slot)
+        self._set_tensor_value(tensors.hot_host_slot, hot.layer_idx,
+                               hot.hot_slot, host_slot)
+        self._set_tensor_value(tensors.hot_commit_gen, hot.layer_idx,
+                               hot.hot_slot, int(hot.commit_gen))
+        self._set_tensor_value(tensors.hot_lru_tick, hot.layer_idx,
+                               hot.hot_slot, int(hot.lru_tick))
+
+    def _clear_hot_record(self, hot: HiSparseHotBlockRecord) -> None:
+        hot.clear()
+        self._write_hot_metadata(hot)
+
     def select_hot_blocks(
         self,
         *,
@@ -805,16 +930,49 @@ class OPTRTHiSparseCoordinator:
         req_pool_idx: int,
         block_positions: Iterable[int],
     ) -> HiSparseHotSelection:
+        selection = self.plan_hot_blocks(
+            layer_idx=layer_idx,
+            req_pool_idx=req_pool_idx,
+            block_positions=block_positions,
+            require_admitted=False,
+        )
+        self.commit_hot_selection(selection)
+        return selection
+
+    def plan_hot_blocks(
+        self,
+        *,
+        layer_idx: int,
+        req_pool_idx: int,
+        block_positions: Iterable[int],
+        require_admitted: bool = False,
+    ) -> HiSparseHotSelection:
+        """Plan hot-pool residency without publishing new miss ownership."""
         tier = self._require_configured()
         layer_idx = int(layer_idx)
         if layer_idx < 0 or layer_idx >= tier.num_layers:
             raise IndexError(
                 f"layer_idx {layer_idx} outside configured HiSparse layer "
                 f"range [0, {tier.num_layers}).")
+        state = self._request_state(req_pool_idx)
+        if require_admitted and not state.admitted:
+            raise RuntimeError(
+                "Cannot plan HiSparse hot blocks for a request that has not "
+                f"been admitted after direct-to-host writes: req={req_pool_idx}.")
         deduped = tuple(dict.fromkeys(int(pos) for pos in block_positions))
+        if len(deduped) > tier.hot_device_capacity_blocks:
+            raise RuntimeError(
+                "HiSparse selection exceeds the layer-local hot capacity: "
+                f"selected={len(deduped)}, "
+                f"hot_capacity={tier.hot_device_capacity_blocks}.")
         hot_records = self._hot_records_by_layer[layer_idx]
         host_slots: List[int] = []
         hot_slots: List[int] = []
+        host_commit_gens: List[int] = []
+        miss_block_positions: List[int] = []
+        miss_host_slots: List[int] = []
+        miss_hot_slots: List[int] = []
+        reserved_hot_slots = set()
         hits = 0
         misses = 0
         for block_pos in deduped:
@@ -826,16 +984,18 @@ class OPTRTHiSparseCoordinator:
             hot = self._find_hot_hit(hot_records, host)
             if hot is not None:
                 hits += 1
+                reserved_hot_slots.add(hot.hot_slot)
             else:
                 misses += 1
-                hot = self._pick_hot_victim(hot_records)
-                hot.req_pool_idx = host.req_pool_idx
-                hot.block_pos = host.block_pos
-                hot.host_slot = host.host_slot
-                hot.commit_gen = host.commit_gen
-            self._touch_hot(hot)
+                hot = self._pick_hot_victim_excluding(hot_records,
+                                                       reserved_hot_slots)
+                reserved_hot_slots.add(hot.hot_slot)
+                miss_block_positions.append(block_pos)
+                miss_host_slots.append(host.host_slot)
+                miss_hot_slots.append(hot.hot_slot)
             host_slots.append(host.host_slot)
             hot_slots.append(hot.hot_slot)
+            host_commit_gens.append(host.commit_gen)
         return HiSparseHotSelection(
             layer_idx=layer_idx,
             req_pool_idx=int(req_pool_idx),
@@ -844,7 +1004,54 @@ class OPTRTHiSparseCoordinator:
             hot_slots=tuple(hot_slots),
             hits=hits,
             misses=misses,
+            host_commit_gens=tuple(host_commit_gens),
+            miss_block_positions=tuple(miss_block_positions),
+            miss_host_slots=tuple(miss_host_slots),
+            miss_hot_slots=tuple(miss_hot_slots),
         )
+
+    def commit_hot_selection(
+        self,
+        selection: HiSparseHotSelection,
+    ) -> HiSparseHotSelection:
+        """Publish a planned hot selection after native miss copies succeed."""
+        tier = self._require_configured()
+        layer_idx = int(selection.layer_idx)
+        if layer_idx < 0 or layer_idx >= tier.num_layers:
+            raise IndexError(
+                f"layer_idx {layer_idx} outside configured HiSparse layer "
+                f"range [0, {tier.num_layers}).")
+        if not (len(selection.block_positions) == len(selection.host_slots) ==
+                len(selection.hot_slots) == len(selection.host_commit_gens)):
+            raise RuntimeError(
+                "Malformed HiSparse hot selection: block, host, hot, and "
+                "commit-gen vectors must be parallel.")
+        hot_records = self._hot_records_by_layer[layer_idx]
+        miss_hot_slots = set(selection.miss_hot_slots)
+        for block_pos, host_slot, hot_slot, commit_gen in zip(
+                selection.block_positions, selection.host_slots,
+                selection.hot_slots, selection.host_commit_gens):
+            host = self._host_record(selection.req_pool_idx, block_pos)
+            if (not host.valid or host.host_slot != int(host_slot)
+                    or host.commit_gen != int(commit_gen)):
+                raise RuntimeError(
+                    "HiSparse hot selection is stale: host block changed "
+                    "between planning and commit "
+                    f"(req={selection.req_pool_idx}, block_pos={block_pos}).")
+            hot = hot_records[int(hot_slot)]
+            if int(hot_slot) in miss_hot_slots:
+                hot.req_pool_idx = host.req_pool_idx
+                hot.block_pos = host.block_pos
+                hot.host_slot = host.host_slot
+                hot.commit_gen = host.commit_gen
+            elif self._find_hot_hit([hot], host) is None:
+                raise RuntimeError(
+                    "HiSparse hot selection is stale: planned hit no longer "
+                    "matches the hot slot "
+                    f"(layer={layer_idx}, hot_slot={hot_slot}).")
+            self._touch_hot(hot)
+            self._write_hot_metadata(hot)
+        return selection
 
     def _host_record(self, req_pool_idx: int,
                      block_pos: int) -> HiSparseHostBlockRecord:
@@ -885,6 +1092,25 @@ class OPTRTHiSparseCoordinator:
                 return hot
         return min(hot_records, key=lambda hot: hot.lru_tick)
 
+    @staticmethod
+    def _pick_hot_victim_excluding(
+        hot_records: List[HiSparseHotBlockRecord],
+        excluded_hot_slots: set[int],
+    ) -> HiSparseHotBlockRecord:
+        for hot in hot_records:
+            if hot.hot_slot in excluded_hot_slots:
+                continue
+            if hot.empty:
+                return hot
+        candidates = [
+            hot for hot in hot_records if hot.hot_slot not in excluded_hot_slots
+        ]
+        if not candidates:
+            raise RuntimeError(
+                "HiSparse hot selection has no evictable slot after "
+                "protecting already-selected blocks.")
+        return min(candidates, key=lambda hot: hot.lru_tick)
+
     def _touch_hot(self, hot: HiSparseHotBlockRecord) -> None:
         self._lru_clock += 1
         hot.lru_tick = self._lru_clock
@@ -916,7 +1142,25 @@ class OPTRTHiSparseCoordinator:
     ) -> Optional[HiSparseTopKMapping]:
         if not self.enabled:
             return None
+        self._require_configured()
+        self._require_tensors()
+        request_ids = getattr(metadata, "hisparse_request_ids", None)
+        if request_ids is None:
+            request_ids = getattr(metadata, "request_ids", None)
+        if request_ids is None:
+            raise RuntimeError(
+                "HiSparse hot-pool mapping requires request ids that match "
+                "the NIXL direct-to-host admission ids.")
+        if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_swap_in_packed_kvarn"):
+            raise NotImplementedError(
+                "trtllm::hisparse_swap_in_packed_kvarn is not registered with "
+                "a CUDA kernel. "
+                "HiSparse must copy packed KVarN miss blocks from NIXL-writable "
+                "host tiers into the hot device tier before sparse MLA reads "
+                "them; no FP16 staging path or full-HBM fallback is allowed.")
         raise NotImplementedError(
-            "HiSparse hot-pool TopK mapping is not implemented yet. The next "
-            "implementation step must map Indexer/HISA request-relative TopK "
-            "into packed KVarN hot blocks before sparse MLA reads them.")
+            "HiSparse hot-pool TopK mapping still needs the CUDA-side "
+            "request/topk-to-block planner and sparse MLA hot-pool read path. "
+            "The coordinator ABI is production-shaped, but serving remains "
+            "fail-closed until those pieces are wired and validated.")

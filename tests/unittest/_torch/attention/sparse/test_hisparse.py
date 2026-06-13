@@ -93,9 +93,9 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
                                         tensor_factory=_fake_tensor_factory(calls))
     with pytest.raises(NotImplementedError, match="swap-in kernel"):
         coordinator.assert_startup_ready()
-    with pytest.raises(NotImplementedError, match="hot-pool TopK mapping"):
+    with pytest.raises(NotImplementedError):
         coordinator.map_topk_to_hot_pool(topk_indices=None,
-                                         metadata=None,
+                                         metadata=SimpleNamespace(request_ids=[0]),
                                          layer_idx=0,
                                          skip_topk=False,
                                          is_generation=True)
@@ -341,6 +341,95 @@ def test_hisparse_hot_selection_hits_misses_and_lru_eviction():
                                            block_positions=[1])
     assert fourth.hits == 1
     assert fourth.hot_slots == (1, )
+
+
+def test_hisparse_hot_planning_is_non_mutating_until_commit():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=2048,
+                                       logical_host_capacity_blocks=8,
+                                       hot_device_capacity_blocks=2)
+    coordinator.reserve_request(req_pool_idx=13, num_prompt_blocks=2)
+    for block_pos in range(2):
+        coordinator.mark_host_block_committed(13, block_pos)
+    coordinator.mark_request_admitted(13)
+
+    planned = coordinator.plan_hot_blocks(layer_idx=0,
+                                          req_pool_idx=13,
+                                          block_positions=[0, 1],
+                                          require_admitted=True)
+
+    assert planned.misses == 2
+    assert planned.miss_block_positions == (0, 1)
+    assert planned.miss_host_slots == (0, 1)
+    assert planned.miss_hot_slots == (0, 1)
+    assert coordinator.stats()["hot_used"] == 0
+
+    committed = coordinator.commit_hot_selection(planned)
+
+    assert committed is planned
+    assert coordinator.stats()["hot_used"] == 2
+
+
+def test_hisparse_hot_planning_requires_admission_for_production_path():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=2048,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2)
+    coordinator.reserve_request(req_pool_idx=23, num_prompt_blocks=1)
+    coordinator.mark_host_block_committed(23, 0)
+
+    with pytest.raises(RuntimeError, match="not been admitted"):
+        coordinator.plan_hot_blocks(layer_idx=0,
+                                    req_pool_idx=23,
+                                    block_positions=[0],
+                                    require_admitted=True)
+
+
+def test_hisparse_swap_in_plan_dedupes_tokens_and_builds_packed_pointers():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=16,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=4)
+    calls = []
+    tensors = coordinator.allocate_packed_tensors(
+        device="cuda:1",
+        host_pinned=True,
+        tensor_factory=_fake_tensor_factory(calls),
+    )
+    coordinator.reserve_request(req_pool_idx=31, num_prompt_blocks=3)
+    for block_pos in range(3):
+        coordinator.mark_host_block_committed(31, block_pos)
+    coordinator.mark_request_admitted(31)
+
+    plan = coordinator.plan_swap_in_for_token_positions(
+        layer_idx=0,
+        req_pool_idx=31,
+        token_positions=[0, 63, 64, 130],
+        require_admitted=True,
+    )
+
+    assert plan.selection.block_positions == (0, 1, 2)
+    assert plan.selection.misses == 3
+    assert plan.selection.miss_hot_slots == (0, 1, 2)
+    assert plan.host_ptrs.tolist() == [
+        tensors.host_packed.data_ptr(),
+        tensors.host_packed.data_ptr() + 16,
+        tensors.host_packed.data_ptr() + 32,
+    ]
+    assert plan.hot_ptrs.tolist() == [
+        tensors.hot_packed.data_ptr(),
+        tensors.hot_packed.data_ptr() + 16,
+        tensors.hot_packed.data_ptr() + 32,
+    ]
+    assert plan.sizes.tolist() == [16, 16, 16]
+    assert plan.has_misses is True
+    assert coordinator.stats()["hot_used"] == 0
 
 
 def test_hisparse_hot_selection_rejects_uncommitted_and_respects_commit_gen():

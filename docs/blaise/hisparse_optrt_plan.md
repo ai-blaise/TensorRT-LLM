@@ -67,18 +67,21 @@ Current branch posture after the June 13 final correctness sweep: the branch
 has a production-shaped, fail-closed partial implementation, not a deployable
 HiSparse serving candidate. The config validation, packed KVarN tier
 allocation, host metadata publication, NIXL DRAM registration, request
-host-slot sideband, packed KVarN source/destination fragment derivation, and
-typed `HISPARSE_HOST` write submission are implemented. The sender now returns
-explicit `(local_layer, request_block_pos)` commit coverage only after the
-normal KV write and typed host write both succeed, and the receiver accumulates
-that coverage before marking host records committed. Admission is explicit: a
+host-slot sideband, packed KVarN source/destination fragment derivation, typed
+`HISPARSE_HOST` write submission, decode admission state, and two-stage
+hot-block planning ABI are implemented. The sender now returns explicit
+`(local_layer, request_block_pos)` commit coverage only after the normal KV
+write and typed host write both succeed, and the receiver accumulates that
+coverage before marking host records committed. Admission is explicit: a
 request cannot be marked HiSparse-ready unless all reserved prompt host blocks
-are committed and no host writes are pending. Startup still intentionally
-rejects `hisparse_enabled=true` before serving because live NIXL E2E proof,
-live cancel/retraction proof, host-to-hot swap-in, sparse MLA hot-pool reading,
-and BDR/on-read dequant are not complete. This is the correct failure mode: no
-manifest should get an implicit full-HBM, FP16-staging, or direct-to-host-off
-substitute.
+are committed and no host writes are pending. Host-to-hot planning is also
+explicit: the coordinator may plan packed KVarN miss copies, but it does not
+publish hot residency until the planned native copy is committed. Startup and
+runtime mapping still intentionally reject `hisparse_enabled=true` before
+serving because the SM100 host-to-hot kernel, sparse MLA hot-pool read path,
+BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete. This is
+the correct failure mode: no manifest should get an implicit full-HBM,
+FP16-staging, or direct-to-host-off substitute.
 
 ## Final Correctness Sweep
 
@@ -668,6 +671,15 @@ Current branch status:
   `logical_block_id`, and request epoch tracking;
 - implemented layer-local hot-slot metadata and LRU hit/miss selection keyed by
   `(req_pool_idx, block_pos, host_slot, commit_gen)`;
+- split hot-slot handling into a non-mutating `plan_hot_blocks()` phase and a
+  `commit_hot_selection()` phase so miss residency is published only after the
+  future native packed KVarN copy succeeds;
+- added `HiSparseSwapInPlan` and pointer helpers that produce parallel host
+  DRAM pointers, hot HBM pointers, and byte sizes for packed KVarN miss blocks;
+- added request-relative token-position planning that dedupes top-k tokens into
+  paged block positions without changing Indexer/HISA scoring;
+- synchronized device hot metadata (`hot_host_slot`, `hot_commit_gen`, and
+  `hot_lru_tick`) whenever hot records are committed or cleared;
 - implemented invalidation that clears hot records when host records are
   invalidated or request slots are released;
 - implemented production-shaped packed tensor allocation for host `uint8`
@@ -678,14 +690,16 @@ Current branch status:
   then still fails closed before serving until the swap-in/read kernels exist;
 - added CPU-level unit tests for allocation, duplicate reservation, capacity
   failure, uncommitted-block rejection, commit-generation refresh, LRU eviction,
-  tensor allocation ABI, and cleanup.
+  non-mutating plan/commit, admitted-request enforcement, packed pointer-plan
+  ABI, tensor allocation ABI, and cleanup.
 
 Still pending before serving enablement:
 
 - live E2E proof that the host-write completion handoff marks host `valid` and
   `commit_gen` only after typed HiSparse host writes succeed for the relevant
   layer/block coverage;
-- host-to-hot packed record copy kernel;
+- native SM100 host-to-hot packed record copy kernel registration as
+  `trtllm::hisparse_swap_in_packed_kvarn`;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
@@ -699,6 +713,32 @@ Deliverables:
 - BDR/on-read dequant for hot packed KVarN records;
 - FSSS reuse layers reuse scoring but rerun per-layer hot-slot mapping when hot
   residency is layer-local.
+
+Current branch status:
+
+- `DSAtrtllmAttention.sparse_attn_predict()` already has the HiSparse mapping
+  seam immediately after Indexer/HISA top-k production and before the existing
+  full-pool index transform;
+- attention metadata now carries `hisparse_request_ids`, keyed by
+  `disagg_request_id` when present, so the decode-side planner uses the same
+  request key that NIXL direct-to-host admission reserved;
+- incremental update paths refresh the HiSparse request-id vector along with
+  normal request ids to avoid stale admission keys under overlap/CUDA-graph
+  reuse;
+- runtime mapping requires configured packed tiers, allocated tensors,
+  admission-compatible request ids, and the native
+  `trtllm::hisparse_swap_in_packed_kvarn` op before it can proceed;
+- if the native op or sparse MLA hot-pool read path is absent, mapping raises
+  rather than falling back to the full-HBM transform.
+
+Still pending before serving enablement:
+
+- CUDA-side row/top-k-to-block planner that consumes graph-safe tensors without
+  Python-side token extraction;
+- native packed KVarN host-to-hot copy and hot metadata update;
+- hot global-index output buffers for sparse MLA;
+- sparse MLA packed hot-pool read with BDR/on-read dequant;
+- FSSS reuse-layer remap over layer-local hot slots.
 
 ### Gate 4: Production Optimization Hardening
 

@@ -84,6 +84,16 @@ def _optrt_me_debug_enabled() -> bool:
 _OPTRT_ME_DEBUG_ENABLED = _optrt_me_debug_enabled()
 
 
+def _optrt_hisparse_request_id(request: LlmRequest) -> int:
+    """Return the request key shared with NIXL HiSparse host admission."""
+    disagg_params = getattr(request, "py_disaggregated_params", None)
+    if disagg_params is not None:
+        disagg_request_id = getattr(disagg_params, "disagg_request_id", None)
+        if disagg_request_id is not None:
+            return int(disagg_request_id)
+    return int(request.py_request_id)
+
+
 def _optrt_fuse_adp_collectives_enabled() -> bool:
     """Whether to fuse the per-step ADP num_tokens + num_ctx_requests gathers.
 
@@ -2583,8 +2593,18 @@ class PyTorchModelEngine(ModelEngine):
         enable_spec_decode = self.enable_spec_decode
         enable_attention_dp = self.enable_attention_dp
         spec_config = self.spec_config if enable_spec_decode else None
+        request_ids = [
+            request.py_request_id
+            for request in scheduled_requests.generation_requests
+        ]
+        hisparse_request_ids = [
+            _optrt_hisparse_request_id(request)
+            for request in scheduled_requests.generation_requests
+        ]
 
         # Set up attention metadata - batch simple assignments
+        attn_metadata.request_ids = request_ids
+        attn_metadata.hisparse_request_ids = hisparse_request_ids
         attn_metadata.beam_width = 1
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = num_extend_ctx_requests if (
@@ -2619,6 +2639,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.request_accepted_path = request_accepted_path
 
             spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.request_ids = request_ids
             spec_metadata.prepare()
 
             # Handle distributed spec metadata
@@ -3021,6 +3042,7 @@ class PyTorchModelEngine(ModelEngine):
         sequence_lengths = []  # per sequence
         prompt_lengths = []  # per sequence
         request_ids = []  # per request
+        hisparse_request_ids = []  # per request, keyed like NIXL admission
         gather_ids = []
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
@@ -3054,6 +3076,7 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
+            hisparse_request_ids.append(_optrt_hisparse_request_id(request))
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
             begin_compute = request.context_current_position
@@ -3219,6 +3242,7 @@ class PyTorchModelEngine(ModelEngine):
         previous_pos_indices = []
         for request in extend_requests:
             request_ids.append(request.py_request_id)
+            hisparse_request_ids.append(_optrt_hisparse_request_id(request))
             request_accepted_path[
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
@@ -3295,6 +3319,7 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
+            hisparse_request_ids.append(_optrt_hisparse_request_id(request))
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
             begin_compute = len(
@@ -3359,6 +3384,7 @@ class PyTorchModelEngine(ModelEngine):
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
+                hisparse_request_ids.append(_optrt_hisparse_request_id(request))
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -3787,6 +3813,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.beam_width = 1
 
         attn_metadata.request_ids = request_ids
+        attn_metadata.hisparse_request_ids = hisparse_request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
         # Use num_chunked_ctx_requests to record the number of extend context requests,
