@@ -77,12 +77,13 @@ request cannot be marked HiSparse-ready unless all reserved prompt host blocks
 are committed and no host writes are pending. Host-to-hot planning is also
 explicit: the coordinator may plan packed KVarN miss copies, but it does not
 publish hot residency until the planned native copy is accepted. A strict
-native thop now exists for packed KVarN host-to-hot copies, but startup and
-runtime mapping still intentionally reject `hisparse_enabled=true` before
-serving because CUDA-side top-k-to-block planning, sparse MLA hot-pool reading,
-BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete. This is
-the correct failure mode: no manifest should get an implicit full-HBM,
-FP16-staging, or direct-to-host-off substitute.
+native thop now exists for packed KVarN host-to-hot copies, and a native
+CUDA-side TopK-to-block dedupe primitive now exists for the first planner stage.
+Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
+before serving because the remaining hot-slot planner, sparse MLA hot-pool
+reading, BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete.
+This is the correct failure mode: no manifest should get an implicit full-HBM,
+FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
 
 ## Final Correctness Sweep
 
@@ -684,6 +685,10 @@ Current branch status:
   metadata publication are sequenced through one production-shaped path;
 - added request-relative token-position planning that dedupes top-k tokens into
   paged block positions without changing Indexer/HISA scoring;
+- added `trtllm::hisparse_topk_to_block_positions`, a native CUDA shared-memory
+  hash dedupe primitive that maps request-relative TopK tokens to unique
+  request-relative block positions and emits device overflow flags without a
+  host sync;
 - synchronized device hot metadata (`hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick`) whenever hot records are committed or cleared;
 - implemented invalidation that clears hot records when host records are
@@ -706,6 +711,8 @@ Still pending before serving enablement:
   layer/block coverage;
 - VM compile and live validation of the native
   `trtllm::hisparse_swap_in_packed_kvarn` packed-copy op;
+- VM compile and live validation of the native
+  `trtllm::hisparse_topk_to_block_positions` planner primitive;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
@@ -733,14 +740,16 @@ Current branch status:
   reuse;
 - runtime mapping requires configured packed tiers, allocated tensors,
   admission-compatible request ids, and the native
-  `trtllm::hisparse_swap_in_packed_kvarn` op before it can proceed;
+  `trtllm::hisparse_topk_to_block_positions` and
+  `trtllm::hisparse_swap_in_packed_kvarn` ops before it can proceed;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
-- CUDA-side row/top-k-to-block planner that consumes graph-safe tensors without
-  Python-side token extraction;
+- hot-slot planner that consumes device block-position rows, request ids,
+  admission metadata, and layer-local hot metadata without Python-side token
+  extraction;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;

@@ -1191,6 +1191,17 @@ class OPTRTHiSparseCoordinator:
             raise RuntimeError(
                 "HiSparse hot-pool mapping requires request ids that match "
                 "the NIXL direct-to-host admission ids.")
+        if topk_indices is None:
+            raise RuntimeError(
+                "HiSparse hot-pool mapping requires request-relative TopK "
+                "indices from the Indexer/HISA path.")
+        if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_topk_to_block_positions"):
+            raise NotImplementedError(
+                "trtllm::hisparse_topk_to_block_positions is not registered "
+                "with a CUDA kernel. HiSparse must dedupe request-relative "
+                "TopK into paged block positions on device before hot-slot "
+                "planning; no Python token extraction path is allowed.")
         if not self._torch_cuda_op_registered(
                 "trtllm::hisparse_swap_in_packed_kvarn"):
             raise NotImplementedError(

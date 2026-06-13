@@ -228,6 +228,14 @@ def _register_fake():
         del packed_bytes_per_block
         pass
 
+    @torch.library.register_fake("trtllm::hisparse_topk_to_block_positions")
+    def _(topk_indices, tokens_per_block, max_blocks_per_row):
+        del tokens_per_block
+        rows = topk_indices.shape[0]
+        return (topk_indices.new_empty((rows, max_blocks_per_row)),
+                topk_indices.new_empty((rows, )),
+                topk_indices.new_empty((rows, ), dtype=torch.uint8))
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.
