@@ -69,7 +69,14 @@ HiSparse serving candidate. The config validation, packed KVarN tier
 allocation, host metadata publication, NIXL DRAM registration, request
 host-slot sideband, packed KVarN source/destination fragment derivation, typed
 `HISPARSE_HOST` write submission, decode admission state, and two-stage
-hot-block planning ABI are implemented. The sender now returns explicit
+hot-block planning ABI are implemented. A device-visible request table now
+publishes disaggregated request ids, request-relative block-to-host-slot rows,
+host commit generations, and admission flags for the future native hot-slot
+planner. This table is the required production ABI shape, but its current
+Python lifecycle writer is not the final serving publication mechanism; before
+the startup guard is relaxed, request-table updates must be batched,
+stream-ordered, and native or async-copy driven so decode does not pay
+per-block Python synchronization cost. The sender now returns explicit
 `(local_layer, request_block_pos)` commit coverage only after the normal KV
 write and typed host write both succeed, and the receiver accumulates that
 coverage before marking host records committed. Admission is explicit: a
@@ -669,6 +676,17 @@ Current branch status:
   logical host capacity, and hot device capacity;
 - implemented request host-row reservation and release, with stable
   request-relative `block_pos -> host_slot` ownership;
+- implemented a host-pinned plus device-mirrored request table keyed by stable
+  coordinator table slots:
+  `request_ids`, `request_block_host_slots`, `request_block_commit_gen`, and
+  `request_admitted`;
+- kept that request table in the final CUDA-planner ABI shape, while requiring
+  a later batched/native metadata writer before enabled serving so table
+  publication is not a Python per-cell hot path;
+- bounded direct `configure_packed_tiers()` request-table defaults to avoid
+  quadratic host-block allocation, while production `configure_from_kv_cache_manager()`
+  derives table capacity from `max_batch_size` and width from
+  `max_blocks_per_seq`;
 - implemented host block commit metadata with `valid`, `commit_gen`,
   `logical_block_id`, and request epoch tracking;
 - implemented layer-local hot-slot metadata and LRU hit/miss selection keyed by
@@ -713,6 +731,9 @@ Still pending before serving enablement:
   `trtllm::hisparse_swap_in_packed_kvarn` packed-copy op;
 - VM compile and live validation of the native
   `trtllm::hisparse_topk_to_block_positions` planner primitive;
+- replacement of scalar lifecycle request-table writes with a stream-ordered
+  batched/native publication path for admission, commit-generation, and cleanup
+  updates;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
@@ -732,6 +753,9 @@ Current branch status:
 - `DSAtrtllmAttention.sparse_attn_predict()` already has the HiSparse mapping
   seam immediately after Indexer/HISA top-k production and before the existing
   full-pool index transform;
+- the coordinator now exposes device-side request/admission tables that the
+  next native hot-slot planner can use with device TopK block rows, without
+  Python token or request-table extraction;
 - attention metadata now carries `hisparse_request_ids`, keyed by
   `disagg_request_id` when present, so the decode-side planner uses the same
   request key that NIXL direct-to-host admission reserved;
@@ -750,6 +774,9 @@ Still pending before serving enablement:
 - hot-slot planner that consumes device block-position rows, request ids,
   admission metadata, and layer-local hot metadata without Python-side token
   extraction;
+- request-id to coordinator-table-slot lookup in CUDA using the mirrored
+  request table, with fail-closed handling for missing, unadmitted, stale, or
+  generation-mismatched rows;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;
@@ -929,6 +956,8 @@ production ABI:
    - input request-relative top-k tokens, request rows, committed host slots,
      per-layer hot metadata, and graph row count;
    - dedupe tokens to paged block positions;
+   - resolve request ids through the device-mirrored request table and reject
+     missing, unadmitted, or stale commit-generation rows;
    - hit/miss/LRU over block slots;
    - copy only packed KVarN records from host DRAM to hot HBM;
    - output hot global indices and selected hot block ids for sparse MLA.
@@ -964,6 +993,8 @@ production ABI:
 7. Optimize before promotion:
    - precompile SM100 buckets for `index_topk=1024`, `tokens_per_block=64`, and
      hot blocks/request `{32,64,96,128}`;
+   - publish request-table lifecycle changes through batched native kernels or
+     stream-ordered async copies, not per-block Python tensor writes;
    - tune host/device ratio, NIXL plugin, NUMA placement, graph buckets, and
      memory fraction;
    - add hit/miss, swap latency, host-write, admission wait, and cleanup

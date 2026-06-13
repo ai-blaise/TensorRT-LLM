@@ -232,6 +232,8 @@ def test_hisparse_configure_from_kv_cache_manager_uses_kvarn_shape():
     assert tier.packed_bytes_per_block == 3072
     assert tier.hot_device_capacity_blocks == 2
     assert tier.logical_host_capacity_blocks == 64
+    assert tier.request_slot_capacity == 4
+    assert tier.max_blocks_per_request == 16
 
 
 def test_hisparse_allocate_packed_tensors_shapes_and_initializers():
@@ -258,11 +260,65 @@ def test_hisparse_allocate_packed_tensors_shapes_and_initializers():
     assert tensors.hot_host_slot.shape == (2, 3)
     assert tensors.hot_commit_gen.shape == (2, 3)
     assert tensors.hot_lru_tick.shape == (2, 3)
+    assert tensors.request_ids_host.shape == (5, )
+    assert tensors.request_ids_device.shape == (5, )
+    assert tensors.request_block_host_slots_host.shape == (5, 5)
+    assert tensors.request_block_host_slots_device.shape == (5, 5)
+    assert tensors.request_block_commit_gen_host.shape == (5, 5)
+    assert tensors.request_block_commit_gen_device.shape == (5, 5)
+    assert tensors.request_admitted_host.shape == (5, )
+    assert tensors.request_admitted_device.shape == (5, )
     assert tensors.host_packed.pin_memory is True
     assert tensors.hot_packed.pin_memory is False
     assert tensors.hot_packed.device == "cuda:1"
-    assert [tensor.fill_value for tensor in calls] == [0, 0, 0, 0, -1, -1, 0]
+    assert [tensor.fill_value for tensor in calls] == [
+        0, 0, 0, 0, -1, -1, 0, -1, -1, -1, -1, -1, -1, 0, 0
+    ]
     assert coordinator.stats()["tensors_allocated"] == 1
+
+
+def test_hisparse_request_table_slots_are_stable_and_reused():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=1024,
+                                       logical_host_capacity_blocks=6,
+                                       hot_device_capacity_blocks=2,
+                                       request_slot_capacity=2,
+                                       max_blocks_per_request=3)
+
+    first = coordinator.reserve_request(req_pool_idx=101, num_prompt_blocks=3)
+    second = coordinator.reserve_request(req_pool_idx=202, num_prompt_blocks=1)
+
+    assert first.table_slot == 0
+    assert second.table_slot == 1
+    assert coordinator.request_table_snapshot(101) == {
+        "table_slot": 0,
+        "req_pool_idx": 101,
+        "host_slots_by_block_pos": {
+            0: 0,
+            1: 1,
+            2: 2,
+        },
+        "admitted": False,
+    }
+    with pytest.raises(MemoryError, match="request table slots"):
+        coordinator.reserve_request(req_pool_idx=303, num_prompt_blocks=1)
+    with pytest.raises(MemoryError, match="request table width"):
+        coordinator.reserve_or_get_request(req_pool_idx=404,
+                                           num_prompt_blocks=4)
+
+    coordinator.mark_host_block_committed(101, 0)
+    coordinator.mark_host_block_committed(101, 1)
+    coordinator.mark_host_block_committed(101, 2)
+    coordinator.mark_request_admitted(101)
+    assert coordinator.request_table_snapshot(101)["admitted"] is True
+
+    coordinator.release_request(101)
+    reused = coordinator.reserve_request(req_pool_idx=303,
+                                         num_prompt_blocks=1)
+
+    assert reused.table_slot == 0
 
 
 def test_hisparse_host_registration_descs_and_slot_ptrs():

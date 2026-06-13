@@ -35,6 +35,8 @@ class HiSparsePackedTierDescriptor:
     packed_bytes_per_block: int
     logical_host_capacity_blocks: int
     hot_device_capacity_blocks: int
+    request_slot_capacity: int
+    max_blocks_per_request: int
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,14 @@ class HiSparsePackedTierTensors:
     hot_host_slot: "torch.Tensor"
     hot_commit_gen: "torch.Tensor"
     hot_lru_tick: "torch.Tensor"
+    request_ids_host: "torch.Tensor"
+    request_ids_device: "torch.Tensor"
+    request_block_host_slots_host: "torch.Tensor"
+    request_block_host_slots_device: "torch.Tensor"
+    request_block_commit_gen_host: "torch.Tensor"
+    request_block_commit_gen_device: "torch.Tensor"
+    request_admitted_host: "torch.Tensor"
+    request_admitted_device: "torch.Tensor"
     host_pinned: bool
     device: object
 
@@ -95,6 +105,7 @@ class HiSparseRequestState:
 
     req_pool_idx: int
     request_epoch: int
+    table_slot: int
     host_slots_by_block_pos: Dict[int, int] = field(default_factory=dict)
     committed_layers_by_block_pos: Dict[int, set[int]] = field(default_factory=dict)
     pending_writes: int = 0
@@ -153,6 +164,8 @@ class OPTRTHiSparseCoordinator:
         self._host_records: Dict[int, HiSparseHostBlockRecord] = {}
         self._requests: Dict[int, HiSparseRequestState] = {}
         self._hot_records_by_layer: Dict[int, List[HiSparseHotBlockRecord]] = {}
+        self._free_request_slots: List[int] = []
+        self._request_slot_by_req_pool_idx: Dict[int, int] = {}
         self._lru_clock = 0
         self._tensors: Optional[HiSparsePackedTierTensors] = None
 
@@ -203,6 +216,8 @@ class OPTRTHiSparseCoordinator:
         packed_bytes_per_block: int,
         logical_host_capacity_blocks: int,
         hot_device_capacity_blocks: int,
+        request_slot_capacity: Optional[int] = None,
+        max_blocks_per_request: Optional[int] = None,
     ) -> HiSparsePackedTierDescriptor:
         """Install packed KVarN host/hot tier metadata.
 
@@ -216,6 +231,11 @@ class OPTRTHiSparseCoordinator:
             "packed_bytes_per_block": packed_bytes_per_block,
             "logical_host_capacity_blocks": logical_host_capacity_blocks,
             "hot_device_capacity_blocks": hot_device_capacity_blocks,
+            "request_slot_capacity": request_slot_capacity
+            if request_slot_capacity is not None else
+            min(int(logical_host_capacity_blocks), 16),
+            "max_blocks_per_request": max_blocks_per_request
+            if max_blocks_per_request is not None else logical_host_capacity_blocks,
         }
         bad = [name for name, value in values.items() if int(value) <= 0]
         if bad:
@@ -229,11 +249,15 @@ class OPTRTHiSparseCoordinator:
             packed_bytes_per_block=int(packed_bytes_per_block),
             logical_host_capacity_blocks=int(logical_host_capacity_blocks),
             hot_device_capacity_blocks=int(hot_device_capacity_blocks),
+            request_slot_capacity=int(values["request_slot_capacity"]),
+            max_blocks_per_request=int(values["max_blocks_per_request"]),
         )
         self._free_host_slots = list(
             range(self._tier.logical_host_capacity_blocks))
+        self._free_request_slots = list(range(self._tier.request_slot_capacity))
         self._host_records.clear()
         self._requests.clear()
+        self._request_slot_by_req_pool_idx.clear()
         self._hot_records_by_layer = {
             layer: [
                 HiSparseHotBlockRecord(hot_slot=slot, layer_idx=layer)
@@ -267,6 +291,11 @@ class OPTRTHiSparseCoordinator:
             getattr(self.sparse_attention_config,
                     "hisparse_host_to_device_ratio", 8))
         max_batch_size = int(getattr(kv_cache_manager, "max_batch_size", 1))
+        max_blocks_per_seq = getattr(kv_cache_manager, "max_blocks_per_seq",
+                                     None)
+        if max_blocks_per_seq is None:
+            max_blocks_per_seq = num_blocks
+        max_blocks_per_seq = int(max_blocks_per_seq)
         return self.configure_packed_tiers(
             num_layers=num_layers,
             tokens_per_block=tokens_per_block,
@@ -276,6 +305,8 @@ class OPTRTHiSparseCoordinator:
                                              * hot_blocks_per_req
                                              * host_to_device_ratio),
             hot_device_capacity_blocks=hot_blocks_per_req,
+            request_slot_capacity=max_batch_size,
+            max_blocks_per_request=max_blocks_per_seq,
         )
 
     def allocate_packed_tensors(
@@ -315,6 +346,9 @@ class OPTRTHiSparseCoordinator:
                      tier.packed_bytes_per_block)
         host_meta_shape = (tier.num_layers, tier.logical_host_capacity_blocks)
         hot_meta_shape = (tier.num_layers, tier.hot_device_capacity_blocks)
+        request_id_shape = (tier.request_slot_capacity, )
+        request_block_shape = (tier.request_slot_capacity,
+                               tier.max_blocks_per_request)
         tensors = HiSparsePackedTierTensors(
             host_packed=tensor_factory(host_shape,
                                        dtype="uint8",
@@ -344,6 +378,42 @@ class OPTRTHiSparseCoordinator:
                                         dtype="int64",
                                         device=device,
                                         pin_memory=False),
+            request_ids_host=tensor_factory(request_id_shape,
+                                            dtype="int64",
+                                            device="cpu",
+                                            pin_memory=host_pinned),
+            request_ids_device=tensor_factory(request_id_shape,
+                                              dtype="int64",
+                                              device=device,
+                                              pin_memory=False),
+            request_block_host_slots_host=tensor_factory(
+                request_block_shape,
+                dtype="int64",
+                device="cpu",
+                pin_memory=host_pinned),
+            request_block_host_slots_device=tensor_factory(
+                request_block_shape,
+                dtype="int64",
+                device=device,
+                pin_memory=False),
+            request_block_commit_gen_host=tensor_factory(
+                request_block_shape,
+                dtype="int64",
+                device="cpu",
+                pin_memory=host_pinned),
+            request_block_commit_gen_device=tensor_factory(
+                request_block_shape,
+                dtype="int64",
+                device=device,
+                pin_memory=False),
+            request_admitted_host=tensor_factory(request_id_shape,
+                                                 dtype="bool",
+                                                 device="cpu",
+                                                 pin_memory=host_pinned),
+            request_admitted_device=tensor_factory(request_id_shape,
+                                                   dtype="bool",
+                                                   device=device,
+                                                   pin_memory=False),
             host_pinned=host_pinned,
             device=device,
         )
@@ -354,6 +424,14 @@ class OPTRTHiSparseCoordinator:
         self._zero_or_fill(tensors.hot_host_slot, -1)
         self._zero_or_fill(tensors.hot_commit_gen, -1)
         self._zero_or_fill(tensors.hot_lru_tick, 0)
+        self._zero_or_fill(tensors.request_ids_host, -1)
+        self._zero_or_fill(tensors.request_ids_device, -1)
+        self._zero_or_fill(tensors.request_block_host_slots_host, -1)
+        self._zero_or_fill(tensors.request_block_host_slots_device, -1)
+        self._zero_or_fill(tensors.request_block_commit_gen_host, -1)
+        self._zero_or_fill(tensors.request_block_commit_gen_device, -1)
+        self._zero_or_fill(tensors.request_admitted_host, 0)
+        self._zero_or_fill(tensors.request_admitted_device, 0)
         self._tensors = tensors
         return tensors
 
@@ -366,6 +444,113 @@ class OPTRTHiSparseCoordinator:
         zero = getattr(tensor, "zero_", None)
         if value == 0 and zero is not None:
             zero()
+
+    @staticmethod
+    def _set_tensor_value_1d(tensor, index: int, value) -> None:
+        try:
+            tensor[int(index)] = value
+        except (AttributeError, TypeError, IndexError):
+            return
+
+    @staticmethod
+    def _set_tensor_value_2d(tensor, row: int, col: int, value) -> None:
+        try:
+            tensor[int(row), int(col)] = value
+        except (AttributeError, TypeError, IndexError):
+            return
+
+    @staticmethod
+    def _fill_tensor_row(tensor, row: int, value) -> bool:
+        try:
+            tensor[int(row)].fill_(value)
+            return True
+        except (AttributeError, TypeError, IndexError):
+            return False
+
+    def _write_request_table_header(self,
+                                    state: HiSparseRequestState) -> None:
+        tensors = self._tensors
+        if tensors is None:
+            return
+        slot = int(state.table_slot)
+        self._set_tensor_value_1d(tensors.request_ids_host, slot,
+                                  int(state.req_pool_idx))
+        self._set_tensor_value_1d(tensors.request_ids_device, slot,
+                                  int(state.req_pool_idx))
+        self._write_request_table_admitted(state, admitted=state.admitted)
+
+    def _write_request_table_block(
+        self,
+        state: HiSparseRequestState,
+        block_pos: int,
+        *,
+        host_slot: int,
+        commit_gen: int,
+    ) -> None:
+        tensors = self._tensors
+        if tensors is None:
+            return
+        slot = int(state.table_slot)
+        block_pos = int(block_pos)
+        tier = self._require_configured()
+        if block_pos < 0 or block_pos >= tier.max_blocks_per_request:
+            raise IndexError(
+                f"HiSparse request block_pos {block_pos} exceeds request "
+                f"table width {tier.max_blocks_per_request}.")
+        for tensor in (tensors.request_block_host_slots_host,
+                       tensors.request_block_host_slots_device):
+            self._set_tensor_value_2d(tensor, slot, block_pos, int(host_slot))
+        for tensor in (tensors.request_block_commit_gen_host,
+                       tensors.request_block_commit_gen_device):
+            self._set_tensor_value_2d(tensor, slot, block_pos,
+                                      int(commit_gen))
+
+    def _write_request_table_admitted(self,
+                                      state: HiSparseRequestState,
+                                      *,
+                                      admitted: bool) -> None:
+        tensors = self._tensors
+        if tensors is None:
+            return
+        slot = int(state.table_slot)
+        self._set_tensor_value_1d(tensors.request_admitted_host, slot,
+                                  bool(admitted))
+        self._set_tensor_value_1d(tensors.request_admitted_device, slot,
+                                  bool(admitted))
+
+    def _clear_request_table_slot(self, table_slot: int) -> None:
+        tensors = self._tensors
+        if tensors is None:
+            return
+        table_slot = int(table_slot)
+        self._set_tensor_value_1d(tensors.request_ids_host, table_slot, -1)
+        self._set_tensor_value_1d(tensors.request_ids_device, table_slot, -1)
+        self._set_tensor_value_1d(tensors.request_admitted_host, table_slot,
+                                  False)
+        self._set_tensor_value_1d(tensors.request_admitted_device, table_slot,
+                                  False)
+        tier = self._require_configured()
+        row_tensors = (tensors.request_block_host_slots_host,
+                       tensors.request_block_host_slots_device,
+                       tensors.request_block_commit_gen_host,
+                       tensors.request_block_commit_gen_device)
+        pending = [
+            tensor for tensor in row_tensors
+            if not self._fill_tensor_row(tensor, table_slot, -1)
+        ]
+        for block_pos in range(tier.max_blocks_per_request):
+            for tensor in pending:
+                self._set_tensor_value_2d(tensor, table_slot, block_pos, -1)
+
+    def request_table_snapshot(self, req_pool_idx: int) -> Dict[str, object]:
+        """Return host-side table metadata for unit/debug validation."""
+        state = self._request_state(req_pool_idx)
+        return {
+            "table_slot": state.table_slot,
+            "req_pool_idx": state.req_pool_idx,
+            "host_slots_by_block_pos": dict(state.host_slots_by_block_pos),
+            "admitted": state.admitted,
+        }
 
     def host_registration_descs(
         self,
@@ -664,7 +849,7 @@ class OPTRTHiSparseCoordinator:
         *,
         request_epoch: Optional[int] = None,
     ) -> HiSparseRequestState:
-        self._require_configured()
+        tier = self._require_configured()
         req_pool_idx = int(req_pool_idx)
         num_prompt_blocks = int(num_prompt_blocks)
         if num_prompt_blocks < 0:
@@ -672,15 +857,28 @@ class OPTRTHiSparseCoordinator:
         if req_pool_idx in self._requests:
             raise ValueError(
                 f"HiSparse request {req_pool_idx} is already reserved.")
+        if num_prompt_blocks > tier.max_blocks_per_request:
+            raise MemoryError(
+                "HiSparse request exceeds device-visible request table width: "
+                f"requested {num_prompt_blocks}, "
+                f"max_blocks_per_request {tier.max_blocks_per_request}.")
+        if not self._free_request_slots:
+            raise MemoryError(
+                "Insufficient HiSparse request table slots: requested 1, "
+                "available 0.")
         if len(self._free_host_slots) < num_prompt_blocks:
             raise MemoryError(
                 "Insufficient HiSparse host slots: requested "
                 f"{num_prompt_blocks}, available {len(self._free_host_slots)}.")
+        table_slot = self._free_request_slots.pop(0)
         state = HiSparseRequestState(
             req_pool_idx=req_pool_idx,
             request_epoch=self.step_id if request_epoch is None else
             int(request_epoch),
+            table_slot=table_slot,
         )
+        self._request_slot_by_req_pool_idx[req_pool_idx] = table_slot
+        self._write_request_table_header(state)
         for block_pos in range(num_prompt_blocks):
             host_slot = self._free_host_slots.pop(0)
             self._host_records[host_slot] = HiSparseHostBlockRecord(
@@ -690,6 +888,10 @@ class OPTRTHiSparseCoordinator:
                 owner_epoch=state.request_epoch,
             )
             state.host_slots_by_block_pos[block_pos] = host_slot
+            self._write_request_table_block(state,
+                                            block_pos,
+                                            host_slot=host_slot,
+                                            commit_gen=-1)
         self._requests[req_pool_idx] = state
         return state
 
@@ -758,12 +960,17 @@ class OPTRTHiSparseCoordinator:
         self._write_host_commit_metadata(record,
                                          range(tier.num_layers),
                                          valid=True)
+        self._write_request_table_block(state,
+                                        int(block_pos),
+                                        host_slot=record.host_slot,
+                                        commit_gen=record.commit_gen)
         return record
 
     def begin_host_write(self, req_pool_idx: int) -> HiSparseRequestState:
         state = self._request_state(req_pool_idx)
         state.pending_writes += 1
         state.admitted = False
+        self._write_request_table_admitted(state, admitted=False)
         return state
 
     def finish_host_write(self, req_pool_idx: int) -> HiSparseRequestState:
@@ -782,6 +989,7 @@ class OPTRTHiSparseCoordinator:
             return
         state.pending_writes = 0
         state.admitted = False
+        self._write_request_table_admitted(state, admitted=False)
 
     def mark_host_write_committed(
         self,
@@ -837,6 +1045,10 @@ class OPTRTHiSparseCoordinator:
                 self._write_host_commit_metadata(record,
                                                  all_layers,
                                                  valid=True)
+                self._write_request_table_block(state,
+                                                int(block_pos),
+                                                host_slot=record.host_slot,
+                                                commit_gen=record.commit_gen)
                 newly_full.append(record)
         return tuple(newly_full)
 
@@ -872,6 +1084,7 @@ class OPTRTHiSparseCoordinator:
                 "host blocks are committed and no host writes are pending: "
                 f"req={req_pool_idx}, pending_writes={state.pending_writes}.")
         state.admitted = True
+        self._write_request_table_admitted(state, admitted=True)
         return state
 
     def release_request(self, req_pool_idx: int, *, force: bool = False) -> None:
@@ -886,6 +1099,11 @@ class OPTRTHiSparseCoordinator:
         if force:
             self.abort_request(req_pool_idx)
         state = self._requests.pop(req_pool_idx)
+        table_slot = self._request_slot_by_req_pool_idx.pop(req_pool_idx,
+                                                            state.table_slot)
+        self._clear_request_table_slot(table_slot)
+        self._free_request_slots.append(table_slot)
+        self._free_request_slots.sort()
         released_slots = sorted(state.host_slots_by_block_pos.values())
         released_set = set(released_slots)
         for records in self._hot_records_by_layer.values():
@@ -912,6 +1130,10 @@ class OPTRTHiSparseCoordinator:
                 range(self._require_configured().num_layers),
                 valid=False,
             )
+            self._write_request_table_block(state,
+                                            int(block_pos),
+                                            host_slot=record.host_slot,
+                                            commit_gen=-1)
             released_host_slots.add(record.host_slot)
         for records in self._hot_records_by_layer.values():
             for hot in records:
