@@ -856,7 +856,7 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
 
 def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
     root = Path(__file__).resolve().parents[5]
-    thop = root / "cpp/tensorrt_llm/thop/hisparseSwapInPackedKvarnOp.cpp"
+    thop = root / "cpp/tensorrt_llm/thop/hisparseSwapInPackedKvarnOp.cu"
     cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
     fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
 
@@ -871,7 +871,7 @@ def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
     assert "prevent overlapping packed records" in source
     assert "layer stride must cover all packed slots" in source
     assert "prevent overlapping layers" in source
-    assert "hisparseSwapInPackedKvarnOp.cpp" in cmake.read_text()
+    assert "hisparseSwapInPackedKvarnOp.cu" in cmake.read_text()
     assert "hisparse_submit_packed_kvarn_copy_schedule" in fake.read_text()
 
 

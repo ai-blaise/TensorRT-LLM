@@ -99,7 +99,7 @@ add_library(
   IndexerKCacheScatterOp.cpp
   mlaBdrKvarnOp.cpp
   hisparseRequestTableOp.cpp
-  hisparseSwapInPackedKvarnOp.cpp
+  hisparseSwapInPackedKvarnOp.cu
   hisparseKvarnHotReadOp.cpp
   hisparseTopkToBlocksOp.cpp
   kvarnGqaOp.cpp

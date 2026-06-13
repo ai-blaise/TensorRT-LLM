@@ -892,9 +892,10 @@ Correctness tests:
 - production full-HBM KVarN decode path vs HiSparse packed-hot block
   equivalence within KVarN tolerance. Any full-restore baseline is external to
   the enabled HiSparse serving path.
-- independent offline references may be used only as test fixtures; no FP16
-  block-hot oracle path may be wired into the coordinator, transceiver, kernel
-  ABI, or deployment config.
+- independent offline references may be used only as fixtures that are outside
+  serving. They may read recorded production-layout tensors after a run, but no
+  FP16 block-hot oracle path may be wired into the coordinator, transceiver,
+  attention dispatch, kernel ABI, or deployment config.
 - LayerSplit TP2xCP2 prefill to TP4/CP1 decode E2E.
 - generation-first NIXL direct-to-host E2E.
 - streaming cancel/cleanup E2E.
@@ -1288,6 +1289,30 @@ Still pending before serving enablement:
 - run the CUDA smoke tests and a full native-library build in a safe B200
   window; current verification has compiled translation units but has not
   executed the CUDA runtime op under the deployed image;
+- use `scripts/blaise_build_hisparse_thop.sh` for the current VM-side native
+  thop proof loop. The June 13 build sweep established the required
+  non-disruptive recipe: run inside the `hisa-buildtools-20260531` image, keep
+  `/home/spencer/work/build-cache/hisparse-thop` as the persistent build/cache
+  mount, pass NCCL include/library paths explicitly from the Python NCCL wheel
+  and system `libnccl.so`, add the real CUTLASS FetchContent Python source dir
+  to `PYTHONPATH`, disable DeepEP/DeepGEMM/FlashMLA for the thop-only proof,
+  disable the OSS CUTLASS GEMM feature families that are not needed for this
+  native-op proof, force dynamic NVRTC linking, and clear the missing `ccache`
+  compiler launchers. That recipe configures cleanly for
+  `BUILD_WHEEL_TARGETS=th_common` and is the fastest known non-invasive path
+  to a native library containing the HiSparse `torch.ops.trtllm.*`
+  registrations. It still pulls the shared TRT-LLM internal CUTLASS dependency
+  graph, so the first build remains large; the persistent build dir is part of
+  the recipe, not an optional convenience. The helper supports `TARGETS=...`
+  for narrow proof builds during downtime, and the swap-in copy bridge now
+  builds as `hisparseSwapInPackedKvarnOp.cu` because it owns the mapped-host
+  CUDA copy kernel and launch syntax. The helper exports the CUTLASS
+  FetchContent Python path inside the container shell as well as at Docker
+  launch, avoiding the disabled-user-site `cutlass_library` import trap during
+  repeated configure loops. The CUTLASS kernel-generation CMake step also now
+  passes the FetchContent CUTLASS Python root directly into its Python
+  subprocess, so native proof builds do not depend on deprecated `develop
+  --user` behavior or user-site activation;
 - optimize `sparse_mla_decode_kvarn_hot` beyond the direct per-row/head kernel
   by importing the compatible FlashMLA split scheduler/combine structure while
   preserving the packed KVarN-hot BDR producer load;
@@ -1616,7 +1641,8 @@ production ABI:
    - VM E2E for generation-first NIXL direct-to-host, LayerSplit prefill,
      TP4/EP4 decode, SMC-SD accept/reject, and Moondream pin preservation;
    - correctness comparison against the existing production full-HBM KVarN path
-     within KVarN tolerance, with no FP16 serving oracle.
+     within KVarN tolerance, with no FP16 serving oracle and no executable
+     intermediate correctness placeholder.
 8. Optimize before promotion:
    - precompile SM100 buckets for `index_topk=1024`, `tokens_per_block=64`, and
      hot blocks/request `{32,64,96,128}`;
