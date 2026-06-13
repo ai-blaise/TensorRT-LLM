@@ -585,6 +585,31 @@ Deliverables:
 - sparse-attention metadata exposes hot block tables without changing Indexer
   scoring.
 
+Current branch status:
+
+- implemented the coordinator's packed-tier descriptor for
+  `num_layers`, `tokens_per_block`, `packed_bytes_per_block`,
+  logical host capacity, and hot device capacity;
+- implemented request host-row reservation and release, with stable
+  request-relative `block_pos -> host_slot` ownership;
+- implemented host block commit metadata with `valid`, `commit_gen`,
+  `logical_block_id`, and request epoch tracking;
+- implemented layer-local hot-slot metadata and LRU hit/miss selection keyed by
+  `(req_pool_idx, block_pos, host_slot, commit_gen)`;
+- implemented invalidation that clears hot records when host records are
+  invalidated or request slots are released;
+- added CPU-level unit tests for allocation, duplicate reservation, capacity
+  failure, uncommitted-block rejection, commit-generation refresh, LRU eviction,
+  and cleanup.
+
+Still pending before serving enablement:
+
+- actual host-pinned packed KVarN tensor allocation;
+- actual device hot packed KVarN tensor allocation;
+- NIXL writable descriptors for host slots;
+- host-to-hot packed record copy kernel;
+- sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
+
 ### Phase 3: Swap-In Kernel And Sparse MLA Hook
 
 Deliverables:
