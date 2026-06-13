@@ -29,6 +29,7 @@ _HISPARSE_NATIVE_PLANNER_OPS = (
 )
 _HISPARSE_KVARN_HOT_READER_OP = "trtllm::hisparse_read_kvarn_hot_bdr"
 _HISPARSE_FUSED_SPARSE_MLA_OP = "trtllm::sparse_mla_decode_kvarn_hot"
+_HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI = "explicit_sink_tail_v1"
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,22 @@ class OPTRTHiSparseCoordinator:
                 "an FP16 hot staging path or NVFP4 sparse MLA compatibility "
                 "path.")
 
+    def assert_resident_token_policy_ready(self) -> None:
+        """Require an explicit sink/tail ABI before enabled serving.
+
+        Packed HiSparse hot records cover committed full blocks only. Sink
+        tokens and the in-progress tail block are still resident in the normal
+        decode KV path, so serving must model them explicitly instead of
+        letting uncommitted-block row status collapse to zero outputs.
+        """
+        raise NotImplementedError(
+            "HiSparse sparse MLA requires the explicit sink/tail resident-token "
+            f"ABI {_HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI!r} before enabled "
+            "serving. Committed packed KVarN hot blocks are wired, but live "
+            "resident sink/tail tokens are not yet represented in the "
+            "descriptor or fused producer-load path; refusing to serve rather "
+            "than silently dropping them or routing through a fallback.")
+
     def assert_sparse_mla_reader_ready(self) -> None:
         """Require the production KVarN-hot sparse MLA chain."""
         if not self.enabled:
@@ -277,6 +294,7 @@ class OPTRTHiSparseCoordinator:
                 f"{_HISPARSE_FUSED_SPARSE_MLA_OP}. Do not route enabled "
                 "HiSparse through sparse_mla_decode_nvfp4, full-HBM restore, "
                 "or an executable dense hot pre-dequant placeholder.")
+        self.assert_resident_token_policy_ready()
 
     def reset_step(self) -> None:
         self.step_id += 1
@@ -1723,6 +1741,7 @@ class OPTRTHiSparseCoordinator:
                 "CUDA kernel. HiSparse must consume packed KVarN hot records "
                 "through the production sparse MLA path; no NVFP4 or full-HBM "
                 "fallback is allowed.")
+        self.assert_resident_token_policy_ready()
         import torch
 
         if not getattr(topk_indices, "is_cuda", False):

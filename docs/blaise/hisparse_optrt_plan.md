@@ -65,10 +65,11 @@ or deployment candidate.
 
 The startup/mapping guard is intentionally granular: enabled HiSparse first
 requires the native planner/copy ops, then the production BDR hot-reader
-primitive, then a fused `sparse_mla_decode_kvarn_hot` sparse MLA dispatch. Even
-if the fused op symbol appears, this branch still fails closed until DSA
-attention is explicitly rewired to call that path and the coordinator output,
-row status, and sink/tail descriptors are live-proven together.
+primitive, then a fused `sparse_mla_decode_kvarn_hot` sparse MLA dispatch, then
+the explicit sink/tail resident-token ABI. Even if the fused op symbol appears,
+this branch still fails closed until DSA attention is explicitly rewired to call
+that path and the coordinator output, row status, and sink/tail descriptors are
+live-proven together.
 
 Serving acceptance is binary: if `hisparse_enabled=true` can answer a request
 before dense-MLA KVarN BDR source writes, typed NIXL direct-to-host, native
@@ -207,9 +208,9 @@ indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
 path.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
-row-status consumption, B200 compile/proof of the native BDR writer, writer
-stream ordering against NIXL source reads, and live NIXL/cancel E2E proofs are
-not complete.
+row-status consumption, explicit sink/tail resident-token descriptors,
+B200 compile/proof of the native BDR writer, writer stream ordering against
+NIXL source reads, and live NIXL/cancel E2E proofs are not complete.
 This is the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
 
@@ -1157,7 +1158,12 @@ Current branch status:
   row-wide hot-index preflight and fails closed before any stale hot-slot read;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
-  `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;
+  `sparse_mla_decode_kvarn_hot` as separate fail-closed gates, then still
+  requires the explicit sink/tail resident-token ABI before enabled serving;
+- startup and mapping now hard-fail after all native sparse-MLA ops are present
+  if live resident sink/tail tokens are not represented in the descriptor and
+  fused producer-load path. This prevents uncommitted-block row status from
+  becoming zero-output serving behavior;
 - the sparse MLA KVarN-hot descriptor now records the coordinator `step_id`,
   and the fused attention dispatch rejects same-shape cached descriptors from
   older request steps before they can consume stale hot-slot metadata;
@@ -1175,6 +1181,9 @@ Still pending before serving enablement:
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
+- implement the explicit sink/tail resident-token ABI so top-k hits on live
+  resident tokens are served through the normal decode KV path rather than
+  invalidating rows or being modeled as committed packed KVarN blocks;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - runtime proof that the hot global-index output buffers and fused sparse MLA

@@ -203,7 +203,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::sparse_mla_decode_kvarn_hot",
         })
     with pytest.raises(NotImplementedError,
-                       match="native orchestration"):
+                       match="sink/tail resident-token ABI"):
         coordinator.map_topk_to_hot_pool(topk_indices=object(),
                                          metadata=SimpleNamespace(request_ids=[0]),
                                          layer_idx=0,
@@ -253,7 +253,40 @@ def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
                             hot_reader,
                             sparse_mla,
                         })
-    coordinator.assert_startup_ready()
+    with pytest.raises(NotImplementedError,
+                       match="sink/tail resident-token ABI"):
+        coordinator.assert_startup_ready()
+
+
+def test_hisparse_resident_token_abi_is_hard_startup_gate(monkeypatch):
+    coordinator = OPTRTHiSparseCoordinator(_cfg(enabled=True))
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=2048,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2,
+                                       kvarn_bits=2)
+    calls = []
+    coordinator.allocate_packed_tensors(device="cuda:0",
+                                        host_pinned=True,
+                                        tensor_factory=_fake_tensor_factory(calls))
+    monkeypatch.setattr(coordinator, "_torch_cuda_op_registered",
+                        lambda name: name in {
+                            "trtllm::hisparse_publish_request_table_slots",
+                            "trtllm::hisparse_topk_to_block_positions",
+                            "trtllm::hisparse_resolve_blocks_to_host_slots",
+                            "trtllm::hisparse_plan_hot_slots",
+                            "trtllm::hisparse_compact_miss_schedule",
+                            "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
+                            "trtllm::hisparse_commit_hot_slots",
+                            "trtllm::hisparse_build_hot_indices",
+                            "trtllm::hisparse_read_kvarn_hot_bdr",
+                            "trtllm::sparse_mla_decode_kvarn_hot",
+                        })
+
+    with pytest.raises(NotImplementedError,
+                       match="explicit sink/tail resident-token ABI"):
+        coordinator.assert_startup_ready()
 
 
 def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
@@ -703,6 +736,7 @@ def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():
 def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     root = Path(__file__).resolve().parents[5]
     attention = root / "tensorrt_llm/_torch/modules/attention.py"
+    hisparse = root / "tensorrt_llm/_torch/attention_backend/sparse/hisparse.py"
     source = attention.read_text()
 
     assert "def _sparse_mla_decode_kvarn_hot" in source
@@ -714,6 +748,7 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "int(descriptor.layer_idx) != expected_layer_idx" in source
     assert "descriptor.row_status.shape[0]" in source
     assert "descriptor.hot_indices.shape[1]" in source
+    assert "assert_resident_token_policy_ready" in hisparse.read_text()
     assert "torch.ops.trtllm.sparse_mla_decode_kvarn_hot" in source
     assert "getattr(attn_metadata, \"num_generations\", 0)" in source
     assert "hisparse_sparse_mla_kvarn_hot" in source
