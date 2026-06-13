@@ -1530,6 +1530,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.has_gated_norm and os.environ.get(
                 "TRTLLM_OPTRT_GATED_PREMLP_QUANT", "1") == "1")
         self._premlp_quant_scale = None
+        # Quantized kv_a_proj-input handoff: the INPUT gated norm emits NVFP4
+        # (SWIZZLED sf) for self_attn.kv_a_proj_with_mqa, mirroring the dense
+        # post-attention handoff. Default OFF — opt-in until the DSA proj path
+        # (mla_dsa_proj custom op + forward_dsa_proj) is wired to consume it;
+        # the helpers below are inert until then.
+        self._prekv_gate_quant_enabled = (
+            self.has_gated_norm and os.environ.get(
+                "TRTLLM_OPTRT_GATED_PREKV_QUANT", "0") == "1")
+        self._prekv_quant_scale = None
 
         # When enable_attention_dp is True, we normally skip attention all-reduce since each
         # DP rank works on different batch elements. However, with CP > 1, attention is split
@@ -1696,6 +1705,51 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         rank = gate_down.weight.shape[0]
         quant_scale = self._resolve_premlp_quant_scale()
+        if (quant_scale is not None
+                and lowrank_gate_quant_nvfp4_swizzled_supported(
+                    flat, rank, gate_down, quant_scale)):
+            y, y_fp4, y_sf = apply_fused_lowrank_gate_quant_nvfp4_swizzled(
+                flat, gate_down, gate_up, quant_scale)
+            return (y.reshape(hidden_states.shape),
+                    Fp4QuantizedTensor(y_fp4, y_sf, is_sf_swizzled=True))
+        return self._maybe_apply_gated_norm(hidden_states, gate_down,
+                                            gate_up), None
+
+    def _resolve_prekv_quant_scale(self) -> Optional[torch.Tensor]:
+        """input_scale of self_attn.kv_a_proj_with_mqa, or None if it cannot take
+        a pre-quantized swizzled-sf NVFP4 tensor. Probed once."""
+        if self._prekv_quant_scale is None:
+            scale = None
+            kv_a = getattr(getattr(self, "self_attn", None),
+                           "kv_a_proj_with_mqa", None)
+            if (self._prekv_gate_quant_enabled and kv_a is not None
+                    and getattr(kv_a, "has_nvfp4", False)
+                    and getattr(kv_a, "input_scale", None) is not None
+                    and getattr(kv_a, "pre_quant_scale", None) is None
+                    and not getattr(kv_a, "force_dynamic_quantization", False)):
+                scale = kv_a.input_scale
+            self._prekv_quant_scale = (scale, ) if scale is not None else ()
+        return self._prekv_quant_scale[0] if self._prekv_quant_scale else None
+
+    def _apply_input_gated_norm_quant(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor]]:
+        """Input gated norm with an NVFP4 handoff to kv_a_proj_with_mqa.
+
+        Mirror of _apply_post_attention_gated_norm_quant_dense for the INPUT
+        gate: returns (gated bf16 hidden states, Fp4QuantizedTensor of the same
+        values quantized with kv_a_proj's input scale in SWIZZLED sf layout, or
+        None). The fp4 feeds the Linear (kv_a_proj_with_mqa) directly; the bf16
+        is kept for the DSA indexer (which does its own fp32 wk/wp GEMM).
+        NOTE: inert until forward + the DSA proj path are wired to consume it.
+        """
+        gate_down = self.input_gated_norm_down
+        gate_up = self.input_gated_norm_up
+        if gate_down is None or gate_up is None:
+            return hidden_states, None
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rank = gate_down.weight.shape[0]
+        quant_scale = self._resolve_prekv_quant_scale()
         if (quant_scale is not None
                 and lowrank_gate_quant_nvfp4_swizzled_supported(
                     flat, rank, gate_down, quant_scale)):
