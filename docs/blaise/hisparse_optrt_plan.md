@@ -1219,6 +1219,14 @@ Current branch status:
   resident tail. The descriptor carries those flags and their row status so
   the next planner/build stage can exclude resident blocks from host-to-hot
   copy while preserving row correctness;
+- request-table resolve, hot-slot planning, post-copy commit, and hot-index
+  build now consume `resident_block_flags`: resident sink/tail blocks bypass
+  host-slot lookup, hot-slot victim selection, host-to-hot copy scheduling, and
+  hot metadata publication, while committed-hot blocks still require admitted
+  request-table host slots, valid commit generations, planned hot slots, and
+  post-copy commit. Hot-index build emits `-1` as the resident-read sentinel
+  for sink/tail token positions and preserves row validity for the future fused
+  producer-load path;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1233,10 +1241,6 @@ Still pending before serving enablement:
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
-- teach the native hot-slot plan, post-copy commit, and hot-index build stages
-  to consume `resident_block_flags`: resident sink/tail blocks must bypass
-  host-slot resolution/copy while true missing or uncommitted committed blocks
-  still fail closed;
 - implement CUDA producer-load consumption of the explicit sink/tail
   resident-token ABI so top-k hits on live resident tokens are served through
   the normal decode KV path rather than invalidating rows or being modeled as
@@ -1515,11 +1519,10 @@ production ABI:
        committed-hot reads from sink/tail resident reads after hot-index
        remapping;
      - resident block flags from
-       `trtllm::hisparse_classify_resident_blocks` must be consumed by the
-       native plan/commit/build stages before serving: sink/tail blocks bypass
-       host-slot resolution and hot-copy requirements, while committed-hot
-       blocks still require valid host-slot commit generations and hot-slot
-       metadata;
+       `trtllm::hisparse_classify_resident_blocks` are consumed by native
+       resolve/plan/commit/build: sink/tail blocks bypass host-slot resolution
+       and hot-copy requirements, while committed-hot blocks still require
+       valid host-slot commit generations and hot-slot metadata;
      - row/token status that distinguishes committed-hot hits, resident
        sink/tail hits, uncommitted invalid hits, and stale-planner failures;
      - fused producer-load consumption that selects packed-hot BDR reads for

@@ -26,6 +26,8 @@ enum HiSparseResolveStatus : uint8_t
     kResolveBlockOutOfRange = 3,
     kResolveUncommittedBlock = 4,
     kResolveBadBlockCount = 5,
+    kResolveResidentInvalid = 6,
+    kResolveInvalidResidentFlag = 7,
 };
 
 enum HiSparseResidentBlockFlag : uint8_t
@@ -49,6 +51,7 @@ enum HiSparsePlanStatus : uint8_t
     kPlanBadBlockCount = 2,
     kPlanInvalidResolvedBlock = 3,
     kPlanInsufficientHotSlots = 4,
+    kPlanInvalidResidentFlag = 5,
 };
 
 enum HiSparseCommitStatus : uint8_t
@@ -76,7 +79,18 @@ enum HiSparseBuildHotIndexStatus : uint8_t
     kBuildHotIndexBlockMissing = 3,
     kBuildHotIndexInvalidHotSlot = 4,
     kBuildHotIndexOverflow = 5,
+    kBuildHotIndexInvalidResidentFlag = 6,
 };
+
+__device__ __forceinline__ bool hisparseIsValidResidentBlockFlag(uint8_t flag)
+{
+    return flag == kResidentBlockCommittedHot || flag == kResidentBlockSink || flag == kResidentBlockTail;
+}
+
+__device__ __forceinline__ bool hisparseIsResidentBlockFlag(uint8_t flag)
+{
+    return flag == kResidentBlockSink || flag == kResidentBlockTail;
+}
 
 __device__ __forceinline__ uint32_t hisparseHash32(uint32_t value)
 {
@@ -180,6 +194,7 @@ __global__ void hisparseTopkToBlockPositionsKernel(int32_t const* __restrict__ t
 
 __global__ void hisparseResolveBlocksToHostSlotsKernel(int64_t const* __restrict__ rowRequestIds,
     int32_t const* __restrict__ blockPositions, int32_t const* __restrict__ blockCounts,
+    uint8_t const* __restrict__ residentBlockFlags, uint8_t const* __restrict__ residentRowStatus,
     int64_t const* __restrict__ requestIds, int64_t const* __restrict__ requestBlockHostSlots,
     int64_t const* __restrict__ requestBlockCommitGen, bool const* __restrict__ requestAdmitted,
     int64_t* __restrict__ hostSlots, int64_t* __restrict__ commitGens, uint8_t* __restrict__ blockStatus,
@@ -204,6 +219,10 @@ __global__ void hisparseResolveBlocksToHostSlotsKernel(int64_t const* __restrict
         if (count < 0 || count > maxBlocksPerRow)
         {
             rowCode = kResolveBadBlockCount;
+        }
+        else if (residentRowStatus[row] != kResidentClassOk)
+        {
+            rowCode = kResolveResidentInvalid;
         }
         else
         {
@@ -239,23 +258,37 @@ __global__ void hisparseResolveBlocksToHostSlotsKernel(int64_t const* __restrict
             code = rowCode;
             if (code == kResolveOk)
             {
-                int32_t const blockPos = blockPositions[rowOffset + i];
-                if (blockPos < 0 || blockPos >= maxBlocksPerRequest)
+                uint8_t const residentFlag = residentBlockFlags[rowOffset + i];
+                if (!hisparseIsValidResidentBlockFlag(residentFlag))
                 {
-                    code = kResolveBlockOutOfRange;
+                    code = kResolveInvalidResidentFlag;
                     atomicCAS(&rowCode, kResolveOk, code);
+                }
+                else if (hisparseIsResidentBlockFlag(residentFlag))
+                {
+                    code = kResolveOk;
                 }
                 else
                 {
-                    int64_t const tableOffset = static_cast<int64_t>(tableSlot) * maxBlocksPerRequest + blockPos;
-                    resolvedHostSlot = requestBlockHostSlots[tableOffset];
-                    resolvedCommitGen = requestBlockCommitGen[tableOffset];
-                    if (resolvedHostSlot < 0 || resolvedCommitGen < 0)
+                    int32_t const blockPos = blockPositions[rowOffset + i];
+                    if (blockPos < 0 || blockPos >= maxBlocksPerRequest)
                     {
-                        resolvedHostSlot = -1;
-                        resolvedCommitGen = -1;
-                        code = kResolveUncommittedBlock;
+                        code = kResolveBlockOutOfRange;
                         atomicCAS(&rowCode, kResolveOk, code);
+                    }
+                    else
+                    {
+                        int64_t const tableOffset
+                            = static_cast<int64_t>(tableSlot) * maxBlocksPerRequest + blockPos;
+                        resolvedHostSlot = requestBlockHostSlots[tableOffset];
+                        resolvedCommitGen = requestBlockCommitGen[tableOffset];
+                        if (resolvedHostSlot < 0 || resolvedCommitGen < 0)
+                        {
+                            resolvedHostSlot = -1;
+                            resolvedCommitGen = -1;
+                            code = kResolveUncommittedBlock;
+                            atomicCAS(&rowCode, kResolveOk, code);
+                        }
                     }
                 }
             }
@@ -331,12 +364,13 @@ __global__ void hisparseClassifyResidentBlocksKernel(int32_t const* __restrict__
 
 __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots,
     int64_t const* __restrict__ commitGens, int32_t const* __restrict__ blockCounts,
-    uint8_t const* __restrict__ resolveRowStatus, int64_t const* __restrict__ hotHostSlot,
-    int64_t const* __restrict__ hotCommitGen, int64_t const* __restrict__ hotLruTick,
-    int64_t* __restrict__ plannedHotSlots, int64_t* __restrict__ plannedLruTick,
-    int64_t* __restrict__ missHostSlots, int64_t* __restrict__ missHotSlots, int32_t* __restrict__ missCounts,
-    uint8_t* __restrict__ hitFlags, uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
-    int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase)
+    uint8_t const* __restrict__ residentBlockFlags, uint8_t const* __restrict__ resolveRowStatus,
+    int64_t const* __restrict__ hotHostSlot, int64_t const* __restrict__ hotCommitGen,
+    int64_t const* __restrict__ hotLruTick, int64_t* __restrict__ plannedHotSlots,
+    int64_t* __restrict__ plannedLruTick, int64_t* __restrict__ missHostSlots,
+    int64_t* __restrict__ missHotSlots, int32_t* __restrict__ missCounts, uint8_t* __restrict__ hitFlags,
+    uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t maxBlocksPerRow, int32_t numLayers,
+    int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase)
 {
     if (blockIdx.x != 0 || layerIdx < 0 || layerIdx >= numLayers)
     {
@@ -394,7 +428,25 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
             rowStatus[row] = kPlanBadBlockCount;
             continue;
         }
-        if (count > hotCapacity)
+        int32_t committedCount = 0;
+        for (int32_t i = 0; i < count; ++i)
+        {
+            uint8_t const residentFlag = residentBlockFlags[rowOffset + i];
+            if (!hisparseIsValidResidentBlockFlag(residentFlag))
+            {
+                rowStatus[row] = kPlanInvalidResidentFlag;
+                break;
+            }
+            if (!hisparseIsResidentBlockFlag(residentFlag))
+            {
+                ++committedCount;
+            }
+        }
+        if (rowStatus[row] != kPlanOk)
+        {
+            continue;
+        }
+        if (committedCount > hotCapacity)
         {
             rowStatus[row] = kPlanInsufficientHotSlots;
             continue;
@@ -403,6 +455,10 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
         bool validResolvedBlocks = true;
         for (int32_t i = 0; i < count; ++i)
         {
+            if (hisparseIsResidentBlockFlag(residentBlockFlags[rowOffset + i]))
+            {
+                continue;
+            }
             if (hostSlots[rowOffset + i] < 0 || commitGens[rowOffset + i] < 0)
             {
                 validResolvedBlocks = false;
@@ -418,6 +474,10 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
         int32_t requiredMisses = 0;
         for (int32_t i = 0; i < count; ++i)
         {
+            if (hisparseIsResidentBlockFlag(residentBlockFlags[rowOffset + i]))
+            {
+                continue;
+            }
             int64_t const hostSlot = hostSlots[rowOffset + i];
             int64_t const commitGen = commitGens[rowOffset + i];
             bool hit = false;
@@ -462,6 +522,13 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
         int32_t missCount = 0;
         for (int32_t i = 0; i < count; ++i)
         {
+            if (hisparseIsResidentBlockFlag(residentBlockFlags[rowOffset + i]))
+            {
+                plannedHotSlots[rowOffset + i] = -1;
+                plannedLruTick[rowOffset + i] = -1;
+                hitFlags[rowOffset + i] = 0;
+                continue;
+            }
             int64_t const hostSlot = hostSlots[rowOffset + i];
             int64_t const commitGen = commitGens[rowOffset + i];
             int32_t selectedHotSlot = -1;
@@ -599,8 +666,9 @@ __global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlo
     int64_t const* __restrict__ commitGens, int64_t const* __restrict__ plannedHotSlots,
     int64_t const* __restrict__ plannedLruTick, int32_t const* __restrict__ blockCounts,
     uint8_t const* __restrict__ planRowStatus, int64_t* __restrict__ hotHostSlot,
-    int64_t* __restrict__ hotCommitGen, int64_t* __restrict__ hotLruTick, uint8_t* __restrict__ rowStatus,
-    int32_t numRows, int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx)
+    int64_t* __restrict__ hotCommitGen, int64_t* __restrict__ hotLruTick,
+    uint8_t const* __restrict__ residentBlockFlags, uint8_t* __restrict__ rowStatus, int32_t numRows,
+    int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0 || layerIdx < 0 || layerIdx >= numLayers)
     {
@@ -627,6 +695,23 @@ __global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlo
         int64_t const rowOffset = static_cast<int64_t>(row) * maxBlocksPerRow;
         for (int32_t i = 0; i < count; ++i)
         {
+            uint8_t const residentFlag = residentBlockFlags[rowOffset + i];
+            if (!hisparseIsValidResidentBlockFlag(residentFlag))
+            {
+                rowStatus[row] = kCommitInvalidPlan;
+                valid = false;
+                break;
+            }
+            if (hisparseIsResidentBlockFlag(residentFlag))
+            {
+                if (plannedHotSlots[rowOffset + i] >= 0 || plannedLruTick[rowOffset + i] >= 0)
+                {
+                    rowStatus[row] = kCommitInvalidPlan;
+                    valid = false;
+                    break;
+                }
+                continue;
+            }
             int64_t const hotSlot = plannedHotSlots[rowOffset + i];
             if (hotSlot < 0 || hotSlot >= hotCapacity)
             {
@@ -648,6 +733,10 @@ __global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlo
 
         for (int32_t i = 0; i < count; ++i)
         {
+            if (hisparseIsResidentBlockFlag(residentBlockFlags[rowOffset + i]))
+            {
+                continue;
+            }
             int64_t const hotSlot = plannedHotSlots[rowOffset + i];
             int64_t const dst = layerOffset + hotSlot;
             hotHostSlot[dst] = hostSlots[rowOffset + i];
@@ -661,8 +750,9 @@ __global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlo
 __global__ void hisparseBuildHotIndicesKernel(int32_t const* __restrict__ topkIndices,
     int32_t const* __restrict__ blockPositions, int64_t const* __restrict__ plannedHotSlots,
     int32_t const* __restrict__ blockCounts, uint8_t const* __restrict__ commitRowStatus,
-    int32_t* __restrict__ hotIndices, uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t indexTopK,
-    int32_t maxBlocksPerRow, int32_t hotCapacity, int32_t tokensPerBlock, int32_t strideFactor, int32_t layerIdx)
+    uint8_t const* __restrict__ residentBlockFlags, int32_t* __restrict__ hotIndices,
+    uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t indexTopK, int32_t maxBlocksPerRow,
+    int32_t hotCapacity, int32_t tokensPerBlock, int32_t strideFactor, int32_t layerIdx)
 {
     int32_t const row = blockIdx.x;
     if (row >= numRows)
@@ -694,12 +784,14 @@ __global__ void hisparseBuildHotIndicesKernel(int32_t const* __restrict__ topkIn
             int32_t const blockPos = token / tokensPerBlock;
             int32_t const tokenOffset = token % tokensPerBlock;
             int64_t hotSlot = -1;
+            uint8_t residentFlag = kResidentBlockCommittedHot;
             bool foundBlock = false;
             for (int32_t i = 0; i < count; ++i)
             {
                 if (blockPositions[blockRowOffset + i] == blockPos)
                 {
                     hotSlot = plannedHotSlots[blockRowOffset + i];
+                    residentFlag = residentBlockFlags[blockRowOffset + i];
                     foundBlock = true;
                     break;
                 }
@@ -707,6 +799,14 @@ __global__ void hisparseBuildHotIndicesKernel(int32_t const* __restrict__ topkIn
             if (!foundBlock)
             {
                 atomicCAS(&rowCode, kBuildHotIndexOk, kBuildHotIndexBlockMissing);
+            }
+            else if (!hisparseIsValidResidentBlockFlag(residentFlag))
+            {
+                atomicCAS(&rowCode, kBuildHotIndexOk, kBuildHotIndexInvalidResidentFlag);
+            }
+            else if (hisparseIsResidentBlockFlag(residentFlag))
+            {
+                out = -1;
             }
             else if (hotSlot < 0 || hotSlot >= hotCapacity)
             {
@@ -762,10 +862,11 @@ void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blo
 }
 
 void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_t const* blockPositions,
-    int32_t const* blockCounts, int64_t const* requestIds, int64_t const* requestBlockHostSlots,
-    int64_t const* requestBlockCommitGen, bool const* requestAdmitted, int64_t* hostSlots, int64_t* commitGens,
-    uint8_t* blockStatus, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
-    int32_t requestSlotCapacity, int32_t maxBlocksPerRequest, cudaStream_t stream)
+    int32_t const* blockCounts, uint8_t const* residentBlockFlags, uint8_t const* residentRowStatus,
+    int64_t const* requestIds, int64_t const* requestBlockHostSlots, int64_t const* requestBlockCommitGen,
+    bool const* requestAdmitted, int64_t* hostSlots, int64_t* commitGens, uint8_t* blockStatus,
+    uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow, int32_t requestSlotCapacity,
+    int32_t maxBlocksPerRequest, cudaStream_t stream)
 {
     if (numRows <= 0)
     {
@@ -779,8 +880,9 @@ void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_
 
     constexpr int32_t kThreads = 128;
     hisparseResolveBlocksToHostSlotsKernel<<<numRows, kThreads, 0, stream>>>(rowRequestIds, blockPositions,
-        blockCounts, requestIds, requestBlockHostSlots, requestBlockCommitGen, requestAdmitted, hostSlots, commitGens,
-        blockStatus, rowStatus, numRows, maxBlocksPerRow, requestSlotCapacity, maxBlocksPerRequest);
+        blockCounts, residentBlockFlags, residentRowStatus, requestIds, requestBlockHostSlots, requestBlockCommitGen,
+        requestAdmitted, hostSlots, commitGens, blockStatus, rowStatus, numRows, maxBlocksPerRow, requestSlotCapacity,
+        maxBlocksPerRequest);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -804,11 +906,11 @@ void invokeHisparseClassifyResidentBlocks(int32_t const* blockPositions, int32_t
 }
 
 void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitGens, int32_t const* blockCounts,
-    uint8_t const* resolveRowStatus, int64_t const* hotHostSlot, int64_t const* hotCommitGen,
-    int64_t const* hotLruTick, int64_t* plannedHotSlots, int64_t* plannedLruTick, int64_t* missHostSlots,
-    int64_t* missHotSlots, int32_t* missCounts, uint8_t* hitFlags, uint8_t* rowStatus, int32_t numRows,
-    int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase,
-    cudaStream_t stream)
+    uint8_t const* residentBlockFlags, uint8_t const* resolveRowStatus, int64_t const* hotHostSlot,
+    int64_t const* hotCommitGen, int64_t const* hotLruTick, int64_t* plannedHotSlots,
+    int64_t* plannedLruTick, int64_t* missHostSlots, int64_t* missHotSlots, int32_t* missCounts,
+    uint8_t* hitFlags, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow, int32_t numLayers,
+    int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase, cudaStream_t stream)
 {
     if (numRows <= 0)
     {
@@ -823,9 +925,9 @@ void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitG
     constexpr int32_t kThreads = 128;
     size_t const smemBytes = static_cast<size_t>(hotCapacity) * (3 * sizeof(int64_t) + sizeof(uint8_t));
     hisparsePlanHotSlotsKernel<<<1, kThreads, smemBytes, stream>>>(hostSlots, commitGens, blockCounts,
-        resolveRowStatus, hotHostSlot, hotCommitGen, hotLruTick, plannedHotSlots, plannedLruTick, missHostSlots,
-        missHotSlots, missCounts, hitFlags, rowStatus, numRows, maxBlocksPerRow, numLayers, hotCapacity, layerIdx,
-        lruTickBase);
+        residentBlockFlags, resolveRowStatus, hotHostSlot, hotCommitGen, hotLruTick, plannedHotSlots, plannedLruTick,
+        missHostSlots, missHotSlots, missCounts, hitFlags, rowStatus, numRows, maxBlocksPerRow, numLayers,
+        hotCapacity, layerIdx, lruTickBase);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -847,8 +949,9 @@ void invokeHisparseCompactMissSchedule(int64_t const* missHostSlots, int64_t con
 
 void invokeHisparseCommitHotSlots(int64_t const* hostSlots, int64_t const* commitGens, int64_t const* plannedHotSlots,
     int64_t const* plannedLruTick, int32_t const* blockCounts, uint8_t const* planRowStatus, int64_t* hotHostSlot,
-    int64_t* hotCommitGen, int64_t* hotLruTick, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
-    int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, cudaStream_t stream)
+    int64_t* hotCommitGen, int64_t* hotLruTick, uint8_t const* residentBlockFlags, uint8_t* rowStatus,
+    int32_t numRows, int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx,
+    cudaStream_t stream)
 {
     if (numRows <= 0)
     {
@@ -860,15 +963,16 @@ void invokeHisparseCommitHotSlots(int64_t const* hostSlots, int64_t const* commi
     TLLM_CHECK_WITH_INFO(layerIdx >= 0 && layerIdx < numLayers, "hisparse_commit_hot_slots layer_idx out of range");
 
     hisparseCommitHotSlotsKernel<<<1, 1, 0, stream>>>(hostSlots, commitGens, plannedHotSlots, plannedLruTick,
-        blockCounts, planRowStatus, hotHostSlot, hotCommitGen, hotLruTick, rowStatus, numRows, maxBlocksPerRow,
-        numLayers, hotCapacity, layerIdx);
+        blockCounts, planRowStatus, hotHostSlot, hotCommitGen, hotLruTick, residentBlockFlags, rowStatus, numRows,
+        maxBlocksPerRow, numLayers, hotCapacity, layerIdx);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 void invokeHisparseBuildHotIndices(int32_t const* topkIndices, int32_t const* blockPositions,
     int64_t const* plannedHotSlots, int32_t const* blockCounts, uint8_t const* commitRowStatus,
-    int32_t* hotIndices, uint8_t* rowStatus, int32_t numRows, int32_t indexTopK, int32_t maxBlocksPerRow,
-    int32_t hotCapacity, int32_t tokensPerBlock, int32_t strideFactor, int32_t layerIdx, cudaStream_t stream)
+    uint8_t const* residentBlockFlags, int32_t* hotIndices, uint8_t* rowStatus, int32_t numRows,
+    int32_t indexTopK, int32_t maxBlocksPerRow, int32_t hotCapacity, int32_t tokensPerBlock,
+    int32_t strideFactor, int32_t layerIdx, cudaStream_t stream)
 {
     if (numRows <= 0)
     {
@@ -883,8 +987,8 @@ void invokeHisparseBuildHotIndices(int32_t const* topkIndices, int32_t const* bl
 
     constexpr int32_t kThreads = 256;
     hisparseBuildHotIndicesKernel<<<numRows, kThreads, 0, stream>>>(topkIndices, blockPositions, plannedHotSlots,
-        blockCounts, commitRowStatus, hotIndices, rowStatus, numRows, indexTopK, maxBlocksPerRow, hotCapacity,
-        tokensPerBlock, strideFactor, layerIdx);
+        blockCounts, commitRowStatus, residentBlockFlags, hotIndices, rowStatus, numRows, indexTopK, maxBlocksPerRow,
+        hotCapacity, tokensPerBlock, strideFactor, layerIdx);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

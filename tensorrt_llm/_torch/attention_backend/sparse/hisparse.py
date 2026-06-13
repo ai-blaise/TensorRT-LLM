@@ -1983,6 +1983,8 @@ class OPTRTHiSparseCoordinator:
                 row_request_ids,
                 blocks,
                 block_counts,
+                resident_block_flags,
+                resident_block_status,
                 tensors.request_ids_device,
                 tensors.request_block_host_slots_device,
                 tensors.request_block_commit_gen_device,
@@ -1997,6 +1999,7 @@ class OPTRTHiSparseCoordinator:
                     host_slots,
                     commit_gens,
                     block_counts,
+                    resident_block_flags,
                     resolve_status,
                     tensors.hot_host_slot,
                     tensors.hot_commit_gen,
@@ -2032,6 +2035,7 @@ class OPTRTHiSparseCoordinator:
             tensors.hot_host_slot,
             tensors.hot_commit_gen,
             tensors.hot_lru_tick,
+            resident_block_flags,
             int(layer_idx),
         )
         stride_factor = int(tier.num_layers * tier.tokens_per_block)
@@ -2041,6 +2045,7 @@ class OPTRTHiSparseCoordinator:
             planned_hot_slots,
             block_counts,
             commit_status,
+            resident_block_flags,
             int(tier.hot_device_capacity_blocks),
             int(tier.tokens_per_block),
             stride_factor,

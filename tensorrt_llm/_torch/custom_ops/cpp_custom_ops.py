@@ -259,10 +259,12 @@ def _register_fake():
                 topk_indices.new_empty((rows, ), dtype=torch.uint8))
 
     @torch.library.register_fake("trtllm::hisparse_resolve_blocks_to_host_slots")
-    def _(row_request_ids, block_positions, block_counts, request_ids,
+    def _(row_request_ids, block_positions, block_counts,
+          resident_block_flags, resident_row_status, request_ids,
           request_block_host_slots, request_block_commit_gen,
           request_admitted):
         del row_request_ids, block_counts, request_ids
+        del resident_block_flags, resident_row_status
         del request_block_host_slots, request_block_commit_gen
         del request_admitted
         return (block_positions.new_empty(block_positions.shape,
@@ -285,10 +287,10 @@ def _register_fake():
                                           dtype=torch.uint8))
 
     @torch.library.register_fake("trtllm::hisparse_plan_hot_slots")
-    def _(host_slots, commit_gens, block_counts, resolve_row_status,
-          hot_host_slot, hot_commit_gen, hot_lru_tick, layer_idx,
-          lru_tick_base):
-        del commit_gens, resolve_row_status, hot_host_slot
+    def _(host_slots, commit_gens, block_counts, resident_block_flags,
+          resolve_row_status, hot_host_slot, hot_commit_gen, hot_lru_tick,
+          layer_idx, lru_tick_base):
+        del commit_gens, resolve_row_status, resident_block_flags, hot_host_slot
         del hot_commit_gen, hot_lru_tick, layer_idx, lru_tick_base
         rows = host_slots.shape[0]
         return (host_slots.new_empty(host_slots.shape),
@@ -313,19 +315,19 @@ def _register_fake():
     @torch.library.register_fake("trtllm::hisparse_commit_hot_slots")
     def _(host_slots, commit_gens, planned_hot_slots, planned_lru_tick,
           block_counts, plan_row_status, hot_host_slot, hot_commit_gen,
-          hot_lru_tick, layer_idx):
+          hot_lru_tick, resident_block_flags, layer_idx):
         del host_slots, commit_gens, planned_hot_slots, planned_lru_tick
         del plan_row_status, hot_host_slot, hot_commit_gen
-        del hot_lru_tick, layer_idx
+        del hot_lru_tick, resident_block_flags, layer_idx
         return block_counts.new_empty((block_counts.shape[0], ),
                                       dtype=torch.uint8)
 
     @torch.library.register_fake("trtllm::hisparse_build_hot_indices")
     def _(topk_indices, block_positions, planned_hot_slots, block_counts,
-          commit_row_status, hot_capacity, tokens_per_block, stride_factor,
-          layer_idx):
+          commit_row_status, resident_block_flags, hot_capacity,
+          tokens_per_block, stride_factor, layer_idx):
         del block_positions, planned_hot_slots, block_counts
-        del commit_row_status, hot_capacity, tokens_per_block
+        del commit_row_status, resident_block_flags, hot_capacity, tokens_per_block
         del stride_factor, layer_idx
         return (topk_indices.new_empty(topk_indices.shape),
                 topk_indices.new_empty((topk_indices.shape[0], ),

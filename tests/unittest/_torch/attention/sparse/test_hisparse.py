@@ -731,6 +731,12 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "kResidentBlockSink" in planner_source
     assert "kResidentBlockTail" in planner_source
     assert "kResidentClassBlockPastKvLen" in planner_source
+    assert "kResolveResidentInvalid" in planner_source
+    assert "kPlanInvalidResidentFlag" in planner_source
+    assert "kBuildHotIndexInvalidResidentFlag" in planner_source
+    assert "hisparseIsResidentBlockFlag" in planner_source
+    assert "residentBlockFlags" in planner_source
+    assert "plannedHotSlots[rowOffset + i] = -1" in planner_source
     assert "readHisparseKvarnK2v2BdrLatentValue" in kernel_source
     assert "decodeHisparseKvarnHotIndex" in kernel_source
     assert "atomicCAS(&rowCode" in kernel_source
@@ -758,6 +764,9 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "resident_sink_blocks must equal resident_sink_tokens" in thop_source
     assert "resident_block_table must have shape [seqs, blocks]" in thop_source
     assert "hisparse_classify_resident_blocks" in planner_thop_source
+    assert "resident_row_status must be uint8" in planner_thop_source
+    assert "resident_block_flags shape must match host_slots" in planner_thop_source
+    assert "resident_block_flags shape must match block_positions" in planner_thop_source
     assert "tail_valid must be bool" in planner_thop_source
     assert "resident_kv_lens=None" in thop_source
     assert "resident_kv_pool=None" in thop_source
@@ -774,6 +783,7 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     fake_source = fake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake_source
     assert "hisparse_classify_resident_blocks" in fake_source
+    assert "resident_block_flags, resident_row_status" in fake_source
     assert "resident_kv_lens=None" in fake_source
     assert "resident_kv_pool=None" in fake_source
     assert "resident_tail_valid=None" in fake_source
@@ -850,6 +860,8 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "descriptor.resident_block_status is None" in source
     assert "descriptor.request_topk_indices.shape[1]" in source
     assert "descriptor.resident_block_flags.shape[0]" in source
+    assert "resident_block_flags," in source
+    assert "resident_block_status," in source
     assert "resident = getattr(descriptor, \"resident_tokens\", None)" in source
     assert "explicit_sink_tail_v1" in source
     assert "resident.row_kv_lens.shape[0]" in source
