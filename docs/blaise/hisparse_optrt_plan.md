@@ -62,6 +62,18 @@ outside the HiSparse coordinator/transceiver path, but there is no
 intermediate FP16 block-hot oracle implementation phase, runtime fallback,
 config mode, or deployment candidate.
 
+Current branch posture after the June 13 correctness sweep: the branch has a
+production-shaped, fail-closed scaffold, not a deployable HiSparse serving
+candidate. The config validation, packed KVarN tier allocation, host metadata
+publication, NIXL DRAM registration, request host-slot sideband, packed KVarN
+source/destination fragment derivation, and typed `HISPARSE_HOST` write
+submission are implemented. Startup still intentionally rejects
+`hisparse_enabled=true` before serving because host-write completion/commit
+handoff, cancel-safe admission, host-to-hot swap-in, sparse MLA hot-pool
+reading, and BDR/on-read dequant are not complete. This is the correct failure
+mode: no manifest should get an implicit full-HBM, FP16-staging, or
+direct-to-host-off substitute.
+
 ## Relevant SGLang Facts
 
 SGLang HiSparse is decode-side hierarchical memory for DSA/DSv4 models. The
@@ -615,7 +627,8 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- request-scoped NIXL write scheduling into the registered host slots;
+- host-write completion handoff that marks host `valid` and `commit_gen` only
+  after the typed HiSparse host write succeeds for the relevant block range;
 - host-to-hot packed record copy kernel;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
@@ -681,8 +694,8 @@ Current branch status:
 - added sender-side validation that aligns source packed KVarN block fragments
   with request-relative destination host slots for dense KV-cache pool pairs,
   skipping indexer, block-scale, and non-attention pools;
-- extended native transfer metadata/request construction so future HiSparse
-  writes can use distinct source and destination memory types
+- extended native transfer metadata/request construction so typed HiSparse
+  writes use distinct source and destination memory types
   (`VRAM -> DRAM` or `DRAM -> DRAM`) instead of overloading uniform KV/AUX
   descriptor assumptions;
 - wired packed HiSparse `VRAM -> DRAM` host writes into the KV sender path so
@@ -692,15 +705,18 @@ Current branch status:
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
   with NIXL as a separate `DRAM` registration group;
-- sender-side HiSparse destination validation now runs when receiver host slots
-  are present, but the fragments are intentionally not appended to
-  `WriteMetaType.KV`, because that path still constructs uniform `VRAM`
-  transfer requests.
+- sender-side HiSparse fragments are intentionally not appended to the normal
+  `WriteMetaType.KV` `VRAM -> VRAM` request. They are carried on `WriteMeta`,
+  validated against request-relative host slots, and submitted as a separate
+  typed `WriteMetaType.HISPARSE_HOST` request with `VRAM -> DRAM` descriptors.
 
 Still pending before serving enablement:
 
 - completion/commit handoff that marks host `valid` and `commit_gen` only after
-  the HiSparse host write succeeds;
+  the HiSparse host write succeeds, without double-bumping commits across
+  layer groups, TP ranks, or partial slices;
+- decode-admission gating that proves the request-visible host slots are
+  committed before sparse MLA can select them;
 - cancel/abort handling that keeps host slots pinned until in-flight DRAM
   writes finish;
 - E2E proof that NIXL writes land directly in decode host slots before decode
@@ -779,14 +795,20 @@ Promotion requires:
 The next implementation work should continue from the current fail-closed
 packed-tier and host-registration skeleton:
 
-1. add request-scoped HiSparse host-slot publication to the generation-first
-   request pin metadata;
-2. add a dedicated `DRAM` write-meta path for prefill-to-decode HiSparse host
-   writes rather than mixing host fragments into `WriteMetaType.KV`;
-3. implement the prefill-side packed KVarN writer and completion-to-commit
-   transition for host `valid` and `commit_gen`;
+1. implement the HiSparse host-write completion-to-commit transition:
+   accumulate the exact request-relative block positions written by each typed
+   `HISPARSE_HOST` request, mark `valid` and bump `commit_gen` only after all
+   required writes for that request/slice/layer coverage succeed, and keep
+   failed or partial blocks invisible to hot selection;
+2. harden cancel/abort/retraction so host rows and hot slots remain pinned
+   while any NIXL DRAM write can still complete, and only recycle them after
+   the transfer agent reports a safe terminal state;
+3. verify generation-first request pinning end to end with live NIXL metadata:
+   decode publishes writable host slots, prefill writes directly into those
+   slots, and decode admission is blocked until the commit handoff completes;
 4. implement the SM100 host-to-hot packed record swap-in kernel and hot global
    index mapping;
-5. wire sparse MLA to consume the hot packed KVarN pool with BDR/on-read dequant;
+5. wire sparse MLA to consume the hot packed KVarN pool with BDR/on-read
+   dequant, with no FP16 hot serving tier;
 6. add LayerSplit owner-local, SMC-SD row geometry, Moondream pinning, cancel,
    and recycle tests before relaxing startup fail-closed behavior.
