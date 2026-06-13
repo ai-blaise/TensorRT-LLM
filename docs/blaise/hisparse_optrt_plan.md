@@ -1578,7 +1578,10 @@ Still pending before serving enablement:
   launch, avoiding the disabled-user-site `cutlass_library` import trap during
   repeated configure loops. The helper now forces `--entrypoint /bin/bash` so
   resident runtime images that already set `/bin/bash` as their entrypoint can
-  run the build command instead of trying to execute `bash` as a script. On
+  run the build command instead of trying to execute `bash` as a script. The
+  serving-import proof-image helper applies the same entrypoint rule for
+  `--run-smoke`, so the proof container runs the smoke command directly rather
+  than handing `bash -lc ...` back to an inherited `/bin/bash` entrypoint. On
   `a4-us-001`, the current serving-layout proof build uses
   `local/dynamo-trtllm-optrt-custom:optrt-34fe7aaec-fixed-20260611011615`
   with `/home/spencer/work/build-cache/hisparse-thop-001`; the older

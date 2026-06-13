@@ -238,6 +238,7 @@ if [[ "$RUN_SMOKE" == 1 ]]; then
   docker run --rm --gpus "device=${GPU_DEVICE}" --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     --cpus="${SMOKE_CPUS:-4}" --memory="${SMOKE_MEMORY:-24g}" \
+    --entrypoint /bin/bash \
     "$IMAGE_TAG" \
-    bash -lc "set -euo pipefail; export LD_LIBRARY_PATH='${SITE_PACKAGES}/tensorrt_llm/libs':\${LD_LIBRARY_PATH:-}; /opt/dynamo/venv/bin/python3 /opt/ai-blaise/hisparse/serving_import_smoke.py --device cuda:0 --expect-site-packages '${SITE_PACKAGES}'"
+    -lc "set -euo pipefail; export LD_LIBRARY_PATH='${SITE_PACKAGES}/tensorrt_llm/libs':\${LD_LIBRARY_PATH:-}; /opt/dynamo/venv/bin/python3 /opt/ai-blaise/hisparse/serving_import_smoke.py --device cuda:0 --expect-site-packages '${SITE_PACKAGES}'"
 fi
