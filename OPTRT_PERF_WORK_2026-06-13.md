@@ -117,6 +117,24 @@ bit-exact data movement. Then #3.
 
 ---
 
+## MEGAKERNEL THESIS-TEST — NEGATIVE (2026-06-13), and it CORRECTS the §10.1 floor framing
+Built a persistent multi-problem NVFP4 GEMM (L-batch via `Sm100BlockScaledPersistentDenseGemmKernel`)
++ microbenched vs separate `nvfp4_gemm` at the real M=16 shapes (`.bench_runs_claude/megakernel/`,
+commit `1d3c64529`). Cosine = 1.0 (clean measurement). **Verdict: do NOT pursue the dense-GEMM
+megakernel.**
+- **The ramp IS amortizable** (mega/cublas climbs with L: kv_a 0.83→1.62x at L=2→32) — premise mechanically correct.
+- **BUT cuBLASLt already amortizes its own ramps in a CUDA graph:** 4 GEMMs back-to-back = **51.8µs, not
+  4×14=56µs** (marginal per-kernel cost +5.7..+18.5µs, below each isolated floor). **So the "14µs floor
+  stacks 315× = 6.5ms recoverable" framing in §10.1 OVERESTIMATED the real baseline** — the floor does NOT
+  stack linearly in graph-replay decode; cuBLASLt overlaps ramps. The dense swarm is **much closer to its
+  true floor than the isolated microbench suggested.**
+- **The megakernel LOSES on the dominant GEMMs:** o_proj (the 22.9µs one) = **0.57x = 1.75x SLOWER**; q_b
+  (N=24576) ≤0.71x. cuBLASLt's per-shape small-M tactics beat the generic persistent kernel at large N/K.
+  It only wins on small-N (kv_a) at L≥4 — which the model doesn't have (heterogeneous N,K, L=1/layer).
+- **Net:** the biggest profiled "lever" (dense GEMM swarm, 6.5ms) is **not recoverable** — it's near floor
+  and the megakernel is net-negative. This is the third rigorously-tested lever to come back not-a-win
+  (after cumsum fusion + FIFO_DEPTH). Reusable analysis: `.bench_runs_claude/megakernel/thesis_test.py`.
+
 ## DEFINITIVE CONCLUSION (2026-06-13) — cheap-win space is exhausted; headroom is structural
 After the full profile + all-spots dig + two measured A/Bs, the picture is conclusive:
 - **GPU 96.5% busy steady** (gap_analysis), at-floor kernels (GEMM microbench), cross-stream overlap.

@@ -471,3 +471,17 @@ M=16 in-pool best-backend roofline: kv_a_proj **2% SOL** (15.5 µs/2.3 MB), q_a_
 **Final verdict on lever #1:** the ~14 µs per-GEMM fixed cost is hit by **every** shipped backend (cutlass/cublaslt/cuda_core/cutedsl), so it's the practical floor for launching+executing an individual block-scaled FP4 GEMM at small M-N on B200. A fixed *per-launch* cost can only be amortized by **fewer, larger GEMMs** — and the easy horizontal fusion (q_a+kv_a) is already done. So recovering the swarm needs **megakernel-style fusion of the per-layer dense projections** (the same structural direction as WarpDecode for MoE), a major kernel project — **not a near-term win.** The biggest lever by size is the hardest to move.
 
 **Revised recommendation (post-measurement):** the near-term tractable wins are (1) the **a2a** (2.08 ms — algorithm/overlap, Spencer-flagged), and (2) the **fusable glue+quant+memset** (elementwise 1.8 ms + quant 1.1 ms + memset 0.6 ms ≈ 3.5 ms combined, medium difficulty). The dense GEMM swarm (6.5 ms, biggest) is parked as a **megakernel project** (long-term). Optional quick ship: add `cutedsl` to `allowed_backends` for the ~0.3 ms o_proj-class win if its stability is acceptable.
+
+### §10.2 — CORRECTION (2026-06-13): the "6.5 ms recoverable via megakernel" framing above was WRONG
+A persistent multi-problem NVFP4 megakernel was built + microbenched vs separate `nvfp4_gemm` at the real
+M=16 shapes (`.bench_runs_claude/megakernel/`, commit `1d3c64529`; cosine=1.0, clean measurement). Result:
+- **cuBLASLt already amortizes its per-grid ramp when GEMMs are chained back-to-back in a CUDA graph** —
+  4 dense projections = **51.8 µs, not 4×14=56 µs**. So the §10.1 "~14 µs floor × 315 = ~6.5 ms
+  recoverable" **overestimated the baseline**; the floor does NOT stack linearly in graph-replay decode.
+- The persistent megakernel is **net-NEGATIVE on the dominant GEMMs** (o_proj 0.57x = 1.75x slower; q_b
+  ≤0.71x); it only beats cuBLASLt on small-N shapes (kv_a) at L≥4 batching — which this model lacks
+  (heterogeneous N,K, L=1/layer). **The dense GEMM swarm is near its true floor; the megakernel is not a
+  lever.** Combined with the neutral cumsum-fusion + FIFO_DEPTH A/Bs and the 96.5%-busy bubble analysis,
+  the rigorous conclusion stands: **the op-trt decode stack is at its optimization frontier — remaining
+  wins (if any) need a fundamentally different approach (precision/algorithm/model-structure), not
+  kernel-fusion of the existing FP4 ops.** Full write-up: `OPTRT_PERF_WORK_2026-06-13.md`.
