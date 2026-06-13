@@ -142,6 +142,13 @@ application, and E4M3 RoPE byte read now live in
 `hisparseKvarnBdrRead.cuh`. The standalone hot-reader smoke op and the future
 fused sparse MLA kernel must use that same device helper layer so the
 validated CUDA smoke path and serving producer-load path cannot drift.
+The coordinator also now constructs a typed
+`HiSparseSparseMlaKvarnHotDescriptor` at the native-chain boundary. That
+descriptor carries `hot_packed`, hot global indices, row status, fixed-top-k
+semantics, layer, stride, capacity, packed-record size, and the production
+`kvarn_k2v2` dense-MLA dimensions. It is built only from real native outputs
+and the function still raises immediately afterward; it is an ABI target for
+`sparse_mla_decode_kvarn_hot`, not a serving fallback.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
@@ -1090,6 +1097,9 @@ Still pending before serving enablement:
   `hisparseKvarnBdrRead.cuh` device helpers that the fused sparse MLA producer
   must include, but promotion still requires fusing those helpers into sparse
   MLA rather than launching a separate dense scratch prepass;
+- attention dispatch must consume `HiSparseSparseMlaKvarnHotDescriptor`
+  directly rather than reconstructing loose hot-pool tensors or allocating a
+  side top-k-length tensor inside the CUDA graph path;
 - final row-status propagation into the sparse MLA hot-read stage so rows with
   resolve/plan/copy/commit/build errors cannot be consumed;
 - live validation and microbenchmarking of native packed KVarN host-to-hot

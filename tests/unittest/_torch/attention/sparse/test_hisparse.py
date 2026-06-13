@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
+    HiSparseSparseMlaKvarnHotDescriptor,
     OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
     KVARN_BDR_HISPARSE_LAYOUT, KVARN_LEGACY_SIDEPOOL_LAYOUT)
@@ -253,6 +254,27 @@ def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
     with pytest.raises(NotImplementedError,
                        match="registered but not integrated"):
         coordinator.assert_startup_ready()
+
+
+def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
+    desc = HiSparseSparseMlaKvarnHotDescriptor(
+        hot_packed=object(),
+        hot_indices=object(),
+        row_status=object(),
+        topk_length=None,
+        layer_idx=3,
+        index_topk=1024,
+        max_blocks_per_row=64,
+        tokens_per_block=64,
+        stride_factor=5120,
+        packed_bytes_per_block=126976,
+        hot_capacity_blocks=128,
+    )
+
+    assert desc.kvarn_bits == 2
+    assert desc.kv_lora_rank == 512
+    assert desc.qk_rope_head_dim == 64
+    assert desc.topk_length is None
 
 
 def test_hisparse_request_allocation_commit_and_release():

@@ -32,12 +32,34 @@ _HISPARSE_FUSED_SPARSE_MLA_OP = "trtllm::sparse_mla_decode_kvarn_hot"
 
 
 @dataclass(frozen=True)
+class HiSparseSparseMlaKvarnHotDescriptor:
+    """Call contract for the future packed-KVarN sparse MLA hot path."""
+
+    hot_packed: "torch.Tensor"
+    hot_indices: "torch.Tensor"
+    row_status: "torch.Tensor"
+    topk_length: Optional["torch.Tensor"]
+    layer_idx: int
+    index_topk: int
+    max_blocks_per_row: int
+    tokens_per_block: int
+    stride_factor: int
+    packed_bytes_per_block: int
+    hot_capacity_blocks: int
+    kvarn_bits: int = 2
+    kv_lora_rank: int = 512
+    qk_rope_head_dim: int = 64
+
+
+@dataclass(frozen=True)
 class HiSparseTopKMapping:
     """Result of mapping request-relative TopK through the HiSparse hot pool."""
 
     topk_indices_global: "torch.Tensor"
     pool_view: Optional["torch.Tensor"] = None
     hot_block_ids: Optional["torch.Tensor"] = None
+    sparse_mla_kvarn_hot: Optional[
+        HiSparseSparseMlaKvarnHotDescriptor] = None
 
 
 @dataclass(frozen=True)
@@ -941,6 +963,61 @@ class OPTRTHiSparseCoordinator:
                 "descriptors.")
         return self._tensors
 
+    def _make_sparse_mla_kvarn_hot_descriptor(
+        self,
+        *,
+        hot_indices,
+        row_status,
+        layer_idx: int,
+        index_topk: int,
+        max_blocks_per_row: int,
+        stride_factor: int,
+    ) -> HiSparseSparseMlaKvarnHotDescriptor:
+        """Build the typed sparse-MLA KVarN-hot ABI from native outputs.
+
+        This descriptor is a production ABI object, not a serving fallback. A
+        ``topk_length`` tensor is intentionally not allocated here: fixed-top-k
+        rows use the full ``index_topk`` contract, and row validity is carried
+        by ``row_status`` from the native resolve/plan/copy/commit/build chain.
+        """
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        kv_lora_rank = int(
+            getattr(self.sparse_attention_config, "kv_lora_rank", 512) or 512)
+        qk_rope_head_dim = int(
+            getattr(self.sparse_attention_config, "qk_rope_head_dim", 64)
+            or 64)
+        if tier.kvarn_bits != 2:
+            raise NotImplementedError(
+                "HiSparse sparse MLA KVarN-hot descriptor requires "
+                f"kvarn_bits=2, got {tier.kvarn_bits}.")
+        if tier.tokens_per_block != 64:
+            raise NotImplementedError(
+                "HiSparse sparse MLA KVarN-hot descriptor requires "
+                f"tokens_per_block=64, got {tier.tokens_per_block}.")
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            raise NotImplementedError(
+                "HiSparse sparse MLA KVarN-hot descriptor is currently "
+                "production-gated to dense MLA dimensions "
+                f"kv_lora_rank=512/qk_rope_head_dim=64, got "
+                f"{kv_lora_rank}/{qk_rope_head_dim}.")
+        return HiSparseSparseMlaKvarnHotDescriptor(
+            hot_packed=tensors.hot_packed,
+            hot_indices=hot_indices,
+            row_status=row_status,
+            topk_length=None,
+            layer_idx=int(layer_idx),
+            index_topk=int(index_topk),
+            max_blocks_per_row=int(max_blocks_per_row),
+            tokens_per_block=int(tier.tokens_per_block),
+            stride_factor=int(stride_factor),
+            packed_bytes_per_block=int(tier.packed_bytes_per_block),
+            hot_capacity_blocks=int(tier.hot_device_capacity_blocks),
+            kvarn_bits=2,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+
     def _host_tier_entries(
         self,
         *,
@@ -1741,7 +1818,7 @@ class OPTRTHiSparseCoordinator:
             int(layer_idx),
         )
         stride_factor = int(tier.num_layers * tier.tokens_per_block)
-        hot_indices, _build_status = torch.ops.trtllm.hisparse_build_hot_indices(
+        hot_indices, build_status = torch.ops.trtllm.hisparse_build_hot_indices(
             topk_indices,
             blocks,
             planned_hot_slots,
@@ -1752,9 +1829,18 @@ class OPTRTHiSparseCoordinator:
             stride_factor,
             int(layer_idx),
         )
+        sparse_mla_descriptor = self._make_sparse_mla_kvarn_hot_descriptor(
+            hot_indices=hot_indices,
+            row_status=build_status,
+            layer_idx=layer_idx,
+            index_topk=int(topk_indices.shape[1]),
+            max_blocks_per_row=max_blocks_per_row,
+            stride_factor=stride_factor,
+        )
         raise NotImplementedError(
             "HiSparse native planner/copy orchestration produced hot global "
-            f"indices with shape {tuple(hot_indices.shape)}, but sparse MLA "
+            f"indices with shape {tuple(sparse_mla_descriptor.hot_indices.shape)} "
+            "and a typed KVarN-hot sparse MLA descriptor, but sparse MLA "
             "hot-pool read with packed KVarN BDR/on-read dequant is not wired "
             "or live-validated. Serving remains fail-closed; do not fall back "
             "to full-HBM, FP16 staging, or direct-to-host-off paths.")
