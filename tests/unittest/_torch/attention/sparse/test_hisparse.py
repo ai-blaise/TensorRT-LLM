@@ -611,6 +611,10 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "expectedBdrBytesPerBlock" in thop_source
     assert "hotPacked.size(2) >= expectedBytes" in thop_source
     assert "hot_packed record bytes are smaller than production BDR layout" in thop_source
+    assert "checkHotPackedStrides" in thop_source
+    assert "prevent overlapping hot records" in thop_source
+    assert "prevent overlapping layers" in thop_source
+    assert "stride_factor must cover all layer token ranges" in thop_source
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake.read_text()

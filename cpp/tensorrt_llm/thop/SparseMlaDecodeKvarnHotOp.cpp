@@ -81,6 +81,17 @@ void checkOptionalContiguous(std::optional<at::Tensor> const& tensor, char const
     }
 }
 
+void checkHotPackedStrides(at::Tensor const& hotPacked, int64_t expectedBytes)
+{
+    TORCH_CHECK(hotPacked.stride(2) == 1, "hot_packed records must be byte-contiguous");
+    TORCH_CHECK(hotPacked.stride(1) >= expectedBytes,
+        "hot_packed slot stride must be at least the production BDR record bytes=", expectedBytes,
+        " to prevent overlapping hot records; got ", hotPacked.stride(1));
+    TORCH_CHECK(hotPacked.stride(0) >= hotPacked.size(1) * hotPacked.stride(1),
+        "hot_packed layer stride must cover all hot slots to prevent overlapping layers; got stride(0)=",
+        hotPacked.stride(0), ", required at least ", hotPacked.size(1) * hotPacked.stride(1));
+}
+
 } // namespace
 
 std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kvarn_hot(th::Tensor const& q,
@@ -133,6 +144,9 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     TORCH_CHECK(hotPacked.size(2) >= expectedBytes,
         "hot_packed record bytes are smaller than production BDR layout: got ", hotPacked.size(2),
         ", expected at least ", expectedBytes);
+    TORCH_CHECK(strideFactor >= numLayers * tokensPerBlock,
+        "stride_factor must cover all layer token ranges: got ", strideFactor,
+        ", expected at least ", numLayers * tokensPerBlock);
     TORCH_CHECK(indices.size(0) == b && indices.size(1) == sQ, "indices batch/s_q dimensions must match q");
     TORCH_CHECK(rowStatus.size(0) == b * sQ, "row_status must have one entry per [batch, s_q] row");
     if (topkLength.has_value())
@@ -146,7 +160,7 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     }
 
     TORCH_CHECK(q.stride(3) == 1, "q last dimension must be contiguous");
-    TORCH_CHECK(hotPacked.stride(2) == 1, "hot_packed records must be byte-contiguous");
+    checkHotPackedStrides(hotPacked, expectedBytes);
     TORCH_CHECK(indices.stride(2) == 1, "indices last dimension must be contiguous");
     TORCH_CHECK(rowStatus.is_contiguous(), "row_status must be contiguous");
     checkOptionalContiguous(topkLength, "topk_length");

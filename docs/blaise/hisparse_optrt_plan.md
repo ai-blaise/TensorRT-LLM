@@ -289,6 +289,9 @@ same ABI shape as the final serving path. The following are hard invariants:
   bytes are contiguous, slot stride covers a full packed record, and layer
   stride covers all slots in the layer. A strided aliasing view is not a valid
   HiSparse copy source or destination.
+- Sparse MLA KVarN-hot consumption has the same packed-layout requirement, and
+  its `stride_factor` must cover every layer's token range. Otherwise hot
+  global indices can decode into the wrong hot slot or layer.
 - Compact copy schedules must fail closed. Any impossible compact row id means
   the schedule is corrupt and no row in that batch may publish hot metadata.
 
@@ -1141,6 +1144,8 @@ Current branch status:
   metadata publication after a skipped miss copy;
 - tightened the packed copy bridge tensor ABI so host/hot packed tiers must
   have non-overlapping slot and layer strides before copy submission;
+- tightened the fused sparse MLA KVarN-hot wrapper so hot tier strides cannot
+  alias packed records/layers and `stride_factor` covers every layer token range;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;
