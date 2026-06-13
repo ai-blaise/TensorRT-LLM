@@ -444,7 +444,11 @@ payload in `KVarNBDRSourcePool`. The writer now emits C-KV scale/zp as bytes
 using CUDA's public half raw-conversion intrinsics, so a packed record remains
 valid even when the slot stride is not half-aligned. Blocks that were already
 committed to the legacy side-pool are backfilled into the BDR source pool
-instead of being skipped.
+instead of being skipped. The BDR source pool now records a CUDA event after the
+native writer and device commit markers, publishes host-visible commit metadata
+only with that event attached, and waits once on the event before exporting
+VRAM source fragments to NIXL. Invalidation clears any outstanding event with
+the recycled block id.
 The dense MLA decode branch also fails closed when a HiSparse coordinator is
 enabled, so an accidentally relaxed planner guard cannot route KVarN-hot
 indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
@@ -452,11 +456,11 @@ path.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because the resident-v1 sparse MLA readiness probe remains
 false until live DSA/NIXL/B200 deployment proof is complete. The sparse MLA
-hot-pool read, BDR/on-read dequant, native BDR writer, and resident sink/tail
-producer-load paths are now present and smoke-proven at the native op level,
-but promotion still requires live DSA row-status proof, writer stream ordering
-against NIXL source reads, live NIXL/cancel E2E proof, CUDA graph lifecycle
-proof, and profiling. This is the correct failure mode: no manifest should get
+hot-pool read, BDR/on-read dequant, native BDR writer, resident sink/tail
+producer-load paths, and source-fragment event fencing are now present and
+smoke-proven at the native op level, but promotion still requires live DSA
+row-status proof, live NIXL/cancel E2E proof, CUDA graph lifecycle proof, and
+profiling. This is the correct failure mode: no manifest should get
 an implicit full-HBM, FP16-staging, Python TopK extraction, or
 direct-to-host-off substitute.
 The resident sink/tail reader also fails closed on its normal-KV dtype at both
@@ -1442,8 +1446,9 @@ Still pending before serving enablement:
   is complete at the native-op level through `th_hisparse_smoke`: the writer
   fills the production BDR byte layout, supports byte-strided records, and the
   shared reader reconstructs the original dense MLA latent through inverse BDR
-  readback. Promotion still requires proof that those current-stream writes are
-  ordered before any NIXL source read in the live DSA/NIXL deployment image;
+  readback. Source-fragment export now records and waits on the current-stream
+  BDR writer event before handing VRAM pointers to NIXL; the remaining proof is
+  multi-rank live DSA/NIXL deployment validation of that ordering path;
 - optional coalescing of native request-table publication across multiple
   lifecycle events. Correctness no longer depends on Python scalar writes, but
   multi-slot batching may still reduce Python call overhead before promotion;
@@ -1975,10 +1980,10 @@ Promotion requires:
    `KVarNBDRSourcePool` for HiSparse source records and rejects legacy side-pool
    pointers at the host-write boundary. The native writer is now wired to that
    pool at full-block commit time; B200 native-op proof is complete for the
-   writer, byte-strided BDR record layout, KVarN-hot reader, sparse MLA hot
-   decode, and resident padding. The remaining required work is stream-order
-   validation against NIXL source reads, live DSA/NIXL deployment proof, graph
-   lifecycle proof, and optimized split scheduling/query-fold.
+   writer, byte-strided BDR record layout, source-fragment event fencing,
+   KVarN-hot reader, sparse MLA hot decode, and resident padding. The remaining
+   required work is live DSA/NIXL deployment proof, graph lifecycle proof, and
+   optimized split scheduling/query-fold.
 
 ## Immediate Execution Plan
 
@@ -2038,9 +2043,9 @@ production ABI:
    - align host/hot packed records with the production BDR layout used by
      `mlaKernels.cu`, including the now-fixed 2-bit read path;
    - keep `torch.ops.trtllm.mla_bdr_write_kvarn_record` locked to the
-     smoke-proven C-KV, byte-addressed scale/zp, inverse-read, and RoPE byte
-     contract; next proof is stream ordering against NIXL source reads in the
-     deployment image;
+     smoke-proven C-KV, byte-addressed scale/zp, inverse-read, RoPE byte, and
+     source-fragment event-fence contract; next proof is live multi-rank
+     DSA/NIXL ordering in the deployment image;
    - reject any serving configuration that would feed the legacy
      Python/Sinkhorn `KVarNLatentPool` record layout directly into a BDR
      sparse MLA hot-read kernel.

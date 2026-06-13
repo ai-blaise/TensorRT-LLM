@@ -126,6 +126,35 @@ def test_kvarn_bdr_source_pool_fragments_and_recycle_cpu():
         pool.packed_source_fragments([2])
 
 
+def test_kvarn_bdr_source_fragments_wait_for_write_event():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNBDRSourcePool(num_blocks=4,
+                              layout=cfg.hisparse_bdr_layout(group=64),
+                              device=torch.device("cpu"))
+    record = torch.ones(pool.bytes_per_block, dtype=torch.uint8)
+    pool.commit_record_bytes(1, record)
+
+    class _FakeWriteEvent:
+
+        def __init__(self):
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    event = _FakeWriteEvent()
+    pool._write_events[1] = event
+
+    src_ptrs, src_sizes = pool.packed_source_fragments([1])
+
+    assert event.synchronized is True
+    assert pool._write_events[1] is None
+    assert src_ptrs.tolist() == [pool.store.data_ptr() + pool.bytes_per_block]
+    assert src_sizes.tolist() == [pool.bytes_per_block]
+
+
 def _has_mla_bdr_writer_cuda_op() -> bool:
     try:
         return bool(

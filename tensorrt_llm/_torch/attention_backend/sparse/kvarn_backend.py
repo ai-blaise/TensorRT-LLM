@@ -168,6 +168,7 @@ class KVarNBDRSourcePool:
                                       device=device)
         self.valid_host = np.zeros((self.num_blocks,), dtype=bool)
         self.commit_gen_host = np.zeros((self.num_blocks,), dtype=np.int64)
+        self._write_events = [None for _ in range(self.num_blocks)]
 
     def _validate_block_ids(self, block_ids) -> np.ndarray:
         ids = np.asarray(block_ids, dtype=np.int64)
@@ -190,6 +191,31 @@ class KVarNBDRSourcePool:
         sizes = np.full(ids.size, self.bytes_per_block, dtype=np.int64)
         return ptrs.astype(np.int64, copy=False), sizes
 
+    def _record_write_ready_event(self, block_id: int) -> None:
+        """Fence the current-stream BDR write before source-pointer export."""
+        bid = int(block_id)
+        if not self.store.is_cuda:
+            self._write_events[bid] = None
+            return
+        with torch.cuda.device(self.store.device):
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.store.device))
+        self._write_events[bid] = event
+
+    def _wait_for_write_events(self, block_ids: np.ndarray) -> None:
+        """Wait once for any current-stream BDR writes backing these blocks."""
+        for raw_bid in block_ids:
+            bid = int(raw_bid)
+            event = self._write_events[bid]
+            if event is None:
+                continue
+            if self.store.is_cuda and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "HiSparse direct-to-host cannot export KVarN BDR source "
+                    "pointers while the current CUDA stream is capturing.")
+            event.synchronize()
+            self._write_events[bid] = None
+
     def mark_record_committed(self, block_id: int) -> None:
         """Publish a native-written BDR record as committed."""
         bid = int(block_id)
@@ -199,6 +225,7 @@ class KVarNBDRSourcePool:
                 f"num_blocks={self.num_blocks}.")
         self.valid[bid] = True
         self.commit_gen[bid] += 1
+        self._record_write_ready_event(bid)
         self.valid_host[bid] = True
         self.commit_gen_host[bid] += 1
 
@@ -228,8 +255,6 @@ class KVarNBDRSourcePool:
                 "torch.ops.trtllm.mla_bdr_write_kvarn_record.")
         op(latent_block, self.store, bid, int(self.layout.ckv_bits),
            int(self.layout.kv_lora_rank), int(self.layout.qk_rope_head_dim))
-        # The serving guard remains closed until B200 validation proves NIXL
-        # source reads are ordered behind this current-stream writer.
         self.mark_record_committed(bid)
 
     def commit_record_bytes(self, block_id: int, record_bytes: torch.Tensor) -> None:
@@ -261,6 +286,7 @@ class KVarNBDRSourcePool:
             raise RuntimeError(
                 "HiSparse direct-to-host requires committed production BDR "
                 f"KVarN records; uncommitted block id(s): {sample}.")
+        self._wait_for_write_events(ids)
         ptrs = int(self.store.data_ptr()) + ids * self.bytes_per_block
         sizes = np.full(ids.size, self.bytes_per_block, dtype=np.int64)
         return ptrs.astype(np.int64, copy=False), sizes
@@ -272,6 +298,8 @@ class KVarNBDRSourcePool:
         live = ids[self.valid_host[ids]]
         if live.size:
             self.valid_host[live] = False
+        for raw_bid in ids:
+            self._write_events[int(raw_bid)] = None
         if dev_ids is None:
             if live.size == 0:
                 return
