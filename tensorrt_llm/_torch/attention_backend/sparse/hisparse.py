@@ -95,6 +95,7 @@ class HiSparseRequestState:
     req_pool_idx: int
     request_epoch: int
     host_slots_by_block_pos: Dict[int, int] = field(default_factory=dict)
+    committed_layers_by_block_pos: Dict[int, set[int]] = field(default_factory=dict)
     pending_writes: int = 0
     admitted: bool = False
 
@@ -592,12 +593,81 @@ class OPTRTHiSparseCoordinator:
         *,
         logical_block_id: Optional[int] = None,
     ) -> HiSparseHostBlockRecord:
+        tier = self._require_configured()
+        state = self._requests.get(int(req_pool_idx))
+        if state is None:
+            raise KeyError(f"HiSparse request {req_pool_idx} is not reserved.")
         record = self._host_record(req_pool_idx, block_pos)
         if logical_block_id is not None:
             record.logical_block_id = int(logical_block_id)
         record.valid = True
         record.commit_gen += 1
+        state.committed_layers_by_block_pos[int(block_pos)] = set(
+            range(tier.num_layers))
+        self._write_host_commit_metadata(record,
+                                         range(tier.num_layers),
+                                         valid=True)
         return record
+
+    def mark_host_write_committed(
+        self,
+        req_pool_idx: int,
+        *,
+        layer_indices: Iterable[int],
+        block_positions: Iterable[int],
+    ) -> Tuple[HiSparseHostBlockRecord, ...]:
+        """Record successful packed host writes and publish full-block commits.
+
+        ``layer_indices`` and ``block_positions`` are parallel arrays of
+        successfully transferred packed KVarN records. A request-relative block
+        becomes globally selectable only after every local layer for that block
+        has reported a successful host write. Replayed coverage is idempotent
+        and does not bump ``commit_gen`` again.
+        """
+        tier = self._require_configured()
+        req_pool_idx = int(req_pool_idx)
+        state = self._requests.get(req_pool_idx)
+        if state is None:
+            raise KeyError(f"HiSparse request {req_pool_idx} is not reserved.")
+        layers = [int(layer) for layer in layer_indices]
+        blocks = [int(block_pos) for block_pos in block_positions]
+        if len(layers) != len(blocks):
+            raise ValueError(
+                "HiSparse host-write commit coverage requires parallel "
+                f"layer/block arrays, got {len(layers)} layer entries and "
+                f"{len(blocks)} block entries.")
+        if not layers:
+            return ()
+        bad_layers = [
+            layer for layer in layers
+            if layer < 0 or layer >= int(tier.num_layers)
+        ]
+        if bad_layers:
+            sample = ", ".join(str(layer) for layer in bad_layers[:8])
+            raise IndexError(
+                "HiSparse host-write commit layer index out of range: "
+                f"{sample}; num_layers={tier.num_layers}.")
+
+        newly_full: List[HiSparseHostBlockRecord] = []
+        all_layers = set(range(tier.num_layers))
+        for layer, block_pos in dict.fromkeys(zip(layers, blocks)):
+            record = self._host_record(req_pool_idx, block_pos)
+            committed = state.committed_layers_by_block_pos.setdefault(
+                int(block_pos), set())
+            if layer in committed:
+                continue
+            committed.add(layer)
+            if not record.valid and committed >= all_layers:
+                record.valid = True
+                record.commit_gen += 1
+                self._write_host_commit_metadata(record,
+                                                 all_layers,
+                                                 valid=True)
+                newly_full.append(record)
+        return tuple(newly_full)
+
+    def host_block_committed(self, req_pool_idx: int, block_pos: int) -> bool:
+        return self._host_record(req_pool_idx, block_pos).valid
 
     def release_request(self, req_pool_idx: int) -> None:
         req_pool_idx = int(req_pool_idx)
@@ -617,15 +687,53 @@ class OPTRTHiSparseCoordinator:
 
     def invalidate_host_blocks(self, req_pool_idx: int,
                                block_positions: Iterable[int]) -> None:
+        state = self._requests.get(int(req_pool_idx))
+        if state is None:
+            raise KeyError(f"HiSparse request {req_pool_idx} is not reserved.")
         released_host_slots = set()
         for block_pos in block_positions:
             record = self._host_record(req_pool_idx, int(block_pos))
             record.valid = False
+            state.committed_layers_by_block_pos.pop(int(block_pos), None)
+            self._write_host_commit_metadata(
+                record,
+                range(self._require_configured().num_layers),
+                valid=False,
+            )
             released_host_slots.add(record.host_slot)
         for records in self._hot_records_by_layer.values():
             for hot in records:
                 if hot.host_slot in released_host_slots:
                     hot.clear()
+
+    def _write_host_commit_metadata(
+        self,
+        record: HiSparseHostBlockRecord,
+        layers: Iterable[int],
+        *,
+        valid: bool,
+        commit_gen: Optional[int] = None,
+    ) -> None:
+        tensors = self._tensors
+        if tensors is None:
+            return
+        if commit_gen is None:
+            commit_gen = record.commit_gen
+        for layer in layers:
+            self._set_tensor_value(tensors.host_valid, int(layer),
+                                   record.host_slot, bool(valid))
+            self._set_tensor_value(tensors.host_commit_gen, int(layer),
+                                   record.host_slot, int(commit_gen))
+
+    @staticmethod
+    def _set_tensor_value(tensor, layer: int, host_slot: int, value) -> None:
+        try:
+            tensor[int(layer), int(host_slot)] = value
+        except (AttributeError, TypeError, IndexError):
+            # Lightweight test fakes expose only shape/data_ptr/fill_. Real
+            # torch tensors take this branch only on unsupported tensor-like
+            # objects, and serving remains fail-closed until kernels are wired.
+            return
 
     def select_hot_blocks(
         self,

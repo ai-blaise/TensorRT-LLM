@@ -532,7 +532,12 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.disaggregation.native.auxiliary import HiSparseHostTierMeta
-    from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        RecvReqInfo,
+        Sender,
+        _pack_hisparse_commit_payload,
+        _unpack_hisparse_commit_payload,
+    )
 
     cfg = KVarNGQAConfig(sinkhorn_iters=1)
     src_pool = _KVarNGQASidePool(
@@ -622,6 +627,18 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
     with pytest.raises(RuntimeError, match="host-tier metadata"):
         Sender._collect_hisparse_host_dst_frags(
             SimpleNamespace(hisparse_host_meta=None), req_info)
+
+    payload = _pack_hisparse_commit_payload(
+        np.array([0, 0, 1], dtype=np.int64),
+        np.array([0, 2, 2], dtype=np.int64),
+    )
+    layers, blocks = _unpack_hisparse_commit_payload(payload)
+    assert layers.tolist() == [0, 0, 1]
+    assert blocks.tolist() == [0, 2, 2]
+    assert _unpack_hisparse_commit_payload(None) == (None, None)
+    with pytest.raises(RuntimeError, match="count mismatch"):
+        _pack_hisparse_commit_payload(np.array([0], dtype=np.int64),
+                                      np.array([0, 1], dtype=np.int64))
 
     task = SimpleNamespace(_unique_rid=123, _slice=SimpleNamespace(is_last_slice=True))
 

@@ -136,6 +136,49 @@ def test_hisparse_request_allocation_commit_and_release():
     }
 
 
+def test_hisparse_host_write_commit_waits_for_all_local_layers():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=2,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=2048,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2)
+    coordinator.reserve_request(req_pool_idx=7, num_prompt_blocks=2)
+
+    newly_full = coordinator.mark_host_write_committed(
+        7,
+        layer_indices=[0],
+        block_positions=[1],
+    )
+
+    assert newly_full == ()
+    assert coordinator.host_block_committed(7, 1) is False
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        coordinator.select_hot_blocks(layer_idx=0,
+                                      req_pool_idx=7,
+                                      block_positions=[1])
+
+    newly_full = coordinator.mark_host_write_committed(
+        7,
+        layer_indices=[1, 1],
+        block_positions=[1, 1],
+    )
+
+    assert len(newly_full) == 1
+    assert newly_full[0].valid is True
+    assert newly_full[0].commit_gen == 1
+    assert coordinator.host_block_committed(7, 1) is True
+
+    duplicate = coordinator.mark_host_write_committed(
+        7,
+        layer_indices=[0, 1],
+        block_positions=[1, 1],
+    )
+
+    assert duplicate == ()
+    assert newly_full[0].commit_gen == 1
+
+
 def test_hisparse_request_reservation_is_idempotent_for_published_slots():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
     coordinator.configure_packed_tiers(num_layers=1,

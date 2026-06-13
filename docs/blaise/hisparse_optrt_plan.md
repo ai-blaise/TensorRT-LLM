@@ -67,12 +67,15 @@ production-shaped, fail-closed scaffold, not a deployable HiSparse serving
 candidate. The config validation, packed KVarN tier allocation, host metadata
 publication, NIXL DRAM registration, request host-slot sideband, packed KVarN
 source/destination fragment derivation, and typed `HISPARSE_HOST` write
-submission are implemented. Startup still intentionally rejects
-`hisparse_enabled=true` before serving because host-write completion/commit
-handoff, cancel-safe admission, host-to-hot swap-in, sparse MLA hot-pool
-reading, and BDR/on-read dequant are not complete. This is the correct failure
-mode: no manifest should get an implicit full-HBM, FP16-staging, or
-direct-to-host-off substitute.
+submission are implemented. The sender now returns explicit
+`(local_layer, request_block_pos)` commit coverage only after the normal KV
+write and typed host write both succeed, and the receiver accumulates that
+coverage before marking host records committed. Startup still intentionally
+rejects `hisparse_enabled=true` before serving because live NIXL E2E proof,
+cancel-safe admission, host-to-hot swap-in, sparse MLA hot-pool reading, and
+BDR/on-read dequant are not complete. This is the correct failure mode: no
+manifest should get an implicit full-HBM, FP16-staging, or direct-to-host-off
+substitute.
 
 ## Relevant SGLang Facts
 
@@ -627,8 +630,9 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- host-write completion handoff that marks host `valid` and `commit_gen` only
-  after the typed HiSparse host write succeeds for the relevant block range;
+- live E2E proof that the host-write completion handoff marks host `valid` and
+  `commit_gen` only after typed HiSparse host writes succeed for the relevant
+  layer/block coverage;
 - host-to-hot packed record copy kernel;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
@@ -701,6 +705,16 @@ Current branch status:
 - wired packed HiSparse `VRAM -> DRAM` host writes into the KV sender path so
   the receiver is not notified of KV success until the normal KV write and the
   HiSparse host write have both completed;
+- added a backward-compatible `KV_AGENT_RESULT` commit payload that carries
+  paired `(local_layer, request_block_pos)` coverage for each successful typed
+  HiSparse host write;
+- added receiver-side coverage accumulation and coordinator commit handoff:
+  replayed coverage is idempotent, partial layer coverage remains unselectable,
+  and a host block becomes globally valid only after all local layers for that
+  block have been written;
+- added a fail-closed receiver guard so a HiSparse-enabled request that
+  reserved host slots cannot complete without successful host-write commit
+  coverage;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -712,9 +726,8 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- completion/commit handoff that marks host `valid` and `commit_gen` only after
-  the HiSparse host write succeeds, without double-bumping commits across
-  layer groups, TP ranks, or partial slices;
+- live E2E validation of the completion/commit handoff, including multi-rank
+  and partial-slice cases;
 - decode-admission gating that proves the request-visible host slots are
   committed before sparse MLA can select them;
 - cancel/abort handling that keeps host slots pinned until in-flight DRAM
@@ -795,11 +808,10 @@ Promotion requires:
 The next implementation work should continue from the current fail-closed
 packed-tier and host-registration skeleton:
 
-1. implement the HiSparse host-write completion-to-commit transition:
-   accumulate the exact request-relative block positions written by each typed
-   `HISPARSE_HOST` request, mark `valid` and bump `commit_gen` only after all
-   required writes for that request/slice/layer coverage succeed, and keep
-   failed or partial blocks invisible to hot selection;
+1. prove and harden the HiSparse host-write completion-to-commit transition
+   with live NIXL: verify multi-rank and partial-slice coverage, ensure failed
+   or partial blocks remain invisible to hot selection, and add any missing
+   receiver-side admission checks exposed by the E2E run;
 2. harden cancel/abort/retraction so host rows and hot slots remain pinned
    while any NIXL DRAM write can still complete, and only recycle them after
    the transfer agent reports a safe terminal state;

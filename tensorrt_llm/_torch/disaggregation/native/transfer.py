@@ -156,6 +156,8 @@ class WriteMeta:
     hisparse_src_ptrs: Optional[np.ndarray] = None
     hisparse_dst_ptrs: Optional[np.ndarray] = None
     hisparse_sizes: Optional[np.ndarray] = None
+    hisparse_commit_layer_indices: Optional[np.ndarray] = None
+    hisparse_commit_block_positions: Optional[np.ndarray] = None
 
 
 class MessageType:
@@ -178,6 +180,56 @@ class TaskStatus(Enum):
 class AgentResult(Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+
+
+def _pack_hisparse_commit_payload(
+    layer_indices: Optional[np.ndarray],
+    block_positions: Optional[np.ndarray],
+) -> Optional[bytes]:
+    if layer_indices is None and block_positions is None:
+        return None
+    if layer_indices is None or block_positions is None:
+        raise RuntimeError(
+            "HiSparse commit coverage requires both layer indices and block "
+            "positions.")
+    layers = np.asarray(layer_indices, dtype=np.int64)
+    blocks = np.asarray(block_positions, dtype=np.int64)
+    if layers.ndim != 1 or blocks.ndim != 1:
+        raise RuntimeError("HiSparse commit coverage arrays must be 1D.")
+    if layers.size != blocks.size:
+        raise RuntimeError(
+            "HiSparse commit coverage layer/block count mismatch: "
+            f"layers={layers.size}, blocks={blocks.size}.")
+    if layers.size == 0:
+        return None
+    return msgpack.packb(
+        {
+            "hisparse_commit_layer_indices": layers.tolist(),
+            "hisparse_commit_block_positions": blocks.tolist(),
+        },
+        use_bin_type=True,
+    )
+
+
+def _unpack_hisparse_commit_payload(
+    payload: Optional[bytes],
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if payload is None:
+        return None, None
+    data = msgpack.unpackb(payload, raw=False)
+    layers = np.asarray(data.get("hisparse_commit_layer_indices", []),
+                        dtype=np.int64)
+    blocks = np.asarray(data.get("hisparse_commit_block_positions", []),
+                        dtype=np.int64)
+    if layers.ndim != 1 or blocks.ndim != 1:
+        raise RuntimeError("HiSparse commit coverage payload must be 1D.")
+    if layers.size != blocks.size:
+        raise RuntimeError(
+            "HiSparse commit coverage payload layer/block count mismatch: "
+            f"layers={layers.size}, blocks={blocks.size}.")
+    if layers.size == 0:
+        return None, None
+    return layers, blocks
 
 
 class SendTaskBase:
@@ -617,16 +669,23 @@ class Sender(SenderBase):
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
+        result_message = [
+            MessageType.KV_AGENT_RESULT,
+            str(self._instance_rank).encode("ascii"),
+            str(write_meta.unique_rid).encode("ascii"),
+            str(write_meta.slice_id).encode("ascii"),
+            str(write_meta.is_last_slice).encode("ascii"),
+            agent_result.value.encode("ascii"),
+        ]
+        if agent_result == AgentResult.SUCCESS:
+            hisparse_payload = _pack_hisparse_commit_payload(
+                write_meta.hisparse_commit_layer_indices,
+                write_meta.hisparse_commit_block_positions,
+            )
+            if hisparse_payload is not None:
+                result_message.append(hisparse_payload)
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
-            [
-                MessageType.KV_AGENT_RESULT,
-                str(self._instance_rank).encode("ascii"),
-                str(write_meta.unique_rid).encode("ascii"),
-                str(write_meta.slice_id).encode("ascii"),
-                str(write_meta.is_last_slice).encode("ascii"),
-                agent_result.value.encode("ascii"),
-            ]
-        )
+            result_message)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -823,7 +882,7 @@ class Sender(SenderBase):
         dest_layer_indices: list[int],
         src_block_ids: np.ndarray,
         dst_block_pos_start: int,
-    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         if req_info.hisparse_host_slots is None:
             return None
         if self._hisparse_kv_cache_manager is None:
@@ -857,7 +916,17 @@ class Sender(SenderBase):
             raise RuntimeError(
                 "HiSparse packed source/destination byte sizes do not match: "
                 f"src={src_sizes.tolist()}, dst={dst_sizes.tolist()}.")
-        return src_ptrs, dst_ptrs, src_sizes
+        dst_block_positions = np.arange(dst_block_pos_start,
+                                        dst_block_pos_stop,
+                                        dtype=np.int64)
+        commit_layers = np.repeat(
+            np.asarray(dest_layer_indices, dtype=np.int64), block_count)
+        commit_blocks = np.tile(dst_block_positions, len(dest_layer_indices))
+        if commit_layers.size != src_ptrs.size:
+            raise RuntimeError(
+                "HiSparse commit coverage does not match packed fragments: "
+                f"coverage={commit_layers.size}, fragments={src_ptrs.size}.")
+        return src_ptrs, dst_ptrs, src_sizes, commit_layers, commit_blocks
 
     def _collect_hisparse_for_pool_pair(
         self,
@@ -870,7 +939,7 @@ class Sender(SenderBase):
         peer_pi: int,
         src_block_ids: np.ndarray,
         dst_block_pos_start: int,
-    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         if req_info.hisparse_host_slots is None or src_block_ids.size == 0:
             return None
         self_pt = self._registrar.self_extractor.page_table
@@ -938,9 +1007,13 @@ class Sender(SenderBase):
         hisparse_src_parts: list[np.ndarray] = []
         hisparse_dst_parts: list[np.ndarray] = []
         hisparse_size_parts: list[np.ndarray] = []
+        hisparse_commit_layer_parts: list[np.ndarray] = []
+        hisparse_commit_block_parts: list[np.ndarray] = []
         hisparse_src_frags: Optional[np.ndarray] = None
         hisparse_dst_frags: Optional[np.ndarray] = None
         hisparse_sizes: Optional[np.ndarray] = None
+        hisparse_commit_layer_indices: Optional[np.ndarray] = None
+        hisparse_commit_block_positions: Optional[np.ndarray] = None
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -1035,10 +1108,12 @@ class Sender(SenderBase):
                     dst_block_pos_start=overlap_start // tpb,
                 )
                 if hisparse_frags is not None:
-                    h_src, h_dst, h_sizes = hisparse_frags
+                    h_src, h_dst, h_sizes, h_layers, h_blocks = hisparse_frags
                     hisparse_src_parts.append(h_src)
                     hisparse_dst_parts.append(h_dst)
                     hisparse_size_parts.append(h_sizes)
+                    hisparse_commit_layer_parts.append(h_layers)
+                    hisparse_commit_block_parts.append(h_blocks)
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -1081,13 +1156,21 @@ class Sender(SenderBase):
             hisparse_src_frags = np.concatenate(hisparse_src_parts)
             hisparse_dst_frags = np.concatenate(hisparse_dst_parts)
             hisparse_sizes = np.concatenate(hisparse_size_parts)
+            hisparse_commit_layer_indices = np.concatenate(
+                hisparse_commit_layer_parts)
+            hisparse_commit_block_positions = np.concatenate(
+                hisparse_commit_block_parts)
             if not (hisparse_src_frags.size == hisparse_dst_frags.size
-                    == hisparse_sizes.size):
+                    == hisparse_sizes.size
+                    == hisparse_commit_layer_indices.size
+                    == hisparse_commit_block_positions.size):
                 raise RuntimeError(
                     "HiSparse packed host-write fragment count mismatch: "
                     f"src={hisparse_src_frags.size}, "
                     f"dst={hisparse_dst_frags.size}, "
-                    f"sizes={hisparse_sizes.size}.")
+                    f"sizes={hisparse_sizes.size}, "
+                    f"layers={hisparse_commit_layer_indices.size}, "
+                    f"blocks={hisparse_commit_block_positions.size}.")
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1109,6 +1192,8 @@ class Sender(SenderBase):
             hisparse_src_ptrs=hisparse_src_frags,
             hisparse_dst_ptrs=hisparse_dst_frags,
             hisparse_sizes=hisparse_sizes,
+            hisparse_commit_layer_indices=hisparse_commit_layer_indices,
+            hisparse_commit_block_positions=hisparse_commit_block_positions,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1561,6 +1646,9 @@ class KVRecvTask:
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
         self.last_slice_count = 0
+        self.hisparse_host_slots: Optional[np.ndarray] = None
+        self.hisparse_commit_layer_parts: list[np.ndarray] = []
+        self.hisparse_commit_block_parts: list[np.ndarray] = []
 
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
@@ -1675,6 +1763,7 @@ class Receiver(ReceiverBase):
         if self._kvarn_gqa_side_pool is not None:
             kvarn_side_slot = self._kvarn_gqa_side_pool.slot_for_request(task._unique_rid)
         hisparse_host_slots = self._reserve_hisparse_host_slots(task)
+        task.hisparse_host_slots = hisparse_host_slots
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
@@ -1872,9 +1961,14 @@ class Receiver(ReceiverBase):
             session.cancel()
 
     def _process_kv_agent_result(self, _send_id: bytes, message: list[bytes]):
+        if len(message) < 6:
+            raise RuntimeError(
+                "KV_AGENT_RESULT message must have at least 6 frames, got "
+                f"{len(message)}.")
         msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = decode_message(
-            message
-        )
+            message[:6])
+        hisparse_layers, hisparse_blocks = _unpack_hisparse_commit_payload(
+            message[6] if len(message) > 6 else None)
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         sender_slice_id = int(slice_id_str)
@@ -1890,7 +1984,12 @@ class Receiver(ReceiverBase):
             )
             return
         session.process_kv_agent_result(
-            peer_rank, sender_slice_id, is_last_slice_str == "True", AgentResult(status)
+            peer_rank,
+            sender_slice_id,
+            is_last_slice_str == "True",
+            AgentResult(status),
+            hisparse_commit_layer_indices=hisparse_layers,
+            hisparse_commit_block_positions=hisparse_blocks,
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1998,7 +2097,14 @@ class RxSession(RxSessionBase):
         self._receiver.dispatch_task(task)
 
     def process_kv_agent_result(
-        self, peer_rank: int, sender_slice_id: int, is_last_slice: bool, status: AgentResult
+        self,
+        peer_rank: int,
+        sender_slice_id: int,
+        is_last_slice: bool,
+        status: AgentResult,
+        *,
+        hisparse_commit_layer_indices: Optional[np.ndarray] = None,
+        hisparse_commit_block_positions: Optional[np.ndarray] = None,
     ):
         with self.lock:
             assert sender_slice_id < len(self._kv_tasks), (
@@ -2008,9 +2114,22 @@ class RxSession(RxSessionBase):
             )
             task = self._kv_tasks[sender_slice_id]
             if status == AgentResult.SUCCESS:
+                self._record_hisparse_commit_coverage(
+                    task,
+                    hisparse_commit_layer_indices,
+                    hisparse_commit_block_positions,
+                )
                 if is_last_slice:
                     task.last_slice_count += 1
                     if task.last_slice_count == task.expected_transfers:
+                        try:
+                            self._commit_hisparse_host_writes(task)
+                        except Exception as exc:
+                            task.fail(exc)
+                            if self._terminal_status is None:
+                                self._terminal_status = SessionStatus.ERROR
+                            logger.error(str(exc))
+                            return
                         task.complete()
 
                         logger.debug(
@@ -2033,6 +2152,64 @@ class RxSession(RxSessionBase):
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"
                 )
+
+    @staticmethod
+    def _record_hisparse_commit_coverage(
+        task: KVRecvTask,
+        layer_indices: Optional[np.ndarray],
+        block_positions: Optional[np.ndarray],
+    ) -> None:
+        if layer_indices is None and block_positions is None:
+            return
+        if layer_indices is None or block_positions is None:
+            raise RuntimeError(
+                "HiSparse commit coverage requires both layer indices and "
+                "block positions.")
+        layers = np.asarray(layer_indices, dtype=np.int64)
+        blocks = np.asarray(block_positions, dtype=np.int64)
+        if layers.ndim != 1 or blocks.ndim != 1 or layers.size != blocks.size:
+            raise RuntimeError(
+                "HiSparse commit coverage must be parallel 1D arrays; "
+                f"layers_shape={layers.shape}, blocks_shape={blocks.shape}.")
+        if layers.size == 0:
+            return
+        task.hisparse_commit_layer_parts.append(layers.copy())
+        task.hisparse_commit_block_parts.append(blocks.copy())
+
+    def _commit_hisparse_host_writes(self, task: KVRecvTask) -> None:
+        coordinator = getattr(self._receiver, "_hisparse_coordinator", None)
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            return
+        slots = task.hisparse_host_slots
+        has_slots = slots is not None and int(slots.size) > 0
+        has_coverage = bool(task.hisparse_commit_layer_parts)
+        if has_slots and not has_coverage:
+            raise RuntimeError(
+                "HiSparse direct-to-host reserved host slots but received no "
+                f"successful host-write commit coverage for request "
+                f"{self.disagg_request_id}, slice={task.slice_id}.")
+        if not has_coverage:
+            return
+        layers = np.concatenate(task.hisparse_commit_layer_parts)
+        blocks = np.concatenate(task.hisparse_commit_block_parts)
+        coordinator.mark_host_write_committed(
+            task._unique_rid,
+            layer_indices=layers,
+            block_positions=blocks,
+        )
+        incomplete = sorted({
+            int(block_pos)
+            for block_pos in blocks
+            if not coordinator.host_block_committed(task._unique_rid,
+                                                   int(block_pos))
+        })
+        if incomplete:
+            sample = ", ".join(str(block_pos) for block_pos in incomplete[:8])
+            raise RuntimeError(
+                "HiSparse host-write coverage completed without committing "
+                "all local layers for block position(s): "
+                f"{sample}; request={self.disagg_request_id}, "
+                f"slice={task.slice_id}.")
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
         # Aux is session-level (not per-slice); expected_transfers is identical
