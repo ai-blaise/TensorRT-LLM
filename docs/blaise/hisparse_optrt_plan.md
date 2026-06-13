@@ -121,6 +121,10 @@ matching source-pool layout; the current DSA side-pool advertises
 `legacy_sinkhorn_v1`, so enabled HiSparse fails closed before allocating
 misleading hot records. The direct-to-host fragment API has the same guard and
 will not publish legacy side-pool pointers as HiSparse host-write sources.
+The dense MLA decode branch also fails closed when a HiSparse coordinator is
+enabled, so an accidentally relaxed planner guard cannot route KVarN-hot
+indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
+path.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
 row-status consumption, and live NIXL/cancel E2E proofs are not complete.
@@ -831,6 +835,9 @@ Current branch status:
 - guarded `kvarn_packed_source_fragments()` with the same production-layout
   requirement so NIXL direct-to-host cannot transfer legacy KVarN records into
   the HiSparse host tier;
+- guarded the dense MLA decode branch so enabled HiSparse cannot silently fall
+  through to `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
+  path before `sparse_mla_decode_kvarn_hot` exists;
 - implemented production-shaped packed tensor allocation for host `uint8`
   KVarN records, device hot `uint8` KVarN records, host commit metadata, and
   device hot-slot metadata;

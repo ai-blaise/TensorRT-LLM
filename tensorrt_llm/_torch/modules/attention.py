@@ -2873,6 +2873,15 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
+        hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
+                                       None)
+        if bool(getattr(hisparse_coordinator, "enabled", False)):
+            raise NotImplementedError(
+                "HiSparse requires sparse MLA to read the packed KVarN hot "
+                "tier through the explicit KVarN-hot BDR path. Do not route "
+                "enabled HiSparse decode through sparse_mla_decode_nvfp4 or "
+                "the restored full-pool TRTLLM MLA path.")
+
         if has_nvfp4_kv_cache:
             # The K write inside mla_rope_generation has already quantized the
             # 576-wide latent into the NVFP4 data + block-scale pools. Read it
