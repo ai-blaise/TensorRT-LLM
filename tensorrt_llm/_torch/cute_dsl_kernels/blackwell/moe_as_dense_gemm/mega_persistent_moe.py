@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Phase-3 persistent decode-MoE megakernel: graph-replay-safe device
 producer, dynamic work-stealing schedule, and gate+quant glue absorption on
@@ -2357,6 +2358,13 @@ def run_mega_persistent_moe_v2(
             _ptr("Int32", num_non_exiting_tiles, 16),
             _ptr("BFloat16", moe_output, 16),  # y unused (absorb off)
             _ptr("Float32", fc2_input_scale, 16),  # gs_x unused (absorb off)
+            # xq_dbg / sf_dbg: only dereferenced under dbg_quant (off here), but
+            # the wrapper still builds a cute.Tensor from each pointer, so they
+            # must be present and address-valid. Reuse moe_output's storage
+            # (never read): its byte span [ntok*H*2] covers the i32 [ntok, H/8]
+            # and [ntok, H/16] views the wrapper constructs.
+            _ptr("Int32", moe_output, 16),
+            _ptr("Int32", moe_output, 16),
             cutlass.Int32(ntok),
         )
 
