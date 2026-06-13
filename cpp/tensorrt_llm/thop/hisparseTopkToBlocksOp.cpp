@@ -252,6 +252,59 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tenso
     return {plannedHotSlots, plannedLruTick, missHostSlots, missHotSlots, missCounts, hitFlags, rowStatus};
 }
 
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> hisparseCompactMissSchedule(
+    th::Tensor const& missHostSlots, th::Tensor const& missHotSlots, th::Tensor const& missCounts,
+    th::Tensor const& planRowStatus)
+{
+    TORCH_CHECK(missHostSlots.is_cuda(), "miss_host_slots must be a CUDA tensor");
+    TORCH_CHECK(missHotSlots.is_cuda(), "miss_hot_slots must be a CUDA tensor");
+    TORCH_CHECK(missCounts.is_cuda(), "miss_counts must be a CUDA tensor");
+    TORCH_CHECK(planRowStatus.is_cuda(), "plan_row_status must be a CUDA tensor");
+    TORCH_CHECK(missHostSlots.scalar_type() == torch::kInt64, "miss_host_slots must be int64");
+    TORCH_CHECK(missHotSlots.scalar_type() == torch::kInt64, "miss_hot_slots must be int64");
+    TORCH_CHECK(missCounts.scalar_type() == torch::kInt32, "miss_counts must be int32");
+    TORCH_CHECK(planRowStatus.scalar_type() == torch::kUInt8, "plan_row_status must be uint8");
+    TORCH_CHECK(missHostSlots.dim() == 2, "miss_host_slots must have shape [rows, max_blocks_per_row]");
+    TORCH_CHECK(missHotSlots.dim() == 2, "miss_hot_slots must have shape [rows, max_blocks_per_row]");
+    TORCH_CHECK(missCounts.dim() == 1, "miss_counts must have shape [rows]");
+    TORCH_CHECK(planRowStatus.dim() == 1, "plan_row_status must have shape [rows]");
+
+    int64_t const rows = missHostSlots.size(0);
+    int64_t const maxBlocksPerRow = missHostSlots.size(1);
+    TORCH_CHECK(missHotSlots.sizes() == missHostSlots.sizes(), "miss_hot_slots shape must match miss_host_slots");
+    TORCH_CHECK(missCounts.size(0) == rows, "miss_counts rows mismatch: got ", missCounts.size(0),
+        ", expected ", rows);
+    TORCH_CHECK(planRowStatus.size(0) == rows, "plan_row_status rows mismatch: got ", planRowStatus.size(0),
+        ", expected ", rows);
+    TORCH_CHECK(maxBlocksPerRow > 0 && maxBlocksPerRow <= std::numeric_limits<int32_t>::max(),
+        "max_blocks_per_row must be positive int32-sized, got ", maxBlocksPerRow);
+    TORCH_CHECK(rows >= 0 && rows <= std::numeric_limits<int32_t>::max(), "rows must be int32-sized, got ", rows);
+
+    c10::cuda::CUDAGuard guard(missHostSlots.device());
+    TORCH_CHECK(missHotSlots.get_device() == missHostSlots.get_device(),
+        "miss_hot_slots must be on the same CUDA device as miss_host_slots");
+    TORCH_CHECK(missCounts.get_device() == missHostSlots.get_device(),
+        "miss_counts must be on the same CUDA device as miss_host_slots");
+    TORCH_CHECK(planRowStatus.get_device() == missHostSlots.get_device(),
+        "plan_row_status must be on the same CUDA device as miss_host_slots");
+
+    auto missHost = missHostSlots.contiguous();
+    auto missHot = missHotSlots.contiguous();
+    auto counts = missCounts.contiguous();
+    auto planStatus = planRowStatus.contiguous();
+    auto compactHost = th::empty({rows * maxBlocksPerRow}, missHost.options());
+    auto compactHot = th::empty({rows * maxBlocksPerRow}, missHot.options());
+    auto copyCount = th::zeros({1}, counts.options());
+    auto rowStatus = th::empty({rows}, missHost.options().dtype(torch::kUInt8));
+
+    tk::invokeHisparseCompactMissSchedule(missHost.data_ptr<int64_t>(), missHot.data_ptr<int64_t>(),
+        counts.data_ptr<int32_t>(), planStatus.data_ptr<uint8_t>(), compactHost.data_ptr<int64_t>(),
+        compactHot.data_ptr<int64_t>(), copyCount.data_ptr<int32_t>(), rowStatus.data_ptr<uint8_t>(),
+        static_cast<int32_t>(rows), static_cast<int32_t>(maxBlocksPerRow),
+        at::cuda::getCurrentCUDAStream(missHost.get_device()).stream());
+    return {compactHost, compactHot, copyCount, rowStatus};
+}
+
 th::Tensor hisparseCommitHotSlots(th::Tensor const& hostSlots, th::Tensor const& commitGens,
     th::Tensor const& plannedHotSlots, th::Tensor const& plannedLruTick, th::Tensor const& blockCounts,
     th::Tensor const& planRowStatus, th::Tensor const& hotHostSlot, th::Tensor const& hotCommitGen,
@@ -437,6 +490,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor resolve_row_status, Tensor hot_host_slot, Tensor hot_commit_gen, Tensor hot_lru_tick, "
         "int layer_idx, int lru_tick_base) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
+        "hisparse_compact_miss_schedule(Tensor miss_host_slots, Tensor miss_hot_slots, Tensor miss_counts, "
+        "Tensor plan_row_status) -> (Tensor, Tensor, Tensor, Tensor)");
+    m.def(
         "hisparse_commit_hot_slots(Tensor host_slots, Tensor commit_gens, Tensor planned_hot_slots, "
         "Tensor planned_lru_tick, Tensor block_counts, Tensor plan_row_status, Tensor(a!) hot_host_slot, "
         "Tensor(b!) hot_commit_gen, Tensor(c!) hot_lru_tick, int layer_idx) -> Tensor");
@@ -451,6 +507,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("hisparse_topk_to_block_positions", &tensorrt_llm::torch_ext::hisparseTopkToBlockPositions);
     m.impl("hisparse_resolve_blocks_to_host_slots", &tensorrt_llm::torch_ext::hisparseResolveBlocksToHostSlots);
     m.impl("hisparse_plan_hot_slots", &tensorrt_llm::torch_ext::hisparsePlanHotSlots);
+    m.impl("hisparse_compact_miss_schedule", &tensorrt_llm::torch_ext::hisparseCompactMissSchedule);
     m.impl("hisparse_commit_hot_slots", &tensorrt_llm::torch_ext::hisparseCommitHotSlots);
     m.impl("hisparse_build_hot_indices", &tensorrt_llm::torch_ext::hisparseBuildHotIndices);
 }

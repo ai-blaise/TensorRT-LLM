@@ -267,6 +267,16 @@ def _register_fake():
                 host_slots.new_empty(host_slots.shape, dtype=torch.uint8),
                 host_slots.new_empty((rows, ), dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::hisparse_compact_miss_schedule")
+    def _(miss_host_slots, miss_hot_slots, miss_counts, plan_row_status):
+        del miss_hot_slots, miss_counts, plan_row_status
+        capacity = miss_host_slots.numel()
+        rows = miss_host_slots.shape[0]
+        return (miss_host_slots.new_empty((capacity, )),
+                miss_host_slots.new_empty((capacity, )),
+                miss_host_slots.new_empty((1, ), dtype=torch.int32),
+                miss_host_slots.new_empty((rows, ), dtype=torch.uint8))
+
     @torch.library.register_fake("trtllm::hisparse_commit_hot_slots")
     def _(host_slots, commit_gens, planned_hot_slots, planned_lru_tick,
           block_counts, plan_row_status, hot_host_slot, hot_commit_gen,

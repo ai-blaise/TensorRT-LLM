@@ -46,6 +46,14 @@ enum HiSparseCommitStatus : uint8_t
     kCommitHotSlotOutOfRange = 4,
 };
 
+enum HiSparseCompactStatus : uint8_t
+{
+    kCompactOk = 0,
+    kCompactUpstreamInvalid = 1,
+    kCompactBadMissCount = 2,
+    kCompactInvalidMissSlot = 3,
+};
+
 enum HiSparseBuildHotIndexStatus : uint8_t
 {
     kBuildHotIndexOk = 0,
@@ -445,6 +453,61 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
     }
 }
 
+__global__ void hisparseCompactMissScheduleKernel(int64_t const* __restrict__ missHostSlots,
+    int64_t const* __restrict__ missHotSlots, int32_t const* __restrict__ missCounts,
+    uint8_t const* __restrict__ planRowStatus, int64_t* __restrict__ compactHostSlots,
+    int64_t* __restrict__ compactHotSlots, int32_t* __restrict__ copyCount, uint8_t* __restrict__ rowStatus,
+    int32_t numRows, int32_t maxBlocksPerRow)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+    {
+        return;
+    }
+
+    int32_t dst = 0;
+    for (int32_t row = 0; row < numRows; ++row)
+    {
+        uint8_t const upstreamStatus = planRowStatus[row];
+        if (upstreamStatus != kPlanOk)
+        {
+            rowStatus[row] = kCompactUpstreamInvalid;
+            continue;
+        }
+
+        int32_t const count = missCounts[row];
+        if (count < 0 || count > maxBlocksPerRow)
+        {
+            rowStatus[row] = kCompactBadMissCount;
+            continue;
+        }
+
+        int64_t const rowOffset = static_cast<int64_t>(row) * maxBlocksPerRow;
+        bool valid = true;
+        for (int32_t i = 0; i < count; ++i)
+        {
+            if (missHostSlots[rowOffset + i] < 0 || missHotSlots[rowOffset + i] < 0)
+            {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+        {
+            rowStatus[row] = kCompactInvalidMissSlot;
+            continue;
+        }
+
+        for (int32_t i = 0; i < count; ++i)
+        {
+            compactHostSlots[dst] = missHostSlots[rowOffset + i];
+            compactHotSlots[dst] = missHotSlots[rowOffset + i];
+            ++dst;
+        }
+        rowStatus[row] = kCompactOk;
+    }
+    copyCount[0] = dst;
+}
+
 __global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlots,
     int64_t const* __restrict__ commitGens, int64_t const* __restrict__ plannedHotSlots,
     int64_t const* __restrict__ plannedLruTick, int32_t const* __restrict__ blockCounts,
@@ -657,6 +720,21 @@ void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitG
         resolveRowStatus, hotHostSlot, hotCommitGen, hotLruTick, plannedHotSlots, plannedLruTick, missHostSlots,
         missHotSlots, missCounts, hitFlags, rowStatus, numRows, maxBlocksPerRow, numLayers, hotCapacity, layerIdx,
         lruTickBase);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeHisparseCompactMissSchedule(int64_t const* missHostSlots, int64_t const* missHotSlots,
+    int32_t const* missCounts, uint8_t const* planRowStatus, int64_t* compactHostSlots, int64_t* compactHotSlots,
+    int32_t* copyCount, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow, cudaStream_t stream)
+{
+    if (numRows <= 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_compact_miss_schedule requires max_blocks_per_row > 0");
+
+    hisparseCompactMissScheduleKernel<<<1, 1, 0, stream>>>(missHostSlots, missHotSlots, missCounts, planRowStatus,
+        compactHostSlots, compactHotSlots, copyCount, rowStatus, numRows, maxBlocksPerRow);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -92,10 +92,13 @@ status flags for missing, unadmitted, out-of-range, or uncommitted rows rather
 than falling back to Python request-table extraction. A native non-mutating
 hot-slot planner now consumes those resolved rows and layer-local hot metadata
 to produce hit/miss/LRU slot decisions, copy schedules, and row status without
-publishing residency before packed copies succeed. A native post-copy hot
-metadata commit op now publishes `hot_host_slot`, `hot_commit_gen`, and
-`hot_lru_tick` on device only after the packed-copy stage has accepted the plan.
-The branch also has a native hot-index builder that preserves the existing
+publishing residency before packed copies succeed. A native compact miss
+schedule op now turns row-major device miss tensors into contiguous device
+`(host_slot, hot_slot)` vectors plus a device copy count for the future
+stream-ordered copy bridge. A native post-copy hot metadata commit op now
+publishes `hot_host_slot`, `hot_commit_gen`, and `hot_lru_tick` on device only
+after the packed-copy stage has accepted the plan. The branch also has a native
+hot-index builder that preserves the existing
 `base * stride_factor + layer_idx * tokens_per_block + token_offset` sparse-MLA
 index contract while targeting HiSparse hot slots instead of full-pool blocks.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
@@ -750,6 +753,10 @@ Current branch status:
   slots selected earlier in the same batch, and emits planned hot slots,
   planned LRU ticks, miss host/hot copy schedules, hit flags, miss counts, and
   row status without publishing hot residency;
+- added `trtllm::hisparse_compact_miss_schedule`, a native CUDA schedule
+  compactor that consumes planner miss tensors and row status, validates
+  upstream rows/counts/slots, and emits contiguous device `host_slot` and
+  `hot_slot` vectors plus a device copy count for the future copy bridge;
 - added `trtllm::hisparse_commit_hot_slots`, a native post-copy CUDA metadata
   commit op that mutates device `hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick` only for rows whose native plan succeeded;
@@ -785,6 +792,8 @@ Still pending before serving enablement:
   `trtllm::hisparse_resolve_blocks_to_host_slots` request-table resolver;
 - VM compile and live validation of the native
   `trtllm::hisparse_plan_hot_slots` non-mutating hot-slot planner;
+- VM compile and live validation of the native
+  `trtllm::hisparse_compact_miss_schedule` copy-schedule compactor;
 - VM compile and live validation of the native
   `trtllm::hisparse_commit_hot_slots` post-copy metadata commit op;
 - VM compile and live validation of the native
@@ -827,6 +836,7 @@ Current branch status:
   `trtllm::hisparse_topk_to_block_positions`,
   `trtllm::hisparse_resolve_blocks_to_host_slots`,
   `trtllm::hisparse_plan_hot_slots`,
+  `trtllm::hisparse_compact_miss_schedule`,
   `trtllm::hisparse_swap_in_packed_kvarn`,
   `trtllm::hisparse_commit_hot_slots`, and
   `trtllm::hisparse_build_hot_indices` ops before it can proceed;

@@ -1440,6 +1440,13 @@ class OPTRTHiSparseCoordinator:
                 "resolved host slots on device before scheduling packed KVarN "
                 "copies; no Python hot-slot planner path is allowed.")
         if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_compact_miss_schedule"):
+            raise NotImplementedError(
+                "trtllm::hisparse_compact_miss_schedule is not registered with "
+                "a CUDA kernel. HiSparse must compact device-side miss schedules "
+                "before the native packed KVarN copy bridge; no Python schedule "
+                "materialization or synchronous host readback is allowed.")
+        if not self._torch_cuda_op_registered(
                 "trtllm::hisparse_swap_in_packed_kvarn"):
             raise NotImplementedError(
                 "trtllm::hisparse_swap_in_packed_kvarn is not registered with "
@@ -1465,7 +1472,8 @@ class OPTRTHiSparseCoordinator:
         raise NotImplementedError(
             "HiSparse hot-pool TopK mapping still needs native orchestration "
             "across TopK block rows, request-table resolution, hot-slot "
-            "planning, packed-copy submission, post-copy metadata commit, hot "
-            "global-index construction, and sparse MLA hot-pool read. The "
-            "coordinator ABI is production-shaped, but serving remains "
-            "fail-closed until those pieces are wired and validated.")
+            "planning, compact miss scheduling, packed-copy submission, "
+            "post-copy metadata commit, hot global-index construction, and "
+            "sparse MLA hot-pool read. The coordinator ABI is production-shaped, "
+            "but serving remains fail-closed until those pieces are wired and "
+            "validated.")

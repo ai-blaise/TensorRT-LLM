@@ -130,6 +130,21 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::hisparse_plan_hot_slots",
         })
     with pytest.raises(NotImplementedError,
+                       match="compact_miss_schedule"):
+        coordinator.map_topk_to_hot_pool(topk_indices=object(),
+                                         metadata=SimpleNamespace(request_ids=[0]),
+                                         layer_idx=0,
+                                         skip_topk=False,
+                                         is_generation=True)
+
+    coordinator._torch_cuda_op_registered = (  # noqa: SLF001
+        lambda name: name in {
+            "trtllm::hisparse_topk_to_block_positions",
+            "trtllm::hisparse_resolve_blocks_to_host_slots",
+            "trtllm::hisparse_plan_hot_slots",
+            "trtllm::hisparse_compact_miss_schedule",
+        })
+    with pytest.raises(NotImplementedError,
                        match="swap_in_packed_kvarn"):
         coordinator.map_topk_to_hot_pool(topk_indices=object(),
                                          metadata=SimpleNamespace(request_ids=[0]),
@@ -142,6 +157,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
             "trtllm::hisparse_plan_hot_slots",
+            "trtllm::hisparse_compact_miss_schedule",
             "trtllm::hisparse_swap_in_packed_kvarn",
         })
     with pytest.raises(NotImplementedError,
@@ -157,6 +173,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
             "trtllm::hisparse_plan_hot_slots",
+            "trtllm::hisparse_compact_miss_schedule",
             "trtllm::hisparse_swap_in_packed_kvarn",
             "trtllm::hisparse_commit_hot_slots",
         })
@@ -173,6 +190,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
             "trtllm::hisparse_plan_hot_slots",
+            "trtllm::hisparse_compact_miss_schedule",
             "trtllm::hisparse_swap_in_packed_kvarn",
             "trtllm::hisparse_commit_hot_slots",
             "trtllm::hisparse_build_hot_indices",
