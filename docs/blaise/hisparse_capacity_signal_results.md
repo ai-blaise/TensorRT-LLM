@@ -12,13 +12,16 @@ and `*.md/*.json` under the same dir.
 
 ## Verdict
 
-**Capacity: GO. Correctness (attention math): GO. Serving viability: HARD NO-GO at
-the current hot-read kernel.** The capacity win and the math are real, but the
-production-ABI `sparse_mla_decode_kvarn_hot` kernel is a naive scaffold ~3 orders
-of magnitude too slow to serve. **The gate's decisive output: the next investment
-must be the Gate-4 FlashMLA-split hot-read kernel — NOT the Gate 5-7 serving
-integration.** This is exactly the "measure before hardening" outcome Rec-4 was
-designed to force.
+**Capacity: GO. Correctness (attention math): GO. Serving viability: the hot-read
+kernel blocker is now RESOLVED (Phase-3 → Phase-4).** The gate's original finding
+held: the production-ABI `sparse_mla_decode_kvarn_hot` kernel was a naive scaffold
+~3 orders of magnitude too slow to serve, and the gate's decisive output was to
+invest in that kernel (Gate-4) — NOT the Gate 5-7 serving integration — exactly the
+"measure before hardening" outcome Rec-4 was designed to force. That investment has
+landed: the FlashMLA-style rewrite plus the FWHT dequant and warp/vectorization
+levers took the hot-read from ~348 ms/call to **0.377 ms/call (B16), ~23 ms/step —
+within the ~20 ms c16 decode budget, A/B-viable** (Phase-4), at cos 0.999999 vs the
+true dense reference with the production ABI frozen.
 
 ## 1a — Capacity (verified)
 
@@ -185,17 +188,80 @@ base dequant shared 8× across heads. (`sparse_mla_decode_kvarn_hot.{cu,h}`.)
   math-faithful scalar-dequant kernel. This is a major step toward A/B-viability
   (74× under the original 348 ms/call), not the finish line.
 
-## Companion track — KVarN-GQA packed decode (24.7×, bit-identical)
+## Phase-4 — FWHT + warp/vectorization to the c16 budget (12× over M4, verified; A/B-viable)
 
-Run in parallel (separate worktree/GPU): the SMC-SD GQA-KVarN dense packed-decode
-kernel (`kvarnGqaKernels.cu`) was **1470 → 59.5 µs (24.7×)**, **bit-identical**
-(`ref_max_abs` unchanged vs an independent torch reference over the dequant
-readable pool, gate atol 7.5e-2 → >100× margin), CUDA-graph-safe — by killing the
-per-(token,dim) shared-mem `atomicAdd` + double-K-dequant (M1), algebraic
-scale-factoring out of the hot loops (M2), and SMEM code-plane staging (M3); plus
-256-tok 7.6×. ABI + `kvarn_gqa_backend_ready()=false` untouched. Sparse top-k only
-1.22× (scattered tokens resist code-plane staging — follow-up). Distinct from the
-dense-MLA HiSparse path.
+Phase-3 left the kernel dequant-bound and flagged "tensor-core Hadamard" as the next
+lever. The ceiling was reached differently — and tensor cores were measured and
+**rejected**. Continued from the Phase-3 M4 baseline (4.49 ms/call B16) to **M15 at
+0.377 ms/call — a verified 12×, holding cos 0.999999** vs the true dense BDR-dequant
+reference at every step, smoke PASS throughout (orchestrator re-gate on GPU 7:
+0.375 ms/call). The kernel `.cu` is committed to `op-trt-hisparse` (GitHub
+`4dc6c7de4`); ABI frozen.
+
+| Step | ms/call | ms/row | × over M4 | note |
+|---|---|---|---|---|
+| M4 baseline | 4.505 | 0.2816 | 1.00× | |
+| M5 FWHT dequant | 1.204 | 0.0751 | 3.74× | bit-identical |
+| M8 warp-per-token dequant | 0.717 | 0.0448 | 6.28× | bit-identical |
+| M9 SMEM softmax-weight precompute | 0.570 | 0.0356 | 7.90× | bit-identical |
+| M11/M13 128-bit PV reads | 0.478 | 0.0299 | 9.43× | bit-identical |
+| M14 kHeadsPerBlock 16→32 | 0.386 | 0.0242 | 11.67× | cos-equal |
+| **M15 128-bit score reads** | **0.377** | **0.0235** | **11.95×** | cos-equal, FINAL |
+
+- **FWHT (the decisive lever, exact):** the O(128²) per-dim inverse-Hadamard was
+  replaced by the Fast Walsh-Hadamard butterfly (warp-cooperative: intra-lane low
+  stages + `__shfl_xor` high stages), verified `FWHT(x) == H@x` in fp64 to 4.4e-15.
+  This removed the dequant wall (the 3.74× M5 win, bit-identical). M8–M15 then
+  removed structural waste: one warp-per-token dequant, SMEM-precomputed softmax
+  weights, 128-bit (int4 / 8-bf16) vectorized Q/PV/score SMEM transactions, and
+  kHeadsPerBlock/kTileTokens swept to 32.
+- **Tensor cores attempted and rejected (honest):** a correct score-MMA (m16n8k16,
+  fragment layout validated standalone at max_abs_err 0) **regressed** — global-Q
+  A-fragment reload per k-step, half-warp idle, and no TMEM for the 512-wide V
+  accumulator make the scalar path win. Component ablation confirms the kernel is
+  occupancy/issue-bound at low arithmetic intensity, not GEMM-bound. A neutral M16
+  (128-bit kTile write) confirmed the ceiling. Further gain needs a TMEM-accumulator
+  UMMA mainloop or fp8 V (SM100 lacks the mixed atom) — not pursued, to keep every
+  step at cos 0.999999.
+- **Accuracy:** M5–M13 are bit-identical to M4 (output signature −327.16367); M14/M15
+  differ ~3–5e-6 rel (split-count + dot-grouping reorder), max_abs 2.44e-4 = M4's own
+  bf16 floor. Full 24-bucket sweep (B16-64 × nn1-2 × hb32-128) uniform 0.0223–0.0244
+  ms/row, zero regressions.
+- **Bottom line:** per-step (×61 layers) ~274 → **~23 ms**, within the ~20 ms c16
+  decode budget — the hot-read is now **A/B-viable** (~920× under the original
+  348 ms/call). Only the kernel `.cu` differs (+173/−70 vs the M4 commit);
+  `SparseMlaDecodeKvarnHotOp.cpp` and `hisparseKvarnBdrRead.cuh` are git-diff-empty
+  and `..._resident_v1_ready()` stays `false`.
+
+## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
+
+Run in parallel (separate worktree/GPU): the SMC-SD GQA-KVarN packed-decode kernel
+(`kvarnGqaKernels.cu`). The first pass took **dense 1470 → 59.5 µs (24.7×),
+bit-identical** (kill the per-(token,dim) shared-mem `atomicAdd` + double-K-dequant
+M1, algebraic scale-factoring M2, SMEM code-plane staging M3). A second pass applied
+the same FWHT insight plus SMEM-staged sparse and split-K — every lever independently
+re-gated by the orchestrator on GPU 7 vs the PyTorch reference (atol 7.5e-2) and for
+CUDA-graph replay:
+
+| kernel | M3 → final | speedup | gate |
+|---|---|---|---|
+| STORE | 1601 → 437 µs | 3.67× | byte-exact, graph byte-delta 0 |
+| BDR dequant | 205 → 73 µs | 2.82× | churn_max_abs 0, replay 0 |
+| dense decode | 59.5 → 18.5 µs (16.4 graphed) | 3.22× | ref 1.2e-4, replay 0 |
+| sparse top-k | 75.8 → 20.5 µs | 3.69× | ref 4.9e-4, replay 0 |
+| blocks=20 dense | 133 → 24.7 µs | 5.4× | replay 0 |
+
+- **FWHT (exact):** every O(N²)=128² natural-order Hadamard matrix-sum → in-place
+  FWHT butterfly (7 stages), `FWHT(x)==H@x` to 7e-15; removed the O(N³) per-tile
+  store rotate and the BDR inverse-rotate (the 3.67×/2.82×).
+- **SMEM-staged sparse top-k** lifted the previously-stuck path (was 1.22×) to
+  **3.69×**: stage resident blocks' K/V code planes + scale vectors into shared
+  memory once, gather scattered top-k from SMEM with touched-block detection
+  (numBlocks ≤ 16, else fall back to global gather).
+- **Flash-decoding split-K** fixed the M=1 dense occupancy starvation, backed by a
+  CUDA-graph-safe persistent workspace; bf16 also gated. ABI +
+  `kvarn_gqa_backend_ready()=false` untouched. Distinct from the dense-MLA HiSparse
+  path. Committed to `op-trt-hisparse` (GitHub `4b35fe6e0`).
 
 ## Audit provenance
 
@@ -205,5 +271,8 @@ cosine (0.999999) on a separate GPU; (c) **caught and quantified the quant-accur
 gap** the subagent's gate left open (0.906/0.890 Gaussian worst-case, RoPE 0.9997)
 and established the real-KV caveat; (d) verified the 1b method uses the production
 counting op against a true reference; (e) confirmed the kernel-latency blocker is
-per-layer (×61). All correctness claims are gated against TRUE references, never
+per-layer (×61); (f) for Phases 3–4 independently re-gated each HiSparse milestone
+(M5_fwht / M14 / M15) and the full KVarN-GQA ladder on GPU 7 — reproducing every
+speedup and confirming bit-identity / cos 0.999999 and CUDA-graph replay-0 before
+each commit. All correctness claims are gated against TRUE references, never
 self-comparison (the K2 / input_scale lesson).
