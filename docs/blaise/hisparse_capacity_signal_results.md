@@ -134,6 +134,34 @@ its cost is small (sub-ms/step) and overlap-hideable.
    up; c16 is the no-regression floor, and HiSparse is scored on the capacity
    axis, not c16 TPOT.
 
+## Phase-2 — hot-read kernel optimization (bit-identical 3.41×, verified)
+
+The gate identified the hot-read kernel as the blocker. A bounded, math-preserving
+optimization was implemented (subagent) and **independently verified by the
+orchestrator** (both `.so` run on GPU 7 with identical seeded inputs).
+
+- **Transform** (`cpp/tensorrt_llm/kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu`,
+  +120/−31): the per-token C-KV base dequant (2-bit unpack) was recomputed
+  O(dim×128) per token — once per output dim sharing a 128-wide inverse-Hadamard
+  subblock, twice (score + V). Now each token's 512 C-KV base values are
+  dequantized **once** into a shared cache (`buildCkvBaseCache`); the
+  inverse-Hadamard (`ckvHadamardFromCache`) and the V accumulation read the cache.
+  The Hadamard accumulation order (ascending j), signs, scale, the score/V
+  reduction order, the per-thread dim partition, and every `__float2bfloat16_rn`
+  rounding point are preserved → bit-identical. Production ABI + BDR layout frozen.
+- **Bit-identical (verified two ways):** subagent strict before/after 8/8 bit-exact
+  (out_maxabs=0.0); orchestrator's independent BEFORE/AFTER run on fixed-seed inputs
+  produced an **identical output signature** (sum `-3.2716332487e+02`, identical head
+  values) on both `.so`; dense-ref 0.999999; existing smoke PASS.
+- **Speedup: 21.79 → 6.38 ms/row (3.41×)** at B16/nn1 (orchestrator-confirmed),
+  3.50× at B64/nn2. The win is the removed 128× redundant unpack — a warp-shuffle
+  reduction variant gave only −8% (the `__syncthreads` were not the bottleneck).
+- **Honest scope:** a bit-identical down-payment, not the finish line. At 6.38 ms/row
+  × 61 layers the kernel is still ~250× from a servable decode step; production speed
+  requires the separate **Gate-4 FlashMLA-split / tensor-core** rewrite (multi-day,
+  CZS/IKP-gated). This optimization does not touch the production ABI/BDR layout and
+  does not flip any readiness gate.
+
 ## Audit provenance
 
 Orchestrator independently: (a) derived the 208 B/token constant from source and

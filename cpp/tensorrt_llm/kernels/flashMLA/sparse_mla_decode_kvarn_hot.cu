@@ -37,6 +37,60 @@ __device__ __forceinline__ float bf16ToFloat(void const* ptr, int64_t offset)
     return __bfloat162float(q[offset]);
 }
 
+// Cooperatively dequant one token's C-KV base values (pre-Hadamard) into shared.
+// base[d] is exactly readHisparseKvarnK2v2PackedCkvValue(...,d) for d in [0,kvLoraRank);
+// caching it removes the kBdrOrder-fold redundant 2-bit unpack that the per-dim
+// readHisparseKvarnK2v2BdrLatentValue path otherwise repeats for every output dim
+// sharing a 128-subblock. Caller must __syncthreads() before reading the cache.
+__device__ __forceinline__ void buildCkvBaseCache(uint8_t const* record,
+    HiSparseKvarnK2v2BdrLayout const& layout, int32_t tokenOffset, float* base)
+{
+    uint8_t const* tokenPacked = record + static_cast<int64_t>(tokenOffset) * layout.ckvBytesPerToken;
+    uint8_t const* tokenScaleZpBytes
+        = record + layout.ckvBytesPerBlock + static_cast<int64_t>(tokenOffset) * layout.scaleZpBytesPerToken;
+    for (int32_t d = static_cast<int32_t>(threadIdx.x); d < layout.kvLoraRank; d += static_cast<int32_t>(blockDim.x))
+    {
+        base[d] = readHisparseKvarnK2v2PackedCkvValue(tokenPacked, tokenScaleZpBytes, d);
+    }
+}
+
+// Inverse-Hadamard-128 of one C-KV dim from the shared base cache. Bit-identical
+// to readHisparseKvarnK2v2PackedCkvOriginalValue: same base[j], same ascending-j
+// accumulation order, same signs, same final scale.
+__device__ __forceinline__ float ckvHadamardFromCache(float const* base, int32_t dim)
+{
+    constexpr int32_t kBdrOrder = 128;
+    constexpr float kInvSqrtHadamard128 = 0.088388347648318f;
+    int32_t const subblockBase = (dim / kBdrOrder) * kBdrOrder;
+    int32_t const localDim = dim - subblockBase;
+    float acc = 0.0F;
+#pragma unroll 1
+    for (int32_t j = 0; j < kBdrOrder; ++j)
+    {
+        float const value = base[subblockBase + j];
+        int32_t const parity = __popc(static_cast<unsigned>(localDim & j)) & 1;
+        acc += parity ? -value : value;
+    }
+    return acc * kInvSqrtHadamard128;
+}
+
+// Latent value for one dim using the cached C-KV base (dim < kvLoraRank) or the
+// uncached RoPE fp8 path (dim >= kvLoraRank). Returns the same bf16-rounded float
+// as readHisparseKvarnK2v2BdrLatentValue.
+__device__ __forceinline__ float cachedLatentValue(uint8_t const* record,
+    HiSparseKvarnK2v2BdrLayout const& layout, float const* base, int32_t tokenOffset, int32_t dim)
+{
+    if (dim < layout.kvLoraRank)
+    {
+        return __bfloat162float(__float2bfloat16_rn(ckvHadamardFromCache(base, dim)));
+    }
+    uint8_t const* peBytes
+        = record + layout.ckvBytesPerBlock + layout.scaleZpBytesPerBlock;
+    int32_t const peDim = dim - layout.kvLoraRank;
+    uint8_t const byte = peBytes[static_cast<int64_t>(tokenOffset) * layout.qkRopeHeadDim + peDim];
+    return __bfloat162float(__float2bfloat16_rn(readHisparseFp8E4m3Byte(byte)));
+}
+
 __device__ __forceinline__ void writeBf16(void* ptr, int64_t offset, float value)
 {
     auto* out = reinterpret_cast<__nv_bfloat16*>(ptr);
@@ -180,6 +234,7 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
     extern __shared__ float shared[];
     float* scores = shared;
     float* reduce = scores + params.topK;
+    float* ckvBase = reduce + kThreads; // kvLoraRank floats: per-token dequantized C-KV base cache
 
     int32_t const batch = row / params.sQ;
     int32_t const s = row - batch * params.sQ;
@@ -257,11 +312,14 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
                     uint8_t const* record = params.hotPacked
                         + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
                         + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
+                    // This (hotIndex>=0, status==Ok) branch is block-uniform, so every
+                    // thread reaches the cache build and its barrier.
+                    buildCkvBaseCache(record, layout, address.tokenOffset, ckvBase);
+                    __syncthreads();
                     for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
                     {
                         float const qVal = bf16ToFloat(params.q, qBase + dim);
-                        float const kVal = __bfloat162float(
-                            readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim));
+                        float const kVal = cachedLatentValue(record, layout, ckvBase, address.tokenOffset, dim);
                         scorePart += qVal * kVal;
                     }
                 }
@@ -377,43 +435,73 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
         return;
     }
 
-    for (int32_t dim = threadIdx.x; dim < params.dV; dim += blockDim.x)
+    // V phase: accumulate out[dim] = sum_k scores[k] * V[k,dim] in k-ascending
+    // order (bit-identical to the original per-dim inner loop). Token-major so the
+    // C-KV base cache is dequantized once per token and shared by all V dims,
+    // removing the kBdrOrder-fold redundant unpack. dV == kvLoraRank so every V dim
+    // is a C-KV (Hadamard) dim; each thread owns dims {tid, tid+blockDim}.
+    int32_t const dim0 = static_cast<int32_t>(threadIdx.x);
+    int32_t const dim1 = dim0 + static_cast<int32_t>(blockDim.x);
+    float acc0 = 0.0F;
+    float acc1 = 0.0F;
+    for (int32_t k = 0; k < rowTopK; ++k)
     {
-        float acc = 0.0F;
-        for (int32_t k = 0; k < rowTopK; ++k)
+        float const weight = scores[k];
+        bool const skip = (weight == kNegInf);
+        int32_t const hotIndex = skip ? 0 : params.indices[indexBase + k];
+        // Block-uniform decision: this token's V comes from the cached hot path,
+        // the direct resident path, or is skipped. All threads agree, so the
+        // cache-build barrier below is reached by the whole block.
+        bool const cachedHot = (!skip) && (hotIndex >= 0);
+        uint8_t const* record = nullptr;
+        int32_t hotTokenOffset = 0;
+        int64_t residentGlobalToken = -1;
+        if (cachedHot)
         {
-            if (scores[k] == kNegInf)
+            HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
+                hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
+            record = params.hotPacked + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
+                + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
+            hotTokenOffset = address.tokenOffset;
+            buildCkvBaseCache(record, layout, hotTokenOffset, ckvBase);
+        }
+        else if (!skip)
+        {
+            int32_t requestToken = -1;
+            uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
+            if (tokenStatus == kHotReadOk && requestToken >= 0)
             {
-                continue;
-            }
-            int32_t const hotIndex = params.indices[indexBase + k];
-            float vVal = 0.0F;
-            if (hotIndex < 0)
-            {
-                int32_t requestToken = -1;
-                uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
-                if (tokenStatus == kHotReadOk && requestToken >= 0)
+                HiSparseResidentTokenAddress const residentAddress
+                    = decodeResidentTokenAddress(params, row, requestToken);
+                if (residentAddress.status == kHotReadOk)
                 {
-                    HiSparseResidentTokenAddress const residentAddress
-                        = decodeResidentTokenAddress(params, row, requestToken);
-                    if (residentAddress.status == kHotReadOk)
-                    {
-                        vVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
-                    }
+                    residentGlobalToken = residentAddress.globalToken;
                 }
             }
-            else
-            {
-                HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-                    hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-                uint8_t const* record = params.hotPacked
-                    + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
-                    + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
-                vVal = __bfloat162float(readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim));
-            }
-            acc += scores[k] * vVal;
         }
-        writeBf16(params.out, outBase + dim, acc);
+        if (cachedHot)
+        {
+            __syncthreads();
+            acc0 += weight * cachedLatentValue(record, layout, ckvBase, hotTokenOffset, dim0);
+            if (dim1 < params.dV)
+            {
+                acc1 += weight * cachedLatentValue(record, layout, ckvBase, hotTokenOffset, dim1);
+            }
+            __syncthreads(); // guard ckvBase before the next token rebuilds it
+        }
+        else if (!skip && residentGlobalToken >= 0)
+        {
+            acc0 += weight * readResidentLatentValue(params, residentGlobalToken, dim0);
+            if (dim1 < params.dV)
+            {
+                acc1 += weight * readResidentLatentValue(params, residentGlobalToken, dim1);
+            }
+        }
+    }
+    writeBf16(params.out, outBase + dim0, acc0);
+    if (dim1 < params.dV)
+    {
+        writeBf16(params.out, outBase + dim1, acc1);
     }
     if (threadIdx.x == 0)
     {
@@ -446,7 +534,8 @@ void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, 
     {
         throw std::runtime_error("sparse MLA KVarN-hot decode currently supports topk <= 2048");
     }
-    size_t const sharedBytes = static_cast<size_t>(params.topK + kThreads) * sizeof(float);
+    size_t const sharedBytes
+        = static_cast<size_t>(params.topK + kThreads + params.kvLoraRank) * sizeof(float);
     dim3 const grid(params.b * params.sQ, params.hQ, 1);
     sparseMlaDecodeKvarnHotKernel<<<grid, kThreads, sharedBytes, stream>>>(params);
     auto const err = cudaGetLastError();
