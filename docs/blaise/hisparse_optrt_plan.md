@@ -1052,8 +1052,11 @@ Current branch status:
   CUDA tier, coalescing consecutive slot runs when both tiers are compact. This
   CPU-slot-vector helper remains a debug/building-block path and is not the
   enabled-serving copy bridge;
-- added coordinator `execute_swap_in_plan()` so native copy acceptance and hot
-  metadata publication are sequenced through one production-shaped path;
+- added coordinator `execute_swap_in_plan()` as a CPU-slot-vector smoke/helper
+  around packed-record copies. It is not part of enabled serving: production
+  mapping requires the compact device-schedule bridge,
+  `trtllm::hisparse_submit_packed_kvarn_copy_schedule`, and fails closed before
+  the helper can become a runtime substitute;
 - added request-relative token-position planning that dedupes top-k tokens into
   paged block positions without changing Indexer/HISA scoring;
 - added `trtllm::hisparse_topk_to_block_positions`, a native CUDA shared-memory
@@ -1139,25 +1142,20 @@ Still pending before serving enablement:
 - live E2E proof that the host-write completion handoff marks host `valid` and
   `commit_gen` only after typed HiSparse host writes succeed for the relevant
   layer/block coverage;
-- VM compile and live validation of the native
-  `trtllm::hisparse_swap_in_packed_kvarn` CPU-schedule packed-copy helper;
-- VM compile and live validation of the native
-  `trtllm::hisparse_topk_to_block_positions` planner primitive;
-- VM compile and live validation of the native
-  `trtllm::hisparse_resolve_blocks_to_host_slots` request-table resolver;
-- VM compile and live validation of the native
-  `trtllm::hisparse_plan_hot_slots` non-mutating hot-slot planner;
-- VM compile and live validation of the native
-  `trtllm::hisparse_compact_miss_schedule` copy-schedule compactor;
-- VM compile and live validation of the native
-  `trtllm::hisparse_commit_hot_slots` post-copy metadata commit op;
-- VM compile and live validation of the native
-  `trtllm::hisparse_build_hot_indices` hot global-index builder;
-- VM compile and live validation of the native device-plan-to-copy bridge,
-  `trtllm::hisparse_submit_packed_kvarn_copy_schedule`, between
-  `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission,
-  including proof that the host tier is mapped/device-addressable on the B200
-  deployment image;
+- exact-clean native thop compile and direct B200 CUDA smoke are complete for
+  the planner/copy/read/write set through `th_hisparse_smoke`: TopK block
+  dedupe, request-table resolve, resident-block classify, hot-slot plan,
+  compact miss schedule, mapped pinned-host copy submission, post-copy hot
+  metadata commit, hot-index build, BDR writer, BDR hot reader,
+  sparse MLA KVarN-hot decode, and resident padding. This proof is native-op
+  level only; promotion still requires running the same contracts through the
+  deployment image/wheel that the DSA serving path loads;
+- deployment-image proof that
+  `trtllm::hisparse_submit_packed_kvarn_copy_schedule` sees the production
+  host tier as mapped/device-addressable on B200. If the image/runtime cannot
+  use the mapped-host kernel path, replace only the bridge with a copy-engine
+  implementation that consumes the same compact device schedule without Python
+  materialization or synchronous host readback;
 - B200 compile/live validation of `torch.ops.trtllm.mla_bdr_write_kvarn_record`
   is complete at the native-op level through `th_hisparse_smoke`: the writer
   fills the production BDR byte layout, supports byte-strided records, and the
