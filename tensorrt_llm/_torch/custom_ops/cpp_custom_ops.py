@@ -277,6 +277,17 @@ def _register_fake():
         return block_counts.new_empty((block_counts.shape[0], ),
                                       dtype=torch.uint8)
 
+    @torch.library.register_fake("trtllm::hisparse_build_hot_indices")
+    def _(topk_indices, block_positions, planned_hot_slots, block_counts,
+          commit_row_status, hot_capacity, tokens_per_block, stride_factor,
+          layer_idx):
+        del block_positions, planned_hot_slots, block_counts
+        del commit_row_status, hot_capacity, tokens_per_block
+        del stride_factor, layer_idx
+        return (topk_indices.new_empty(topk_indices.shape),
+                topk_indices.new_empty((topk_indices.shape[0], ),
+                                       dtype=torch.uint8))
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.

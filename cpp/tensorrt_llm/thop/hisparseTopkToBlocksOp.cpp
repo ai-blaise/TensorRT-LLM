@@ -347,6 +347,78 @@ th::Tensor hisparseCommitHotSlots(th::Tensor const& hostSlots, th::Tensor const&
     return rowStatus;
 }
 
+std::tuple<th::Tensor, th::Tensor> hisparseBuildHotIndices(th::Tensor const& topkIndices,
+    th::Tensor const& blockPositions, th::Tensor const& plannedHotSlots, th::Tensor const& blockCounts,
+    th::Tensor const& commitRowStatus, int64_t hotCapacity, int64_t tokensPerBlock, int64_t strideFactor,
+    int64_t layerIdx)
+{
+    TORCH_CHECK(topkIndices.is_cuda(), "topk_indices must be a CUDA tensor");
+    TORCH_CHECK(blockPositions.is_cuda(), "block_positions must be a CUDA tensor");
+    TORCH_CHECK(plannedHotSlots.is_cuda(), "planned_hot_slots must be a CUDA tensor");
+    TORCH_CHECK(blockCounts.is_cuda(), "block_counts must be a CUDA tensor");
+    TORCH_CHECK(commitRowStatus.is_cuda(), "commit_row_status must be a CUDA tensor");
+    TORCH_CHECK(topkIndices.scalar_type() == torch::kInt32, "topk_indices must be int32");
+    TORCH_CHECK(blockPositions.scalar_type() == torch::kInt32, "block_positions must be int32");
+    TORCH_CHECK(plannedHotSlots.scalar_type() == torch::kInt64, "planned_hot_slots must be int64");
+    TORCH_CHECK(blockCounts.scalar_type() == torch::kInt32, "block_counts must be int32");
+    TORCH_CHECK(commitRowStatus.scalar_type() == torch::kUInt8, "commit_row_status must be uint8");
+    TORCH_CHECK(topkIndices.dim() == 2, "topk_indices must have shape [rows, index_topk]");
+    TORCH_CHECK(blockPositions.dim() == 2, "block_positions must have shape [rows, max_blocks_per_row]");
+    TORCH_CHECK(plannedHotSlots.dim() == 2, "planned_hot_slots must have shape [rows, max_blocks_per_row]");
+    TORCH_CHECK(blockCounts.dim() == 1, "block_counts must have shape [rows]");
+    TORCH_CHECK(commitRowStatus.dim() == 1, "commit_row_status must have shape [rows]");
+
+    int64_t const rows = topkIndices.size(0);
+    int64_t const indexTopK = topkIndices.size(1);
+    int64_t const maxBlocksPerRow = blockPositions.size(1);
+    TORCH_CHECK(blockPositions.size(0) == rows, "block_positions rows mismatch: got ", blockPositions.size(0),
+        ", expected ", rows);
+    TORCH_CHECK(plannedHotSlots.size(0) == rows && plannedHotSlots.size(1) == maxBlocksPerRow,
+        "planned_hot_slots shape must match block_positions");
+    TORCH_CHECK(blockCounts.size(0) == rows, "block_counts rows mismatch: got ", blockCounts.size(0),
+        ", expected ", rows);
+    TORCH_CHECK(commitRowStatus.size(0) == rows, "commit_row_status rows mismatch: got ", commitRowStatus.size(0),
+        ", expected ", rows);
+    TORCH_CHECK(indexTopK > 0 && indexTopK <= std::numeric_limits<int32_t>::max(),
+        "index_topk must be positive int32-sized, got ", indexTopK);
+    TORCH_CHECK(maxBlocksPerRow > 0 && maxBlocksPerRow <= std::numeric_limits<int32_t>::max(),
+        "max_blocks_per_row must be positive int32-sized, got ", maxBlocksPerRow);
+    TORCH_CHECK(hotCapacity > 0 && hotCapacity <= std::numeric_limits<int32_t>::max(),
+        "hot_capacity must be positive int32-sized, got ", hotCapacity);
+    TORCH_CHECK(tokensPerBlock > 0 && tokensPerBlock <= std::numeric_limits<int32_t>::max(),
+        "tokens_per_block must be positive int32-sized, got ", tokensPerBlock);
+    TORCH_CHECK(strideFactor > 0 && strideFactor <= std::numeric_limits<int32_t>::max(),
+        "stride_factor must be positive int32-sized, got ", strideFactor);
+    TORCH_CHECK(layerIdx >= 0 && layerIdx <= std::numeric_limits<int32_t>::max(),
+        "layer_idx must be non-negative int32-sized, got ", layerIdx);
+
+    c10::cuda::CUDAGuard guard(topkIndices.device());
+    TORCH_CHECK(blockPositions.get_device() == topkIndices.get_device(),
+        "block_positions must be on the same CUDA device as topk_indices");
+    TORCH_CHECK(plannedHotSlots.get_device() == topkIndices.get_device(),
+        "planned_hot_slots must be on the same CUDA device as topk_indices");
+    TORCH_CHECK(blockCounts.get_device() == topkIndices.get_device(),
+        "block_counts must be on the same CUDA device as topk_indices");
+    TORCH_CHECK(commitRowStatus.get_device() == topkIndices.get_device(),
+        "commit_row_status must be on the same CUDA device as topk_indices");
+
+    auto topk = topkIndices.contiguous();
+    auto blocks = blockPositions.contiguous();
+    auto hotSlots = plannedHotSlots.contiguous();
+    auto counts = blockCounts.contiguous();
+    auto commitStatus = commitRowStatus.contiguous();
+    auto hotIndices = th::empty_like(topk);
+    auto rowStatus = th::empty({rows}, topk.options().dtype(torch::kUInt8));
+
+    tk::invokeHisparseBuildHotIndices(topk.data_ptr<int32_t>(), blocks.data_ptr<int32_t>(),
+        hotSlots.data_ptr<int64_t>(), counts.data_ptr<int32_t>(), commitStatus.data_ptr<uint8_t>(),
+        hotIndices.data_ptr<int32_t>(), rowStatus.data_ptr<uint8_t>(), static_cast<int32_t>(rows),
+        static_cast<int32_t>(indexTopK), static_cast<int32_t>(maxBlocksPerRow), static_cast<int32_t>(hotCapacity),
+        static_cast<int32_t>(tokensPerBlock), static_cast<int32_t>(strideFactor), static_cast<int32_t>(layerIdx),
+        at::cuda::getCurrentCUDAStream(topk.get_device()).stream());
+    return {hotIndices, rowStatus};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -368,6 +440,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "hisparse_commit_hot_slots(Tensor host_slots, Tensor commit_gens, Tensor planned_hot_slots, "
         "Tensor planned_lru_tick, Tensor block_counts, Tensor plan_row_status, Tensor(a!) hot_host_slot, "
         "Tensor(b!) hot_commit_gen, Tensor(c!) hot_lru_tick, int layer_idx) -> Tensor");
+    m.def(
+        "hisparse_build_hot_indices(Tensor topk_indices, Tensor block_positions, Tensor planned_hot_slots, "
+        "Tensor block_counts, Tensor commit_row_status, int hot_capacity, int tokens_per_block, int stride_factor, "
+        "int layer_idx) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -376,4 +452,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("hisparse_resolve_blocks_to_host_slots", &tensorrt_llm::torch_ext::hisparseResolveBlocksToHostSlots);
     m.impl("hisparse_plan_hot_slots", &tensorrt_llm::torch_ext::hisparsePlanHotSlots);
     m.impl("hisparse_commit_hot_slots", &tensorrt_llm::torch_ext::hisparseCommitHotSlots);
+    m.impl("hisparse_build_hot_indices", &tensorrt_llm::torch_ext::hisparseBuildHotIndices);
 }

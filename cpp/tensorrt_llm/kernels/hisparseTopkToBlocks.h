@@ -38,6 +38,11 @@ void invokeHisparseCommitHotSlots(int64_t const* hostSlots, int64_t const* commi
     int64_t* hotCommitGen, int64_t* hotLruTick, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
     int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, cudaStream_t stream);
 
+void invokeHisparseBuildHotIndices(int32_t const* topkIndices, int32_t const* blockPositions,
+    int64_t const* plannedHotSlots, int32_t const* blockCounts, uint8_t const* commitRowStatus,
+    int32_t* hotIndices, uint8_t* rowStatus, int32_t numRows, int32_t indexTopK, int32_t maxBlocksPerRow,
+    int32_t hotCapacity, int32_t tokensPerBlock, int32_t strideFactor, int32_t layerIdx, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

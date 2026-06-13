@@ -95,6 +95,9 @@ to produce hit/miss/LRU slot decisions, copy schedules, and row status without
 publishing residency before packed copies succeed. A native post-copy hot
 metadata commit op now publishes `hot_host_slot`, `hot_commit_gen`, and
 `hot_lru_tick` on device only after the packed-copy stage has accepted the plan.
+The branch also has a native hot-index builder that preserves the existing
+`base * stride_factor + layer_idx * tokens_per_block + token_offset` sparse-MLA
+index contract while targeting HiSparse hot slots instead of full-pool blocks.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because the full mapping orchestration, sparse MLA hot-pool
 reading, BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete.
@@ -730,6 +733,10 @@ Current branch status:
 - added `trtllm::hisparse_commit_hot_slots`, a native post-copy CUDA metadata
   commit op that mutates device `hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick` only for rows whose native plan succeeded;
+- added `trtllm::hisparse_build_hot_indices`, a native CUDA hot-index builder
+  that remaps request-relative TopK token positions through selected
+  request-relative block rows and planned hot slots into sparse-MLA-compatible
+  hot global indices with explicit row status;
 - synchronized device hot metadata (`hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick`) whenever hot records are committed or cleared;
 - implemented invalidation that clears hot records when host records are
@@ -760,6 +767,8 @@ Still pending before serving enablement:
   `trtllm::hisparse_plan_hot_slots` non-mutating hot-slot planner;
 - VM compile and live validation of the native
   `trtllm::hisparse_commit_hot_slots` post-copy metadata commit op;
+- VM compile and live validation of the native
+  `trtllm::hisparse_build_hot_indices` hot global-index builder;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;
@@ -795,9 +804,10 @@ Current branch status:
   admission-compatible request ids, and the native
   `trtllm::hisparse_topk_to_block_positions`,
   `trtllm::hisparse_resolve_blocks_to_host_slots`,
-  `trtllm::hisparse_plan_hot_slots`, and
-  `trtllm::hisparse_swap_in_packed_kvarn`, and
-  `trtllm::hisparse_commit_hot_slots` ops before it can proceed;
+  `trtllm::hisparse_plan_hot_slots`,
+  `trtllm::hisparse_swap_in_packed_kvarn`,
+  `trtllm::hisparse_commit_hot_slots`, and
+  `trtllm::hisparse_build_hot_indices` ops before it can proceed;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -808,7 +818,8 @@ Still pending before serving enablement:
   without Python-side token or table extraction;
 - full native orchestration that passes planner miss schedules into packed-copy
   scheduling, calls post-copy hot metadata commit, rejects stale generations,
-  and constructs hot global-index output;
+  validates row status across every native stage, and returns the hot-index
+  output to sparse MLA;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;

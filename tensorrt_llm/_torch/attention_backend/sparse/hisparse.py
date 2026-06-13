@@ -1454,6 +1454,14 @@ class OPTRTHiSparseCoordinator:
                 "CUDA kernel. HiSparse must publish post-copy hot metadata on "
                 "device before sparse MLA can consume the hot tier; no Python "
                 "hot metadata commit path is allowed for enabled serving.")
+        if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_build_hot_indices"):
+            raise NotImplementedError(
+                "trtllm::hisparse_build_hot_indices is not registered with a "
+                "CUDA kernel. HiSparse must build sparse-MLA-compatible hot "
+                "global indices from request-relative TopK and planned hot "
+                "slots on device; no Python hot-index construction path is "
+                "allowed for enabled serving.")
         raise NotImplementedError(
             "HiSparse hot-pool TopK mapping still needs native orchestration "
             "across TopK block rows, request-table resolution, hot-slot "

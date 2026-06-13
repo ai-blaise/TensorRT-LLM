@@ -46,6 +46,16 @@ enum HiSparseCommitStatus : uint8_t
     kCommitHotSlotOutOfRange = 4,
 };
 
+enum HiSparseBuildHotIndexStatus : uint8_t
+{
+    kBuildHotIndexOk = 0,
+    kBuildHotIndexUpstreamInvalid = 1,
+    kBuildHotIndexBadBlockCount = 2,
+    kBuildHotIndexBlockMissing = 3,
+    kBuildHotIndexInvalidHotSlot = 4,
+    kBuildHotIndexOverflow = 5,
+};
+
 __device__ __forceinline__ uint32_t hisparseHash32(uint32_t value)
 {
     value ^= value >> 16;
@@ -498,6 +508,84 @@ __global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlo
     }
 }
 
+__global__ void hisparseBuildHotIndicesKernel(int32_t const* __restrict__ topkIndices,
+    int32_t const* __restrict__ blockPositions, int64_t const* __restrict__ plannedHotSlots,
+    int32_t const* __restrict__ blockCounts, uint8_t const* __restrict__ commitRowStatus,
+    int32_t* __restrict__ hotIndices, uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t indexTopK,
+    int32_t maxBlocksPerRow, int32_t hotCapacity, int32_t tokensPerBlock, int32_t strideFactor, int32_t layerIdx)
+{
+    int32_t const row = blockIdx.x;
+    if (row >= numRows)
+    {
+        return;
+    }
+
+    __shared__ int32_t rowCode;
+    if (threadIdx.x == 0)
+    {
+        rowCode = commitRowStatus[row] == kCommitOk ? kBuildHotIndexOk : kBuildHotIndexUpstreamInvalid;
+        int32_t const count = blockCounts[row];
+        if (rowCode == kBuildHotIndexOk && (count < 0 || count > maxBlocksPerRow))
+        {
+            rowCode = kBuildHotIndexBadBlockCount;
+        }
+    }
+    __syncthreads();
+
+    int64_t const topkRowOffset = static_cast<int64_t>(row) * indexTopK;
+    int64_t const blockRowOffset = static_cast<int64_t>(row) * maxBlocksPerRow;
+    int32_t const count = blockCounts[row];
+    for (int32_t col = threadIdx.x; col < indexTopK; col += blockDim.x)
+    {
+        int32_t out = -1;
+        int32_t const token = topkIndices[topkRowOffset + col];
+        if (token >= 0 && rowCode == kBuildHotIndexOk)
+        {
+            int32_t const blockPos = token / tokensPerBlock;
+            int32_t const tokenOffset = token % tokensPerBlock;
+            int64_t hotSlot = -1;
+            bool foundBlock = false;
+            for (int32_t i = 0; i < count; ++i)
+            {
+                if (blockPositions[blockRowOffset + i] == blockPos)
+                {
+                    hotSlot = plannedHotSlots[blockRowOffset + i];
+                    foundBlock = true;
+                    break;
+                }
+            }
+            if (!foundBlock)
+            {
+                atomicCAS(&rowCode, kBuildHotIndexOk, kBuildHotIndexBlockMissing);
+            }
+            else if (hotSlot < 0 || hotSlot >= hotCapacity)
+            {
+                atomicCAS(&rowCode, kBuildHotIndexOk, kBuildHotIndexInvalidHotSlot);
+            }
+            else
+            {
+                int64_t const global = hotSlot * static_cast<int64_t>(strideFactor)
+                    + static_cast<int64_t>(layerIdx) * tokensPerBlock + tokenOffset;
+                if (global < 0 || global > 2147483647LL)
+                {
+                    atomicCAS(&rowCode, kBuildHotIndexOk, kBuildHotIndexOverflow);
+                }
+                else
+                {
+                    out = static_cast<int32_t>(global);
+                }
+            }
+        }
+        hotIndices[topkRowOffset + col] = out;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        rowStatus[row] = static_cast<uint8_t>(rowCode);
+    }
+}
+
 } // namespace
 
 void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blockPositions, int32_t* blockCounts,
@@ -589,6 +677,29 @@ void invokeHisparseCommitHotSlots(int64_t const* hostSlots, int64_t const* commi
     hisparseCommitHotSlotsKernel<<<1, 1, 0, stream>>>(hostSlots, commitGens, plannedHotSlots, plannedLruTick,
         blockCounts, planRowStatus, hotHostSlot, hotCommitGen, hotLruTick, rowStatus, numRows, maxBlocksPerRow,
         numLayers, hotCapacity, layerIdx);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeHisparseBuildHotIndices(int32_t const* topkIndices, int32_t const* blockPositions,
+    int64_t const* plannedHotSlots, int32_t const* blockCounts, uint8_t const* commitRowStatus,
+    int32_t* hotIndices, uint8_t* rowStatus, int32_t numRows, int32_t indexTopK, int32_t maxBlocksPerRow,
+    int32_t hotCapacity, int32_t tokensPerBlock, int32_t strideFactor, int32_t layerIdx, cudaStream_t stream)
+{
+    if (numRows <= 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(indexTopK > 0, "hisparse_build_hot_indices requires index_topk > 0");
+    TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_build_hot_indices requires max_blocks_per_row > 0");
+    TLLM_CHECK_WITH_INFO(hotCapacity > 0, "hisparse_build_hot_indices requires hot_capacity > 0");
+    TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "hisparse_build_hot_indices requires tokens_per_block > 0");
+    TLLM_CHECK_WITH_INFO(strideFactor > 0, "hisparse_build_hot_indices requires stride_factor > 0");
+    TLLM_CHECK_WITH_INFO(layerIdx >= 0, "hisparse_build_hot_indices requires layer_idx >= 0");
+
+    constexpr int32_t kThreads = 256;
+    hisparseBuildHotIndicesKernel<<<numRows, kThreads, 0, stream>>>(topkIndices, blockPositions, plannedHotSlots,
+        blockCounts, commitRowStatus, hotIndices, rowStatus, numRows, indexTopK, maxBlocksPerRow, hotCapacity,
+        tokensPerBlock, strideFactor, layerIdx);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
