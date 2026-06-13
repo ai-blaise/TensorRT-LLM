@@ -15,6 +15,28 @@ def _cfg(enabled=False):
     )
 
 
+class FakeTensor:
+
+    def __init__(self, shape, dtype, device, pin_memory):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.device = device
+        self.pin_memory = pin_memory
+        self.fill_value = None
+
+    def fill_(self, value):
+        self.fill_value = value
+        return self
+
+
+def _fake_tensor_factory(calls):
+    def factory(shape, *, dtype, device, pin_memory=False):
+        tensor = FakeTensor(shape, dtype, device, pin_memory)
+        calls.append(tensor)
+        return tensor
+    return factory
+
+
 def test_hisparse_coordinator_disabled_path_is_noop():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
 
@@ -42,6 +64,12 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
                                        packed_bytes_per_block=2048,
                                        logical_host_capacity_blocks=4,
                                        hot_device_capacity_blocks=2)
+    with pytest.raises(NotImplementedError, match="tensors are not allocated"):
+        coordinator.assert_startup_ready()
+    calls = []
+    coordinator.allocate_packed_tensors(device="cuda:0",
+                                        host_pinned=True,
+                                        tensor_factory=_fake_tensor_factory(calls))
     with pytest.raises(NotImplementedError, match="swap-in kernel"):
         coordinator.assert_startup_ready()
     with pytest.raises(NotImplementedError, match="hot-pool TopK mapping"):
@@ -83,6 +111,7 @@ def test_hisparse_request_allocation_commit_and_release():
         "host_used": 0,
         "host_free": 4,
         "hot_used": 0,
+        "tensors_allocated": 0,
     }
 
 
@@ -103,6 +132,37 @@ def test_hisparse_configure_from_kv_cache_manager_uses_kvarn_shape():
     assert tier.packed_bytes_per_block == 3072
     assert tier.hot_device_capacity_blocks == 2
     assert tier.logical_host_capacity_blocks == 64
+
+
+def test_hisparse_allocate_packed_tensors_shapes_and_initializers():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=2,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=3072,
+                                       logical_host_capacity_blocks=5,
+                                       hot_device_capacity_blocks=3)
+    calls = []
+
+    tensors = coordinator.allocate_packed_tensors(
+        device="cuda:1",
+        host_pinned=True,
+        tensor_factory=_fake_tensor_factory(calls),
+    )
+
+    assert coordinator.packed_tensors_allocated is True
+    assert coordinator.tensors is tensors
+    assert tensors.host_packed.shape == (2, 5, 3072)
+    assert tensors.hot_packed.shape == (2, 3, 3072)
+    assert tensors.host_valid.shape == (2, 5)
+    assert tensors.host_commit_gen.shape == (2, 5)
+    assert tensors.hot_host_slot.shape == (2, 3)
+    assert tensors.hot_commit_gen.shape == (2, 3)
+    assert tensors.hot_lru_tick.shape == (2, 3)
+    assert tensors.host_packed.pin_memory is True
+    assert tensors.hot_packed.pin_memory is False
+    assert tensors.hot_packed.device == "cuda:1"
+    assert [tensor.fill_value for tensor in calls] == [0, 0, 0, 0, -1, -1, 0]
+    assert coordinator.stats()["tensors_allocated"] == 1
 
 
 def test_hisparse_hot_selection_hits_misses_and_lru_eviction():

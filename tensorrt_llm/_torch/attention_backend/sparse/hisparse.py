@@ -7,7 +7,7 @@ introducing an FP16 staging path or a silent full-HBM fallback.
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 if TYPE_CHECKING:
     import torch
@@ -31,6 +31,21 @@ class HiSparsePackedTierDescriptor:
     packed_bytes_per_block: int
     logical_host_capacity_blocks: int
     hot_device_capacity_blocks: int
+
+
+@dataclass(frozen=True)
+class HiSparsePackedTierTensors:
+    """Packed dense-MLA KVarN storage owned by the HiSparse coordinator."""
+
+    host_packed: "torch.Tensor"
+    hot_packed: "torch.Tensor"
+    host_valid: "torch.Tensor"
+    host_commit_gen: "torch.Tensor"
+    hot_host_slot: "torch.Tensor"
+    hot_commit_gen: "torch.Tensor"
+    hot_lru_tick: "torch.Tensor"
+    host_pinned: bool
+    device: object
 
 
 @dataclass
@@ -116,6 +131,7 @@ class OPTRTHiSparseCoordinator:
         self._requests: Dict[int, HiSparseRequestState] = {}
         self._hot_records_by_layer: Dict[int, List[HiSparseHotBlockRecord]] = {}
         self._lru_clock = 0
+        self._tensors: Optional[HiSparsePackedTierTensors] = None
 
     @property
     def packed_tiers_configured(self) -> bool:
@@ -124,6 +140,14 @@ class OPTRTHiSparseCoordinator:
     @property
     def tier(self) -> Optional[HiSparsePackedTierDescriptor]:
         return self._tier
+
+    @property
+    def packed_tensors_allocated(self) -> bool:
+        return self._tensors is not None
+
+    @property
+    def tensors(self) -> Optional[HiSparsePackedTierTensors]:
+        return self._tensors
 
     def assert_startup_ready(self) -> None:
         if not self.enabled:
@@ -134,6 +158,11 @@ class OPTRTHiSparseCoordinator:
                 "configured yet. This is fail-closed by design: do not use an "
                 "FP16 staging path, full-HBM fallback, or direct-to-host-off "
                 "runtime for enabled HiSparse.")
+        if not self.packed_tensors_allocated:
+            raise NotImplementedError(
+                "HiSparse is enabled and packed tier metadata is configured, "
+                "but host-pinned/device packed KVarN tensors are not allocated "
+                "yet. This remains fail-closed for serving.")
         raise NotImplementedError(
             "HiSparse packed tiers are configured, but the production packed "
             "KVarN swap-in kernel and sparse MLA hot-pool read path are not "
@@ -189,6 +218,7 @@ class OPTRTHiSparseCoordinator:
             for layer in range(self._tier.num_layers)
         }
         self._lru_clock = 0
+        self._tensors = None
         return self._tier
 
     def configure_from_kv_cache_manager(self) -> HiSparsePackedTierDescriptor:
@@ -223,6 +253,95 @@ class OPTRTHiSparseCoordinator:
                                              * host_to_device_ratio),
             hot_device_capacity_blocks=hot_blocks_per_req,
         )
+
+    def allocate_packed_tensors(
+        self,
+        *,
+        device=None,
+        host_pinned: bool = True,
+        tensor_factory: Optional[Callable[..., object]] = None,
+    ) -> HiSparsePackedTierTensors:
+        """Allocate production-shaped packed KVarN host/hot tensors.
+
+        The host tier is CPU `uint8` and pinned when requested so NIXL can
+        publish it as writable remote memory. The hot tier is device `uint8`.
+        Metadata tensors are allocated alongside the packed bytes so the native
+        swap-in kernel can consume a compact ABI later. This does not enable
+        serving by itself; startup remains fail-closed until the swap-in/read
+        kernels are wired.
+        """
+        tier = self._require_configured()
+        if tensor_factory is None:
+            import torch
+
+            def tensor_factory(shape, *, dtype, device, pin_memory=False):
+                kwargs = {
+                    "dtype": getattr(torch, dtype),
+                    "device": device,
+                }
+                if pin_memory:
+                    kwargs["pin_memory"] = True
+                return torch.empty(shape, **kwargs)
+
+        if device is None:
+            device = "cuda"
+        host_shape = (tier.num_layers, tier.logical_host_capacity_blocks,
+                      tier.packed_bytes_per_block)
+        hot_shape = (tier.num_layers, tier.hot_device_capacity_blocks,
+                     tier.packed_bytes_per_block)
+        host_meta_shape = (tier.num_layers, tier.logical_host_capacity_blocks)
+        hot_meta_shape = (tier.num_layers, tier.hot_device_capacity_blocks)
+        tensors = HiSparsePackedTierTensors(
+            host_packed=tensor_factory(host_shape,
+                                       dtype="uint8",
+                                       device="cpu",
+                                       pin_memory=host_pinned),
+            hot_packed=tensor_factory(hot_shape,
+                                      dtype="uint8",
+                                      device=device,
+                                      pin_memory=False),
+            host_valid=tensor_factory(host_meta_shape,
+                                      dtype="bool",
+                                      device="cpu",
+                                      pin_memory=host_pinned),
+            host_commit_gen=tensor_factory(host_meta_shape,
+                                           dtype="int64",
+                                           device="cpu",
+                                           pin_memory=host_pinned),
+            hot_host_slot=tensor_factory(hot_meta_shape,
+                                         dtype="int64",
+                                         device=device,
+                                         pin_memory=False),
+            hot_commit_gen=tensor_factory(hot_meta_shape,
+                                          dtype="int64",
+                                          device=device,
+                                          pin_memory=False),
+            hot_lru_tick=tensor_factory(hot_meta_shape,
+                                        dtype="int64",
+                                        device=device,
+                                        pin_memory=False),
+            host_pinned=host_pinned,
+            device=device,
+        )
+        self._zero_or_fill(tensors.host_packed, 0)
+        self._zero_or_fill(tensors.hot_packed, 0)
+        self._zero_or_fill(tensors.host_valid, 0)
+        self._zero_or_fill(tensors.host_commit_gen, 0)
+        self._zero_or_fill(tensors.hot_host_slot, -1)
+        self._zero_or_fill(tensors.hot_commit_gen, -1)
+        self._zero_or_fill(tensors.hot_lru_tick, 0)
+        self._tensors = tensors
+        return tensors
+
+    @staticmethod
+    def _zero_or_fill(tensor, value: int) -> None:
+        fill = getattr(tensor, "fill_", None)
+        if fill is not None:
+            fill(value)
+            return
+        zero = getattr(tensor, "zero_", None)
+        if value == 0 and zero is not None:
+            zero()
 
     def _require_configured(self) -> HiSparsePackedTierDescriptor:
         if self._tier is None:
@@ -409,6 +528,7 @@ class OPTRTHiSparseCoordinator:
             "host_used": len(self._host_records),
             "host_free": len(self._free_host_slots),
             "hot_used": hot_used,
+            "tensors_allocated": int(self._tensors is not None),
         }
 
     def map_topk_to_hot_pool(

@@ -598,14 +598,18 @@ Current branch status:
   `(req_pool_idx, block_pos, host_slot, commit_gen)`;
 - implemented invalidation that clears hot records when host records are
   invalidated or request slots are released;
+- implemented production-shaped packed tensor allocation for host `uint8`
+  KVarN records, device hot `uint8` KVarN records, host commit metadata, and
+  device hot-slot metadata;
+- wired `DSACacheManager` so an explicitly enabled HiSparse config derives
+  packed tier sizes from dense MLA KVarN, allocates the host/hot tensors, and
+  then still fails closed before serving until the swap-in/read kernels exist;
 - added CPU-level unit tests for allocation, duplicate reservation, capacity
   failure, uncommitted-block rejection, commit-generation refresh, LRU eviction,
-  and cleanup.
+  tensor allocation ABI, and cleanup.
 
 Still pending before serving enablement:
 
-- actual host-pinned packed KVarN tensor allocation;
-- actual device hot packed KVarN tensor allocation;
 - NIXL writable descriptors for host slots;
 - host-to-hot packed record copy kernel;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.

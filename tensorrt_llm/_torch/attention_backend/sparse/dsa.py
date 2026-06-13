@@ -5625,11 +5625,18 @@ class DSACacheManager(KVCacheManager):
 
         self.hisparse_coordinator = OPTRTHiSparseCoordinator(
             sparse_attn_config, kv_cache_manager=self)
+        if self.hisparse_coordinator.enabled:
+            hisparse_device = dev if self.kvarn_cfg is not None else torch.device(
+                "cuda")
+            self.hisparse_coordinator.configure_from_kv_cache_manager()
+            self.hisparse_coordinator.allocate_packed_tensors(
+                device=hisparse_device, host_pinned=prefer_pinned())
         self.hisparse_coordinator.assert_startup_ready()
         if self.hisparse_coordinator.enabled:
             logger.info(
                 "OP-TRT HiSparse enabled: mode=%s, topk=%s, hot_blocks_per_req=%s, "
-                "host_to_device_ratio=%s. Startup passed production guardrails.",
+                "host_to_device_ratio=%s. Packed tiers are allocated; serving "
+                "remains fail-closed until swap-in/read kernels are ready.",
                 getattr(sparse_attn_config, "hisparse_mode", None),
                 getattr(sparse_attn_config, "hisparse_topk", None),
                 getattr(sparse_attn_config, "hisparse_hot_blocks_per_req", None),
