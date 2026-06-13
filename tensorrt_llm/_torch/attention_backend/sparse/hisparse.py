@@ -33,6 +33,24 @@ _HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI = "explicit_sink_tail_v1"
 
 
 @dataclass(frozen=True)
+class HiSparseResidentTokenDescriptor:
+    """Production ABI for sink/tail tokens still resident in normal KV."""
+
+    policy: str
+    row_kv_lens: "torch.Tensor"
+    row_request_ids: "torch.Tensor"
+    row_req_idx: "torch.Tensor"
+    block_table: "torch.Tensor"
+    tail_block_pos: "torch.Tensor"
+    tail_token_count: "torch.Tensor"
+    tail_valid: "torch.Tensor"
+    sink_tokens: int
+    sink_blocks: int
+    tokens_per_block: int
+    source: str = "normal_decode_kv"
+
+
+@dataclass(frozen=True)
 class HiSparseSparseMlaKvarnHotDescriptor:
     """Call contract for the future packed-KVarN sparse MLA hot path."""
 
@@ -47,6 +65,8 @@ class HiSparseSparseMlaKvarnHotDescriptor:
     stride_factor: int
     packed_bytes_per_block: int
     hot_capacity_blocks: int
+    resident_token_policy: str = _HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI
+    resident_tokens: Optional[HiSparseResidentTokenDescriptor] = None
     step_id: int = -1
     kvarn_bits: int = 2
     kv_lora_rank: int = 512
@@ -269,16 +289,17 @@ class OPTRTHiSparseCoordinator:
 
         Packed HiSparse hot records cover committed full blocks only. Sink
         tokens and the in-progress tail block are still resident in the normal
-        decode KV path, so serving must model them explicitly instead of
-        letting uncommitted-block row status collapse to zero outputs.
+        decode KV path, so serving must consume the explicit descriptor ABI
+        rather than letting uncommitted-block row status collapse to zero
+        outputs.
         """
         raise NotImplementedError(
             "HiSparse sparse MLA requires the explicit sink/tail resident-token "
             f"ABI {_HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI!r} before enabled "
-            "serving. Committed packed KVarN hot blocks are wired, but live "
-            "resident sink/tail tokens are not yet represented in the "
-            "descriptor or fused producer-load path; refusing to serve rather "
-            "than silently dropping them or routing through a fallback.")
+            "serving. The descriptor ABI is production-shaped, but the fused "
+            "producer-load path has not yet consumed and live-proven resident "
+            "normal-KV reads for sink/tail hits; refusing to serve rather than "
+            "silently dropping them or routing through a fallback.")
 
     def assert_sparse_mla_reader_ready(self) -> None:
         """Require the production KVarN-hot sparse MLA chain."""
@@ -985,6 +1006,7 @@ class OPTRTHiSparseCoordinator:
         index_topk: int,
         max_blocks_per_row: int,
         stride_factor: int,
+        resident_tokens: Optional[HiSparseResidentTokenDescriptor] = None,
     ) -> HiSparseSparseMlaKvarnHotDescriptor:
         """Build the typed sparse-MLA KVarN-hot ABI from native outputs.
 
@@ -992,6 +1014,8 @@ class OPTRTHiSparseCoordinator:
         ``topk_length`` tensor is intentionally not allocated here: fixed-top-k
         rows use the full ``index_topk`` contract, and row validity is carried
         by ``row_status`` from the native resolve/plan/copy/commit/build chain.
+        ``resident_tokens`` describes sink/tail hits that must be served from
+        the normal decode KV path, separately from committed packed hot blocks.
         """
         tier = self._require_configured()
         tensors = self._require_tensors()
@@ -1026,10 +1050,105 @@ class OPTRTHiSparseCoordinator:
             stride_factor=int(stride_factor),
             packed_bytes_per_block=int(tier.packed_bytes_per_block),
             hot_capacity_blocks=int(tier.hot_device_capacity_blocks),
+            resident_token_policy=_HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI,
+            resident_tokens=resident_tokens,
             step_id=int(self.step_id),
             kvarn_bits=2,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+        )
+
+    def _resident_sink_tokens(self) -> int:
+        kv_cache_manager = self.kv_cache_manager
+        kvarn_cfg = getattr(kv_cache_manager, "kvarn_cfg", None)
+        return max(0, int(getattr(kvarn_cfg, "sink_tokens", 0) or 0))
+
+    def _make_resident_token_descriptor(
+        self,
+        *,
+        metadata,
+        req_idx,
+        row_request_ids,
+        is_generation: bool,
+    ) -> HiSparseResidentTokenDescriptor:
+        """Build the explicit sink/tail resident-token ABI from DSA metadata."""
+        tier = self._require_configured()
+        import torch
+
+        kv_lens = getattr(metadata, "kv_lens_cuda_runtime", None)
+        if kv_lens is None:
+            kv_lens = getattr(metadata, "kv_lens_cuda", None)
+        if kv_lens is None:
+            kv_lens = getattr(metadata, "kv_lens_runtime", None)
+        if kv_lens is None:
+            raise RuntimeError(
+                "HiSparse resident-token ABI requires DSA kv_lens metadata "
+                "so sink/tail hits can be served from the normal decode KV "
+                "path.")
+        block_table = (getattr(metadata, "_cached_block_table_gen", None)
+                       if is_generation else
+                       getattr(metadata, "_cached_block_table_ctx", None))
+        if block_table is None:
+            block_table = getattr(metadata, "block_table", None)
+        if block_table is None:
+            raise RuntimeError(
+                "HiSparse resident-token ABI requires cached DSA block-table "
+                "metadata for the normal resident KV source.")
+
+        if not torch.is_tensor(req_idx):
+            req_idx = torch.as_tensor(req_idx, dtype=torch.int64)
+        if not torch.is_tensor(row_request_ids):
+            row_request_ids = torch.as_tensor(row_request_ids, dtype=torch.int64)
+        target_device = row_request_ids.device
+        req_idx_i64 = req_idx.to(device=target_device, dtype=torch.int64)
+
+        if torch.is_tensor(kv_lens):
+            kv_lens_tensor = kv_lens.to(device=target_device, dtype=torch.int64)
+        else:
+            kv_lens_tensor = torch.as_tensor(kv_lens,
+                                             dtype=torch.int64,
+                                             device=target_device)
+
+        if is_generation:
+            num_contexts = int(getattr(metadata, "num_contexts", 0) or 0)
+            num_generations = int(
+                getattr(metadata, "num_generations", 0) or 0)
+            kv_lens_tensor = kv_lens_tensor[
+                num_contexts:num_contexts + num_generations]
+        else:
+            num_contexts = int(getattr(metadata, "num_contexts", 0) or 0)
+            kv_lens_tensor = kv_lens_tensor[:num_contexts]
+        if int(kv_lens_tensor.numel()) <= 0:
+            raise RuntimeError(
+                "HiSparse resident-token ABI received an empty kv_lens slice.")
+        if int(req_idx_i64.numel()) != int(row_request_ids.numel()):
+            raise RuntimeError(
+                "HiSparse resident-token ABI row request ids must match "
+                "request-row indices.")
+
+        row_kv_lens = kv_lens_tensor.index_select(0, req_idx_i64)
+        tokens_per_block = int(tier.tokens_per_block)
+        tail_block_pos = torch.div(row_kv_lens,
+                                   tokens_per_block,
+                                   rounding_mode="floor").to(torch.int32)
+        tail_token_count = (row_kv_lens % tokens_per_block).to(torch.int32)
+        tail_valid = tail_token_count.ne(0)
+        sink_tokens = self._resident_sink_tokens()
+        sink_blocks = sink_tokens // tokens_per_block
+
+        return HiSparseResidentTokenDescriptor(
+            policy=_HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI,
+            row_kv_lens=row_kv_lens,
+            row_request_ids=row_request_ids.to(device=target_device,
+                                               dtype=torch.int64),
+            row_req_idx=req_idx_i64,
+            block_table=block_table,
+            tail_block_pos=tail_block_pos,
+            tail_token_count=tail_token_count,
+            tail_valid=tail_valid,
+            sink_tokens=sink_tokens,
+            sink_blocks=sink_blocks,
+            tokens_per_block=tokens_per_block,
         )
 
     def _host_tier_entries(
@@ -1880,6 +1999,12 @@ class OPTRTHiSparseCoordinator:
             stride_factor,
             int(layer_idx),
         )
+        resident_tokens = self._make_resident_token_descriptor(
+            metadata=metadata,
+            req_idx=req_idx,
+            row_request_ids=row_request_ids,
+            is_generation=is_generation,
+        )
         sparse_mla_descriptor = self._make_sparse_mla_kvarn_hot_descriptor(
             hot_indices=hot_indices,
             row_status=build_status,
@@ -1887,6 +2012,7 @@ class OPTRTHiSparseCoordinator:
             index_topk=index_topk,
             max_blocks_per_row=max_blocks_per_row,
             stride_factor=stride_factor,
+            resident_tokens=resident_tokens,
         )
         return HiSparseTopKMapping(
             topk_indices_global=hot_indices,

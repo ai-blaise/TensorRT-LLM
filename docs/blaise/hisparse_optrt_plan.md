@@ -1191,12 +1191,16 @@ Current branch status:
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates, then still
   requires the explicit sink/tail resident-token ABI before enabled serving;
 - startup and mapping now hard-fail after all native sparse-MLA ops are present
-  if live resident sink/tail tokens are not represented in the descriptor and
-  fused producer-load path. This prevents uncommitted-block row status from
-  becoming zero-output serving behavior;
-- the sparse MLA KVarN-hot descriptor now records the coordinator `step_id`,
-  and the fused attention dispatch rejects same-shape cached descriptors from
-  older request steps before they can consume stale hot-slot metadata;
+  until the fused producer-load path consumes and live-proves the
+  `explicit_sink_tail_v1` resident-token ABI. This prevents uncommitted-block
+  row status from becoming zero-output serving behavior;
+- the sparse MLA KVarN-hot descriptor now records the coordinator `step_id`
+  and carries production-shaped sink/tail resident metadata:
+  row kv-lens, row request ids, row request indices, the cached normal-KV
+  block table source, sink token/block counts, tail block position, tail token
+  count, and tail validity. The fused attention dispatch rejects same-shape
+  cached descriptors from older request steps or descriptors missing matching
+  resident-token metadata before they can consume stale hot-slot state;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1211,9 +1215,10 @@ Still pending before serving enablement:
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
-- implement the explicit sink/tail resident-token ABI so top-k hits on live
-  resident tokens are served through the normal decode KV path rather than
-  invalidating rows or being modeled as committed packed KVarN blocks;
+- implement fused sparse MLA consumption of the explicit sink/tail
+  resident-token ABI so top-k hits on live resident tokens are served through
+  the normal decode KV path rather than invalidating rows or being modeled as
+  committed packed KVarN blocks;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - runtime proof that the hot global-index output buffers and fused sparse MLA
@@ -1474,8 +1479,8 @@ production ABI:
      not on an intermediate correctness-only path;
    - propagate resolve/plan/copy/commit/build row status into attention before
      any row can read hot storage;
-   - implement the explicit sink/tail resident-token ABI before relaxing the
-     final readiness guard:
+   - complete fused consumption of the explicit sink/tail resident-token ABI
+     before relaxing the final readiness guard:
      - descriptor policy string/version:
        `explicit_sink_tail_v1`;
      - per-row sink coverage derived from `sink_tokens / tokens_per_block`;

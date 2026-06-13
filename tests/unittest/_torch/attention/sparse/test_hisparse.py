@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
+    HiSparseResidentTokenDescriptor,
     HiSparseSparseMlaKvarnHotDescriptor,
     OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
@@ -307,8 +308,55 @@ def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
     assert desc.kvarn_bits == 2
     assert desc.kv_lora_rank == 512
     assert desc.qk_rope_head_dim == 64
+    assert desc.resident_token_policy == "explicit_sink_tail_v1"
+    assert desc.resident_tokens is None
     assert desc.topk_length is None
     assert desc.step_id == -1
+
+
+def test_hisparse_resident_token_descriptor_derives_sink_tail_geometry():
+    coordinator = OPTRTHiSparseCoordinator(
+        _cfg(),
+        kv_cache_manager=SimpleNamespace(kvarn_cfg=SimpleNamespace(
+            sink_tokens=128)))
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=126976,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2,
+                                       kvarn_bits=2)
+    metadata = SimpleNamespace(
+        kv_lens_cuda_runtime=torch.tensor([512, 130, 192, 257],
+                                          dtype=torch.int32),
+        num_contexts=1,
+        num_generations=3,
+        _cached_block_table_gen=torch.arange(12,
+                                             dtype=torch.int32).view(3, 4),
+    )
+    req_idx = torch.tensor([0, 1, 1, 2], dtype=torch.int64)
+    row_request_ids = torch.tensor([7001, 7002, 7002, 7003],
+                                   dtype=torch.int64)
+
+    desc = coordinator._make_resident_token_descriptor(  # noqa: SLF001
+        metadata=metadata,
+        req_idx=req_idx,
+        row_request_ids=row_request_ids,
+        is_generation=True,
+    )
+
+    assert isinstance(desc, HiSparseResidentTokenDescriptor)
+    assert desc.policy == "explicit_sink_tail_v1"
+    assert desc.source == "normal_decode_kv"
+    assert desc.sink_tokens == 128
+    assert desc.sink_blocks == 2
+    assert desc.tokens_per_block == 64
+    assert desc.block_table is metadata._cached_block_table_gen
+    assert desc.row_kv_lens.tolist() == [130, 192, 192, 257]
+    assert desc.row_req_idx.tolist() == [0, 1, 1, 2]
+    assert desc.row_request_ids.tolist() == [7001, 7002, 7002, 7003]
+    assert desc.tail_block_pos.tolist() == [2, 3, 3, 4]
+    assert desc.tail_token_count.tolist() == [2, 0, 0, 1]
+    assert desc.tail_valid.tolist() == [True, False, False, True]
 
 
 def test_hisparse_sparse_mla_descriptor_records_coordinator_step():
@@ -332,6 +380,7 @@ def test_hisparse_sparse_mla_descriptor_records_coordinator_step():
     )
 
     assert desc.step_id == coordinator.step_id
+    assert desc.resident_token_policy == "explicit_sink_tail_v1"
 
 
 def test_hisparse_request_allocation_commit_and_release():
@@ -748,7 +797,13 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "int(descriptor.layer_idx) != expected_layer_idx" in source
     assert "descriptor.row_status.shape[0]" in source
     assert "descriptor.hot_indices.shape[1]" in source
+    assert "resident = getattr(descriptor, \"resident_tokens\", None)" in source
+    assert "explicit_sink_tail_v1" in source
+    assert "resident.row_kv_lens.shape[0]" in source
+    assert "resident.block_table.device" in source
+    assert "resident.tail_token_count.device" in source
     assert "assert_resident_token_policy_ready" in hisparse.read_text()
+    assert "HiSparseResidentTokenDescriptor" in hisparse.read_text()
     assert "torch.ops.trtllm.sparse_mla_decode_kvarn_hot" in source
     assert "getattr(attn_metadata, \"num_generations\", 0)" in source
     assert "hisparse_sparse_mla_kvarn_hot" in source

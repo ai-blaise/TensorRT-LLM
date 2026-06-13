@@ -2708,9 +2708,34 @@ class MLA(nn.Module):
                     topk_indices.shape[1]):
                 return False
             expected_device = topk_indices.device
-            return (descriptor.hot_indices.device == expected_device
+            if not (descriptor.hot_indices.device == expected_device
                     and descriptor.row_status.device == expected_device
-                    and descriptor.hot_packed.device == fused_q.device)
+                    and descriptor.hot_packed.device == fused_q.device):
+                return False
+            resident = getattr(descriptor, "resident_tokens", None)
+            if resident is None:
+                return False
+            if getattr(resident, "policy", None) != "explicit_sink_tail_v1":
+                return False
+            if int(resident.row_kv_lens.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.row_request_ids.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.row_req_idx.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.tail_block_pos.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.tail_token_count.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.tail_valid.shape[0]) != int(num_tokens):
+                return False
+            return (resident.row_kv_lens.device == expected_device
+                    and resident.row_request_ids.device == expected_device
+                    and resident.row_req_idx.device == expected_device
+                    and resident.block_table.device == expected_device
+                    and resident.tail_block_pos.device == expected_device
+                    and resident.tail_token_count.device == expected_device
+                    and resident.tail_valid.device == expected_device)
 
         descriptor = getattr(attn_metadata, "hisparse_sparse_mla_kvarn_hot",
                              None)
