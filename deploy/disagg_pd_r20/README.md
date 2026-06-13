@@ -205,8 +205,10 @@ path for fixes such as C++ LayerSplit handoff or
 libraries in the runtime image.
 
 Run the full non-mutating strict-smoke/C16 preflight bundle. It chains exact
-image handoff, DGD server dry-run, prewarm Job server dry-run with image handoff,
-and persistent cache requirements into one proof directory plus next commands:
+NIXL/custom-stack local gate audit, exact image handoff, DGD server dry-run,
+prewarm Job server dry-run with image handoff, and persistent cache requirements
+into one proof directory plus next commands. The active r20 helpers fail closed
+if `--target-node a4-us-002-rl9` is supplied:
 
 ```bash
 deploy/disagg_pd_r20/strict_smoke_preflight.sh \
@@ -325,8 +327,9 @@ deploy/disagg_pd_r20/prewarm_caches.sh \
 - `prewarm_caches.sh` -- persistent-cache preparation and lightweight offline HF
   prewarm/validation job.
 - `strict_smoke_preflight.sh` -- non-mutating R20 strict-smoke/C16 handoff
-  bundle that writes proof logs, registry/cache pressure, exact image-handoff
-  checks, and exact next commands.
+  bundle that writes proof logs, local NIXL/custom-stack gate audit output,
+  registry/cache pressure, exact image-handoff checks, and exact next commands.
+  It refuses `a4-us-002-rl9` under the current node constraint.
 - `smoke_request_pinning.sh` -- ready-only live gate for non-MORI request
   pinning, Moondream overlap compatibility, normal close, and early stream
   close cleanup before A/B.

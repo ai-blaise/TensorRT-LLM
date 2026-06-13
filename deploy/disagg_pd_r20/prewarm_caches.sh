@@ -68,6 +68,9 @@ if [[ -z "$IMAGE" ]]; then
   exit 2
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
+
 SSH_TARGET="${VM_USER}@${VM_HOST}"
 JOB_NAME="optrt-cache-prewarm-$(date -u +%Y%m%d%H%M%S)"
 

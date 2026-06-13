@@ -60,6 +60,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+source "$(dirname "${BASH_SOURCE[0]}")/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
+
 SSH_TARGET="${VM_USER}@${VM_HOST}"
 
 read -r -d '' REMOTE_SCRIPT <<'EOS' || true

@@ -126,6 +126,9 @@ if [[ "$LOCAL_REGISTRY_MODE" == "resident" && "$USE_LOCAL_REGISTRY" != 1 ]]; the
   echo "--local-registry-mode=resident requires --use-local-registry" >&2
   exit 2
 fi
+source "$(dirname "${BASH_SOURCE[0]}")/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
+
 IMAGE_HANDOFF_MODE=resident
 if [[ "$USE_LOCAL_REGISTRY" == 1 && "$LOCAL_REGISTRY_MODE" == "push" ]]; then
   IMAGE_HANDOFF_MODE=registry
