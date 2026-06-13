@@ -8,7 +8,7 @@ with the custom pieces toggled ON.
 | Worker   | GPUs  | Parallelism            | Custom piece ON                              |
 |----------|-------|------------------------|----------------------------------------------|
 | prefill  | 4 GPUs | TP2xCP2 LayerSplit / EP4, ADP=false | **LayerSplit** (`layersplit_enabled: true`) + **2-bit KVarN dense MLA latent KV** (`mla_latent_kv_dtype: kvarn_k2v2`) |
-| decode   | 4 GPUs | TP4 / EP4, ADP=true, MNNVL | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **2-bit KVarN dense MLA latent KV** |
+| decode   | 4 GPUs | TP4 / EP4, ADP=true, MNNVL allreduce + DeepEP low-latency MoE comm | **WarpDecode** (`warp_decode.enabled: true`, `tile_mode: decode_1cta`) + **SMC-SD GLM draft** + **2-bit KVarN dense MLA latent KV** |
 | Frontend | -     | KV router (`--router-mode kv`) | -                                  |
 
 This is 1P x 4GPU + 1D x 4GPU disaggregated serving with real LayerSplit on
@@ -17,11 +17,17 @@ prefill (`TP2 x CP2`) and non-CP decode (`TP4 x CP1`).
 ## Why node 002 (k3s)
 
 The disaggregated P/D artifact is the `DynamoGraphDeployment` CRD
-(`nvidia.com/v1alpha1`), which is k3s-native and is the pre-A/B artifact for the NIXL + LayerSplit + request-pinning gate. Aggregated SMC-SD launch paths are not part of this disaggregated gate.
+(`nvidia.com/v1alpha1`), which is k3s-native and is the pre-A/B artifact for
+the NIXL + LayerSplit + request-pinning gate. The r20 DGD now carries the SMC-SD
+GLM draft decode config; standalone aggregated SMC launch paths are not the
+production gate, and generic/GQA KVarN remains fail-closed until its readiness
+guard is promoted.
 
 ## Image
 
-Both workers + frontend run the unified NIXL/LayerSplit gate image, parameterized as `${UNIFIED_IMAGE}`. Confirm the tag with the build agent before apply and keep draft-diagnostic images off this gate.
+Both workers + frontend run the unified NIXL/LayerSplit/SMC gate image,
+parameterized as `${UNIFIED_IMAGE}`. Confirm the tag with the build agent before
+apply and keep draft-diagnostic images off this gate.
 
 For TP2xCP2 prefill -> TP4xCP1 decode, use a full source-built runtime image,
 not a Python-only overlay over an older base. The C++ MLA cache formatter must
@@ -477,7 +483,12 @@ deploy/disagg_pd_r20/snapshot_take_canary.sh \
   `mla_latent_kv_amortize`, `docs/blaise/kvarn.md`. This deployment uses
   `kvarn_k2v2` for **dense MLA latent KV only**; `indexer_k_dtype` remains
   `fp4` and is not replaced by KVarN.
-- SMC-SD/GLM draft decoding is post-gate. Keep it out of this pre-A/B manifest, smoke, and image provenance until NIXL, LayerSplit, request pinning, WarpDecode, and dense KVarN are proven.
+- SMC-SD/GLM draft decoding: enabled in the r20 DGD through
+  `speculative_config.decoding_type: SMC`,
+  `speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`,
+  `gamma: 6`, `n_particles: 4`, and `draft_kv_cache_dtype: bfloat16`.
+  Dense MLA KVarN remains on for the target model; generic/GQA KVarN is not used
+  for the draft until `kvarnGqaBackendReady()` is promoted.
 - Prefill NCCL: `NCCL_NVLS_ENABLE=0`. LayerSplit prefill uses native TP/CP
   subgroup allreduces; on the tested B200/K3s stack, NCCL NVLS multicast
   binding fails for those subgroups while NCCL CUMEM/P2P completes correctly.
@@ -532,10 +543,16 @@ The highest-impact NIXL knobs for the current B200/NVLink R20 shape are:
   KV transfer/inference overlap explicitly enabled; the second allows generation
   ranks to receive KV from the prefill CP ranks in parallel instead of
   sequentially.
-- `UCX_CUDA_IPC_ENABLE_MNNVL=0`, `NVIDIA_GDRCOPY=1`, `NCCL_NET_PLUGIN=none`, and
-  `TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED` keep the single-node B200/NVLink
-  path explicit and avoid the direct UCX MNNVL warning path seen in earlier
-  rollouts.
+- `UCX_CUDA_IPC_ENABLE_MNNVL=0`, `NVIDIA_GDRCOPY=1`, and
+  `NCCL_NET_PLUGIN=none` keep the single-node B200/NVLink path explicit and
+  avoid the direct UCX MNNVL warning path seen in earlier rollouts. Prefill keeps
+  `TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED` for the LayerSplit TP/CP path.
+  Decode uses the measured DeepEP low-latency MoE path:
+  `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY`,
+  `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`,
+  `TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE=0`, and
+  `TRTLLM_MOE_POST_QUANT_ALLTOALLV=1`; keep low-precision MoE combine disabled
+  on this path until the combine correctness gate is promoted.
 - Prefill keeps `NCCL_NVLS_ENABLE=0` because TP/CP subgroup allreduces hit NVLS
   binding failures on this stack; decode keeps `NCCL_NVLS_ENABLE=1` for the
   non-CP TP4 decode side.
@@ -606,7 +623,7 @@ After the audit passes, run the strict smoke. After strict smoke passes, run the
 NIXL c16 gate before any UCX/Mooncake/MORI A/B:
 
 ```bash
-SMC_GATE_MODE=deferred REQUIRE_DYNAMO_PIN_MARKERS=1 \
+REQUIRE_DYNAMO_PIN_MARKERS=1 \
 REQUIRE_POSITIVE_TRANSFER_METRICS=1 REQUIRE_ABORT_CLEANUP_MARKER=1 \
   deploy/disagg_pd_r20/smoke_request_pinning.sh
 
@@ -617,6 +634,9 @@ deploy/disagg_pd_r20/run_c16_transport_bench.sh \
   --max-tokens 128 \
   --min-tok-per-user 150
 ```
+
+`SMC_GATE_MODE=deferred` is now a regression-bisect aid only. It no longer
+clears the production r20 gate because SMC-SD is part of the default manifest.
 
 ## KV handoff shape
 

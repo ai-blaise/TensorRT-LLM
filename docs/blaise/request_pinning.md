@@ -75,7 +75,9 @@ back to an unknown-DP broadcast path before A/B testing.
   - `mla_latent_kv_dtype: kvarn_k2v2`
 - Decode config:
   - `disable_overlap_scheduler: false`
-  - `speculative_config.decoding_type: SMC` for the full production proof; use the explicit `SMC_GATE_MODE=deferred` smoke only while the SMC-SD kernel is behind the NIXL/LayerSplit gate.
+  - `speculative_config.decoding_type: SMC` for the full production proof, with
+    the GLM-4-9B-FP8 draft and bf16 draft KV while generic/GQA KVarN remains
+    fail-closed.
   - `moe_config.backend: WARPDECODE`
   - `warp_decode.policy: force`
   - `warp_decode.allow_parallelism_fallback: false`
@@ -104,8 +106,8 @@ Collect these from the live rollout before A/B:
 - Prefill/decode engine args show `disable_overlap_scheduler: False`.
 - Prefill engine args show `cp_config={'cp_type': 'LAYERSPLIT'}` and
   `layersplit_enabled: True`.
-- Full production proof: decode engine args show `decoding_type='SMC'`, WarpDecode enabled with
-  `policy='force'`, and no backend fallback. The temporary NIXL/LayerSplit smoke may run with `SMC_GATE_MODE=deferred`; that mode does not clear the SMC-SD A/B item.
+- Full production proof: decode engine args show `decoding_type='SMC'`,
+  WarpDecode enabled with `policy='force'`, and no backend fallback.
 - KVarN dense MLA shows `mla_latent_kv_dtype='kvarn_k2v2'` and amortized restore.
 - Worker pods have zero restarts through smoke and 16-concurrency warmup.
 - `deploy/disagg_pd_r20/audit_cpp_context_endpoint_static.py` passes before a
@@ -121,10 +123,10 @@ without putting load on the canary.
 
 ```bash
 deploy/disagg_pd_r20/smoke_request_pinning.sh
-
-# Temporary critical-path smoke while SMC-SD is deferred behind NIXL/LayerSplit:
-SMC_GATE_MODE=deferred deploy/disagg_pd_r20/smoke_request_pinning.sh
 ```
+
+`SMC_GATE_MODE=deferred` may still be used for regression bisection, but it does
+not clear the production r20 request-pinning gate.
 
 Equivalent manual command sequence:
 

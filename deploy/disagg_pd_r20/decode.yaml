@@ -1,6 +1,7 @@
 # =============================================================================
 # Disagg P/D r20 -- DECODE worker engine config (cell1 DP2/TP4-disagg winner)
-# 1 decode worker, TP4 / EP4, enable_attention_dp=true, MNNVL, GPUs 4-7.
+# 1 decode worker, TP4 / EP4, enable_attention_dp=true, MNNVL allreduce
+# plus DeepEP low-latency MoE comms from the pod env, GPUs 4-7.
 # Custom piece ON for decode: WarpDecode (NVFP4 MoE decode fast path).
 # WarpDecode ON knobs (warpdecode.md + llm_args.py WarpDecodeConfig):
 #   moe_config.backend: WARPDECODE          -> selects output-owned NVFP4 decode path
@@ -50,7 +51,8 @@ cache_transceiver_config:
   max_tokens_in_buffer: 131072
 moe_config:
   backend: WARPDECODE
-  use_low_precision_moe_combine: true
+  # DeepEP low-latency combine remains correctness-gated on this path.
+  use_low_precision_moe_combine: false
   warp_decode:
     enabled: true                  # WarpDecode ON (decode fast path armed)
     tile_mode: decode_1cta         # pin 1-CTA decode-optimal tile, skip profiling
@@ -80,3 +82,14 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   layersplit_enabled: false        # LayerSplit is the PREFILL piece; off on decode
+speculative_config:
+  decoding_type: SMC
+  speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
+  gamma: 6
+  n_particles: 4
+  resample_threshold: 0.5
+  draft_temperature: 0.7
+  target_temperature: 1.0
+  draft_attention_backend: triton
+  # Generic/GQA KVarN stays fail-closed; use bf16 draft KV for the r20 gate.
+  draft_kv_cache_dtype: bfloat16

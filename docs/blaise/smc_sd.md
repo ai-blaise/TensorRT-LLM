@@ -32,7 +32,7 @@ speculative_config = {
     "n_particles": 4,            # SMC particles per request
     "resample_threshold": 0.5,   # ESS ratio below which particles resample, in (0,1]
     "target_temperature": 1.0,
-    "draft_temperature": 1.0,
+    "draft_temperature": 0.7,
     "draft_attention_backend": "triton",   # auto | triton | fa3 | trtllm_mha
     "draft_kv_cache_dtype": "auto",        # auto | bfloat16 | fp8_e4m3 | fp8_e5m2
 }
@@ -52,21 +52,21 @@ The validator enforces `max_draft_len == gamma` and sets
 
 ## Status
 
-- **Draft path validated** (draft image `smcsd-20260603`): the static-particle
-  draft forward + log-prob recording + batched particle selection (which
-  collapses per-request d2h syncs) are correct. Rejection-sampling acceptance is
-  the default for higher accepted length.
-- **GLM-4-9B-FP8 draft specifics handled:** duplicate draft KV-head FP8 block
-  scales at `tp > num_kv_heads`; route the GLM draft to FlashInfer (no fused
-  trtllm-gen GQA kernel on SM100); force non-fp8 draft KV to avoid the
-  unfused-MHA OOM; coerce dense GLM-4-0414-FP8 draft activations to bf16.
-- **End-to-end serving blocked / regressing** at the time of writing: the
-  aggregated-TP4 SMC deploy hit an intermittent **libnccl 2.29.2 double-free**
-  (root-caused; fix = NCCL 2.29.7 swap) and a measured **~2 tok/s regression**
-  vs the no-SMC baseline on the same hardware — i.e. the draft overhead was not
-  yet repaid by acceptance at the tested operating point. A no-SMC baseline on
-  the same agg-TP4 hardware is staged for a clean A/B. SMC-SD is therefore
-  **opt-in and not a production default** pending the e2e win.
+- **Production r20 manifest default:** commit `2634a162d` wires SMC-SD into the
+  disaggregated r20 decode config with
+  `/models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`, `gamma: 6`,
+  `n_particles: 4`, `resample_threshold: 0.5`, `draft_temperature: 0.7`,
+  `target_temperature: 1.0`, `draft_attention_backend: triton`, and
+  `draft_kv_cache_dtype: bfloat16`.
+- **GLM-4-9B-FP8 draft specifics handled:** the June commit train handles the
+  FP8/block-scale and draft-shape integration issues in the r20 path. The
+  production default intentionally uses bf16 draft KV while generic/GQA KVarN
+  remains fail-closed.
+- **Remaining proof before A/B:** run the synchronized TensorRT+Dynamo r20
+  manifest through strict request-pinning smoke with SMC enabled, verify
+  Moondream overlap markers and zero fallback/broadcast handoff, then compare
+  SMC-on/off during the c16 A/B sweep. `SMC_GATE_MODE=deferred` is now only a
+  regression-bisect aid; it does not clear the production gate.
 
 ## Correctness validation
 

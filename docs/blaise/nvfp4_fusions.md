@@ -11,7 +11,7 @@ direct win. Six fusions land here:
 | 13c | lowrank-gate + NVFP4-quant single-launch epilogue (MoE input) | `cute_lowrank_gate.py` / `fused_lowrank_gate.py` | chain 7.04 → 4.19 µs/layer ⇒ −165 µs/tok | on (`68866e061`) |
 | 13d | dense-MLP gated-norm + NVFP4-quant handoff (swizzled-SF) | `cute_lowrank_gate.py` / `modeling_deepseekv3.py` | 4 → 3 kernels per dense-layer input; ~6–8 µs/tok | on (`TRTLLM_OPTRT_GATED_PREMLP_QUANT`, `8e44aeae1`) |
 | 14 | fused RoPE-cat-FP4 | `fusedRopeCatFp4Op.cpp` / `fusedRopeCatFp4.cu` | −3.2…−4.1 µs / F-layer (graphed) | on when shape matches |
-| 15 | KVarN-BDR fold | see `kvarn.md` | (capacity, not latency) | opt-in |
+| 15 | KVarN-BDR fold | see `kvarn.md` | (capacity, not latency) | default with dense MLA KVarN |
 
 All are validated by **numerical match vs the unfused decomposition** (residual
 bit-identical; NVFP4 quant error reported), not end-to-end text.
@@ -215,9 +215,10 @@ The KVarN variance-normalized KV quant folds its block-diagonal-rotation (BDR)
 dequant into the read path / the add+RMSNorm path rather than running a
 standalone dequant launch. Because it is part of the KV-cache capacity story
 (not a decode-latency fusion per se), it is documented in full in
-[`kvarn.md`](kvarn.md#bdr-fold-in-kernel-dequant-on-read). It is **opt-in**
-(KVarN flag) and composes with the add+RMSNorm fusion above (the dequant can ride
-the same kernel that produces the normed activation).
+[`kvarn.md`](kvarn.md#bdr-fold-in-kernel-dequant-on-read). It is default-on
+whenever production dense MLA KVarN is selected and composes with the
+add+RMSNorm fusion above (the dequant can ride the same kernel that produces the
+normed activation).
 
 ---
 
@@ -235,7 +236,8 @@ the same kernel that produces the normed activation).
 - **fused RoPE-cat-FP4 (#14):** on automatically when `_rope_cat_fuse_ok` is
   true for the model shape (DeepSeek-V3.2 NVFP4 indexer qualifies). No config;
   falls back transparently otherwise.
-- **KVarN-BDR fold (#15):** opt-in via the KVarN flag (see `kvarn.md`).
+- **KVarN-BDR fold (#15):** on whenever production dense MLA KVarN is selected
+  (see `kvarn.md`).
 
 ## Correctness validation summary
 

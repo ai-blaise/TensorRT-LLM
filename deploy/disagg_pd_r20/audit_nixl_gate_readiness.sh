@@ -7,7 +7,7 @@ MODE="${NIXL_AUDIT_MODE:-live}"
 MIN_MAX_TOKENS_IN_BUFFER="${MIN_MAX_TOKENS_IN_BUFFER:-131072}"
 CHECK_RUNTIME_LIBS="${CHECK_RUNTIME_LIBS:-1}"
 EXPECTED_NIXL_PLUGIN_BACKEND="${EXPECTED_NIXL_PLUGIN_BACKEND:-UCX}"
-SMC_GATE_MODE="${SMC_GATE_MODE:-deferred}"
+SMC_GATE_MODE="${SMC_GATE_MODE:-required}"
 OUTPUT_DIR="${NIXL_AUDIT_OUT:-/tmp/nixl_gate_audit_${MODE}_$(date -u +%Y%m%dT%H%M%SZ)_$$}"
 LOCAL_DGD_MANIFEST="${LOCAL_DGD_MANIFEST:-deploy/disagg_pd_r20/topo-c1-dp2tp4-disagg-r20.yaml}"
 
@@ -137,8 +137,13 @@ require_config_shape() {
   require_fixed 'UCX_CUDA_IPC_ENABLE_MNNVL' "$cfg" "UCX CUDA IPC MNNVL guard"
   require_fixed 'NVIDIA_GDRCOPY' "$cfg" "GDRCopy env"
   require_fixed 'NCCL_NET_PLUGIN' "$cfg" "NCCL net plugin guard"
-  require_fixed 'TRTLLM_FORCE_COMM_METHOD' "$cfg" "NVLink MoE comm method"
-  require_fixed 'NVLINK_TWO_SIDED' "$cfg" "NVLink two-sided comm method"
+  require_fixed 'TRTLLM_FORCE_COMM_METHOD' "$cfg" "explicit MoE comm method"
+  require_fixed 'NVLINK_TWO_SIDED' "$cfg" "prefill NVLink two-sided comm method"
+  require_fixed 'DEEPEPLOWLATENCY' "$cfg" "decode DeepEP low-latency comm method"
+  require_fixed 'TRTLLM_DEEP_EP_TOKEN_LIMIT' "$cfg" "decode DeepEP token limit"
+  require_fixed "value: '64'" "$cfg" "decode DeepEP token limit value"
+  require_fixed 'TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE' "$cfg" "decode DeepEP P2P mode"
+  require_fixed 'TRTLLM_MOE_POST_QUANT_ALLTOALLV' "$cfg" "decode post-quant alltoallv"
 
   case "$SMC_GATE_MODE" in
     deferred)
@@ -147,6 +152,11 @@ require_config_shape() {
       ;;
     required)
       require_fixed 'decoding_type: SMC' "$cfg" "SMC-SD required gate"
+      require_fixed 'speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP' "$cfg" "SMC-SD GLM draft"
+      require_fixed 'draft_attention_backend: triton' "$cfg" "SMC-SD draft attention backend"
+      require_fixed 'draft_kv_cache_dtype: bfloat16' "$cfg" "SMC-SD bf16 draft KV"
+      reject_fixed 'draft_kv_cache_dtype: kvarn' "$cfg" "GQA KVarN draft KV before readiness promotion"
+      require_fixed 'use_low_precision_moe_combine: false' "$cfg" "DeepEP low-latency combine gate"
       ;;
     *) fail "SMC_GATE_MODE must be deferred or required, got $SMC_GATE_MODE" ;;
   esac

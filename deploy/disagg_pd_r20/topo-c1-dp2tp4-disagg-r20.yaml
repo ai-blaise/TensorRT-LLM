@@ -7,6 +7,7 @@
 #   * 1 DECODE  worker -- TP4 / EP4, enable_attention_dp=true, GPUs 4-7,
 #       WarpDecode ON   (decode.yaml: moe_config.warp_decode.enabled=true, tile_mode=decode_1cta
 #                        + env TRTLLM_WARP_DECODE_FIXED_TACTIC=1)
+#       SMC-SD + DeepEP-LL ON (GLM draft with bf16 draft KV; DeepEP low-latency MoE comm)
 #   * 1 Frontend (KV router) -- dynamo.frontend, http :8000
 #
 # Target node: set TARGET_NODE before envsubst. The 001 VM is the canary/build
@@ -15,7 +16,7 @@
 # (nvidia.com/v1alpha1), which is k3s-native and is the pre-A/B gate for NIXL,
 # LayerSplit owner-local handoff, request pinning, WarpDecode, and dense KVarN.
 #
-# Image: BOTH workers + frontend run the unified NIXL/LayerSplit gate image.
+# Image: BOTH workers + frontend run the unified NIXL/LayerSplit/SMC gate image.
 # Parameterized as ${UNIFIED_IMAGE}; confirm the image tag with the build agent
 # before apply.
 # Substitute at deploy time, e.g.:
@@ -147,7 +148,8 @@ data:
       max_tokens_in_buffer: 131072
     moe_config:
       backend: WARPDECODE
-      use_low_precision_moe_combine: true
+      # DeepEP low-latency combine remains correctness-gated on this path.
+      use_low_precision_moe_combine: false
       warp_decode:
         enabled: true
         tile_mode: decode_1cta
@@ -477,7 +479,13 @@ spec:
       - name: TRTLLM_WORKER_DISABLE_GC
         value: '1'
       - name: TRTLLM_FORCE_COMM_METHOD
-        value: NVLINK_TWO_SIDED
+        value: DEEPEPLOWLATENCY
+      - name: TRTLLM_DEEP_EP_TOKEN_LIMIT
+        value: '64'
+      - name: TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE
+        value: '0'
+      - name: TRTLLM_MOE_POST_QUANT_ALLTOALLV
+        value: '1'
       - name: ENABLE_CONFIGURABLE_MOE
         value: '1'
       - name: TLLM_LOG_LEVEL
