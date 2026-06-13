@@ -514,22 +514,65 @@ Implementation sequence:
 
 1. Install production packed host/hot KVarN allocation and metadata first.
 2. Implement packed KVarN host-to-hot swap-in and hot global-index mapping.
-3. Define and implement the sparse MLA KVarN-hot ABI against the production BDR
-   layout:
+3. Define and implement the sparse MLA KVarN-hot ABI against the target
+   production BDR layout, not a compatibility wrapper around the existing
+   NVFP4 sparse MLA ABI:
    - `q`: bf16 `[B, s_q, 128, 576]`;
    - `hot_packed`: uint8 layer-major hot records;
    - `hot_indices`: int32 `[B, s_q, topk]` using the hot-slot global-index
      contract emitted by `hisparse_build_hot_indices`;
+   - sink/tail descriptors for live resident tokens that are not yet committed
+     full blocks, explicitly separated from packed committed host/hot blocks;
    - row status from resolve/plan/copy/commit/build, consumed before attention
      so invalid rows cannot read stale hot slots;
    - explicit BDR field offsets/strides, `tokens_per_block`, `kvarn_bits`,
      and dense MLA dimensions, derived from the configured production model
      rather than inferred from legacy test tensors.
 4. Make sparse MLA consume the hot packed KVarN view through BDR/on-read dequant
-   in the producer load path. Reuse the existing sparse MLA scheduler/combine
-   pieces only where their assumptions still match the KVarN-hot ABI.
+   in the producer load path. This must be a real KVarN-hot producer read:
+   decode hot global index -> `(hot_slot, token_offset)` -> BDR byte fields ->
+   2-bit C-KV dequant with scale/zp -> RoPE payload read -> existing sparse MLA
+   math/combine where compatible. Reuse scheduler/combine pieces only where
+   their memory-layout assumptions still match the KVarN-hot ABI.
 5. Keep external FP16/KVarN references in tests only; do not add a serving
-   staging path that dequants committed cold blocks into a hot FP16 pool.
+   staging path that dequants committed cold blocks into a hot FP16 pool, and
+   do not add an executable "correctness" placeholder that can answer requests
+   before the production KVarN-hot reader is live.
+
+## Production Sparse MLA KVarN-Hot Contract
+
+The next unlock is not a nominal op name. It is the production dense-MLA
+hot-read path for the target model architecture. A valid implementation must
+satisfy all of these conditions before the HiSparse startup/mapping guard can
+be relaxed:
+
+- The serving kernel path reads packed `kvarn_k2v2` hot records, not FP16,
+  BF16/FP8 FlashMLA, NVFP4 sparse MLA records, or the legacy Python/Sinkhorn
+  `KVarNLatentPool` layout.
+- The op schema carries the real BDR layout fields: C-KV low-bit byte offsets,
+  scale/zp offsets, RoPE byte offsets, record stride, `tokens_per_block`,
+  `kvarn_bits=2`, dense MLA head dimensions, and layer/hot-slot strides.
+- Row status from native block dedupe, request-table resolve, hot-slot plan,
+  miss compaction, copy submission, post-copy commit, and hot-index build is
+  reduced into a device-visible launch/row validity contract. Invalid rows
+  cannot be masked into plausible output after reading stale hot storage.
+- Sink and tail tokens that are still resident in the normal decode KV path are
+  represented explicitly in the ABI. They are not modeled as a committed packed
+  host block and are not copied through an FP16 hot tier.
+- The producer-load path performs the BDR fold in-kernel on read. A separate
+  pre-dequant pass into a dense hot buffer is a serving placeholder and is not
+  acceptable for promotion.
+- Correctness proof compares the production HiSparse hot path against the
+  existing production full-HBM `kvarn_k2v2` path within KVarN tolerance. An
+  independent FP16 reference may exist only as an offline fixture outside the
+  coordinator, transceiver, kernel ABI, and deployment config.
+- The implementation is wired through the current production DSA/dense-MLA
+  path with Indexer/HISA, FSSS reuse, LayerSplit owner-local prefill,
+  NIXL direct-to-host admission, request pinning, Moondream pinning, and
+  SMC-SD row expansion. It is not a standalone microkernel promotion.
+- The first acceptable CUDA target is SM100/B200 with the production buckets:
+  `index_topk=1024`, `tokens_per_block=64`, and hot blocks/request
+  `{32,64,96,128}`.
 
 ## Indexer And HISA Integration
 
@@ -1256,13 +1299,18 @@ production ABI:
      Python/Sinkhorn `KVarNLatentPool` record layout directly into a BDR
      sparse MLA hot-read kernel.
 3. Wire the sparse MLA KVarN-hot read path:
-   - add `sparse_mla_decode_kvarn_hot` or an equivalent explicit KVarN mode;
-   - consume hot packed KVarN records directly through hot global indices;
-   - add BDR/on-read dequant in the sparse MLA producer load path;
+   - add `sparse_mla_decode_kvarn_hot` or an equivalent explicit KVarN mode
+     that satisfies the production sparse MLA KVarN-hot contract above;
+   - consume hot packed KVarN records directly through hot global indices,
+     decoding `(hot_slot, token_offset)` into production BDR field addresses;
+   - add BDR/on-read dequant in the sparse MLA producer load path, including
+     2-bit C-KV unpack, scale/zp apply, and RoPE payload read without an
+     intermediate dense/FP16 hot staging pass;
    - propagate resolve/plan/copy/commit/build row status into attention before
      any row can read hot storage;
-   - keep sink/tail resident policy separate from committed packed blocks;
-   - remove any need for full-working-set restore of committed cold blocks.
+   - keep sink/tail resident policy separate from committed packed blocks and
+     represent that policy explicitly in the kernel ABI;
+   - remove any need for full-working-set restore of committed cold blocks;
    - do not introduce an FP16 block-hot oracle, an NVFP4 sparse-MLA
      compatibility mode, or any executable serving placeholder while wiring
      this path. Reference comparisons stay outside serving code.
@@ -1286,6 +1334,8 @@ production ABI:
 7. Add production tests:
    - unit tests for block dedupe, hit/miss/LRU, commit coverage, admission,
      cancel, recycle, and FSSS reuse;
+   - kernel tests for the KVarN-hot producer load path using production BDR
+     records and row-status rejection, not a synthetic FP16 hot pool;
    - VM E2E for generation-first NIXL direct-to-host, LayerSplit prefill,
      TP4/EP4 decode, SMC-SD accept/reject, and Moondream pin preservation;
    - correctness comparison against the existing production full-HBM KVarN path
