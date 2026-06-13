@@ -122,7 +122,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::hisparse_resolve_blocks_to_host_slots",
         })
     with pytest.raises(NotImplementedError,
-                       match="plan_hot_slots"):
+                       match="classify_resident_blocks"):
         coordinator.map_topk_to_hot_pool(topk_indices=object(),
                                          metadata=SimpleNamespace(request_ids=[0]),
                                          layer_idx=0,
@@ -133,6 +133,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
         lambda name: name in {
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
+            "trtllm::hisparse_classify_resident_blocks",
             "trtllm::hisparse_plan_hot_slots",
         })
     with pytest.raises(NotImplementedError,
@@ -147,6 +148,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
         lambda name: name in {
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
+            "trtllm::hisparse_classify_resident_blocks",
             "trtllm::hisparse_plan_hot_slots",
             "trtllm::hisparse_compact_miss_schedule",
         })
@@ -162,6 +164,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
         lambda name: name in {
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
+            "trtllm::hisparse_classify_resident_blocks",
             "trtllm::hisparse_plan_hot_slots",
             "trtllm::hisparse_compact_miss_schedule",
             "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
@@ -178,6 +181,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
         lambda name: name in {
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
+            "trtllm::hisparse_classify_resident_blocks",
             "trtllm::hisparse_plan_hot_slots",
             "trtllm::hisparse_compact_miss_schedule",
             "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
@@ -195,6 +199,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
         lambda name: name in {
             "trtllm::hisparse_topk_to_block_positions",
             "trtllm::hisparse_resolve_blocks_to_host_slots",
+            "trtllm::hisparse_classify_resident_blocks",
             "trtllm::hisparse_plan_hot_slots",
             "trtllm::hisparse_compact_miss_schedule",
             "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
@@ -228,6 +233,7 @@ def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
         "trtllm::hisparse_publish_request_table_slots",
         "trtllm::hisparse_topk_to_block_positions",
         "trtllm::hisparse_resolve_blocks_to_host_slots",
+        "trtllm::hisparse_classify_resident_blocks",
         "trtllm::hisparse_plan_hot_slots",
         "trtllm::hisparse_compact_miss_schedule",
         "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
@@ -276,6 +282,7 @@ def test_hisparse_resident_token_abi_is_hard_startup_gate(monkeypatch):
                             "trtllm::hisparse_publish_request_table_slots",
                             "trtllm::hisparse_topk_to_block_positions",
                             "trtllm::hisparse_resolve_blocks_to_host_slots",
+                            "trtllm::hisparse_classify_resident_blocks",
                             "trtllm::hisparse_plan_hot_slots",
                             "trtllm::hisparse_compact_miss_schedule",
                             "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
@@ -296,6 +303,8 @@ def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
         hot_indices=object(),
         row_status=object(),
         request_topk_indices=object(),
+        resident_block_flags=object(),
+        resident_block_status=object(),
         topk_length=None,
         layer_idx=3,
         index_topk=1024,
@@ -312,6 +321,8 @@ def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
     assert desc.resident_token_policy == "explicit_sink_tail_v1"
     assert desc.resident_tokens is None
     assert desc.request_topk_indices is not None
+    assert desc.resident_block_flags is not None
+    assert desc.resident_block_status is not None
     assert desc.topk_length is None
     assert desc.step_id == -1
 
@@ -704,14 +715,22 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     root = Path(__file__).resolve().parents[5]
     kernel = root / "cpp/tensorrt_llm/kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu"
     header = root / "cpp/tensorrt_llm/kernels/flashMLA/sparse_mla_decode_kvarn_hot.h"
+    planner_kernel = root / "cpp/tensorrt_llm/kernels/hisparseTopkToBlocks.cu"
     thop = root / "cpp/tensorrt_llm/thop/SparseMlaDecodeKvarnHotOp.cpp"
+    planner_thop = root / "cpp/tensorrt_llm/thop/hisparseTopkToBlocksOp.cpp"
     flash_cmake = root / "cpp/tensorrt_llm/kernels/flashMLA/CMakeLists.txt"
     thop_cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
     fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
 
     kernel_source = kernel.read_text()
+    planner_source = planner_kernel.read_text()
     thop_source = thop.read_text()
+    planner_thop_source = planner_thop.read_text()
     assert "hisparseKvarnBdrRead.cuh" in kernel_source
+    assert "hisparseClassifyResidentBlocksKernel" in planner_source
+    assert "kResidentBlockSink" in planner_source
+    assert "kResidentBlockTail" in planner_source
+    assert "kResidentClassBlockPastKvLen" in planner_source
     assert "readHisparseKvarnK2v2BdrLatentValue" in kernel_source
     assert "decodeHisparseKvarnHotIndex" in kernel_source
     assert "atomicCAS(&rowCode" in kernel_source
@@ -738,6 +757,8 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "resident_tail_valid must be bool" in thop_source
     assert "resident_sink_blocks must equal resident_sink_tokens" in thop_source
     assert "resident_block_table must have shape [seqs, blocks]" in thop_source
+    assert "hisparse_classify_resident_blocks" in planner_thop_source
+    assert "tail_valid must be bool" in planner_thop_source
     assert "resident_kv_lens=None" in thop_source
     assert "resident_kv_pool=None" in thop_source
     assert "request_topk_indices=None" in thop_source
@@ -752,6 +773,7 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     fake_source = fake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake_source
+    assert "hisparse_classify_resident_blocks" in fake_source
     assert "resident_kv_lens=None" in fake_source
     assert "resident_kv_pool=None" in fake_source
     assert "resident_tail_valid=None" in fake_source
@@ -824,7 +846,10 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "descriptor.row_status.shape[0]" in source
     assert "descriptor.hot_indices.shape[1]" in source
     assert "descriptor.request_topk_indices is None" in source
+    assert "descriptor.resident_block_flags is None" in source
+    assert "descriptor.resident_block_status is None" in source
     assert "descriptor.request_topk_indices.shape[1]" in source
+    assert "descriptor.resident_block_flags.shape[0]" in source
     assert "resident = getattr(descriptor, \"resident_tokens\", None)" in source
     assert "explicit_sink_tail_v1" in source
     assert "resident.row_kv_lens.shape[0]" in source

@@ -274,6 +274,16 @@ def _register_fake():
                 block_positions.new_empty((block_positions.shape[0], ),
                                           dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::hisparse_classify_resident_blocks")
+    def _(block_positions, block_counts, row_kv_lens, tail_block_pos,
+          tail_valid, tokens_per_block, sink_blocks):
+        del block_counts, row_kv_lens, tail_block_pos, tail_valid
+        del tokens_per_block, sink_blocks
+        return (block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.uint8),
+                block_positions.new_empty((block_positions.shape[0], ),
+                                          dtype=torch.uint8))
+
     @torch.library.register_fake("trtllm::hisparse_plan_hot_slots")
     def _(host_slots, commit_gens, block_counts, resolve_row_status,
           hot_host_slot, hot_commit_gen, hot_lru_tick, layer_idx,

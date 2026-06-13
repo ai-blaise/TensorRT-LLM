@@ -21,6 +21,7 @@ _HISPARSE_NATIVE_PLANNER_OPS = (
     "trtllm::hisparse_publish_request_table_slots",
     "trtllm::hisparse_topk_to_block_positions",
     "trtllm::hisparse_resolve_blocks_to_host_slots",
+    "trtllm::hisparse_classify_resident_blocks",
     "trtllm::hisparse_plan_hot_slots",
     "trtllm::hisparse_compact_miss_schedule",
     "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
@@ -59,6 +60,8 @@ class HiSparseSparseMlaKvarnHotDescriptor:
     hot_indices: "torch.Tensor"
     row_status: "torch.Tensor"
     request_topk_indices: Optional["torch.Tensor"]
+    resident_block_flags: Optional["torch.Tensor"]
+    resident_block_status: Optional["torch.Tensor"]
     topk_length: Optional["torch.Tensor"]
     layer_idx: int
     index_topk: int
@@ -1010,6 +1013,8 @@ class OPTRTHiSparseCoordinator:
         stride_factor: int,
         resident_tokens: Optional[HiSparseResidentTokenDescriptor] = None,
         request_topk_indices=None,
+        resident_block_flags=None,
+        resident_block_status=None,
     ) -> HiSparseSparseMlaKvarnHotDescriptor:
         """Build the typed sparse-MLA KVarN-hot ABI from native outputs.
 
@@ -1020,6 +1025,9 @@ class OPTRTHiSparseCoordinator:
         ``request_topk_indices`` preserves the original request-relative token
         positions so resident sink/tail hits can map through the normal KV
         block table instead of relying on hot-slot indices alone.
+        ``resident_block_flags`` classifies each selected unique block as
+        committed-hot, resident sink, or resident tail for the future native
+        planner/build stages.
         ``resident_tokens`` describes sink/tail hits that must be served from
         the normal decode KV path, separately from committed packed hot blocks.
         """
@@ -1049,6 +1057,8 @@ class OPTRTHiSparseCoordinator:
             hot_indices=hot_indices,
             row_status=row_status,
             request_topk_indices=request_topk_indices,
+            resident_block_flags=resident_block_flags,
+            resident_block_status=resident_block_status,
             topk_length=None,
             layer_idx=int(layer_idx),
             index_topk=int(index_topk),
@@ -1831,6 +1841,13 @@ class OPTRTHiSparseCoordinator:
                 "request table and admission metadata before hot-slot "
                 "planning; no Python request-table extraction path is allowed.")
         if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_classify_resident_blocks"):
+            raise NotImplementedError(
+                "trtllm::hisparse_classify_resident_blocks is not registered "
+                "with a CUDA kernel. HiSparse must classify selected sink/tail "
+                "blocks on device before relaxing the resident-token sparse "
+                "MLA gate; no row-status masking path is allowed.")
+        if not self._torch_cuda_op_registered(
                 "trtllm::hisparse_plan_hot_slots"):
             raise NotImplementedError(
                 "trtllm::hisparse_plan_hot_slots is not registered with a "
@@ -1945,6 +1962,22 @@ class OPTRTHiSparseCoordinator:
                 int(tier.tokens_per_block),
                 max_blocks_per_row,
             ))
+        resident_tokens = self._make_resident_token_descriptor(
+            metadata=metadata,
+            req_idx=req_idx,
+            row_request_ids=row_request_ids,
+            is_generation=is_generation,
+        )
+        resident_block_flags, resident_block_status = (
+            torch.ops.trtllm.hisparse_classify_resident_blocks(
+                blocks,
+                block_counts,
+                resident_tokens.row_kv_lens,
+                resident_tokens.tail_block_pos,
+                resident_tokens.tail_valid,
+                int(tier.tokens_per_block),
+                int(resident_tokens.sink_blocks),
+            ))
         host_slots, commit_gens, _block_status, resolve_status = (
             torch.ops.trtllm.hisparse_resolve_blocks_to_host_slots(
                 row_request_ids,
@@ -2013,12 +2046,6 @@ class OPTRTHiSparseCoordinator:
             stride_factor,
             int(layer_idx),
         )
-        resident_tokens = self._make_resident_token_descriptor(
-            metadata=metadata,
-            req_idx=req_idx,
-            row_request_ids=row_request_ids,
-            is_generation=is_generation,
-        )
         sparse_mla_descriptor = self._make_sparse_mla_kvarn_hot_descriptor(
             hot_indices=hot_indices,
             row_status=build_status,
@@ -2028,6 +2055,8 @@ class OPTRTHiSparseCoordinator:
             max_blocks_per_row=max_blocks_per_row,
             stride_factor=stride_factor,
             resident_tokens=resident_tokens,
+            resident_block_flags=resident_block_flags,
+            resident_block_status=resident_block_status,
         )
         return HiSparseTopKMapping(
             topk_indices_global=hot_indices,

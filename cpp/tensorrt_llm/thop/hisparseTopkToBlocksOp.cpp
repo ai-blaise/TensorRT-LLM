@@ -163,6 +163,67 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> hisparseResolveBlocks
     return {hostSlots, commitGens, blockStatus, rowStatus};
 }
 
+std::tuple<th::Tensor, th::Tensor> hisparseClassifyResidentBlocks(th::Tensor const& blockPositions,
+    th::Tensor const& blockCounts, th::Tensor const& rowKvLens, th::Tensor const& tailBlockPos,
+    th::Tensor const& tailValid, int64_t tokensPerBlock, int64_t sinkBlocks)
+{
+    TORCH_CHECK(blockPositions.is_cuda(), "block_positions must be a CUDA tensor");
+    TORCH_CHECK(blockCounts.is_cuda(), "block_counts must be a CUDA tensor");
+    TORCH_CHECK(rowKvLens.is_cuda(), "row_kv_lens must be a CUDA tensor");
+    TORCH_CHECK(tailBlockPos.is_cuda(), "tail_block_pos must be a CUDA tensor");
+    TORCH_CHECK(tailValid.is_cuda(), "tail_valid must be a CUDA tensor");
+    TORCH_CHECK(blockPositions.scalar_type() == torch::kInt32, "block_positions must be int32");
+    TORCH_CHECK(blockCounts.scalar_type() == torch::kInt32, "block_counts must be int32");
+    TORCH_CHECK(rowKvLens.scalar_type() == torch::kInt64, "row_kv_lens must be int64");
+    TORCH_CHECK(tailBlockPos.scalar_type() == torch::kInt32, "tail_block_pos must be int32");
+    TORCH_CHECK(tailValid.scalar_type() == torch::kBool, "tail_valid must be bool");
+    TORCH_CHECK(blockPositions.dim() == 2, "block_positions must have shape [rows, max_blocks_per_row]");
+    TORCH_CHECK(blockCounts.dim() == 1, "block_counts must have shape [rows]");
+    TORCH_CHECK(rowKvLens.dim() == 1, "row_kv_lens must have shape [rows]");
+    TORCH_CHECK(tailBlockPos.dim() == 1, "tail_block_pos must have shape [rows]");
+    TORCH_CHECK(tailValid.dim() == 1, "tail_valid must have shape [rows]");
+
+    int64_t const rows = blockPositions.size(0);
+    int64_t const maxBlocksPerRow = blockPositions.size(1);
+    TORCH_CHECK(rows <= std::numeric_limits<int32_t>::max(),
+        "rows must fit int32 for hisparse_classify_resident_blocks, got ", rows);
+    TORCH_CHECK(maxBlocksPerRow > 0 && maxBlocksPerRow <= std::numeric_limits<int32_t>::max(),
+        "max_blocks_per_row must be positive int32-sized, got ", maxBlocksPerRow);
+    TORCH_CHECK(blockCounts.size(0) == rows, "block_counts rows mismatch");
+    TORCH_CHECK(rowKvLens.size(0) == rows, "row_kv_lens rows mismatch");
+    TORCH_CHECK(tailBlockPos.size(0) == rows, "tail_block_pos rows mismatch");
+    TORCH_CHECK(tailValid.size(0) == rows, "tail_valid rows mismatch");
+    TORCH_CHECK(tokensPerBlock > 0 && tokensPerBlock <= std::numeric_limits<int32_t>::max(),
+        "tokens_per_block must be positive int32-sized, got ", tokensPerBlock);
+    TORCH_CHECK(sinkBlocks >= 0 && sinkBlocks <= std::numeric_limits<int32_t>::max(),
+        "sink_blocks must be non-negative int32-sized, got ", sinkBlocks);
+
+    c10::cuda::CUDAGuard guard(blockPositions.device());
+    TORCH_CHECK(blockCounts.get_device() == blockPositions.get_device(),
+        "block_counts must be on the same CUDA device as block_positions");
+    TORCH_CHECK(rowKvLens.get_device() == blockPositions.get_device(),
+        "row_kv_lens must be on the same CUDA device as block_positions");
+    TORCH_CHECK(tailBlockPos.get_device() == blockPositions.get_device(),
+        "tail_block_pos must be on the same CUDA device as block_positions");
+    TORCH_CHECK(tailValid.get_device() == blockPositions.get_device(),
+        "tail_valid must be on the same CUDA device as block_positions");
+
+    auto blocks = blockPositions.contiguous();
+    auto counts = blockCounts.contiguous();
+    auto kvLens = rowKvLens.contiguous();
+    auto tailPos = tailBlockPos.contiguous();
+    auto tail = tailValid.contiguous();
+    auto residentBlockFlags = th::empty({rows, maxBlocksPerRow}, blocks.options().dtype(torch::kUInt8));
+    auto rowStatus = th::empty({rows}, blocks.options().dtype(torch::kUInt8));
+
+    tk::invokeHisparseClassifyResidentBlocks(blocks.data_ptr<int32_t>(), counts.data_ptr<int32_t>(),
+        kvLens.data_ptr<int64_t>(), tailPos.data_ptr<int32_t>(), tail.data_ptr<bool>(),
+        residentBlockFlags.data_ptr<uint8_t>(), rowStatus.data_ptr<uint8_t>(), static_cast<int32_t>(rows),
+        static_cast<int32_t>(maxBlocksPerRow), static_cast<int32_t>(tokensPerBlock), static_cast<int32_t>(sinkBlocks),
+        at::cuda::getCurrentCUDAStream(blocks.get_device()).stream());
+    return {residentBlockFlags, rowStatus};
+}
+
 std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tensor> hisparsePlanHotSlots(
     th::Tensor const& hostSlots, th::Tensor const& commitGens, th::Tensor const& blockCounts,
     th::Tensor const& resolveRowStatus, th::Tensor const& hotHostSlot, th::Tensor const& hotCommitGen,
@@ -487,6 +548,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor request_ids, Tensor request_block_host_slots, Tensor request_block_commit_gen, "
         "Tensor request_admitted) -> (Tensor, Tensor, Tensor, Tensor)");
     m.def(
+        "hisparse_classify_resident_blocks(Tensor block_positions, Tensor block_counts, Tensor row_kv_lens, "
+        "Tensor tail_block_pos, Tensor tail_valid, int tokens_per_block, int sink_blocks) -> (Tensor, Tensor)");
+    m.def(
         "hisparse_plan_hot_slots(Tensor host_slots, Tensor commit_gens, Tensor block_counts, "
         "Tensor resolve_row_status, Tensor hot_host_slot, Tensor hot_commit_gen, Tensor hot_lru_tick, "
         "int layer_idx, int lru_tick_base) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
@@ -507,6 +571,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("hisparse_topk_to_block_positions", &tensorrt_llm::torch_ext::hisparseTopkToBlockPositions);
     m.impl("hisparse_resolve_blocks_to_host_slots", &tensorrt_llm::torch_ext::hisparseResolveBlocksToHostSlots);
+    m.impl("hisparse_classify_resident_blocks", &tensorrt_llm::torch_ext::hisparseClassifyResidentBlocks);
     m.impl("hisparse_plan_hot_slots", &tensorrt_llm::torch_ext::hisparsePlanHotSlots);
     m.impl("hisparse_compact_miss_schedule", &tensorrt_llm::torch_ext::hisparseCompactMissSchedule);
     m.impl("hisparse_commit_hot_slots", &tensorrt_llm::torch_ext::hisparseCommitHotSlots);

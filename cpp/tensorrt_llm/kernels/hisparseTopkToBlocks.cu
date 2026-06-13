@@ -28,6 +28,20 @@ enum HiSparseResolveStatus : uint8_t
     kResolveBadBlockCount = 5,
 };
 
+enum HiSparseResidentBlockFlag : uint8_t
+{
+    kResidentBlockCommittedHot = 0,
+    kResidentBlockSink = 1,
+    kResidentBlockTail = 2,
+};
+
+enum HiSparseResidentClassStatus : uint8_t
+{
+    kResidentClassOk = 0,
+    kResidentClassBadBlockCount = 1,
+    kResidentClassBlockPastKvLen = 2,
+};
+
 enum HiSparsePlanStatus : uint8_t
 {
     kPlanOk = 0,
@@ -249,6 +263,63 @@ __global__ void hisparseResolveBlocksToHostSlotsKernel(int64_t const* __restrict
         hostSlots[rowOffset + i] = resolvedHostSlot;
         commitGens[rowOffset + i] = resolvedCommitGen;
         blockStatus[rowOffset + i] = static_cast<uint8_t>(code);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        rowStatus[row] = static_cast<uint8_t>(rowCode);
+    }
+}
+
+__global__ void hisparseClassifyResidentBlocksKernel(int32_t const* __restrict__ blockPositions,
+    int32_t const* __restrict__ blockCounts, int64_t const* __restrict__ rowKvLens,
+    int32_t const* __restrict__ tailBlockPos, bool const* __restrict__ tailValid,
+    uint8_t* __restrict__ residentBlockFlags, uint8_t* __restrict__ rowStatus, int32_t numRows,
+    int32_t maxBlocksPerRow, int32_t tokensPerBlock, int32_t sinkBlocks)
+{
+    int32_t const row = blockIdx.x;
+    if (row >= numRows)
+    {
+        return;
+    }
+
+    __shared__ int32_t rowCode;
+    if (threadIdx.x == 0)
+    {
+        int32_t const count = blockCounts[row];
+        rowCode = (count < 0 || count > maxBlocksPerRow) ? kResidentClassBadBlockCount : kResidentClassOk;
+    }
+    __syncthreads();
+
+    int32_t const count = rowCode == kResidentClassBadBlockCount ? maxBlocksPerRow : blockCounts[row];
+    int64_t const kvLen = rowKvLens[row];
+    int32_t const tailPos = tailBlockPos[row];
+    bool const hasTail = tailValid[row];
+    int64_t const maxReadableToken = kvLen > 0 ? kvLen - 1 : -1;
+    int64_t const maxReadableBlock = maxReadableToken >= 0 ? maxReadableToken / tokensPerBlock : -1;
+    int64_t const rowOffset = static_cast<int64_t>(row) * maxBlocksPerRow;
+
+    for (int32_t i = threadIdx.x; i < maxBlocksPerRow; i += blockDim.x)
+    {
+        uint8_t flag = kResidentBlockCommittedHot;
+        if (i < count)
+        {
+            int32_t const blockPos = blockPositions[rowOffset + i];
+            if (blockPos < 0 || static_cast<int64_t>(blockPos) > maxReadableBlock)
+            {
+                atomicCAS(&rowCode, kResidentClassOk, kResidentClassBlockPastKvLen);
+            }
+            else if (blockPos < sinkBlocks)
+            {
+                flag = kResidentBlockSink;
+            }
+            else if (hasTail && blockPos == tailPos)
+            {
+                flag = kResidentBlockTail;
+            }
+        }
+        residentBlockFlags[rowOffset + i] = flag;
     }
     __syncthreads();
 
@@ -710,6 +781,25 @@ void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_
     hisparseResolveBlocksToHostSlotsKernel<<<numRows, kThreads, 0, stream>>>(rowRequestIds, blockPositions,
         blockCounts, requestIds, requestBlockHostSlots, requestBlockCommitGen, requestAdmitted, hostSlots, commitGens,
         blockStatus, rowStatus, numRows, maxBlocksPerRow, requestSlotCapacity, maxBlocksPerRequest);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeHisparseClassifyResidentBlocks(int32_t const* blockPositions, int32_t const* blockCounts,
+    int64_t const* rowKvLens, int32_t const* tailBlockPos, bool const* tailValid, uint8_t* residentBlockFlags,
+    uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow, int32_t tokensPerBlock, int32_t sinkBlocks,
+    cudaStream_t stream)
+{
+    if (numRows <= 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_classify_resident_blocks requires max_blocks_per_row > 0");
+    TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "hisparse_classify_resident_blocks requires tokens_per_block > 0");
+    TLLM_CHECK_WITH_INFO(sinkBlocks >= 0, "hisparse_classify_resident_blocks requires sink_blocks >= 0");
+
+    constexpr int32_t kThreads = 128;
+    hisparseClassifyResidentBlocksKernel<<<numRows, kThreads, 0, stream>>>(blockPositions, blockCounts, rowKvLens,
+        tailBlockPos, tailValid, residentBlockFlags, rowStatus, numRows, maxBlocksPerRow, tokensPerBlock, sinkBlocks);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -958,8 +958,8 @@ Deliverables:
 
 - host-pinned packed KVarN cold pool for committed dense MLA blocks;
 - hot device packed KVarN pool for selected committed blocks;
-- resident sink/tail policy for the uncommitted FP16 blocks already required by
-  dense MLA KVarN;
+- resident sink/tail policy for live normal decode KV blocks that are not yet
+  committed full-block `kvarn_k2v2` HiSparse records;
 - host/hot `valid`, `commit_gen`, request epoch, and recycle invalidation;
 - sparse-attention metadata exposes hot block tables without changing Indexer
   scoring.
@@ -1212,6 +1212,13 @@ Current branch status:
   fields from the descriptor into the op. The kernel still fails closed at the
   readiness guard until the CUDA producer-load path actually selects resident
   normal-KV reads for sink/tail hits;
+- the native planner ABI now has `trtllm::hisparse_classify_resident_blocks`,
+  a CUDA classifier that consumes selected request-relative block positions,
+  row kv-lens, tail block positions, tail validity, and sink-block count, then
+  emits per-selected-block flags for committed-hot, resident sink, and
+  resident tail. The descriptor carries those flags and their row status so
+  the next planner/build stage can exclude resident blocks from host-to-hot
+  copy while preserving row correctness;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1226,6 +1233,10 @@ Still pending before serving enablement:
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
+- teach the native hot-slot plan, post-copy commit, and hot-index build stages
+  to consume `resident_block_flags`: resident sink/tail blocks must bypass
+  host-slot resolution/copy while true missing or uncommitted committed blocks
+  still fail closed;
 - implement CUDA producer-load consumption of the explicit sink/tail
   resident-token ABI so top-k hits on live resident tokens are served through
   the normal decode KV path rather than invalidating rows or being modeled as
@@ -1503,6 +1514,12 @@ production ABI:
      - original request-relative TopK token positions so CUDA can distinguish
        committed-hot reads from sink/tail resident reads after hot-index
        remapping;
+     - resident block flags from
+       `trtllm::hisparse_classify_resident_blocks` must be consumed by the
+       native plan/commit/build stages before serving: sink/tail blocks bypass
+       host-slot resolution and hot-copy requirements, while committed-hot
+       blocks still require valid host-slot commit generations and hot-slot
+       metadata;
      - row/token status that distinguishes committed-hot hits, resident
        sink/tail hits, uncommitted invalid hits, and stale-planner failures;
      - fused producer-load consumption that selects packed-hot BDR reads for

@@ -26,6 +26,11 @@ void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_
     uint8_t* blockStatus, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
     int32_t requestSlotCapacity, int32_t maxBlocksPerRequest, cudaStream_t stream);
 
+void invokeHisparseClassifyResidentBlocks(int32_t const* blockPositions, int32_t const* blockCounts,
+    int64_t const* rowKvLens, int32_t const* tailBlockPos, bool const* tailValid, uint8_t* residentBlockFlags,
+    uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow, int32_t tokensPerBlock, int32_t sinkBlocks,
+    cudaStream_t stream);
+
 void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitGens, int32_t const* blockCounts,
     uint8_t const* resolveRowStatus, int64_t const* hotHostSlot, int64_t const* hotCommitGen,
     int64_t const* hotLruTick, int64_t* plannedHotSlots, int64_t* plannedLruTick, int64_t* missHostSlots,

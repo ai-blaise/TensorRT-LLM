@@ -2709,15 +2709,27 @@ class MLA(nn.Module):
                 return False
             if descriptor.request_topk_indices is None:
                 return False
+            if descriptor.resident_block_flags is None:
+                return False
+            if descriptor.resident_block_status is None:
+                return False
             if int(descriptor.request_topk_indices.shape[0]) != int(
                     num_tokens):
                 return False
             if int(descriptor.request_topk_indices.shape[1]) != int(
                     topk_indices.shape[1]):
                 return False
+            if int(descriptor.resident_block_flags.shape[0]) != int(
+                    num_tokens):
+                return False
+            if int(descriptor.resident_block_status.shape[0]) != int(
+                    num_tokens):
+                return False
             expected_device = topk_indices.device
             if not (descriptor.hot_indices.device == expected_device
                     and descriptor.request_topk_indices.device == expected_device
+                    and descriptor.resident_block_flags.device == expected_device
+                    and descriptor.resident_block_status.device == expected_device
                     and descriptor.row_status.device == expected_device
                     and descriptor.hot_packed.device == fused_q.device):
                 return False
