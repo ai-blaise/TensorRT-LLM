@@ -292,7 +292,7 @@ class KVarNBDRSourcePool:
         return ptrs.astype(np.int64, copy=False), sizes
 
     def invalidate_blocks(self, block_ids, dev_ids=None) -> None:
-        ids = np.asarray(block_ids, dtype=np.int64)
+        ids = self._validate_block_ids(block_ids)
         if ids.size == 0:
             return
         live = ids[self.valid_host[ids]]

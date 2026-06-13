@@ -126,6 +126,22 @@ def test_kvarn_bdr_source_pool_fragments_and_recycle_cpu():
         pool.packed_source_fragments([2])
 
 
+def test_kvarn_bdr_source_pool_recycle_rejects_invalid_ids():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNBDRSourcePool(num_blocks=4,
+                              layout=cfg.hisparse_bdr_layout(group=64),
+                              device=torch.device("cpu"))
+    pool.commit_record_bytes(3, torch.ones(pool.bytes_per_block,
+                                           dtype=torch.uint8))
+
+    with pytest.raises(ValueError, match="out of range"):
+        pool.invalidate_blocks([-1])
+
+    assert bool(pool.valid_host[3])
+
+
 def test_kvarn_bdr_source_fragments_wait_for_write_event():
     cfg = parse_kvarn_dtype(
         "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2

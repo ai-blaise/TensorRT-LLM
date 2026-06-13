@@ -444,7 +444,9 @@ payload in `KVarNBDRSourcePool`. The writer now emits C-KV scale/zp as bytes
 using CUDA's public half raw-conversion intrinsics, so a packed record remains
 valid even when the slot stride is not half-aligned. Blocks that were already
 committed to the legacy side-pool are backfilled into the BDR source pool
-instead of being skipped. The BDR source pool now records a CUDA event after the
+instead of being skipped. BDR source-pool recycle invalidation now uses the
+same block-id range validation as source/destination fragment export, so a bad
+negative id cannot alias a live tail metadata row. The BDR source pool now records a CUDA event after the
 native writer and device commit markers, publishes host-visible commit metadata
 only with that event attached, and waits once on the event before exporting
 VRAM source fragments to NIXL. Invalidation clears any outstanding event with
