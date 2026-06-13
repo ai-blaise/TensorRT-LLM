@@ -8,6 +8,7 @@ SMC-SD decode path depends on when ``mla_latent_kv_dtype='kvarn_k2v2'``.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSATrtllmAttention
@@ -90,6 +91,13 @@ def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
     ckv_b, kpe_b = pool.load_blocks(torch.tensor([2], dtype=torch.long))
     assert torch.equal(ckv_b[0], ckv_rt)
     assert torch.equal(kpe_b[0], kpe_rt)
+
+    src_ptrs, src_sizes = pool.packed_source_fragments([2])
+    assert src_ptrs.tolist() == [pool.store.data_ptr() +
+                                 2 * pool.bytes_per_block]
+    assert src_sizes.tolist() == [pool.bytes_per_block]
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        pool.packed_source_fragments([1])
 
 
 class _FakeNonLocalKVarNManager:

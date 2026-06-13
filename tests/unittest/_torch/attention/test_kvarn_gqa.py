@@ -612,6 +612,13 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
         SimpleNamespace(hisparse_host_meta=hisparse_meta), req_info)
     assert dst_ptrs.tolist() == [1064, 1080, 1144, 2064, 2080, 2144]
     assert host_sizes.tolist() == [16, 16, 16, 16, 16, 16]
+    dst_ptrs_l1, sizes_l1 = Sender._collect_hisparse_host_dst_frags(
+        SimpleNamespace(hisparse_host_meta=hisparse_meta),
+        req_info,
+        layer_indices=[1],
+    )
+    assert dst_ptrs_l1.tolist() == [2064, 2080, 2144]
+    assert sizes_l1.tolist() == [16, 16, 16]
     with pytest.raises(RuntimeError, match="host-tier metadata"):
         Sender._collect_hisparse_host_dst_frags(
             SimpleNamespace(hisparse_host_meta=None), req_info)

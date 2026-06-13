@@ -675,6 +675,12 @@ Current branch status:
   safe-close boundary as existing KV receive sessions;
 - added layer-major destination-fragment construction for packed KVarN host
   writes, including bounds validation against the published host-slot capacity;
+- added source-fragment construction from the production dense-MLA
+  `KVarNLatentPool.store` byte records, with fail-closed rejection of
+  uncommitted sink/tail blocks;
+- added sender-side validation that aligns source packed KVarN block fragments
+  with request-relative destination host slots for dense KV-cache pool pairs,
+  skipping indexer, block-scale, and non-attention pools;
 - extended native transfer metadata/request construction so future HiSparse
   writes can use distinct source and destination memory types
   (`VRAM -> DRAM` or `DRAM -> DRAM`) instead of overloading uniform KV/AUX
@@ -691,8 +697,9 @@ Current branch status:
 Still pending before serving enablement:
 
 - a dedicated `DRAM` write meta path for prefill-to-decode packed KVarN host
-  writes;
-- prefill-side packed KVarN writer and completion/commit handoff;
+  writes, submitted before the receiver sees KV transfer completion;
+- completion/commit handoff that marks host `valid` and `commit_gen` only after
+  the HiSparse host write succeeds;
 - cancel/abort handling that keeps host slots pinned until in-flight DRAM
   writes finish;
 - E2E proof that NIXL writes land directly in decode host slots before decode

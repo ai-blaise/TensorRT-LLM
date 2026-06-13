@@ -6111,6 +6111,29 @@ class DSACacheManager(KVCacheManager):
             return None
         return pool.load_block(int(block_id))
 
+    def kvarn_packed_source_fragments(self, layer_indices,
+                                      block_ids) -> Tuple[np.ndarray, np.ndarray]:
+        """Layer-major source fragments for committed packed KVarN records."""
+        if not self.kvarn_enabled:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires dense MLA KVarN source pools.")
+        ptr_parts = []
+        size_parts = []
+        for layer_idx in layer_indices:
+            pool = self.get_kvarn_latent_pool(int(layer_idx))
+            if pool is None:
+                raise RuntimeError(
+                    "HiSparse direct-to-host cannot source non-local KVarN "
+                    f"layer {int(layer_idx)} from this rank.")
+            ptrs, sizes = pool.packed_source_fragments(block_ids)
+            ptr_parts.append(ptrs)
+            size_parts.append(sizes)
+        if not ptr_parts:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        return (np.concatenate(ptr_parts).astype(np.int64, copy=False),
+                np.concatenate(size_parts).astype(np.int64, copy=False))
+
     def kvarn_bytes_per_token(self, num_attention_layers: int) -> float:
         if not self.kvarn_enabled:
             return 0.0

@@ -47,7 +47,14 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    PoolRole,
+    get_pool_role,
+    get_pool_view_global_layer_ids,
+    get_unique_layers,
+    get_unique_pool_memory_descs,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
@@ -244,9 +251,11 @@ class Sender(SenderBase):
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
         kvarn_gqa_side_pool=None,
+        hisparse_kv_cache_manager=None,
     ):
         self._registrar = peer_registrar
         self._kvarn_gqa_side_pool = kvarn_gqa_side_pool
+        self._hisparse_kv_cache_manager = hisparse_kv_cache_manager
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._peer_requests: dict = {}
@@ -751,6 +760,8 @@ class Sender(SenderBase):
     def _collect_hisparse_host_dst_frags(
         peer_ri: RankInfo,
         req_info: RecvReqInfo,
+        *,
+        layer_indices: Optional[list[int]] = None,
     ) -> Optional[tuple[np.ndarray, np.ndarray]]:
         if req_info.hisparse_host_slots is None:
             return None
@@ -760,7 +771,112 @@ class Sender(SenderBase):
                 "HiSparse direct-to-host requires host-tier metadata on the "
                 "receiver; refusing to send packed KVarN blocks without "
                 "published DRAM destinations.")
-        return dst_meta.packed_destination_fragments(req_info.hisparse_host_slots)
+        return dst_meta.packed_destination_fragments(
+            req_info.hisparse_host_slots,
+            layer_indices=layer_indices,
+        )
+
+    def _collect_hisparse_host_frags(
+        self,
+        peer_ri: RankInfo,
+        req_info: RecvReqInfo,
+        *,
+        layer_indices: list[int],
+        dest_layer_indices: list[int],
+        src_block_ids: np.ndarray,
+        dst_block_pos_start: int,
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if req_info.hisparse_host_slots is None:
+            return None
+        if self._hisparse_kv_cache_manager is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires the sender KV cache manager "
+                "to expose packed KVarN source fragments.")
+        host_slots = req_info.hisparse_host_slots
+        block_count = int(src_block_ids.size)
+        dst_block_pos_start = int(dst_block_pos_start)
+        dst_block_pos_stop = dst_block_pos_start + block_count
+        if dst_block_pos_start < 0 or dst_block_pos_stop > host_slots.size:
+            raise RuntimeError(
+                "HiSparse host-slot publication does not cover aligned "
+                f"destination block range [{dst_block_pos_start}, "
+                f"{dst_block_pos_stop}); slots={host_slots.size}.")
+        dst_slots = host_slots[dst_block_pos_start:dst_block_pos_stop]
+        src_ptrs, src_sizes = (
+            self._hisparse_kv_cache_manager.kvarn_packed_source_fragments(
+                layer_indices, src_block_ids))
+        dst_ptrs, dst_sizes = Sender._collect_hisparse_host_dst_frags(
+            peer_ri,
+            RecvReqInfo(sender_req_id=req_info.sender_req_id,
+                        instance_name=req_info.instance_name,
+                        instance_rank=req_info.instance_rank,
+                        block_ids_per_layer_groups=[],
+                        unique_rid=req_info.unique_rid,
+                        hisparse_host_slots=dst_slots),
+            layer_indices=dest_layer_indices,
+        )
+        if not np.array_equal(src_sizes, dst_sizes):
+            raise RuntimeError(
+                "HiSparse packed source/destination byte sizes do not match: "
+                f"src={src_sizes.tolist()}, dst={dst_sizes.tolist()}.")
+        return src_ptrs, dst_ptrs, src_sizes
+
+    def _collect_hisparse_for_pool_pair(
+        self,
+        *,
+        peer_ri: RankInfo,
+        req_info: RecvReqInfo,
+        self_lg: int,
+        self_pi: int,
+        peer_lg: int,
+        peer_pi: int,
+        src_block_ids: np.ndarray,
+        dst_block_pos_start: int,
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if req_info.hisparse_host_slots is None or src_block_ids.size == 0:
+            return None
+        self_pt = self._registrar.self_extractor.page_table
+        peer_pt = peer_ri.page_table
+        if peer_pt is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires peer page-table metadata.")
+        self_lg_info = self_pt.layer_groups[self_lg]
+        peer_lg_info = peer_pt.layer_groups[peer_lg]
+        if (not isinstance(self_lg_info, AttentionLayerGroup)
+                or not isinstance(peer_lg_info, AttentionLayerGroup)):
+            return None
+        self_pv = self_lg_info.pool_views[self_pi]
+        peer_pv = peer_lg_info.pool_views[peer_pi]
+        if len(self_pv.buffer_entries) == 0 or len(peer_pv.buffer_entries) == 0:
+            return None
+        attention = self._registrar.self_rank_info.attention
+        if attention is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires attention rank metadata.")
+        try:
+            pool_role = get_pool_role(self_pv, kv_factor=attention.kv_factor)
+        except ValueError:
+            return None
+        if pool_role != PoolRole.KV_CACHE:
+            return None
+        source_layers = get_pool_view_global_layer_ids(self_pv, self_lg_info)
+        peer_local_layers = get_unique_layers(peer_pv)
+        dest_layers = [
+            int(layer.local_layer_id) for layer in peer_lg_info.local_layers
+            if int(layer.local_layer_id) in peer_local_layers
+        ]
+        if len(source_layers) != len(dest_layers):
+            raise RuntimeError(
+                "HiSparse source/destination layer count mismatch: "
+                f"src={source_layers}, dst={dest_layers}.")
+        return self._collect_hisparse_host_frags(
+            peer_ri,
+            req_info,
+            layer_indices=source_layers,
+            src_block_ids=src_block_ids,
+            dst_block_pos_start=dst_block_pos_start,
+            dest_layer_indices=dest_layers,
+        )
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -781,6 +897,9 @@ class Sender(SenderBase):
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
+        hisparse_src_parts: list[np.ndarray] = []
+        hisparse_dst_parts: list[np.ndarray] = []
+        hisparse_size_parts: list[np.ndarray] = []
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -842,6 +961,7 @@ class Sender(SenderBase):
                     stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
                     src_start = max(stale_end * tpb, src_start)
                     dst_start = max(stale_end * tpb, dst_start)
+                overlap_start = max(src_start, dst_start)
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                     src_block_ids,
                     dst_block_ids,
@@ -863,6 +983,21 @@ class Sender(SenderBase):
                     src_frag_parts.append(rp.src.memory.ptrs)
                     dst_frag_parts.append(rp.dst.memory.ptrs)
                     size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+                hisparse_frags = self._collect_hisparse_for_pool_pair(
+                    peer_ri=peer_ri,
+                    req_info=req_info,
+                    self_lg=self_lg,
+                    self_pi=self_pi,
+                    peer_lg=peer_lg,
+                    peer_pi=peer_pi,
+                    src_block_ids=src_block_ids,
+                    dst_block_pos_start=overlap_start // tpb,
+                )
+                if hisparse_frags is not None:
+                    h_src, h_dst, h_sizes = hisparse_frags
+                    hisparse_src_parts.append(h_src)
+                    hisparse_dst_parts.append(h_dst)
+                    hisparse_size_parts.append(h_sizes)
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -898,12 +1033,20 @@ class Sender(SenderBase):
             src_frags = np.concatenate([src_frags, s_src])
             dst_frags = np.concatenate([dst_frags, s_dst])
             kv_sizes = np.concatenate([kv_sizes, s_sizes])
-        if Sender._collect_hisparse_host_dst_frags(peer_ri,
-                                                   req_info) is not None:
-            # Destination descriptors are validated here, but not appended to
-            # the VRAM KV write. HiSparse host writes need a separate DRAM
-            # WriteMeta once the prefill packed-KVarN source writer exists.
-            pass
+        if hisparse_src_parts:
+            # Source/destination descriptors are validated here, but not
+            # appended to the VRAM KV write. HiSparse host writes need a
+            # separate DRAM WriteMeta once the host-write completion path is
+            # wired into the session result semantics.
+            _hisparse_src = np.concatenate(hisparse_src_parts)
+            _hisparse_dst = np.concatenate(hisparse_dst_parts)
+            _hisparse_sizes = np.concatenate(hisparse_size_parts)
+            if not (_hisparse_src.size == _hisparse_dst.size
+                    == _hisparse_sizes.size):
+                raise RuntimeError(
+                    "HiSparse packed host-write fragment count mismatch: "
+                    f"src={_hisparse_src.size}, dst={_hisparse_dst.size}, "
+                    f"sizes={_hisparse_sizes.size}.")
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -2211,7 +2354,9 @@ class TransferWorker:
             self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
-            self._sender = Sender(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
+            self._sender = Sender(self._peer_registrar, self._agent,
+                                  self._kvarn_gqa_side_pool,
+                                  self._config.kv_cache_manager)
             self._receiver = Receiver(self._peer_registrar, self._agent,
                                       self._kvarn_gqa_side_pool,
                                       getattr(self._config.kv_cache_manager,

@@ -273,6 +273,35 @@ class KVarNLatentPool:
         self.valid_host[bid] = True
         self.commit_gen_host[bid] += 1
 
+    def packed_source_fragments(self, block_ids) -> tuple[np.ndarray, np.ndarray]:
+        """Return VRAM source pointers for committed packed KVarN blocks.
+
+        The fragments point directly at the authoritative packed byte records.
+        This is the only valid source for HiSparse direct-to-host writes; an
+        uncommitted block is still sink/tail fp16 state and must not be
+        published as a packed host record.
+        """
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.ndim != 1:
+            raise ValueError("KVarN packed source fragments require 1D block ids.")
+        if ids.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        if int(ids.min()) < 0 or int(ids.max()) >= int(self.num_blocks):
+            raise ValueError(
+                f"KVarN packed source block id out of range: "
+                f"min={int(ids.min())}, max={int(ids.max())}, "
+                f"num_blocks={self.num_blocks}.")
+        uncommitted = ids[~self.valid_host[ids]]
+        if uncommitted.size:
+            sample = ", ".join(str(int(x)) for x in uncommitted[:8])
+            raise RuntimeError(
+                "HiSparse direct-to-host requires committed dense MLA KVarN "
+                f"records; uncommitted block id(s): {sample}.")
+        ptrs = int(self.store.data_ptr()) + ids * int(self.bytes_per_block)
+        sizes = np.full(ids.size, int(self.bytes_per_block), dtype=np.int64)
+        return ptrs.astype(np.int64, copy=False), sizes
+
     def stale_committed_host(self, block_ids) -> list:
         """Filter ``block_ids`` (host ints) down to committed blocks whose
         fp16 main-pool slot lags their commit epoch. Pure host; no syncs."""
