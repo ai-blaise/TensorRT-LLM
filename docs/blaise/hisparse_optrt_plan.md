@@ -1612,19 +1612,23 @@ Promotion requires:
    and zero point. The branch now allocates a separate
    `KVarNBDRSourcePool` for HiSparse source records and rejects legacy side-pool
    pointers at the host-write boundary. The native writer is now wired to that
-   pool at full-block commit time; the remaining required work is B200
-   compile/proof, stream-order validation against NIXL source reads, and the
-   sparse MLA KVarN-hot reader.
+   pool at full-block commit time; B200 native-op proof is complete for the
+   writer, byte-strided BDR record layout, KVarN-hot reader, sparse MLA hot
+   decode, and resident padding. The remaining required work is stream-order
+   validation against NIXL source reads, live DSA/NIXL deployment proof, graph
+   lifecycle proof, and optimized split scheduling/query-fold.
 
 ## Immediate Execution Plan
 
 The next implementation work should continue from the current fail-closed
 production ABI:
 
-1. Prove the existing native planner/copy chain on B200:
-   - compile and load the thops for top-k-to-block dedupe, request-table
-     resolve, hot-slot plan, compact miss schedule, mapped pinned-host copy
-     bridge, post-copy commit, and hot-index build;
+1. Prove the existing native planner/copy chain inside the deployment image:
+   - the exact-clean `th_hisparse_smoke` target now compiles and loads the
+     thops/kernels for top-k-to-block dedupe, request-table resolve, hot-slot
+     plan, compact miss schedule, mapped pinned-host copy bridge, post-copy
+     commit, hot-index build, BDR writer, hot reader, and sparse MLA hot
+     decode;
    - run CUDA unit/micro tests for overflow, unadmitted rows, stale commit
      generations, duplicate selected blocks, hit/miss/LRU, copy-status
      propagation, and hot-index construction;
@@ -1635,15 +1639,17 @@ production ABI:
    - make `kvarn_k2v2` the dense MLA HiSparse source of truth;
    - align host/hot packed records with the production BDR layout used by
      `mlaKernels.cu`, including the now-fixed 2-bit read path;
-   - compile/prove `torch.ops.trtllm.mla_bdr_write_kvarn_record` on B200 and
-     verify its C-KV, scale/zp, and RoPE byte fields match the documented
-     `KVarNBDRLayout`;
+   - keep `torch.ops.trtllm.mla_bdr_write_kvarn_record` locked to the
+     smoke-proven C-KV, byte-addressed scale/zp, inverse-read, and RoPE byte
+     contract; next proof is stream ordering against NIXL source reads in the
+     deployment image;
    - reject any serving configuration that would feed the legacy
      Python/Sinkhorn `KVarNLatentPool` record layout directly into a BDR
      sparse MLA hot-read kernel.
 3. Wire the sparse MLA KVarN-hot read path:
-   - add `sparse_mla_decode_kvarn_hot` or an equivalent explicit KVarN mode
-     that satisfies the production sparse MLA KVarN-hot contract above;
+   - `sparse_mla_decode_kvarn_hot` now exists as the explicit KVarN mode and
+     satisfies the production sparse MLA KVarN-hot ABI at native-op smoke
+     level;
    - consume hot packed KVarN records directly through hot global indices,
      decoding `(hot_slot, token_offset)` into production BDR field addresses;
    - add BDR/on-read dequant in the sparse MLA producer load path, including
