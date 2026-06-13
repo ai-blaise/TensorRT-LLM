@@ -129,6 +129,13 @@ requirements are carried into this plan:
   flat byte arrays; avoid CLC/dynamic persistent scheduling unless CZS proves
   race-freeness; and keep radix/cluster TopK changes behind measured
   production-live-KV gates.
+- During long builds, the audit loop should spend idle time on whole-system
+  constraints before kernel rewrites: check request-row publication/recycle
+  generations, NIXL write-mode ordering, compact miss schedule admission,
+  host/hot copy stream ordering, graph-capture eligibility, cache/prewarm
+  reuse, and strict preflight coverage. Kernel candidates are useful only when
+  they preserve those contracts and come with CZS layout/race proofs plus IKP
+  and NSys evidence that the improvement survives the production path.
 
 ## Executive Decision
 
@@ -423,6 +430,23 @@ running the NIXL/PYTHON transceiver configuration with `--connector none`; the
 explicit
 `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` value is the NIXL plugin backend on the
 current GCP B200 lane, not the legacy/direct UCX cache transceiver.
+The current-head proof has also been refreshed after the r20 preflight hardening
+commit at source SHA `aaa7e2b542b2eb1f84180da4a1ee5c05c334efc5`:
+`localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-aaa7e2b542b2-hisparse-current-head-proof-20260613T155354Z`
+was built from the same persistent `hisparse-thop-001` `libth_common.so`,
+pushed into the VM-local registry, and reported registry digest
+`sha256:ded009a8740349beeb2c10b78f97325143ddd8acda3a407880865a00708c4b82`.
+Its build smoke imported `tensorrt_llm` from deployment-runtime
+`site-packages`, loaded `libth_common.so` through the package loader, and passed
+both `native_planner_copy_smoke.py` and
+`blaise_perf/hisparse/sparse_mla_kvarn_hot_smoke.py`. The exact tag then passed
+the read-only handoff gate (`handoff_ready=yes`) and
+`strict_smoke_preflight.sh` with NIXL local audit, image handoff, DGD
+server-dry-run, and cache report at
+`/tmp/r20-strict-preflight-current-head-proof-20260613T155628Z`. This is still
+an image/import/preflight proof only: it does not create a live DGD, does not
+exercise live DSA row-status traffic, and does not relax
+`hisparse_sparse_mla_resident_v1_ready()`.
 The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
 `mlaKernels.cu`: the paged MLA KVarN read launcher validated `kvarn_bits` but
 did not pass it into the CUDA kernel, which meant `kvarn_k2v2` could be read

@@ -33,6 +33,24 @@ Both workers + frontend run the unified NIXL/LayerSplit/SMC gate image,
 parameterized as `${UNIFIED_IMAGE}`. Confirm the tag with the build agent before
 apply and keep draft-diagnostic images off this gate.
 
+Current non-mutating HiSparse proof image:
+
+```bash
+localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-aaa7e2b542b2-hisparse-current-head-proof-20260613T155354Z
+```
+
+This tag was built from source SHA
+`aaa7e2b542b2eb1f84180da4a1ee5c05c334efc5`, uses the persistent
+`hisparse-thop-001` `libth_common.so`, imports TRT-LLM through the normal
+deployment-runtime package path, and passed the native HiSparse planner/copy
+and sparse MLA KVarN-hot smokes. It is available from the VM-local registry
+with digest
+`sha256:ded009a8740349beeb2c10b78f97325143ddd8acda3a407880865a00708c4b82`
+and passed `strict_smoke_preflight.sh` through NIXL audit, image handoff, DGD
+server-dry-run, and cache report at
+`/tmp/r20-strict-preflight-current-head-proof-20260613T155628Z`. This is an
+image/import/preflight proof, not a live DGD deployment proof.
+
 For TP2xCP2 prefill -> TP4xCP1 decode, use a full source-built runtime image,
 not a Python-only overlay over an older base. The C++ MLA cache formatter must
 include the CP-domain reassembly path (`mDomainCPSize > 1`) or decode KV receive
