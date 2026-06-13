@@ -1697,30 +1697,42 @@ Still pending before serving enablement:
 - optimize `sparse_mla_decode_kvarn_hot` beyond the direct per-row/head kernel
   by importing only the compatible FlashMLA split scheduler/combine structure
   while preserving the packed KVarN-hot BDR producer load. The intended shape is
-  to reuse the scheduler metadata and bf16 combine path, add a new KVarN-hot
-  split producer that reads packed `kvarn_k2v2` records through
-  `hisparseKvarnBdrRead.cuh`, writes per-split accumulators/LSE, and then lets
-  the existing combine logic reduce them. Do not reuse the NVFP4 producer or
-  its `[block, token, hkv, 288]` plus scale layout as a compatibility backend;
-  Confucius has produced a bounded VM worktree candidate at
+  to reuse the scheduler metadata, add a new KVarN-hot split producer that reads
+  packed `kvarn_k2v2` records through `hisparseKvarnBdrRead.cuh`, writes
+  per-split accumulators/LSE, and use a KVarN-specific combine because the
+  existing NVFP4 combine does not preserve the direct KVarN-hot `attn_sink` LSE
+  convention exactly. Do not reuse the NVFP4 producer or its `[block, token,
+  hkv, 288]` plus scale layout as a compatibility backend. Confucius produced
+  the initial bounded VM worktree candidate at
   `a4-us-001-rl9:/home/spencer/work/op-trt-hisparse-splitprod-wt` on branch
-  `op-trt-hisparse-splitprod`. It registers
-  `trtllm::sparse_mla_decode_kvarn_hot_split`, reuses only the FlashMLA sparse
-  scheduler metadata, keeps packed `kvarn_k2v2` BDR producer loads and
-  explicit sink/tail resident reads, and validates split output/LSE parity
-  against the current direct KVarN-hot op for committed hot records, resident
-  sink, resident tail, padding-only, invalid upstream row, stale hot slot, and
-  stale layer cases. The June 13 audit found it promising but not merge-ready:
-  scheduler/split sizing must be rechecked for per-row `topk_length`, the fake
-  op metadata shape must stop being a placeholder before graph/export use, the
-  combine kernel's fixed `splitScale[128]` shared array must become dynamic or
-  chunked because the candidate heuristic can create more than 128 splits per
-  batch, and the worktree must be rebased over the resident sink/tail dtype
-  fail-closed guard. The candidate needs IKP timing artifacts before it
-  replaces the direct kernel.
-  This candidate still needs main-branch audit, merge, and proof through the
-  same serving-layout `libth_common.so` path before it can count as integrated
-  production optimization;
+  `op-trt-hisparse-splitprod`. The June 13 continuation rebased that candidate
+  over `origin/op-trt-hisparse` into
+  `/home/spencer/work/op-trt-hisparse-splitprod-rebased` on branch
+  `op-trt-hisparse-splitprod-rebased`; the equivalent GitHub branch is
+  `origin/op-trt-hisparse-splitprod-rebased` at `2fa724252`. That guarded
+  branch registers `trtllm::sparse_mla_decode_kvarn_hot_split`, reuses only the
+  FlashMLA sparse scheduler metadata, keeps packed `kvarn_k2v2` BDR producer
+  loads and explicit sink/tail resident reads, and validates split output/LSE
+  parity against the current direct KVarN-hot op for committed hot records,
+  resident sink, resident tail, padding-only, invalid upstream row, stale hot
+  slot, and stale layer cases. It also fixes the concrete audit blockers that
+  could be closed without promoting it to production: the KVarN-specific combine
+  no longer has a fixed `splitScale[128]` shared-memory ceiling and computes
+  split softmax scales on demand, the fake op metadata row count mirrors the
+  B200 scheduler heuristic for concrete dimensions, fake/export symbolic
+  dimensions conservatively reserve the maximum 4096 metadata rows, and the
+  split launcher inherits the resident sink/tail dtype fail-closed guard. A
+  targeted object proof against the cached proof image compiled
+  `sparse_mla_decode_kvarn_hot.cu.o` and
+  `SparseMlaDecodeKvarnHotOp.cpp.o`; ptxas reported SM100a zero-spill kernels
+  with 56 registers for the direct kernel, 38 for the split producer, and 30
+  for split combine. The branch remains promising but not merge-ready for the
+  main production path: scheduler/split sizing still needs runtime parity for
+  `s_q` and per-row `topk_length`, the serving-layout `libth_common.so` import
+  and live DSA/NIXL proof have not run on this rebased candidate, graph/export
+  behavior still needs a real symbolic fake-tensor proof, IKP/NSys artifacts
+  are required before promotion, and any future CuTe/CLC rewrite must add the
+  CZS proof package before replacing this direct-ABI split path;
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
