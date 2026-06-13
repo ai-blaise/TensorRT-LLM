@@ -285,6 +285,7 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
             {
                 if (scores[k] == kNegInf)
                 {
+                    scores[k] = 0.0F;
                     continue;
                 }
                 float const weight = expf(scores[k] - maxVal);

@@ -1263,7 +1263,9 @@ Current branch status:
   at the original request-relative TopK token: `hot_index < 0` plus
   `request_topk_index < 0` is padding and contributes no score/value, while
   `hot_index < 0` plus a nonnegative request token must pass the explicit
-  sink/tail resident checks;
+  sink/tail resident checks. Padded `-inf` scores are converted to zero weights
+  before normalization so all-padding/no-sink rows cannot produce NaNs from
+  `-inf * 0`;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
