@@ -8,7 +8,8 @@ stack. It is based on direct review of:
   https://www.lmsys.org/blog/2026-04-10-sglang-hisparse/
 - SGLang HiSparse guide:
   https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/hisparse_guide.md
-- SGLang implementation:
+- SGLang implementation, re-checked against `sgl-project/sglang` main
+  `eb18416` on June 13, 2026:
   - `python/sglang/srt/managers/hisparse_coordinator.py`
   - `python/sglang/srt/mem_cache/allocator/hisparse.py`
   - `python/sglang/srt/mem_cache/hisparse_memory_pool.py`
@@ -58,19 +59,19 @@ architecture from the first executable serving path. That means dense MLA
 BDR/on-read dequant, NIXL generation-first direct-to-host, and the r20
 LayerSplit/SMC/Moondream wiring. Do not implement FP16 host/hot tiers in
 serving code. Independent test fixtures may compare against reference tensors
-outside the HiSparse coordinator/transceiver path, but there is no
-intermediate FP16 block-hot oracle implementation phase, runtime fallback,
-config mode, or deployment candidate.
+outside the HiSparse coordinator/transceiver path, but there is no FP16
+block-hot oracle in the serving implementation, runtime fallback, config mode,
+or deployment candidate.
 
-Current branch posture after the June 13 correctness sweep: the branch has a
-production-shaped, fail-closed scaffold, not a deployable HiSparse serving
-candidate. The config validation, packed KVarN tier allocation, host metadata
-publication, NIXL DRAM registration, request host-slot sideband, packed KVarN
-source/destination fragment derivation, and typed `HISPARSE_HOST` write
-submission are implemented. The sender now returns explicit
-`(local_layer, request_block_pos)` commit coverage only after the normal KV
-write and typed host write both succeed, and the receiver accumulates that
-coverage before marking host records committed. Admission is explicit: a
+Current branch posture after the June 13 final correctness sweep: the branch
+has a production-shaped, fail-closed partial implementation, not a deployable
+HiSparse serving candidate. The config validation, packed KVarN tier
+allocation, host metadata publication, NIXL DRAM registration, request
+host-slot sideband, packed KVarN source/destination fragment derivation, and
+typed `HISPARSE_HOST` write submission are implemented. The sender now returns
+explicit `(local_layer, request_block_pos)` commit coverage only after the
+normal KV write and typed host write both succeed, and the receiver accumulates
+that coverage before marking host records committed. Admission is explicit: a
 request cannot be marked HiSparse-ready unless all reserved prompt host blocks
 are committed and no host writes are pending. Startup still intentionally
 rejects `hisparse_enabled=true` before serving because live NIXL E2E proof,
@@ -78,6 +79,39 @@ live cancel/retraction proof, host-to-hot swap-in, sparse MLA hot-pool reading,
 and BDR/on-read dequant are not complete. This is the correct failure mode: no
 manifest should get an implicit full-HBM, FP16-staging, or direct-to-host-off
 substitute.
+
+## Final Correctness Sweep
+
+The full implementation must remain production-architecture-first. Partial code
+may exist only when it is behind fail-closed startup/mapping guards and has the
+same ABI shape as the final serving path. The following are hard invariants:
+
+- Dense MLA cold and hot storage is packed KVarN `kvarn_k2v2`, not FP16 and not
+  an FP16 staging tier.
+- The Indexer/HISA path stays device-resident FP4/HISA; Indexer K is not moved
+  into KVarN or host HiSparse storage.
+- HiSparse uses request-relative top-k token positions from the existing
+  Indexer/HISA path and maps them into selected packed KVarN hot blocks before
+  sparse MLA.
+- The hot tier is block-oriented for OP-TRT, even though SGLang's generic DSA
+  implementation is token-slot-oriented, because OP-TRT KVarN, BDR/on-read
+  dequant, paged sparse MLA, LayerSplit ownership, and NIXL page metadata all
+  key on paged blocks.
+- Direct-to-host is the production path: prefill writes packed dense-MLA KVarN
+  records into decode host-pinned slots through typed NIXL `HISPARSE_HOST`
+  writes, and decode admission waits for commit coverage.
+- SGLang's naive top-k loader/debug oracle is not a model for OP-TRT serving.
+  Any offline references used by tests must stay outside the coordinator,
+  transceiver, kernel ABI, and deployment config.
+- There is no HELIX, completed-prefill staging fallback, full-HBM fallback,
+  direct-to-host-off fallback, FP16 block-hot oracle, or runtime downgrade when
+  `hisparse_enabled=true`.
+- LayerSplit owner-local prefill, TP4/EP4 decode, SMC-SD row expansion,
+  Moondream pinning, request pinning, cancellation, and request recycle must
+  compose with HiSparse before the startup guard is relaxed.
+- MORI-IO remains an A/B candidate only; the gate path is NIXL write-mode/direct
+  host writes.
+- Promotion requires live VM proof and A/B data, not just unit tests.
 
 ## Relevant SGLang Facts
 
@@ -90,7 +124,7 @@ device-to-device. In OP-TRT, "prefill transparent" means no target-model compute
 detour: the prefill transceiver still has to expose/write NIXL host descriptors
 for the production packed KVarN host tier.
 
-Implementation details worth preserving:
+Implementation details worth preserving or adapting:
 
 - `HiSparseTokenToKVPoolAllocator` separates logical capacity from hot device
   capacity. `alloc_logical_only()` is used by direct-to-host transfer.
@@ -98,15 +132,26 @@ Implementation details worth preserving:
   `full_to_hisparse_device_index_mapping`, LRU slots, raw top-k capture buffer,
   graph-safe output buffers, request-admission queues, eager backup stream, and
   cleanup.
-- `swap_in_selected_pages()` launches one CUDA kernel per layer and returns
-  device locations for attention.
+- `swap_in_selected_pages()`/`load_cache_to_device_buffer_*` launches one CUDA
+  kernel per layer and returns device locations for attention.
 - The CUDA kernel has a short-sequence fast path, newest-token reserved slot,
   shared-memory top-k hash, LRU hit/miss compaction, host-to-device miss copy,
   and `num_real_reqs` early exit for padded CUDA-graph batches.
 - DSv4 top-k captures raw request-relative token positions separately from
   physical page-table locations so the swap-in path can target logical host
   rows.
-- SGLang requires decode radix cache disabled with HiSparse.
+- SGLang validates model/backend constraints, requires radix cache disabled for
+  HiSparse, and pairs DSA backends with the selected KV dtype.
+
+Implementation details not to copy directly:
+
+- SGLang's generic DSA hot buffer is token-slot based; OP-TRT's first serving
+  candidate must be block-based packed KVarN.
+- SGLang's BF16/FP8 FlashMLA hot tier is not OP-TRT's dense MLA KVarN hot tier.
+- SGLang's staging and naive debug loader are useful for understanding
+  correctness, but they are not acceptable OP-TRT deployment modes.
+- DeepSeek V4 C4 layout handling is relevant as an example of architecture
+  specialization, not as the OP-TRT target path for the current dense-MLA model.
 
 ## OP-TRT Facts That Change The Design
 
@@ -553,15 +598,19 @@ Performance tests:
   - compare full-HBM sparse attention, production KVarN only, HiSparse packed
     KVarN, and HiSparse packed KVarN with direct-to-host.
 
-## Implementation Phases
+## Production Workstreams And Gates
 
-### Phase 0: Branch and Docs
+These labels describe ordered workstreams and proof gates. They are not
+deployable states. Any incomplete workstream remains fail-closed and must not
+become a serving candidate until all promotion gates pass.
+
+### Gate 0: Branch And Docs
 
 - Work branch: `op-trt-hisparse`.
 - Keep production r20 manifests unchanged until proof gates pass.
 - Add this plan and keep a running implementation checklist.
 
-### Phase 1: Metadata And Allocator Skeleton
+### Gate 1: Metadata And Allocator
 
 Files:
 
@@ -592,10 +641,11 @@ Current branch status:
 - wired coordinator ownership into `DSACacheManager`, per-step metadata reset,
   and the `sparse_attn_predict()` TopK mapping seam;
 - disabled HiSparse remains a no-op and preserves current behavior;
-- enabled HiSparse intentionally raises before serving until Phase 2/3 provide
-  packed KVarN host/hot allocation, swap-in, and sparse MLA read support.
+- enabled HiSparse intentionally raises before serving until packed KVarN
+  host/hot allocation, NIXL commit, host-to-hot swap-in, and sparse MLA hot-read
+  support are all complete and live-validated.
 
-### Phase 2: Production Packed KVarN Cold/Hot Tiers
+### Gate 2: Production Packed KVarN Cold/Hot Tiers
 
 Deliverables:
 
@@ -638,7 +688,7 @@ Still pending before serving enablement:
 - host-to-hot packed record copy kernel;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
-### Phase 3: Swap-In Kernel And Sparse MLA Hook
+### Gate 3: Swap-In Kernel And Sparse MLA Hook
 
 Deliverables:
 
@@ -650,7 +700,7 @@ Deliverables:
 - FSSS reuse layers reuse scoring but rerun per-layer hot-slot mapping when hot
   residency is layer-local.
 
-### Phase 4: Production Optimization Hardening
+### Gate 4: Production Optimization Hardening
 
 Deliverables:
 
@@ -660,7 +710,7 @@ Deliverables:
 - performance proof that KVarN+HiSparse beats KVarN-only at long context and
   concurrency 16.
 
-### Phase 5: NIXL Direct-To-Host
+### Gate 5: NIXL Direct-To-Host
 
 Files:
 
@@ -746,7 +796,7 @@ Still pending before serving enablement:
 - E2E proof that NIXL writes land directly in decode host slots before decode
   admits the request.
 
-### Phase 6: LayerSplit, SMC, Moondream Hardening
+### Gate 6: LayerSplit, SMC, Moondream Hardening
 
 Deliverables:
 
@@ -757,7 +807,7 @@ Deliverables:
 - Moondream pin preservation;
 - no draft rejected-token host pollution.
 
-### Phase 7: A/B And Promotion
+### Gate 7: A/B And Promotion
 
 Promotion candidate:
 
@@ -814,24 +864,58 @@ Promotion requires:
    `hisparse_min_seq_len` should prevent low-concurrency/short-context overhead
    from hurting the default path.
 
-## Next Code Changes
+## Immediate Execution Plan
 
 The next implementation work should continue from the current fail-closed
-packed-tier and host-registration skeleton:
+production ABI:
 
-1. prove and harden the HiSparse host-write completion-to-commit transition
-   with live NIXL: verify multi-rank and partial-slice coverage, ensure failed
-   or partial blocks remain invisible to hot selection, and add any missing
-   receiver-side admission checks exposed by the E2E run;
-2. prove and harden cancel/abort/retraction on live NIXL so host rows and hot
-   slots remain pinned while any DRAM write can still complete, and only
-   recycle them after the transfer agent reports a safe terminal state;
-3. verify generation-first request pinning end to end with live NIXL metadata:
-   decode publishes writable host slots, prefill writes directly into those
-   slots, and decode admission is blocked until the commit handoff completes;
-4. implement the SM100 host-to-hot packed record swap-in kernel and hot global
-   index mapping;
-5. wire sparse MLA to consume the hot packed KVarN pool with BDR/on-read
-   dequant, with no FP16 hot serving tier;
-6. add LayerSplit owner-local, SMC-SD row geometry, Moondream pinning, cancel,
-   and recycle tests before relaxing startup fail-closed behavior.
+1. Build the SM100 packed KVarN host-to-hot op and ABI:
+   - input request-relative top-k tokens, request rows, committed host slots,
+     per-layer hot metadata, and graph row count;
+   - dedupe tokens to paged block positions;
+   - hit/miss/LRU over block slots;
+   - copy only packed KVarN records from host DRAM to hot HBM;
+   - output hot global indices and selected hot block ids for sparse MLA.
+2. Wire the sparse MLA hot-pool read path:
+   - consume hot packed KVarN records directly;
+   - add BDR/on-read dequant in the sparse MLA path;
+   - keep sink/tail resident policy separate from committed packed blocks;
+   - remove any need for full-working-set restore of committed cold blocks.
+3. Prove and harden NIXL direct-to-host on live B200 VMs:
+   - decode publishes writable host-pinned slots;
+   - prefill writes exact packed KVarN records into those slots;
+   - commit coverage is multi-rank and partial-slice safe;
+   - decode admission remains blocked until all reserved prompt blocks commit.
+4. Prove and harden cancellation/retraction/recycle:
+   - no host or hot slot is freed while a DRAM write can still complete;
+   - failed/partial writes never become selectable;
+   - request recycle invalidates KVarN host/hot records and pin metadata.
+5. Compose with the custom stack:
+   - LayerSplit owner-local prefill and CP1 decode first, CP>1 decode guarded
+     or implemented explicitly;
+   - SMC-SD row geometry maps every speculative row to the base request host
+     table;
+   - Moondream pinning stays tied to the same `disagg_request_id`,
+     `ctx_dp_rank`, and `ctx_info_endpoint`;
+   - FSSS reuse keeps scoring reuse but reruns per-layer hot mapping.
+6. Add production tests:
+   - unit tests for block dedupe, hit/miss/LRU, commit coverage, admission,
+     cancel, recycle, and FSSS reuse;
+   - VM E2E for generation-first NIXL direct-to-host, LayerSplit prefill,
+     TP4/EP4 decode, SMC-SD accept/reject, and Moondream pin preservation;
+   - correctness comparison against the existing production full-HBM KVarN path
+     within KVarN tolerance, with no FP16 serving oracle.
+7. Optimize before promotion:
+   - precompile SM100 buckets for `index_topk=1024`, `tokens_per_block=64`, and
+     hot blocks/request `{32,64,96,128}`;
+   - tune host/device ratio, NIXL plugin, NUMA placement, graph buckets, and
+     memory fraction;
+   - add hit/miss, swap latency, host-write, admission wait, and cleanup
+     counters.
+8. Promote only after A/B:
+   - target concurrency 16;
+   - input lengths 1k through 128k;
+   - compare full-HBM sparse, production KVarN-only, HiSparse packed KVarN with
+     NIXL direct-to-host, and MORI-IO only as an A/B candidate;
+   - require no correctness regression, no fallback logs, no leaked pins/slots,
+     and tokens/second/user improvement on the long-context target.

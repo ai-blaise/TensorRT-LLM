@@ -1,8 +1,9 @@
-"""OP-TRT HiSparse coordinator scaffolding.
+"""OP-TRT HiSparse coordinator and production ABI guardrails.
 
-The production HiSparse path is intentionally fail-closed until the packed
-dense-MLA KVarN host/hot tiers, swap-in kernel, and NIXL direct-to-host
-writer are wired. This module gives DSA a stable extension point without
+The enabled HiSparse serving path is intentionally fail-closed until the
+packed dense-MLA KVarN host/hot tiers, NIXL direct-to-host commit path,
+host-to-hot swap-in kernel, and sparse MLA hot-pool read path are all wired
+and live-validated. This module gives DSA a stable extension point without
 introducing an FP16 staging path or a silent full-HBM fallback.
 """
 
@@ -186,9 +187,9 @@ class OPTRTHiSparseCoordinator:
     ) -> HiSparsePackedTierDescriptor:
         """Install packed KVarN host/hot tier metadata.
 
-        This method allocates metadata only. The actual host-pinned packed
-        records, device hot packed records, and NIXL descriptors are Phase 2/3
-        tensor work; callers must not treat this as a serving-ready data path.
+        This method allocates metadata only. Tensor allocation and transfer
+        descriptor publication are separate production-ABI steps; callers must
+        not treat metadata configuration alone as a serving-ready data path.
         """
         values = {
             "num_layers": num_layers,
@@ -356,8 +357,9 @@ class OPTRTHiSparseCoordinator:
         """Return DRAM registration descriptors for NIXL writable host tiers.
 
         The descriptors intentionally describe CPU host-pinned memory only. The
-        transfer path must keep these DRAM regions out of the existing VRAM KV
-        write batch until a dedicated HiSparse host-write meta path is added.
+        transfer path must submit these DRAM regions through explicit
+        ``HISPARSE_HOST`` write metadata rather than appending them to normal
+        VRAM KV-cache writes.
         """
         entries = self._host_tier_entries(include_metadata=include_metadata)
         descs: List[Tuple[int, int, int, str]] = []
@@ -916,5 +918,5 @@ class OPTRTHiSparseCoordinator:
             return None
         raise NotImplementedError(
             "HiSparse hot-pool TopK mapping is not implemented yet. The next "
-            "phase must map Indexer/HISA request-relative TopK into packed "
-            "KVarN hot blocks before sparse MLA reads them.")
+            "implementation step must map Indexer/HISA request-relative TopK "
+            "into packed KVarN hot blocks before sparse MLA reads them.")
