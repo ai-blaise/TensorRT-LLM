@@ -34,6 +34,11 @@ struct SparseMlaDecodeKvarnHotParams
     float* attnSink;
     float* lse;
     void* out;
+    int32_t* tileSchedulerMetadata;
+    int32_t* numSplits;
+    float* lseAccum;
+    float* outAccum;
+    int32_t* rowHeadStatus;
 
     int32_t b;
     int32_t sQ;
@@ -57,6 +62,7 @@ struct SparseMlaDecodeKvarnHotParams
     int32_t kvarnBits;
     int32_t kvLoraRank;
     int32_t qkRopeHeadDim;
+    int32_t numSmParts;
     float smScale;
 
     int64_t strideQB;
@@ -78,9 +84,19 @@ struct SparseMlaDecodeKvarnHotParams
     int64_t strideOB;
     int64_t strideOSQ;
     int64_t strideOHQ;
+    int64_t strideLseAccumSplit;
+    int64_t strideLseAccumSQ;
+    int64_t strideOAccumSplit;
+    int64_t strideOAccumSQ;
+    int64_t strideOAccumHQ;
 };
 
+int32_t getSparseMlaDecodeKvarnHotMetadataWidth();
+int32_t getSparseMlaDecodeKvarnHotNumSmPartsForShape(int32_t b, int32_t sQ, int32_t topK);
+int32_t getSparseMlaDecodeKvarnHotTotalSplits(int32_t b, int32_t numSmParts);
+
 void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, cudaStream_t stream);
+void invokeSparseMlaDecodeKvarnHotSplit(SparseMlaDecodeKvarnHotParams const& params, cudaStream_t stream);
 
 } // namespace kernels
 

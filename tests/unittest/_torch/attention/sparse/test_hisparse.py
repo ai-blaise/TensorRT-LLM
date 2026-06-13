@@ -788,7 +788,10 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "readRequestTopkToken" in kernel_source
     assert "params.residentKvPoolDtype != kResidentKvPoolBf16" in kernel_source
     assert "sparse MLA KVarN-hot decode requires resident KV pool dtype bf16 or fp16" in kernel_source
+    assert "sparse MLA KVarN-hot split decode requires resident KV pool dtype bf16 or fp16" in kernel_source
     assert "return 0.0F;" in kernel_source
+    assert "splitScale[128]" not in kernel_source
+    assert "float const splitScale = lse == kNegInf" in kernel_source
     assert "bool activeToken = false" in kernel_source
     assert "requestToken >= 0" in kernel_source
     assert "scores[k] = (rowCode == kHotReadOk && k < rowTopK && activeToken)" in kernel_source
@@ -851,6 +854,10 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     fake_source = fake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake_source
+    assert "_fake_sparse_mla_kvarn_hot_num_sm_parts" in fake_source
+    assert "except (TypeError, ValueError)" in fake_source
+    assert "return 4096" in fake_source
+    assert "indices.new_empty((num_sm_parts, meta_width))" in fake_source
     assert "hisparse_classify_resident_blocks" in fake_source
     assert "resident_block_flags, resident_row_status" in fake_source
     assert "resident_kv_lens=None" in fake_source

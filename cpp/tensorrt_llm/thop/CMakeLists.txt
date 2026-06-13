@@ -154,7 +154,8 @@ add_library(
   ../kernels/mlaBdrKvarnRecordKernels.cu
   ../kernels/hisparseTopkToBlocks.cu
   ../kernels/hisparseKvarnHotRead.cu
-  ../kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu)
+  ../kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu
+  ../kernels/flashMLA/nvfp4_sparse/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu)
 set_property(TARGET th_hisparse_smoke PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_hisparse_smoke PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD 20)
@@ -162,6 +163,11 @@ set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD_REQUIRED ON)
 target_link_libraries(
   th_hisparse_smoke PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                             ${CUDA_DRV_LIB} ${CUBLAS_LIB} ${CURAND_LIB})
+target_include_directories(
+  th_hisparse_smoke
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse/smxx/decode/get_decoding_sched_meta)
 target_compile_options(
   th_hisparse_smoke
   PRIVATE

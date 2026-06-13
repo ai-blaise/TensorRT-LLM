@@ -11,6 +11,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from .cute_dsl_custom_ops import GroupedGemmInputsHelper
 
 
+def _fake_sparse_mla_kvarn_hot_num_sm_parts(batch, s_q, topk):
+    # Mirrors the C++ split-producer scheduler heuristic for the B200 proof
+    # environment. Fake kernels need stable output shapes for graph/export;
+    # runtime still uses the C++ helper and the actual device SM count.
+    try:
+        b = int(batch)
+        s_q = int(s_q)
+        topk = int(topk)
+    except (TypeError, ValueError):
+        return 4096
+    topk_blocks = (topk + 63) // 64
+    if b == 1:
+        scheduler_overhead = 16
+    elif b >= 64:
+        scheduler_overhead = 5
+    elif b >= 32:
+        scheduler_overhead = 14
+    else:
+        scheduler_overhead = 15
+    one_block_parts = b * (topk_blocks + scheduler_overhead)
+    sm_floor = 1 if topk >= 1024 else max(148 // max(s_q, 1), 1)
+    return min(max(sm_floor, one_block_parts), 4096)
+
+
 def _register_fake():
 
     @torch.library.register_fake("trtllm::allreduce")
@@ -365,6 +389,32 @@ def _register_fake():
                 q.new_empty((q.shape[0], q.shape[2], q.shape[1]),
                             dtype=torch.float32),
                 indices.new_empty((0, 0)), indices.new_empty((0, )))
+
+    @torch.library.register_fake("trtllm::sparse_mla_decode_kvarn_hot_split")
+    def _(q, hot_packed, indices, row_status, topk_length=None, attn_sink=None,
+          layer_idx=0, tokens_per_block=64, stride_factor=64, kvarn_bits=2,
+          kv_lora_rank=512, qk_rope_head_dim=64, sm_scale=1.0,
+          resident_kv_lens=None, resident_req_idx=None,
+          resident_request_ids=None, resident_kv_pool=None,
+          resident_block_table=None,
+          resident_tail_block_pos=None, resident_tail_token_count=None,
+          resident_tail_valid=None, resident_sink_tokens=0,
+          resident_sink_blocks=0, request_topk_indices=None):
+        del hot_packed, row_status, topk_length, attn_sink, layer_idx
+        del tokens_per_block, stride_factor, kvarn_bits, kv_lora_rank
+        del qk_rope_head_dim, sm_scale, resident_kv_lens, resident_req_idx
+        del resident_request_ids, resident_kv_pool, resident_block_table
+        del resident_tail_block_pos, resident_tail_token_count
+        del resident_tail_valid, resident_sink_tokens, resident_sink_blocks
+        del request_topk_indices
+        meta_width = 8
+        num_sm_parts = _fake_sparse_mla_kvarn_hot_num_sm_parts(
+            q.shape[0], q.shape[1], indices.shape[2])
+        return (q.new_empty((*q.shape[:3], 512)),
+                q.new_empty((q.shape[0], q.shape[2], q.shape[1]),
+                            dtype=torch.float32),
+                indices.new_empty((num_sm_parts, meta_width)),
+                indices.new_empty((q.shape[0] + 1, )))
 
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):

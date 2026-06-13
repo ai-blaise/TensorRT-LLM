@@ -153,6 +153,15 @@ def _has_sparse_mla_kvarn_hot_cuda_op() -> bool:
         return False
 
 
+def _has_sparse_mla_kvarn_hot_split_cuda_op() -> bool:
+    try:
+        return bool(
+            torch._C._dispatch_has_kernel_for_dispatch_key(
+                "trtllm::sparse_mla_decode_kvarn_hot_split", "CUDA"))
+    except RuntimeError:
+        return False
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="requires CUDA for the native BDR writer")
 def test_mla_bdr_write_kvarn_record_cuda_layout_smoke():
@@ -321,6 +330,148 @@ def test_sparse_mla_decode_kvarn_hot_one_token_cuda_smoke():
                           torch.zeros((1, 128, 1)),
                           atol=1e-5,
                           rtol=0)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for sparse MLA KVarN-hot split decode")
+def test_sparse_mla_decode_kvarn_hot_split_matches_direct_cuda_smoke():
+    """B200 smoke: split producer preserves direct KVarN-hot semantics.
+
+    This is intentionally a production-layout comparison, not an FP16 hot-tier
+    oracle. Both ops read the same packed ``kvarn_k2v2`` BDR records and the
+    same explicit resident sink/tail normal-KV metadata.
+    """
+    if not _has_mla_bdr_writer_cuda_op():
+        pytest.skip("trtllm::mla_bdr_write_kvarn_record CUDA op is not loaded")
+    if not _has_sparse_mla_kvarn_hot_cuda_op():
+        pytest.skip("trtllm::sparse_mla_decode_kvarn_hot CUDA op is not loaded")
+    if not _has_sparse_mla_kvarn_hot_split_cuda_op():
+        pytest.skip(
+            "trtllm::sparse_mla_decode_kvarn_hot_split CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    batch = 7
+    topk = 128
+    num_layers = 2
+    hot_capacity = 2
+    stride_factor = num_layers * layout.tokens_per_block
+
+    hot_packed = torch.full(
+        (num_layers, hot_capacity, layout.packed_bytes_per_block + 17),
+        0xA5,
+        dtype=torch.uint8,
+        device=device)
+    latent = torch.zeros((64, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                         dtype=torch.float16,
+                         device=device)
+    latent[:, :cfg.kv_lora_rank] = 0.50
+    torch.ops.trtllm.mla_bdr_write_kvarn_record(
+        latent, hot_packed[0], 0, layout.ckv_bits, layout.kv_lora_rank,
+        layout.qk_rope_head_dim)
+    latent[:, :cfg.kv_lora_rank] = 0.25
+    torch.ops.trtllm.mla_bdr_write_kvarn_record(
+        latent, hot_packed[0], 1, layout.ckv_bits, layout.kv_lora_rank,
+        layout.qk_rope_head_dim)
+
+    q = torch.zeros((batch, 1, 128, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device)
+    indices = torch.full((batch, 1, topk), -1, dtype=torch.int32, device=device)
+    request_topk_indices = torch.full_like(indices, -1)
+    topk_length = torch.full((batch,), 2, dtype=torch.int32, device=device)
+    row_status = torch.zeros((batch,), dtype=torch.uint8, device=device)
+
+    # Row 0: two committed hot records, split across one active TopK block.
+    indices[0, 0, 0] = 3
+    indices[0, 0, 1] = stride_factor + 5
+    # Row 1: resident sink sentinel.
+    request_topk_indices[1, 0, 0] = 3
+    # Row 2: resident tail sentinel outside the sink block.
+    request_topk_indices[2, 0, 0] = 70
+    # Row 3: padding-only row; negative original TopK remains padding.
+    # Row 4: upstream invalid row must fail closed.
+    row_status[4] = 1
+    indices[4, 0, 0] = 3
+    # Row 5: stale hot slot must fail closed.
+    indices[5, 0, 0] = hot_capacity * stride_factor
+    # Row 6: stale layer in encoded hot index must fail closed.
+    indices[6, 0, 0] = layout.tokens_per_block + 4
+
+    resident_kv_pool = torch.zeros((stride_factor * 2, 1,
+                                    cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                                   dtype=torch.bfloat16,
+                                   device=device)
+    resident_kv_pool[3, 0, :cfg.kv_lora_rank] = 0.75
+    resident_kv_pool[stride_factor + 6, 0, :cfg.kv_lora_rank] = 0.33
+    resident_kv_lens = torch.full((batch,), 80, dtype=torch.int64, device=device)
+    resident_req_idx = torch.zeros((batch,), dtype=torch.int64, device=device)
+    resident_request_ids = torch.full((batch,), 7001, dtype=torch.int64,
+                                      device=device)
+    resident_block_table = torch.tensor([[0, 1]], dtype=torch.int32,
+                                        device=device)
+    resident_tail_block_pos = torch.full((batch,), 1, dtype=torch.int32,
+                                         device=device)
+    resident_tail_token_count = torch.full((batch,), 7, dtype=torch.int32,
+                                           device=device)
+    resident_tail_valid = torch.ones((batch,), dtype=torch.bool, device=device)
+
+    args = (
+        q,
+        hot_packed,
+        indices,
+        row_status,
+        topk_length,
+        None,
+        0,
+        layout.tokens_per_block,
+        stride_factor,
+        layout.ckv_bits,
+        layout.kv_lora_rank,
+        layout.qk_rope_head_dim,
+        1.0,
+        resident_kv_lens,
+        resident_req_idx,
+        resident_request_ids,
+        resident_kv_pool,
+        resident_block_table,
+        resident_tail_block_pos,
+        resident_tail_token_count,
+        resident_tail_valid,
+        layout.tokens_per_block,
+        1,
+        request_topk_indices,
+    )
+    direct_out, direct_lse, direct_meta, direct_splits = (
+        torch.ops.trtllm.sparse_mla_decode_kvarn_hot(*args))
+    split_out, split_lse, split_meta, split_splits = (
+        torch.ops.trtllm.sparse_mla_decode_kvarn_hot_split(*args))
+    torch.cuda.synchronize()
+
+    assert direct_meta.numel() == 0
+    assert direct_splits.numel() == 0
+    assert split_meta.shape[1] == 8
+    assert split_splits.shape == (batch + 1,)
+    assert torch.allclose(split_out.float(), direct_out.float(), atol=1e-2,
+                          rtol=0)
+    assert torch.equal(torch.isneginf(split_lse), torch.isneginf(direct_lse))
+    finite = torch.isfinite(direct_lse)
+    assert torch.allclose(split_lse[finite], direct_lse[finite], atol=1e-5,
+                          rtol=0)
+
+    split_cpu = split_out.float().cpu()
+    split_lse_cpu = split_lse.float().cpu()
+    assert torch.allclose(split_cpu[0], torch.full_like(split_cpu[0], 0.375),
+                          atol=1e-2, rtol=0)
+    assert torch.allclose(split_cpu[1], torch.full_like(split_cpu[1], 0.75),
+                          atol=1e-4, rtol=0)
+    assert torch.allclose(split_cpu[2], torch.full_like(split_cpu[2], 0.33),
+                          atol=1e-4, rtol=0)
+    assert float(split_cpu[3:].abs().max()) == 0.0
+    assert bool(torch.isneginf(split_lse_cpu[3:]).all())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),

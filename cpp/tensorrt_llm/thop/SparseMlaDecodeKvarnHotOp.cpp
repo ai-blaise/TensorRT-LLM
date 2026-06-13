@@ -349,6 +349,199 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     return {out, lse.transpose(1, 2), metadata, splits};
 }
 
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kvarn_hot_split(th::Tensor const& q,
+    th::Tensor const& hotPacked, th::Tensor const& indices, th::Tensor const& rowStatus,
+    std::optional<th::Tensor> const& topkLength, std::optional<th::Tensor> const& attnSink, int64_t layerIdx,
+    int64_t tokensPerBlock, int64_t strideFactor, int64_t kvarnBits, int64_t kvLoraRank, int64_t qkRopeHeadDim,
+    double smScale, std::optional<th::Tensor> const& residentKvLens, std::optional<th::Tensor> const& residentReqIdx,
+    std::optional<th::Tensor> const& residentRequestIds, std::optional<th::Tensor> const& residentKvPool,
+    std::optional<th::Tensor> const& residentBlockTable, std::optional<th::Tensor> const& residentTailBlockPos,
+    std::optional<th::Tensor> const& residentTailTokenCount, std::optional<th::Tensor> const& residentTailValid,
+    int64_t residentSinkTokens, int64_t residentSinkBlocks, std::optional<th::Tensor> const& requestTopkIndices)
+{
+    checkCudaTensor(q, "q");
+    checkSameDevice(q, hotPacked, "hot_packed");
+    checkSameDevice(q, indices, "indices");
+    checkSameDevice(q, rowStatus, "row_status");
+    checkOptionalSameDevice(q, topkLength, "topk_length");
+    checkOptionalSameDevice(q, attnSink, "attn_sink");
+
+    TORCH_CHECK(q.scalar_type() == at::ScalarType::BFloat16, "q must be bf16");
+    TORCH_CHECK(hotPacked.scalar_type() == at::ScalarType::Byte, "hot_packed must be uint8 production BDR KVarN records");
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Int, "indices must be int32");
+    TORCH_CHECK(rowStatus.scalar_type() == at::ScalarType::Byte, "row_status must be uint8");
+    if (topkLength.has_value())
+    {
+        TORCH_CHECK(topkLength->scalar_type() == at::ScalarType::Int, "topk_length must be int32");
+    }
+    if (attnSink.has_value())
+    {
+        TORCH_CHECK(attnSink->scalar_type() == at::ScalarType::Float, "attn_sink must be fp32");
+    }
+
+    TORCH_CHECK(q.dim() == 4, "q must have shape [batch, s_q, h_q, d_qk]");
+    TORCH_CHECK(hotPacked.dim() == 3, "hot_packed must have shape [num_layers, hot_capacity, packed_bytes]");
+    TORCH_CHECK(indices.dim() == 3, "indices must have shape [batch, s_q, topk]");
+    TORCH_CHECK(rowStatus.dim() == 1, "row_status must have shape [batch * s_q]");
+
+    auto const b = q.size(0);
+    auto const sQ = q.size(1);
+    auto const hQ = q.size(2);
+    auto const dQk = q.size(3);
+    auto const numLayers = hotPacked.size(0);
+    auto const hotCapacity = hotPacked.size(1);
+    auto const topK = indices.size(2);
+    TORCH_CHECK(b > 0 && sQ > 0 && topK > 0, "batch, s_q, and topk must be positive");
+    TORCH_CHECK(hQ == kHeadQ && dQk == kDqk, "q must use production V3.2 shape [*,*,128,576]");
+    TORCH_CHECK(tokensPerBlock == kTokensPerBlock, "tokens_per_block must be 64");
+    TORCH_CHECK(kvarnBits == 2, "kvarn_bits must be 2 for production kvarn_k2v2");
+    TORCH_CHECK(kvLoraRank == kKvLoraRank && qkRopeHeadDim == kQkRopeHeadDim,
+        "production dense MLA KVarN-hot decode requires kv_lora_rank=512 and qk_rope_head_dim=64");
+    TORCH_CHECK(layerIdx >= 0 && layerIdx < numLayers, "layer_idx out of range");
+    TORCH_CHECK(hotCapacity > 0, "hot_packed hot capacity must be positive");
+    auto const expectedBytes = expectedBdrBytesPerBlock(tokensPerBlock, kvLoraRank, qkRopeHeadDim, kvarnBits);
+    TORCH_CHECK(hotPacked.size(2) >= expectedBytes,
+        "hot_packed record bytes are smaller than production BDR layout: got ", hotPacked.size(2),
+        ", expected at least ", expectedBytes);
+    TORCH_CHECK(strideFactor >= numLayers * tokensPerBlock,
+        "stride_factor must cover all layer token ranges: got ", strideFactor,
+        ", expected at least ", numLayers * tokensPerBlock);
+    TORCH_CHECK(indices.size(0) == b && indices.size(1) == sQ, "indices batch/s_q dimensions must match q");
+    TORCH_CHECK(rowStatus.size(0) == b * sQ, "row_status must have one entry per [batch, s_q] row");
+    if (topkLength.has_value())
+    {
+        TORCH_CHECK(topkLength->dim() == 1 && (topkLength->size(0) == b || topkLength->size(0) == b * sQ),
+            "topk_length must be [batch] or [batch * s_q]");
+    }
+    if (attnSink.has_value())
+    {
+        TORCH_CHECK(attnSink->dim() == 1 && attnSink->size(0) == hQ, "attn_sink must be [h_q]");
+    }
+    checkResidentTokenAbi(q, indices, b * sQ, tokensPerBlock, residentSinkTokens, residentSinkBlocks, residentKvLens,
+        residentReqIdx, residentRequestIds, residentKvPool, residentBlockTable, residentTailBlockPos, residentTailTokenCount,
+        residentTailValid, requestTopkIndices);
+
+    TORCH_CHECK(q.stride(3) == 1, "q last dimension must be contiguous");
+    checkHotPackedStrides(hotPacked, expectedBytes);
+    TORCH_CHECK(indices.stride(2) == 1, "indices last dimension must be contiguous");
+    TORCH_CHECK(rowStatus.is_contiguous(), "row_status must be contiguous");
+    checkOptionalContiguous(topkLength, "topk_length");
+    checkOptionalContiguous(attnSink, "attn_sink");
+    checkOptionalContiguous(requestTopkIndices, "request_topk_indices");
+    checkOptionalContiguous(residentKvLens, "resident_kv_lens");
+    checkOptionalContiguous(residentReqIdx, "resident_req_idx");
+    checkOptionalContiguous(residentRequestIds, "resident_request_ids");
+    checkOptionalContiguous(residentKvPool, "resident_kv_pool");
+    checkOptionalContiguous(residentBlockTable, "resident_block_table");
+    checkOptionalContiguous(residentTailBlockPos, "resident_tail_block_pos");
+    checkOptionalContiguous(residentTailTokenCount, "resident_tail_token_count");
+    checkOptionalContiguous(residentTailValid, "resident_tail_valid");
+
+    c10::cuda::CUDAGuard deviceGuard(q.device());
+    auto out = th::empty({b, sQ, hQ, kDv}, q.options());
+    auto lse = th::empty({b, sQ, hQ}, q.options().dtype(at::ScalarType::Float));
+    auto const numSmParts = tk::getSparseMlaDecodeKvarnHotNumSmPartsForShape(
+        checkedInt32(b, "batch"), checkedInt32(sQ, "s_q"), checkedInt32(topK, "topk"));
+    auto metadata = th::empty({numSmParts, tk::getSparseMlaDecodeKvarnHotMetadataWidth()},
+        q.options().dtype(at::ScalarType::Int));
+    auto splits = th::empty({b + 1}, q.options().dtype(at::ScalarType::Int));
+    auto const totalSplits = tk::getSparseMlaDecodeKvarnHotTotalSplits(checkedInt32(b, "batch"), numSmParts);
+    auto lseAccum = th::empty({totalSplits, sQ, hQ}, q.options().dtype(at::ScalarType::Float));
+    auto outAccum = th::empty({totalSplits, sQ, hQ, kDv}, q.options().dtype(at::ScalarType::Float));
+    auto rowHeadStatus = th::empty({b * sQ, hQ}, q.options().dtype(at::ScalarType::Int));
+
+    tk::SparseMlaDecodeKvarnHotParams params{};
+    params.q = q.data_ptr();
+    params.hotPacked = reinterpret_cast<uint8_t*>(hotPacked.data_ptr());
+    params.indices = reinterpret_cast<int32_t*>(indices.data_ptr());
+    params.rowStatus = reinterpret_cast<uint8_t*>(rowStatus.data_ptr());
+    params.requestTopkIndices
+        = requestTopkIndices.has_value() ? reinterpret_cast<int32_t*>(requestTopkIndices->data_ptr()) : nullptr;
+    params.topkLength = topkLength.has_value() ? reinterpret_cast<int32_t*>(topkLength->data_ptr()) : nullptr;
+    params.residentKvLens
+        = residentKvLens.has_value() ? reinterpret_cast<int64_t*>(residentKvLens->data_ptr()) : nullptr;
+    params.residentReqIdx
+        = residentReqIdx.has_value() ? reinterpret_cast<int64_t*>(residentReqIdx->data_ptr()) : nullptr;
+    params.residentRequestIds
+        = residentRequestIds.has_value() ? reinterpret_cast<int64_t*>(residentRequestIds->data_ptr()) : nullptr;
+    params.residentKvPool = residentKvPool.has_value() ? residentKvPool->data_ptr() : nullptr;
+    params.residentBlockTable
+        = residentBlockTable.has_value() ? reinterpret_cast<int32_t*>(residentBlockTable->data_ptr()) : nullptr;
+    params.residentTailBlockPos = residentTailBlockPos.has_value()
+        ? reinterpret_cast<int32_t*>(residentTailBlockPos->data_ptr())
+        : nullptr;
+    params.residentTailTokenCount = residentTailTokenCount.has_value()
+        ? reinterpret_cast<int32_t*>(residentTailTokenCount->data_ptr())
+        : nullptr;
+    params.residentTailValid
+        = residentTailValid.has_value() ? reinterpret_cast<bool*>(residentTailValid->data_ptr()) : nullptr;
+    params.attnSink = attnSink.has_value() ? reinterpret_cast<float*>(attnSink->data_ptr()) : nullptr;
+    params.lse = reinterpret_cast<float*>(lse.data_ptr());
+    params.out = out.data_ptr();
+    params.tileSchedulerMetadata = reinterpret_cast<int32_t*>(metadata.data_ptr());
+    params.numSplits = reinterpret_cast<int32_t*>(splits.data_ptr());
+    params.lseAccum = reinterpret_cast<float*>(lseAccum.data_ptr());
+    params.outAccum = reinterpret_cast<float*>(outAccum.data_ptr());
+    params.rowHeadStatus = reinterpret_cast<int32_t*>(rowHeadStatus.data_ptr());
+    params.b = checkedInt32(b, "batch");
+    params.sQ = checkedInt32(sQ, "s_q");
+    params.hQ = checkedInt32(hQ, "h_q");
+    params.dQk = checkedInt32(dQk, "d_qk");
+    params.dV = kDv;
+    params.numLayers = checkedInt32(numLayers, "num_layers");
+    params.hotCapacity = checkedInt32(hotCapacity, "hot_capacity");
+    params.topK = checkedInt32(topK, "topk");
+    params.topkLengthSize = topkLength.has_value() ? checkedInt32(topkLength->size(0), "topk_length.size(0)") : 0;
+    params.residentRows = residentKvLens.has_value() ? checkedInt32(residentKvLens->size(0), "resident_rows") : 0;
+    params.residentKvPoolTokens
+        = residentKvPool.has_value() ? checkedInt32(residentKvPool->size(0), "resident_kv_pool.size(0)") : 0;
+    params.residentBlockTableRows
+        = residentBlockTable.has_value() ? checkedInt32(residentBlockTable->size(0), "resident_block_table.rows") : 0;
+    params.residentBlockTableBlocks = residentBlockTable.has_value()
+        ? checkedInt32(residentBlockTable->size(1), "resident_block_table.blocks")
+        : 0;
+    params.residentKvPoolDtype = residentKvPool.has_value()
+        ? (residentKvPool->scalar_type() == at::ScalarType::Half ? kResidentKvPoolFp16 : kResidentKvPoolBf16)
+        : kResidentKvPoolBf16;
+    params.residentSinkTokens = checkedInt32(residentSinkTokens, "resident_sink_tokens");
+    params.residentSinkBlocks = checkedInt32(residentSinkBlocks, "resident_sink_blocks");
+    params.layerIdx = checkedInt32(layerIdx, "layer_idx");
+    params.tokensPerBlock = checkedInt32(tokensPerBlock, "tokens_per_block");
+    params.strideFactor = checkedInt32(strideFactor, "stride_factor");
+    params.kvarnBits = checkedInt32(kvarnBits, "kvarn_bits");
+    params.kvLoraRank = checkedInt32(kvLoraRank, "kv_lora_rank");
+    params.qkRopeHeadDim = checkedInt32(qkRopeHeadDim, "qk_rope_head_dim");
+    params.numSmParts = checkedInt32(numSmParts, "num_sm_parts");
+    params.smScale = static_cast<float>(smScale);
+    params.strideQB = q.stride(0);
+    params.strideQSQ = q.stride(1);
+    params.strideQHQ = q.stride(2);
+    params.strideHotLayer = hotPacked.stride(0);
+    params.strideHotSlot = hotPacked.stride(1);
+    params.strideHotRecord = hotPacked.size(2);
+    params.strideIndicesB = indices.stride(0);
+    params.strideIndicesSQ = indices.stride(1);
+    params.strideRequestTopkB = requestTopkIndices.has_value() ? requestTopkIndices->stride(0) : 0;
+    params.strideRequestTopkSQ = requestTopkIndices.has_value() ? requestTopkIndices->stride(1) : 0;
+    params.strideResidentKvPoolToken = residentKvPool.has_value() ? residentKvPool->stride(0) : 0;
+    params.strideResidentKvPoolHead = residentKvPool.has_value() ? residentKvPool->stride(1) : 0;
+    params.strideResidentBlockTableB = residentBlockTable.has_value() ? residentBlockTable->stride(0) : 0;
+    params.strideResidentBlockTableBlock = residentBlockTable.has_value() ? residentBlockTable->stride(1) : 0;
+    params.strideLseB = lse.stride(0);
+    params.strideLseSQ = lse.stride(1);
+    params.strideOB = out.stride(0);
+    params.strideOSQ = out.stride(1);
+    params.strideOHQ = out.stride(2);
+    params.strideLseAccumSplit = lseAccum.stride(0);
+    params.strideLseAccumSQ = lseAccum.stride(1);
+    params.strideOAccumSplit = outAccum.stride(0);
+    params.strideOAccumSQ = outAccum.stride(1);
+    params.strideOAccumHQ = outAccum.stride(2);
+
+    tk::invokeSparseMlaDecodeKvarnHotSplit(params, at::cuda::getCurrentCUDAStream(q.get_device()));
+    return {out, lse.transpose(1, 2), metadata, splits};
+}
+
 bool hisparse_sparse_mla_resident_v1_ready()
 {
     // Source implements the resident sink/tail producer-load path, but serving
@@ -373,6 +566,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? resident_tail_valid=None, int resident_sink_tokens=0, int resident_sink_blocks=0, "
         "Tensor? request_topk_indices=None) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
+    m.def(
+        "sparse_mla_decode_kvarn_hot_split(Tensor q, Tensor hot_packed, Tensor indices, Tensor row_status, "
+        "Tensor? topk_length=None, Tensor? attn_sink=None, int layer_idx=0, int tokens_per_block=64, "
+        "int stride_factor=64, int kvarn_bits=2, int kv_lora_rank=512, int qk_rope_head_dim=64, "
+        "float sm_scale=1., Tensor? resident_kv_lens=None, Tensor? resident_req_idx=None, "
+        "Tensor? resident_request_ids=None, Tensor? resident_kv_pool=None, Tensor? resident_block_table=None, "
+        "Tensor? resident_tail_block_pos=None, Tensor? resident_tail_token_count=None, "
+        "Tensor? resident_tail_valid=None, int resident_sink_tokens=0, int resident_sink_blocks=0, "
+        "Tensor? request_topk_indices=None) "
+        "-> (Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
@@ -384,4 +587,5 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("sparse_mla_decode_kvarn_hot", &tensorrt_llm::torch_ext::sparse_mla_decode_kvarn_hot);
+    m.impl("sparse_mla_decode_kvarn_hot_split", &tensorrt_llm::torch_ext::sparse_mla_decode_kvarn_hot_split);
 }
