@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -248,7 +248,12 @@ struct FusedMoePairInfo
 class FusedMoeCommunicator
 {
 public:
-    static constexpr int FIFO_DEPTH = 4;
+    // FIFO_DEPTH bounds the number of in-flight FIFO entries per channel before the sender
+    // must wait on a peer credit (tail) round-trip. The MoE a2a is latency-bound at decode
+    // (small messages, ~tens of token-sends per peer >> depth), so the credit round-trips
+    // serialize. Raised 4 -> 8 to keep more transfers in flight and hide that latency; the
+    // workspace (FIFO_TOTAL_BYTES * epSize * channelCount) auto-scales, +~148MB/rank @ ep4.
+    static constexpr int FIFO_DEPTH = 8;
     static constexpr int FIFO_ENTRY_BYTES = 256 * 1024;
     static constexpr int FIFO_ENTRY_128_BYTE_COUNT = FIFO_ENTRY_BYTES / 128;
     static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
