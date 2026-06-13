@@ -451,3 +451,23 @@ In-depth breakdown of the whole decode step (analyzer `.bench_runs_claude/analyz
 **c1-latency levers (host; overlapped at c16, so NOT throughput levers):** `cudaEventSynchronize` 5.13 ms/iter (2×, step-boundary pacing), `cudaGraphLaunch` 2.95 ms/iter (needs whole-layer node reduction — see §9 #2), aten glue `copy_`/`to`/`index` ≈ 2.7 ms/iter.
 
 **Recommended order of attack:** (1) **ncu-confirm the dense GEMM swarm** — it's 27% of the step and the floor analysis says ~5–6× headroom *if* it's launch/occupancy-bound at M=16 (better small-M tactic, grouped/fused projections, or cuda_core for the tiny-M ones). This is the single biggest potential win and the decisive next measurement. (2) the **a2a** (2.08 ms, known lever). (3) the **elementwise/quant glue** (1.8 + 1.1 ms — fusable). The GEMM-efficiency question gates everything: if ncu shows the GEMMs are near memory-SOL, the swarm is irreducible and the a2a becomes #1; if they're launch/occupancy-bound, the GEMM swarm is the headline win. Method caveat: kineto gives time, not SOL% — confirm via a standalone FP4-GEMM microbench under ncu (clean, non-disruptive in the buildtools container) before committing to lever #1.
+
+### §10.1 — Lever #1 measured: the dense GEMM swarm is FIXED-OVERHEAD-bound (2026-06-13)
+
+Ran Spencer's `blaise_perf/decode_nvfp4_gemm/nvfp4_gemm_backend_microbench.py` (CUDA-graph timing) + a memory roofline (`.bench_runs_claude/gemm_roofline.py`). **The microbench latencies match the trace nvjet kernels exactly** (o_proj 22.89 µs ≈ trace `nvjet_64x8` 22.9 µs), so it faithfully reproduces production — and ncu (perf counters) wasn't even needed.
+
+M=16 in-pool best-backend roofline: kv_a_proj **2% SOL** (15.5 µs/2.3 MB), q_a_proj **5%** (15.4 µs), shared_down **8%**, kv_b **10%**, shared_gate_up **13%**, q_b **19%**, o_proj 36% (22.9 µs/66 MB), dense_gate_up 49% (38 µs/149 MB).
+
+**Verdict — biggest lever by size, but recovery is KERNEL work, not config:**
+- A **~13–16 µs fixed floor per GEMM, FLAT across M=1→16 and roughly independent of weight size** (kv_a 2.3 MB and shared_down 8.3 MB both ~13–15 µs; q_a_proj is ~15 µs at *every* M). The small projections run at **2–19 % HBM-SOL** ⇒ **GPU fixed-overhead/launch-bound**, not memory- or compute-bound. ~315 dense GEMMs/iter × this floor ≈ the 6.5 ms swarm, mostly overhead.
+- **In-pool selection is already optimal** (`win%_vs_default = 0` for every shape; cublaslt wins 33/40 rows, cutlass 5, cuda_core 2). **No free `allowed_backends` win.**
+- **`cuda_core` is *worse*, not the lightweight path** — it scales terribly with N (q_b@8 144 µs, o_proj@8 211 µs, dense_gate_up@8 571 µs); only marginally wins kv_a at M=1–2. Its M≤8 cap (`MAX_M_DIMENSION=8`) is moot — raising it would not help.
+- **q_a + kv_a already fused** (`modeling_deepseekv3.py:530`), so the obvious horizontal-fusion win is taken.
+
+**Net:** among the shipped backends (cutlass/cublaslt/cuda_core) the ~15 µs floor is the practical best — even NVIDIA's own cublaslt can't beat it for these small FP4 W4A4+block-scale shapes.
+
+**`cutedsl` verdict (measured, M=16):** marginally faster on 3/4 shapes but **does NOT break the floor** — kv_a 14.85→14.45 (2.7%), q_b 14.64→14.14 (3.4%), o_proj 22.52→20.27 (**10%**), q_a 14.72→14.97 (cublaslt still wins). cutedsl hits the **same ~14 µs floor** on the small projections; its only real gain is ~10% on the large o_proj. Adding cutedsl to `allowed_backends` would save ≈ 0.3 ms/iter (~5% of the swarm) — real but marginal, and it carries the integration cost that got it excluded from the default pool.
+
+**Final verdict on lever #1:** the ~14 µs per-GEMM fixed cost is hit by **every** shipped backend (cutlass/cublaslt/cuda_core/cutedsl), so it's the practical floor for launching+executing an individual block-scaled FP4 GEMM at small M-N on B200. A fixed *per-launch* cost can only be amortized by **fewer, larger GEMMs** — and the easy horizontal fusion (q_a+kv_a) is already done. So recovering the swarm needs **megakernel-style fusion of the per-layer dense projections** (the same structural direction as WarpDecode for MoE), a major kernel project — **not a near-term win.** The biggest lever by size is the hardest to move.
+
+**Revised recommendation (post-measurement):** the near-term tractable wins are (1) the **a2a** (2.08 ms — algorithm/overlap, Spencer-flagged), and (2) the **fusable glue+quant+memset** (elementwise 1.8 ms + quant 1.1 ms + memset 0.6 ms ≈ 3.5 ms combined, medium difficulty). The dense GEMM swarm (6.5 ms, biggest) is parked as a **megakernel project** (long-term). Optional quick ship: add `cutedsl` to `allowed_backends` for the ~0.3 ms o_proj-class win if its stability is acceptable.
