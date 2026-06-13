@@ -58,6 +58,7 @@ class HiSparseSparseMlaKvarnHotDescriptor:
     hot_packed: "torch.Tensor"
     hot_indices: "torch.Tensor"
     row_status: "torch.Tensor"
+    request_topk_indices: Optional["torch.Tensor"]
     topk_length: Optional["torch.Tensor"]
     layer_idx: int
     index_topk: int
@@ -1008,6 +1009,7 @@ class OPTRTHiSparseCoordinator:
         max_blocks_per_row: int,
         stride_factor: int,
         resident_tokens: Optional[HiSparseResidentTokenDescriptor] = None,
+        request_topk_indices=None,
     ) -> HiSparseSparseMlaKvarnHotDescriptor:
         """Build the typed sparse-MLA KVarN-hot ABI from native outputs.
 
@@ -1015,6 +1017,9 @@ class OPTRTHiSparseCoordinator:
         ``topk_length`` tensor is intentionally not allocated here: fixed-top-k
         rows use the full ``index_topk`` contract, and row validity is carried
         by ``row_status`` from the native resolve/plan/copy/commit/build chain.
+        ``request_topk_indices`` preserves the original request-relative token
+        positions so resident sink/tail hits can map through the normal KV
+        block table instead of relying on hot-slot indices alone.
         ``resident_tokens`` describes sink/tail hits that must be served from
         the normal decode KV path, separately from committed packed hot blocks.
         """
@@ -1043,6 +1048,7 @@ class OPTRTHiSparseCoordinator:
             hot_packed=tensors.hot_packed,
             hot_indices=hot_indices,
             row_status=row_status,
+            request_topk_indices=request_topk_indices,
             topk_length=None,
             layer_idx=int(layer_idx),
             index_topk=int(index_topk),
@@ -2016,6 +2022,7 @@ class OPTRTHiSparseCoordinator:
         sparse_mla_descriptor = self._make_sparse_mla_kvarn_hot_descriptor(
             hot_indices=hot_indices,
             row_status=build_status,
+            request_topk_indices=topk_indices,
             layer_idx=layer_idx,
             index_topk=index_topk,
             max_blocks_per_row=max_blocks_per_row,

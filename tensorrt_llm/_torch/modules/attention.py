@@ -2707,8 +2707,17 @@ class MLA(nn.Module):
             if int(descriptor.hot_indices.shape[1]) != int(
                     topk_indices.shape[1]):
                 return False
+            if descriptor.request_topk_indices is None:
+                return False
+            if int(descriptor.request_topk_indices.shape[0]) != int(
+                    num_tokens):
+                return False
+            if int(descriptor.request_topk_indices.shape[1]) != int(
+                    topk_indices.shape[1]):
+                return False
             expected_device = topk_indices.device
             if not (descriptor.hot_indices.device == expected_device
+                    and descriptor.request_topk_indices.device == expected_device
                     and descriptor.row_status.device == expected_device
                     and descriptor.hot_packed.device == fused_q.device):
                 return False
@@ -2783,6 +2792,8 @@ class MLA(nn.Module):
         q_concat = q_concat.view([num_seqs, s_q, padding, head_dim])
         indices = descriptor.hot_indices.reshape(num_seqs, s_q,
                                                  -1).contiguous()
+        request_topk_indices = descriptor.request_topk_indices.reshape(
+            num_seqs, s_q, -1).contiguous()
         resident = descriptor.resident_tokens
 
         out = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
@@ -2809,6 +2820,7 @@ class MLA(nn.Module):
             resident.tail_valid,
             resident.sink_tokens,
             resident.sink_blocks,
+            request_topk_indices,
         )[0]
         out = out.view([num_tokens, padding, self.kv_lora_rank])
         out = out[:, :self.num_heads_tp_cp, :]

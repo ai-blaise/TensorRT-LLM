@@ -295,6 +295,7 @@ def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
         hot_packed=object(),
         hot_indices=object(),
         row_status=object(),
+        request_topk_indices=object(),
         topk_length=None,
         layer_idx=3,
         index_topk=1024,
@@ -310,6 +311,7 @@ def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
     assert desc.qk_rope_head_dim == 64
     assert desc.resident_token_policy == "explicit_sink_tail_v1"
     assert desc.resident_tokens is None
+    assert desc.request_topk_indices is not None
     assert desc.topk_length is None
     assert desc.step_id == -1
 
@@ -728,6 +730,9 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "checkHotPackedStrides" in thop_source
     assert "checkResidentTokenAbi" in thop_source
     assert "explicit_sink_tail_v1 requires resident_kv_lens" in thop_source
+    assert "and request_topk_indices" in thop_source
+    assert "request_topk_indices must be int32" in thop_source
+    assert "same [batch, s_q, topk] shape as hot indices" in thop_source
     assert "resident_kv_pool must be bf16 or fp16 normal decode KV" in thop_source
     assert "resident_kv_pool must have shape [global_tokens, 1, 576]" in thop_source
     assert "resident_tail_valid must be bool" in thop_source
@@ -735,11 +740,13 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "resident_block_table must have shape [seqs, blocks]" in thop_source
     assert "resident_kv_lens=None" in thop_source
     assert "resident_kv_pool=None" in thop_source
+    assert "request_topk_indices=None" in thop_source
     assert "prevent overlapping hot records" in thop_source
     assert "prevent overlapping layers" in thop_source
     assert "stride_factor must cover all layer token ranges" in thop_source
     assert "residentKvLens" in header.read_text()
     assert "residentKvPool" in header.read_text()
+    assert "requestTopkIndices" in header.read_text()
     assert "residentTailTokenCount" in header.read_text()
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
@@ -748,6 +755,7 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "resident_kv_lens=None" in fake_source
     assert "resident_kv_pool=None" in fake_source
     assert "resident_tail_valid=None" in fake_source
+    assert "request_topk_indices=None" in fake_source
 
 
 def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
@@ -815,6 +823,8 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "int(descriptor.layer_idx) != expected_layer_idx" in source
     assert "descriptor.row_status.shape[0]" in source
     assert "descriptor.hot_indices.shape[1]" in source
+    assert "descriptor.request_topk_indices is None" in source
+    assert "descriptor.request_topk_indices.shape[1]" in source
     assert "resident = getattr(descriptor, \"resident_tokens\", None)" in source
     assert "explicit_sink_tail_v1" in source
     assert "resident.row_kv_lens.shape[0]" in source
@@ -827,6 +837,7 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "resident.tail_block_pos" in source
     assert "resident.tail_valid" in source
     assert "resident.sink_blocks" in source
+    assert "request_topk_indices = descriptor.request_topk_indices.reshape" in source
     assert "assert_resident_token_policy_ready" in hisparse.read_text()
     assert "HiSparseResidentTokenDescriptor" in hisparse.read_text()
     assert "torch.ops.trtllm.sparse_mla_decode_kvarn_hot" in source
