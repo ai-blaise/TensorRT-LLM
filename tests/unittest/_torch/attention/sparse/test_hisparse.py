@@ -783,6 +783,11 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "readHisparseKvarnK2v2BdrLatentValue" in kernel_source
     assert "decodeResidentTokenAddress" in kernel_source
     assert "readResidentLatentValue" in kernel_source
+    assert "readRequestTopkToken" in kernel_source
+    assert "bool activeToken = false" in kernel_source
+    assert "requestToken >= 0" in kernel_source
+    assert "scores[k] = (rowCode == kHotReadOk && k < rowTopK && activeToken)" in kernel_source
+    assert "if (scores[k] == kNegInf)" in kernel_source
     assert "requestTopkIndices" in kernel_source
     assert "params.residentRequestIds == nullptr" in kernel_source
     assert "params.residentRequestIds[row] < 0" in kernel_source

@@ -67,12 +67,25 @@ struct HiSparseResidentTokenAddress
     int64_t globalToken;
 };
 
+__device__ __forceinline__ uint8_t readRequestTopkToken(
+    SparseMlaDecodeKvarnHotParams const& params, int32_t batch, int32_t s, int32_t k, int32_t& token)
+{
+    if (params.requestTopkIndices == nullptr)
+    {
+        return kHotReadInvalidIndex;
+    }
+    int64_t const requestIndexBase = static_cast<int64_t>(batch) * params.strideRequestTopkB
+        + static_cast<int64_t>(s) * params.strideRequestTopkSQ;
+    token = params.requestTopkIndices[requestIndexBase + k];
+    return kHotReadOk;
+}
+
 __device__ __forceinline__ HiSparseResidentTokenAddress decodeResidentTokenAddress(
-    SparseMlaDecodeKvarnHotParams const& params, int32_t row, int32_t batch, int32_t s, int32_t k)
+    SparseMlaDecodeKvarnHotParams const& params, int32_t row, int32_t requestToken)
 {
     HiSparseResidentTokenAddress address{kHotReadOk, -1};
-    if (params.requestTopkIndices == nullptr || params.residentKvLens == nullptr || params.residentReqIdx == nullptr
-        || params.residentRequestIds == nullptr || params.residentKvPool == nullptr || params.residentBlockTable == nullptr
+    if (params.residentKvLens == nullptr || params.residentReqIdx == nullptr || params.residentRequestIds == nullptr
+        || params.residentKvPool == nullptr || params.residentBlockTable == nullptr
         || params.residentTailBlockPos == nullptr || params.residentTailTokenCount == nullptr
         || params.residentTailValid == nullptr)
     {
@@ -90,18 +103,15 @@ __device__ __forceinline__ HiSparseResidentTokenAddress decodeResidentTokenAddre
         return address;
     }
 
-    int64_t const requestIndexBase = static_cast<int64_t>(batch) * params.strideRequestTopkB
-        + static_cast<int64_t>(s) * params.strideRequestTopkSQ;
-    int32_t const token = params.requestTopkIndices[requestIndexBase + k];
     int64_t const kvLen = params.residentKvLens[row];
-    if (token < 0 || static_cast<int64_t>(token) >= kvLen)
+    if (requestToken < 0 || static_cast<int64_t>(requestToken) >= kvLen)
     {
         address.status = kHotReadInvalidIndex;
         return address;
     }
 
-    int32_t const blockPos = token / params.tokensPerBlock;
-    int32_t const tokenOffset = token % params.tokensPerBlock;
+    int32_t const blockPos = requestToken / params.tokensPerBlock;
+    int32_t const tokenOffset = requestToken % params.tokensPerBlock;
     bool const isSink = blockPos < params.residentSinkBlocks;
     bool const isTail = params.residentTailValid[row] && blockPos == params.residentTailBlockPos[row]
         && tokenOffset < params.residentTailTokenCount[row];
@@ -197,29 +207,41 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
     for (int32_t k = 0; k < params.topK; ++k)
     {
         float scorePart = 0.0F;
+        bool activeToken = false;
         if (rowCode == kHotReadOk && k < rowTopK)
         {
             int32_t const hotIndex = params.indices[indexBase + k];
             if (hotIndex < 0)
             {
-                HiSparseResidentTokenAddress const residentAddress
-                    = decodeResidentTokenAddress(params, row, batch, s, k);
-                if (residentAddress.status != kHotReadOk)
+                int32_t requestToken = -1;
+                uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
+                if (tokenStatus != kHotReadOk)
                 {
-                    atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+                    atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(tokenStatus));
                 }
-                else
+                else if (requestToken >= 0)
                 {
-                    for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                    activeToken = true;
+                    HiSparseResidentTokenAddress const residentAddress
+                        = decodeResidentTokenAddress(params, row, requestToken);
+                    if (residentAddress.status != kHotReadOk)
                     {
-                        float const qVal = bf16ToFloat(params.q, qBase + dim);
-                        float const kVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
-                        scorePart += qVal * kVal;
+                        atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+                    }
+                    else
+                    {
+                        for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                        {
+                            float const qVal = bf16ToFloat(params.q, qBase + dim);
+                            float const kVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
+                            scorePart += qVal * kVal;
+                        }
                     }
                 }
             }
             else
             {
+                activeToken = true;
                 HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
                     hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
                 if (address.status != kHotReadOk)
@@ -244,7 +266,7 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
         float const score = blockReduceSum(scorePart, reduce) * params.smScale;
         if (threadIdx.x == 0)
         {
-            scores[k] = (rowCode == kHotReadOk && k < rowTopK) ? score : kNegInf;
+            scores[k] = (rowCode == kHotReadOk && k < rowTopK && activeToken) ? score : kNegInf;
         }
         __syncthreads();
     }
@@ -261,6 +283,10 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
             float denom = params.attnSink == nullptr ? 0.0F : expf(params.attnSink[head] - maxVal);
             for (int32_t k = 0; k < rowTopK; ++k)
             {
+                if (scores[k] == kNegInf)
+                {
+                    continue;
+                }
                 float const weight = expf(scores[k] - maxVal);
                 scores[k] = weight;
                 denom += weight;
@@ -304,10 +330,20 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
         int32_t const hotIndex = params.indices[indexBase + k];
         if (hotIndex < 0)
         {
-            HiSparseResidentTokenAddress const residentAddress = decodeResidentTokenAddress(params, row, batch, s, k);
-            if (residentAddress.status != kHotReadOk)
+            int32_t requestToken = -1;
+            uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
+            if (tokenStatus != kHotReadOk)
             {
-                atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+                atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(tokenStatus));
+            }
+            else if (requestToken >= 0)
+            {
+                HiSparseResidentTokenAddress const residentAddress
+                    = decodeResidentTokenAddress(params, row, requestToken);
+                if (residentAddress.status != kHotReadOk)
+                {
+                    atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+                }
             }
         }
         else
@@ -341,13 +377,25 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
         float acc = 0.0F;
         for (int32_t k = 0; k < rowTopK; ++k)
         {
+            if (scores[k] == kNegInf)
+            {
+                continue;
+            }
             int32_t const hotIndex = params.indices[indexBase + k];
             float vVal = 0.0F;
             if (hotIndex < 0)
             {
-                HiSparseResidentTokenAddress const residentAddress
-                    = decodeResidentTokenAddress(params, row, batch, s, k);
-                vVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
+                int32_t requestToken = -1;
+                uint8_t const tokenStatus = readRequestTopkToken(params, batch, s, k, requestToken);
+                if (tokenStatus == kHotReadOk && requestToken >= 0)
+                {
+                    HiSparseResidentTokenAddress const residentAddress
+                        = decodeResidentTokenAddress(params, row, requestToken);
+                    if (residentAddress.status == kHotReadOk)
+                    {
+                        vVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
+                    }
+                }
             }
             else
             {

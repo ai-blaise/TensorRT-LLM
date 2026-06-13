@@ -1258,7 +1258,12 @@ Current branch status:
   producer load can use the token. The resident reader also rejects missing or
   negative per-row request ids before resolving through the normal KV block
   table, keeping request-pinning metadata in the ABI rather than treating the
-  block-table row index as sufficient identity;
+  block-table row index as sufficient identity. The fused kernel now
+  distinguishes the resident-read sentinel from padded TopK entries by looking
+  at the original request-relative TopK token: `hot_index < 0` plus
+  `request_topk_index < 0` is padding and contributes no score/value, while
+  `hot_index < 0` plus a nonnegative request token must pass the explicit
+  sink/tail resident checks;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1552,7 +1557,8 @@ production ABI:
        copies through an FP16 hot tier;
      - original request-relative TopK token positions so CUDA can distinguish
        committed-hot reads from sink/tail resident reads after hot-index
-       remapping;
+       remapping, and so padded TopK entries remain padding rather than being
+       mistaken for resident normal-KV reads;
      - resident block flags from
        `trtllm::hisparse_classify_resident_blocks` are consumed by native
        resolve/plan/commit/build: sink/tail blocks bypass host-slot resolution
