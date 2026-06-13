@@ -112,8 +112,8 @@ same ABI shape as the final serving path. The following are hard invariants:
 
 - Dense MLA cold and hot storage is packed KVarN `kvarn_k2v2`, not FP16 and not
   an FP16 staging tier.
-- The Indexer/HISA path stays device-resident FP4/HISA; Indexer K is not moved
-  into KVarN or host HiSparse storage.
+- The Indexer/HISA path stays device-resident FP4/HISA.
+- Indexer K is not moved into KVarN or host HiSparse storage.
 - HiSparse uses request-relative top-k token positions from the existing
   Indexer/HISA path and maps them into selected packed KVarN hot blocks before
   sparse MLA.
@@ -127,15 +127,23 @@ same ABI shape as the final serving path. The following are hard invariants:
 - SGLang's naive top-k loader/debug oracle is not a model for OP-TRT serving.
   Any offline references used by tests must stay outside the coordinator,
   transceiver, kernel ABI, and deployment config.
-- There is no HELIX, completed-prefill staging fallback, full-HBM fallback,
-  direct-to-host-off fallback, FP16 block-hot oracle, or runtime downgrade when
-  `hisparse_enabled=true`.
+- There is no HELIX, completed-prefill staging fallback, full-HBM fallback, or
+  direct-to-host-off fallback when `hisparse_enabled=true`.
+- There is no FP16 block-hot oracle in enabled serving.
+- There is no runtime downgrade when `hisparse_enabled=true`.
 - LayerSplit owner-local prefill, TP4/EP4 decode, SMC-SD row expansion,
   Moondream pinning, request pinning, cancellation, and request recycle must
   compose with HiSparse before the startup guard is relaxed.
 - MORI-IO remains an A/B candidate only; the gate path is NIXL write-mode/direct
   host writes.
 - Promotion requires live VM proof and A/B data, not just unit tests.
+- The miss-copy boundary must be explicit. CUDA kernels must not pretend that
+  CPU pinned host KVarN storage is ordinary device memory. The production path
+  dedupes and plans misses on device, then hands a compact miss schedule to a
+  native stream-ordered copy bridge that schedules host-to-device copy-engine
+  transfers and only then commits hot metadata. Python-side token extraction,
+  Python request-table extraction, synchronous schedule reads, and hidden
+  mapped-host-memory kernel reads are not valid serving paths.
 
 ## Relevant SGLang Facts
 
@@ -368,7 +376,11 @@ Algorithm:
    - scan LRU slots for hits;
    - assign misses to evictable slots;
    - update LRU order;
-   - copy host KVarN packed block to hot KVarN block slot;
+   - emit a compact miss schedule for packed host KVarN block to hot KVarN
+     block copies;
+   - submit that schedule to a native stream-ordered copy bridge that uses
+     host-to-device copy-engine transfers from pinned DRAM to hot HBM;
+   - commit hot metadata only after copy submission succeeds;
    - update `hot_global_indices` so sparse MLA reads from hot physical block ids
      plus original token offset.
 6. Latest token:
@@ -377,7 +389,9 @@ Algorithm:
    - do not evict it until committed/backed up.
 7. CUDA graph:
    - no allocations;
-   - no host reads;
+   - no Python token/request-table reads;
+   - no synchronous host schedule readback;
+   - no CUDA-kernel dereference of CPU pinned KVarN storage;
    - `num_real_rows` guards padded graph rows;
    - fixed buckets for hot block count and top-k.
 
@@ -711,6 +725,12 @@ Current branch status:
 - added `trtllm::hisparse_swap_in_packed_kvarn`, a strict native thop that
   copies only packed `uint8` KVarN records from pinned host memory into the hot
   CUDA tier, coalescing consecutive slot runs when both tiers are compact;
+- final-sweep caveat: the current packed-copy thop accepts CPU slot vectors and
+  is therefore only a partial building block behind fail-closed guards. The
+  serving path still requires a native device-plan-to-copy bridge that consumes
+  `hisparse_plan_hot_slots` miss tensors without Python materialization or a
+  synchronous host readback, schedules stream-ordered host-to-device copies, and
+  feeds `hisparse_commit_hot_slots` only after copy submission succeeds;
 - added coordinator `execute_swap_in_plan()` so native copy acceptance and hot
   metadata publication are sequenced through one production-shaped path;
 - added request-relative token-position planning that dedupes top-k tokens into
@@ -769,6 +789,8 @@ Still pending before serving enablement:
   `trtllm::hisparse_commit_hot_slots` post-copy metadata commit op;
 - VM compile and live validation of the native
   `trtllm::hisparse_build_hot_indices` hot global-index builder;
+- implementation and VM proof of the native device-plan-to-copy bridge between
+  `hisparse_plan_hot_slots` and packed KVarN host-to-hot copy submission;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;
@@ -817,9 +839,9 @@ Still pending before serving enablement:
   resolution, hot-slot planning, packed copy, and hot global-index construction
   without Python-side token or table extraction;
 - full native orchestration that passes planner miss schedules into packed-copy
-  scheduling, calls post-copy hot metadata commit, rejects stale generations,
-  validates row status across every native stage, and returns the hot-index
-  output to sparse MLA;
+  scheduling without synchronous host readback, calls post-copy hot metadata
+  commit, rejects stale generations, validates row status across every native
+  stage, and returns the hot-index output to sparse MLA;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;
@@ -995,14 +1017,18 @@ Promotion requires:
 The next implementation work should continue from the current fail-closed
 production ABI:
 
-1. Build the SM100 packed KVarN host-to-hot op and ABI:
+1. Finish the SM100 packed KVarN planner/copy ABI:
    - input request-relative top-k tokens, request rows, committed host slots,
      per-layer hot metadata, and graph row count;
    - dedupe tokens to paged block positions;
    - resolve request ids through the device-mirrored request table and reject
      missing, unadmitted, or stale commit-generation rows;
    - hit/miss/LRU over block slots;
-   - copy only packed KVarN records from host DRAM to hot HBM;
+   - emit compact device miss schedules;
+   - bridge those schedules into stream-ordered host-to-device copy-engine
+     submissions without Python materialization or synchronous schedule readback;
+   - copy only packed KVarN records from pinned host DRAM to hot HBM;
+   - commit hot metadata after copy submission succeeds;
    - output hot global indices and selected hot block ids for sparse MLA.
 2. Wire the sparse MLA hot-pool read path:
    - consume hot packed KVarN records directly;
