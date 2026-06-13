@@ -245,6 +245,8 @@ def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
 
     monkeypatch.setattr(coordinator, "_torch_cuda_op_registered",
                         lambda name: name in planner_ops)
+    monkeypatch.setattr(coordinator, "_torch_bool_op_ready",
+                        lambda name: False)
     with pytest.raises(NotImplementedError,
                        match="KVarN-hot BDR reader primitive"):
         coordinator.assert_startup_ready()
@@ -264,8 +266,12 @@ def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
                        match="sink/tail resident-token ABI"):
         coordinator.assert_startup_ready()
 
+    monkeypatch.setattr(coordinator, "_torch_bool_op_ready",
+                        lambda name: name == "hisparse_sparse_mla_resident_v1_ready")
+    coordinator.assert_startup_ready()
 
-def test_hisparse_resident_token_abi_is_hard_startup_gate(monkeypatch):
+
+def test_hisparse_resident_token_readiness_is_hard_startup_gate(monkeypatch):
     coordinator = OPTRTHiSparseCoordinator(_cfg(enabled=True))
     coordinator.configure_packed_tiers(num_layers=1,
                                        tokens_per_block=64,
@@ -291,10 +297,16 @@ def test_hisparse_resident_token_abi_is_hard_startup_gate(monkeypatch):
                             "trtllm::hisparse_read_kvarn_hot_bdr",
                             "trtllm::sparse_mla_decode_kvarn_hot",
                         })
+    monkeypatch.setattr(coordinator, "_torch_bool_op_ready",
+                        lambda name: False)
 
     with pytest.raises(NotImplementedError,
                        match="explicit sink/tail resident-token ABI"):
         coordinator.assert_startup_ready()
+
+    monkeypatch.setattr(coordinator, "_torch_bool_op_ready",
+                        lambda name: name == "hisparse_sparse_mla_resident_v1_ready")
+    coordinator.assert_startup_ready()
 
 
 def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
@@ -764,6 +776,8 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "hot_packed record bytes are smaller than production BDR layout" in thop_source
     assert "checkHotPackedStrides" in thop_source
     assert "checkResidentTokenAbi" in thop_source
+    assert "hisparse_sparse_mla_resident_v1_ready" in thop_source
+    assert "return false" in thop_source
     assert "explicit_sink_tail_v1 requires resident_kv_lens" in thop_source
     assert "and request_topk_indices" in thop_source
     assert "request_topk_indices must be int32" in thop_source

@@ -346,12 +346,20 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     return {out, lse.transpose(1, 2), metadata, splits};
 }
 
+bool hisparse_sparse_mla_resident_v1_ready()
+{
+    // Source implements the resident sink/tail producer-load path, but serving
+    // promotion still requires live DSA/NIXL/B200 proof before this flips.
+    return false;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("hisparse_sparse_mla_resident_v1_ready() -> bool");
     m.def(
         "sparse_mla_decode_kvarn_hot(Tensor q, Tensor hot_packed, Tensor indices, Tensor row_status, "
         "Tensor? topk_length=None, Tensor? attn_sink=None, int layer_idx=0, int tokens_per_block=64, "
@@ -362,6 +370,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? resident_tail_valid=None, int resident_sink_tokens=0, int resident_sink_blocks=0, "
         "Tensor? request_topk_indices=None) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("hisparse_sparse_mla_resident_v1_ready",
+        &tensorrt_llm::torch_ext::hisparse_sparse_mla_resident_v1_ready);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

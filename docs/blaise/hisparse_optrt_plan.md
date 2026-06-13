@@ -68,10 +68,12 @@ attention dispatch, or kernel ABI used by a serving request.
 The startup/mapping guard is intentionally granular: enabled HiSparse first
 requires the native planner/copy ops, then the production BDR hot-reader
 primitive, then a fused `sparse_mla_decode_kvarn_hot` sparse MLA dispatch, then
-the explicit sink/tail resident-token ABI. Even if the fused op symbol appears,
-this branch still fails closed until DSA attention is explicitly rewired to call
-that path and the coordinator output, row status, and sink/tail descriptors are
-live-proven together.
+the explicit sink/tail resident-token readiness probe. The direct fused kernel
+now consumes resident normal-KV sink/tail tokens through the production
+descriptor ABI, but the readiness probe intentionally returns false until that
+path is rebuilt in the deployment image and live-proven with DSA row metadata,
+NIXL admission, cleanup, and stale-row rejection. This avoids the earlier
+stale guard wording without promoting an unproven runtime path.
 
 Serving acceptance is binary: if `hisparse_enabled=true` can answer a request
 before dense-MLA KVarN BDR source writes, typed NIXL direct-to-host, native
@@ -83,9 +85,10 @@ that is unreachable from the coordinator, transceiver, kernel ABI, deployment
 config, and runtime fallback policy.
 
 Current branch posture after the June 13 final thoroughness/correctness sweep:
-the branch has a production-shaped, fail-closed partial implementation, not a
-deployable HiSparse serving candidate. The config validation, packed KVarN tier
-allocation, host metadata publication, NIXL DRAM registration, request
+the branch has a production-architecture HiSparse path with fail-closed
+promotion gates, not a deployable HiSparse serving candidate. The config
+validation, packed KVarN tier allocation, host metadata publication, NIXL DRAM
+registration, request
 host-slot sideband, packed KVarN source/destination fragment derivation, typed
 `HISPARSE_HOST` write submission, decode admission state, and two-stage
 hot-block planning ABI are implemented. A device-visible request table now
@@ -156,15 +159,20 @@ The branch now has the first native `trtllm::sparse_mla_decode_kvarn_hot`
 operator. It is not a wrapper over `sparse_mla_decode_nvfp4`: the CUDA kernel
 reads packed `kvarn_k2v2` BDR hot records through `hisparseKvarnBdrRead.cuh`,
 computes scores against the 576-wide dense-MLA key, applies softmax, and emits
-the 512-wide latent value output. This is a real KVarN-hot producer-load path,
-and the HiSparse absorption-generation branch now calls it through the typed
-descriptor before any NVFP4 or full-HBM path can run. It is not yet promoted:
-it uses a direct per-row/head kernel while the optimized FlashMLA-style split
-scheduler, CUDA smoke execution, E2E DSA/SMC/Moondream validation, and live
-B200 profiling are still pending. The June 13 final sweep tightened the fused
-operator ABI guard so `hot_packed` records must be at least the production
-`kvarn_k2v2` BDR byte size before launch; a too-short hot record now fails in
-the C++ wrapper instead of allowing a CUDA out-of-record read.
+the 512-wide latent value output. It also consumes the `explicit_sink_tail_v1`
+resident-read sentinel: committed blocks read packed-hot BDR records, while
+sink/tail hits resolve the original request-relative TopK token through the
+live normal decode block table and read bf16/fp16 latent K/V from the resident
+normal-KV pool. This is a real KVarN-hot producer-load path, and the HiSparse
+absorption-generation branch now calls it through the typed descriptor before
+any NVFP4 or full-HBM path can run. It is not yet promoted: the new
+`torch.ops.trtllm.hisparse_sparse_mla_resident_v1_ready()` readiness surface
+currently returns false until live runtime proof and profiling are complete,
+and the kernel still uses a direct per-row/head schedule before the optimized
+FlashMLA-style split scheduler is imported. The June 13 final sweep tightened
+the fused operator ABI guard so `hot_packed` records must be at least the
+production `kvarn_k2v2` BDR byte size before launch; a too-short hot record now
+fails in the C++ wrapper instead of allowing a CUDA out-of-record read.
 The dispatch keys generation sparse-MLA shape on `num_generations`, not total
 mixed-batch sequence count, and the coordinator slices generation request IDs
 before resolving hot host slots. That keeps mixed prefill+decode batches from
@@ -209,10 +217,12 @@ enabled, so an accidentally relaxed planner guard cannot route KVarN-hot
 indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
 path.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
-before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
-row-status consumption, explicit sink/tail resident-token descriptors,
-B200 compile/proof of the native BDR writer, writer stream ordering against
-NIXL source reads, and live NIXL/cancel E2E proofs are not complete.
+before serving because the resident-v1 sparse MLA readiness probe remains
+false until live DSA/NIXL/B200 proof is complete. The sparse MLA hot-pool read,
+BDR/on-read dequant, and resident sink/tail producer-load paths are now present
+in the production-layout direct kernel, but promotion still requires runtime
+row-status proof, CUDA smoke execution, native BDR writer proof, writer stream
+ordering against NIXL source reads, live NIXL/cancel E2E proof, and profiling.
 This is the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
 
@@ -1189,11 +1199,15 @@ Current branch status:
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates, then still
-  requires the explicit sink/tail resident-token ABI before enabled serving;
+  requires the explicit sink/tail resident-token readiness probe before enabled
+  serving;
 - startup and mapping now hard-fail after all native sparse-MLA ops are present
-  until the fused producer-load path consumes and live-proves the
-  `explicit_sink_tail_v1` resident-token ABI. This prevents uncommitted-block
-  row status from becoming zero-output serving behavior;
+  while `torch.ops.trtllm.hisparse_sparse_mla_resident_v1_ready()` returns
+  false. The fused producer-load path now consumes the `explicit_sink_tail_v1`
+  resident-token ABI in source, but the readiness surface remains false until
+  live DSA/NIXL/B200 proof shows resident sink/tail hits, row status, stale
+  descriptor rejection, and cleanup compose correctly. This prevents
+  uncommitted-block row status from becoming zero-output serving behavior;
 - the sparse MLA KVarN-hot descriptor now records the coordinator `step_id`
   and carries production-shaped sink/tail resident metadata:
   row kv-lens, row request ids, row request indices, the cached normal-KV
@@ -1209,9 +1223,9 @@ Current branch status:
   ids, normal-KV pool view, normal-KV block table, original request-relative
   TopK token positions, tail block positions, tail token counts, tail validity,
   and sink token/block counts. The production attention call passes these
-  fields from the descriptor into the op. The kernel still fails closed at the
-  readiness guard until the CUDA producer-load path actually selects resident
-  normal-KV reads for sink/tail hits;
+  fields from the descriptor into the op. The CUDA kernel now uses the
+  resident-read sentinel to select resident normal-KV reads for sink/tail hits;
+  the separate readiness op remains false until live runtime proof is complete;
 - the native planner ABI now has `trtllm::hisparse_classify_resident_blocks`,
   a CUDA classifier that consumes selected request-relative block positions,
   row kv-lens, tail block positions, tail validity, and sink-block count, then
@@ -1250,9 +1264,10 @@ Still pending before serving enablement:
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
 - live-prove CUDA producer-load consumption of the explicit sink/tail
-  resident-token ABI under real DSA metadata and then relax the final startup
-  guard; until that proof lands, enabled serving remains fail-closed even
-  though the production-shaped kernel path exists;
+  resident-token ABI under real DSA metadata and then flip
+  `hisparse_sparse_mla_resident_v1_ready()`; until that proof lands, enabled
+  serving remains fail-closed even though the production-shaped kernel path
+  exists;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - runtime proof that the hot global-index output buffers and fused sparse MLA
@@ -1513,8 +1528,8 @@ production ABI:
      not on an intermediate correctness-only path;
    - propagate resolve/plan/copy/commit/build row status into attention before
      any row can read hot storage;
-   - complete fused consumption of the explicit sink/tail resident-token ABI
-     before relaxing the final readiness guard:
+   - complete live proof of fused consumption of the explicit sink/tail
+     resident-token ABI before flipping the resident-v1 readiness op:
      - descriptor policy string/version:
        `explicit_sink_tail_v1`;
      - per-row sink coverage derived from `sink_tokens / tokens_per_block`;
@@ -1537,7 +1552,7 @@ production ABI:
        committed blocks and resident normal-KV reads for sink/tail tokens
        before any row can emit output. This path is now implemented in the
        direct kernel, but promotion still requires live DSA runtime proof and
-       the final readiness guard update;
+       flipping the readiness op from false to true;
    - remove any need for full-working-set restore of committed cold blocks;
    - do not introduce an FP16 block-hot oracle, an NVFP4 sparse-MLA
      compatibility mode, or any executable serving placeholder while wiring

@@ -31,6 +31,7 @@ _HISPARSE_NATIVE_PLANNER_OPS = (
 _HISPARSE_KVARN_HOT_READER_OP = "trtllm::hisparse_read_kvarn_hot_bdr"
 _HISPARSE_FUSED_SPARSE_MLA_OP = "trtllm::sparse_mla_decode_kvarn_hot"
 _HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI = "explicit_sink_tail_v1"
+_HISPARSE_RESIDENT_TOKEN_READY_OP = "hisparse_sparse_mla_resident_v1_ready"
 
 
 @dataclass(frozen=True)
@@ -298,13 +299,18 @@ class OPTRTHiSparseCoordinator:
         rather than letting uncommitted-block row status collapse to zero
         outputs.
         """
+        if self._torch_bool_op_ready(_HISPARSE_RESIDENT_TOKEN_READY_OP):
+            return
         raise NotImplementedError(
             "HiSparse sparse MLA requires the explicit sink/tail resident-token "
             f"ABI {_HISPARSE_REQUIRED_RESIDENT_TOKEN_ABI!r} before enabled "
-            "serving. The descriptor ABI is production-shaped, but the fused "
-            "producer-load path has not yet consumed and live-proven resident "
-            "normal-KV reads for sink/tail hits; refusing to serve rather than "
-            "silently dropping them or routing through a fallback.")
+            "serving. The fused KVarN-hot kernel now has a production-shaped "
+            "resident normal-KV producer-load path for sink/tail hits, but "
+            f"torch.ops.trtllm.{_HISPARSE_RESIDENT_TOKEN_READY_OP}() did not "
+            "report production readiness. Keep serving fail-closed until that "
+            "path is rebuilt, runtime-proven with real DSA metadata, and "
+            "validated against stale row status, cleanup, and NIXL admission; "
+            "do not drop resident hits or route through a fallback.")
 
     def assert_sparse_mla_reader_ready(self) -> None:
         """Require the production KVarN-hot sparse MLA chain."""
@@ -1239,6 +1245,23 @@ class OPTRTHiSparseCoordinator:
                 torch_mod._C._dispatch_has_kernel_for_dispatch_key(
                     qualified_name, "CUDA"))
         except RuntimeError:
+            return False
+
+    @staticmethod
+    def _torch_bool_op_ready(op_name: str) -> bool:
+        try:
+            torch_mod = __import__("torch")
+        except ImportError:
+            return False
+        trtllm_ops = getattr(getattr(torch_mod, "ops", None), "trtllm", None)
+        if trtllm_ops is None:
+            return False
+        ready_op = getattr(trtllm_ops, op_name, None)
+        if ready_op is None:
+            return False
+        try:
+            return bool(ready_op())
+        except Exception:
             return False
 
     def _require_configured(self) -> HiSparsePackedTierDescriptor:
