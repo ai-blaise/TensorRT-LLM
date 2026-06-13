@@ -104,6 +104,7 @@ add_library(
   hisparseTopkToBlocksOp.cpp
   kvarnGqaOp.cpp
   IndexerTopKOp.cpp
+  SparseMlaDecodeKvarnHotOp.cpp
   SparseMlaDecodeNvfp4Op.cpp
   indexerXstepRecencyPatchOp.cpp
   ncclCommunicatorOp.cpp

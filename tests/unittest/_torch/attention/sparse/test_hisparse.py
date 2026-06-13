@@ -590,6 +590,29 @@ def test_hisparse_kvarn_hot_bdr_reader_is_registered_in_sources():
     assert "hisparse_read_kvarn_hot_bdr" in fake.read_text()
 
 
+def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
+    root = Path(__file__).resolve().parents[5]
+    kernel = root / "cpp/tensorrt_llm/kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu"
+    header = root / "cpp/tensorrt_llm/kernels/flashMLA/sparse_mla_decode_kvarn_hot.h"
+    thop = root / "cpp/tensorrt_llm/thop/SparseMlaDecodeKvarnHotOp.cpp"
+    flash_cmake = root / "cpp/tensorrt_llm/kernels/flashMLA/CMakeLists.txt"
+    thop_cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
+    fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
+
+    kernel_source = kernel.read_text()
+    thop_source = thop.read_text()
+    assert "hisparseKvarnBdrRead.cuh" in kernel_source
+    assert "readHisparseKvarnK2v2BdrLatentValue" in kernel_source
+    assert "decodeHisparseKvarnHotIndex" in kernel_source
+    assert "kvarn_k2v2" in kernel_source
+    assert "sparse_mla_decode_kvarn_hot" in header.read_text()
+    assert "sparse_mla_decode_kvarn_hot" in thop_source
+    assert "kvarn_bits must be 2" in thop_source
+    assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
+    assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
+    assert "sparse_mla_decode_kvarn_hot" in fake.read_text()
+
+
 def test_hisparse_request_table_slots_are_stable_and_reused():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
     coordinator.configure_packed_tiers(num_layers=1,

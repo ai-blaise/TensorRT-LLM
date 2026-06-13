@@ -141,6 +141,15 @@ def _has_hisparse_hot_reader_cuda_op() -> bool:
         return False
 
 
+def _has_sparse_mla_kvarn_hot_cuda_op() -> bool:
+    try:
+        return bool(
+            torch._C._dispatch_has_kernel_for_dispatch_key(
+                "trtllm::sparse_mla_decode_kvarn_hot", "CUDA"))
+    except RuntimeError:
+        return False
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="requires CUDA for the native BDR writer")
 def test_mla_bdr_write_kvarn_record_cuda_layout_smoke():
@@ -247,6 +256,68 @@ def test_hisparse_read_kvarn_hot_bdr_cuda_layout_smoke():
                           atol=1e-2,
                           rtol=0)
     assert float(decoded[0, 1:].abs().max().cpu()) == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for sparse MLA KVarN-hot decode")
+def test_sparse_mla_decode_kvarn_hot_one_token_cuda_smoke():
+    """B200 smoke: sparse MLA reads packed KVarN-hot BDR records directly."""
+    if not _has_mla_bdr_writer_cuda_op():
+        pytest.skip("trtllm::mla_bdr_write_kvarn_record CUDA op is not loaded")
+    if not _has_sparse_mla_kvarn_hot_cuda_op():
+        pytest.skip("trtllm::sparse_mla_decode_kvarn_hot CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    hot_packed = torch.full((1, 2, layout.packed_bytes_per_block + 17),
+                            0xA5,
+                            dtype=torch.uint8,
+                            device=device)
+    latent = torch.zeros((64, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                         dtype=torch.float16,
+                         device=device)
+    latent[:, :cfg.kv_lora_rank] = 0.5
+    torch.ops.trtllm.mla_bdr_write_kvarn_record(
+        latent, hot_packed[0], 1, layout.ckv_bits, layout.kv_lora_rank,
+        layout.qk_rope_head_dim)
+
+    q = torch.zeros((1, 1, 128, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device)
+    indices = torch.tensor([[[64 + 3]]], dtype=torch.int32, device=device)
+    row_status = torch.zeros((1,), dtype=torch.uint8, device=device)
+
+    out, lse, metadata, splits = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
+        q,
+        hot_packed,
+        indices,
+        row_status,
+        None,
+        None,
+        0,
+        layout.tokens_per_block,
+        layout.tokens_per_block,
+        layout.ckv_bits,
+        layout.kv_lora_rank,
+        layout.qk_rope_head_dim,
+        1.0,
+    )
+    torch.cuda.synchronize()
+
+    assert tuple(out.shape) == (1, 1, 128, cfg.kv_lora_rank)
+    assert tuple(lse.shape) == (1, 128, 1)
+    assert metadata.numel() == 0
+    assert splits.numel() == 0
+    assert torch.allclose(out.float().cpu(),
+                          torch.full((1, 1, 128, cfg.kv_lora_rank), 0.5),
+                          atol=1e-2,
+                          rtol=0)
+    assert torch.allclose(lse.float().cpu(),
+                          torch.zeros((1, 128, 1)),
+                          atol=1e-5,
+                          rtol=0)
 
 
 def test_kvarn_latent_pool_k2v2_roundtrip_cpu():

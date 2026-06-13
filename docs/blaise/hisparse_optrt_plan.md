@@ -149,6 +149,14 @@ semantics, layer, stride, capacity, packed-record size, and the production
 `kvarn_k2v2` dense-MLA dimensions. It is built only from real native outputs
 and the function still raises immediately afterward; it is an ABI target for
 `sparse_mla_decode_kvarn_hot`, not a serving fallback.
+The branch now has the first native `trtllm::sparse_mla_decode_kvarn_hot`
+operator. It is not a wrapper over `sparse_mla_decode_nvfp4`: the CUDA kernel
+reads packed `kvarn_k2v2` BDR hot records through `hisparseKvarnBdrRead.cuh`,
+computes scores against the 576-wide dense-MLA key, applies softmax, and emits
+the 512-wide latent value output. This is a real KVarN-hot producer-load path,
+but it is not yet promoted: it uses a direct per-row/head kernel while the
+optimized FlashMLA-style split scheduler, DSA call-site wiring, row-status
+promotion checks, and live B200 profiling are still pending.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
@@ -1088,9 +1096,11 @@ Still pending before serving enablement:
   indices against packed KVarN hot storage instead of the full dense pool;
 - a `sparse_mla_decode_kvarn_hot` implementation, or an equivalent explicit
   KVarN mode, that does not route through the current
-  `sparse_mla_decode_nvfp4` tensor contract. The existing NVFP4 op is still a
-  useful scheduler/combine reference, but its `kv [num_pages,64,1,288]` plus
-  `kv_scales [num_pages,64,1,36]` layout is not the production KVarN-hot ABI;
+  `sparse_mla_decode_nvfp4` tensor contract. Initial native op registration is
+  present, but DSA dispatch wiring and optimized split scheduling remain
+  pending. The existing NVFP4 op is still a useful scheduler/combine reference,
+  but its `kv [num_pages,64,1,288]` plus `kv_scales [num_pages,64,1,36]`
+  layout is not the production KVarN-hot ABI;
 - BDR/on-read dequant for packed hot KVarN records at the sparse MLA producer
   load point, using `kvarn_bits=2` and production field offsets. The native
   standalone hot-reader primitive now calls the shared

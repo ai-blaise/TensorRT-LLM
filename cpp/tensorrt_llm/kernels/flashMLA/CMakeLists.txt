@@ -17,9 +17,9 @@
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
-# NVFP4 sparse sources are built by the dedicated flash_mla_nvfp4_sparse_src
-# target (SM100f + its own include dirs); exclude them from this SM90 glob.
-list(FILTER SRC_CU EXCLUDE REGEX "nvfp4")
+# SM100 sparse sources are built by the dedicated
+# flash_mla_nvfp4_sparse_src target; exclude them from this SM90 glob.
+list(FILTER SRC_CU EXCLUDE REGEX "nvfp4|sparse_mla_decode_kvarn_hot\\.cu")
 
 add_library(flash_mla_src OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET flash_mla_src PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -28,6 +28,7 @@ set_cuda_architectures(flash_mla_src 90)
 
 
 set(NVFP4_SPARSE_SRC_CU
+    sparse_mla_decode_kvarn_hot.cu
     sparse_mla_decode_nvfp4.cu
     nvfp4_sparse/sm100/decode/head64_nvfp4/instantiations/v32.cu
     nvfp4_sparse/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu

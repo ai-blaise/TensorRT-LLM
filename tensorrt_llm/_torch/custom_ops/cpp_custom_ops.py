@@ -332,6 +332,18 @@ def _register_fake():
             dtype=torch.bfloat16),
                 row_status.new_empty(row_status.shape))
 
+    @torch.library.register_fake("trtllm::sparse_mla_decode_kvarn_hot")
+    def _(q, hot_packed, indices, row_status, topk_length=None, attn_sink=None,
+          layer_idx=0, tokens_per_block=64, stride_factor=64, kvarn_bits=2,
+          kv_lora_rank=512, qk_rope_head_dim=64, sm_scale=1.0):
+        del hot_packed, row_status, topk_length, attn_sink, layer_idx
+        del tokens_per_block, stride_factor, kvarn_bits, kv_lora_rank
+        del qk_rope_head_dim, sm_scale
+        return (q.new_empty((*q.shape[:3], 512)),
+                q.new_empty((q.shape[0], q.shape[2], q.shape[1]),
+                            dtype=torch.float32),
+                indices.new_empty((0, 0)), indices.new_empty((0, )))
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.
