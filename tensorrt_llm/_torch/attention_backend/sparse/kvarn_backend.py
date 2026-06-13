@@ -368,9 +368,11 @@ class KVarNLatentPool:
         """Return VRAM source pointers for committed packed KVarN blocks.
 
         The fragments point directly at the authoritative packed byte records.
-        This is the only valid source for HiSparse direct-to-host writes; an
+        This legacy side-pool layout is valid for amortized restore, but not
+        for HiSparse sparse-MLA hot reads. HiSparse direct-to-host must first
+        migrate or adapt records to ``KVARN_BDR_HISPARSE_LAYOUT``; an
         uncommitted block is still sink/tail fp16 state and must not be
-        published as a packed host record.
+        published as a packed host record in either layout.
         """
         ids = np.asarray(block_ids, dtype=np.int64)
         if ids.ndim != 1:

@@ -22,7 +22,7 @@ from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
     OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
-    KVarNLatentPool, KVARN_LEGACY_SIDEPOOL_LAYOUT,
+    KVarNLatentPool, KVARN_BDR_HISPARSE_LAYOUT, KVARN_LEGACY_SIDEPOOL_LAYOUT,
     kvarn_latent_bytes_per_token, resolve_kvarn_config)
 
 
@@ -6117,10 +6117,17 @@ class DSACacheManager(KVCacheManager):
 
     def kvarn_packed_source_fragments(self, layer_indices,
                                       block_ids) -> Tuple[np.ndarray, np.ndarray]:
-        """Layer-major source fragments for committed packed KVarN records."""
+        """Layer-major source fragments for production BDR KVarN records."""
         if not self.kvarn_enabled:
             raise RuntimeError(
                 "HiSparse direct-to-host requires dense MLA KVarN source pools.")
+        source_layout = getattr(self, "kvarn_hisparse_source_layout", None)
+        if source_layout != KVARN_BDR_HISPARSE_LAYOUT:
+            raise NotImplementedError(
+                "HiSparse direct-to-host requires production BDR KVarN source "
+                f"records ({KVARN_BDR_HISPARSE_LAYOUT}); current source "
+                f"layout is {source_layout!r}. Do not transfer legacy "
+                "KVarNLatentPool records into sparse-MLA hot storage.")
         ptr_parts = []
         size_parts = []
         for layer_idx in layer_indices:

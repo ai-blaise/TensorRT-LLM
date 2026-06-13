@@ -127,6 +127,17 @@ def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
         pool.packed_source_fragments([1])
 
 
+def test_hisparse_direct_to_host_rejects_legacy_kvarn_source_layout():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = [object()]
+    mgr.kvarn_hisparse_source_layout = KVARN_LEGACY_SIDEPOOL_LAYOUT
+
+    with pytest.raises(NotImplementedError, match=KVARN_BDR_HISPARSE_LAYOUT):
+        DSACacheManager.kvarn_packed_source_fragments(mgr, [0], [0])
+
+
 class _FakeNonLocalKVarNManager:
     kvarn_enabled = True
     tokens_per_block = 64

@@ -119,7 +119,8 @@ the legacy Python/Sinkhorn `KVarNLatentPool` record. HiSparse tier derivation
 requires a production BDR layout descriptor (`bdr_ckv_lowbit_fp8_pe_v1`) and a
 matching source-pool layout; the current DSA side-pool advertises
 `legacy_sinkhorn_v1`, so enabled HiSparse fails closed before allocating
-misleading hot records.
+misleading hot records. The direct-to-host fragment API has the same guard and
+will not publish legacy side-pool pointers as HiSparse host-write sources.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
 row-status consumption, and live NIXL/cancel E2E proofs are not complete.
@@ -827,6 +828,9 @@ Current branch status:
   `bdr_ckv_lowbit_fp8_pe_v1` source records before deriving HiSparse tier
   sizes, and rejects the current `legacy_sinkhorn_v1` KVarN side-pool rather
   than allocating host/hot buffers with the wrong ABI;
+- guarded `kvarn_packed_source_fragments()` with the same production-layout
+  requirement so NIXL direct-to-host cannot transfer legacy KVarN records into
+  the HiSparse host tier;
 - implemented production-shaped packed tensor allocation for host `uint8`
   KVarN records, device hot `uint8` KVarN records, host commit metadata, and
   device hot-slot metadata;
