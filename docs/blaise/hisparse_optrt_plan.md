@@ -109,6 +109,11 @@ index contract while targeting HiSparse hot slots instead of full-pool blocks.
 The coordinator now chains those native stages through hot-index construction
 when real CUDA TopK/request metadata is present, then fails closed at the
 remaining sparse MLA hot-pool read/BDR dequant gate.
+The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
+`mlaKernels.cu`: the paged MLA KVarN read launcher validated `kvarn_bits` but
+did not pass it into the CUDA kernel, which meant `kvarn_k2v2` could be read
+through the default 4-bit path. The launcher now forwards the validated bit
+width, so dense MLA KVarN readback uses the selected 2-bit production mode.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
 row-status consumption, and live NIXL/cancel E2E proofs are not complete.
@@ -401,8 +406,11 @@ Algorithm:
    - update LRU order;
    - emit a compact miss schedule for packed host KVarN block to hot KVarN
      block copies;
-   - submit that schedule to a native stream-ordered copy bridge that uses
-     host-to-device copy-engine transfers from pinned DRAM to hot HBM;
+   - submit that schedule to a native stream-ordered copy bridge. The current
+     bridge uses a checked mapped pinned-host CUDA kernel path and fails closed
+     when the host tier is not device-addressable; a future copy-engine variant
+     may replace it only if it consumes the same compact device schedule without
+     Python materialization or a synchronous host readback;
    - commit hot metadata only after copy submission succeeds;
    - update `hot_global_indices` so sparse MLA reads from hot physical block ids
      plus original token offset.
@@ -414,7 +422,8 @@ Algorithm:
    - no allocations;
    - no Python token/request-table reads;
    - no synchronous host schedule readback;
-   - no CUDA-kernel dereference of CPU pinned KVarN storage;
+   - no unguarded CUDA-kernel dereference of CPU pinned KVarN storage. Mapped
+     pinned-host reads are allowed only through the checked native copy bridge;
    - `num_real_rows` guards padded graph rows;
    - fixed buckets for hot block count and top-k.
 
@@ -442,6 +451,10 @@ The optimized target is:
 - host-to-hot copies packed KVarN records;
 - sparse MLA reads through a hot-pool view;
 - BDR/in-kernel dequant-on-read handles selected hot blocks;
+- the sparse MLA hot-read layout is the production BDR low-bit dense-MLA
+  layout. It must not accidentally consume the older Python/Sinkhorn
+  `KVarNLatentPool` record shape unless that record shape has first been
+  intentionally migrated or adapted into the production BDR ABI;
 - `commit_gen` and `restored_gen` remain block-id keyed;
 - `KVarNLatentPool.invalidate_blocks()` is called for host and hot tiers when
   `free_resources()` or `rewind_kv_cache()` recycles a block id.
@@ -450,8 +463,21 @@ Implementation sequence:
 
 1. Install production packed host/hot KVarN allocation and metadata first.
 2. Implement packed KVarN host-to-hot swap-in and hot global-index mapping.
-3. Make sparse MLA consume the hot packed KVarN view through BDR/on-read dequant.
-4. Keep external FP16/KVarN references in tests only; do not add a serving
+3. Define and implement the sparse MLA KVarN-hot ABI against the production BDR
+   layout:
+   - `q`: bf16 `[B, s_q, 128, 576]`;
+   - `hot_packed`: uint8 layer-major hot records;
+   - `hot_indices`: int32 `[B, s_q, topk]` using the hot-slot global-index
+     contract emitted by `hisparse_build_hot_indices`;
+   - row status from resolve/plan/copy/commit/build, consumed before attention
+     so invalid rows cannot read stale hot slots;
+   - explicit BDR field offsets/strides, `tokens_per_block`, `kvarn_bits`,
+     and dense MLA dimensions, derived from the configured production model
+     rather than inferred from legacy test tensors.
+4. Make sparse MLA consume the hot packed KVarN view through BDR/on-read dequant
+   in the producer load path. Reuse the existing sparse MLA scheduler/combine
+   pieces only where their assumptions still match the KVarN-hot ABI.
+5. Keep external FP16/KVarN references in tests only; do not add a serving
    staging path that dequants committed cold blocks into a hot FP16 pool.
 
 ## Indexer And HISA Integration
@@ -747,13 +773,9 @@ Current branch status:
   DRAM pointers, hot HBM pointers, and byte sizes for packed KVarN miss blocks;
 - added `trtllm::hisparse_swap_in_packed_kvarn`, a strict native thop that
   copies only packed `uint8` KVarN records from pinned host memory into the hot
-  CUDA tier, coalescing consecutive slot runs when both tiers are compact;
-- final-sweep caveat: the current packed-copy thop accepts CPU slot vectors and
-  is therefore only a partial building block behind fail-closed guards. The
-  serving path still requires a native device-plan-to-copy bridge that consumes
-  `hisparse_plan_hot_slots` miss tensors without Python materialization or a
-  synchronous host readback, schedules stream-ordered host-to-device copies, and
-  feeds `hisparse_commit_hot_slots` only after copy submission succeeds;
+  CUDA tier, coalescing consecutive slot runs when both tiers are compact. This
+  CPU-slot-vector helper remains a debug/building-block path and is not the
+  enabled-serving copy bridge;
 - added coordinator `execute_swap_in_plan()` so native copy acceptance and hot
   metadata publication are sequenced through one production-shaped path;
 - added request-relative token-position planning that dedupes top-k tokens into
@@ -779,9 +801,10 @@ Current branch status:
   upstream rows/counts/slots, and emits contiguous device `host_slot` and
   `hot_slot` vectors, row ids, and a device copy count for the copy bridge;
 - added `trtllm::hisparse_submit_packed_kvarn_copy_schedule`, a native mapped
-  pinned-host copy bridge that consumes the compact device schedule, copies
-  packed KVarN records into the hot HBM tier in stream order, and returns
-  per-row copy status so post-copy metadata commit can remain fail-closed;
+  pinned-host copy bridge that consumes the compact device schedule without
+  Python materialization or a synchronous schedule readback, copies packed
+  KVarN records into the hot HBM tier in stream order, and returns per-row copy
+  status so post-copy metadata commit can remain fail-closed;
 - added `trtllm::hisparse_commit_hot_slots`, a native post-copy CUDA metadata
   commit op that mutates device `hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick` only for rows whose native plan succeeded;
@@ -877,15 +900,22 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- sparse MLA hot-pool read ABI that consumes the constructed hot global indices
-  against packed KVarN hot storage instead of the full dense pool;
-- BDR/on-read dequant for packed hot KVarN records;
+- sparse MLA KVarN-hot read ABI that consumes the constructed hot global
+  indices against packed KVarN hot storage instead of the full dense pool;
+- a `sparse_mla_decode_kvarn_hot` implementation, or an equivalent explicit
+  KVarN mode, that does not route through the current
+  `sparse_mla_decode_nvfp4` tensor contract. The existing NVFP4 op is still a
+  useful scheduler/combine reference, but its `kv [num_pages,64,1,288]` plus
+  `kv_scales [num_pages,64,1,36]` layout is not the production KVarN-hot ABI;
+- BDR/on-read dequant for packed hot KVarN records at the sparse MLA producer
+  load point, using the configured `kvarn_bits` and production field offsets;
 - final row-status propagation into the sparse MLA hot-read stage so rows with
   resolve/plan/copy/commit/build errors cannot be consumed;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;
-- sparse MLA packed hot-pool read with BDR/on-read dequant;
+- sparse MLA packed hot-pool read with BDR/on-read dequant, proven against the
+  existing production full-HBM KVarN path within KVarN tolerance;
 - FSSS reuse-layer remap over layer-local hot slots.
 
 ### Gate 4: Production Optimization Hardening
@@ -1041,8 +1071,9 @@ Promotion requires:
 
 1. NIXL host-pinned memory registration may need native wrapper changes because
    current memory descriptors do not encode memory kind.
-2. Packed KVarN sparse MLA read may need a dedicated hot-pool ABI instead of
-   reusing the existing main-pool pointer layout.
+2. Packed KVarN sparse MLA read needs a dedicated hot-pool ABI or an explicit
+   KVarN mode; reusing the existing NVFP4 sparse MLA pointer layout would be a
+   correctness bug.
 3. FSSS reuse layers cannot blindly affine-shift hot global indices if each
    layer has independent hot slots. Safer first implementation reruns per-layer
    swap-in using reused local top-k.
@@ -1051,40 +1082,53 @@ Promotion requires:
 5. HiSparse benefits appear mostly under high concurrency and long context.
    `hisparse_min_seq_len` should prevent low-concurrency/short-context overhead
    from hurting the default path.
+6. The Python `KVarNLatentPool` layout still documents and materializes the
+   earlier Sinkhorn-style record shape, while the production dense-MLA BDR path
+   in `mlaKernels.cu` uses low-bit packed C-KV plus per-token/sub-block scale
+   and zero point. HiSparse serving must either migrate the side-pool source to
+   that production BDR layout or insert an explicit native conversion before
+   any hot-read kernel is enabled.
 
 ## Immediate Execution Plan
 
 The next implementation work should continue from the current fail-closed
 production ABI:
 
-1. Finish the SM100 packed KVarN planner/copy ABI:
-   - input request-relative top-k tokens, request rows, committed host slots,
-     per-layer hot metadata, and graph row count;
-   - dedupe tokens to paged block positions;
-   - resolve request ids through the device-mirrored request table and reject
-     missing, unadmitted, or stale commit-generation rows;
-   - hit/miss/LRU over block slots;
-   - emit compact device miss schedules;
-   - bridge those schedules into stream-ordered host-to-device copy-engine
-     submissions without Python materialization or synchronous schedule readback;
-   - copy only packed KVarN records from pinned host DRAM to hot HBM;
-   - commit hot metadata after copy submission succeeds;
-   - output hot global indices and selected hot block ids for sparse MLA.
-2. Wire the sparse MLA hot-pool read path:
-   - consume hot packed KVarN records directly;
-   - add BDR/on-read dequant in the sparse MLA path;
+1. Prove the existing native planner/copy chain on B200:
+   - compile and load the thops for top-k-to-block dedupe, request-table
+     resolve, hot-slot plan, compact miss schedule, mapped pinned-host copy
+     bridge, post-copy commit, and hot-index build;
+   - run CUDA unit/micro tests for overflow, unadmitted rows, stale commit
+     generations, duplicate selected blocks, hit/miss/LRU, copy-status
+     propagation, and hot-index construction;
+   - prove the mapped pinned-host bridge is device-addressable on the B200
+     deployment image. If it is not, replace only the bridge with a copy-engine
+     variant that consumes the same compact device schedule without host sync.
+2. Lock the production KVarN hot-record layout:
+   - make `kvarn_k2v2` the dense MLA HiSparse source of truth;
+   - align host/hot packed records with the production BDR layout used by
+     `mlaKernels.cu`, including the now-fixed 2-bit read path;
+   - reject any serving configuration that would feed the legacy
+     Python/Sinkhorn `KVarNLatentPool` record layout directly into a BDR
+     sparse MLA hot-read kernel.
+3. Wire the sparse MLA KVarN-hot read path:
+   - add `sparse_mla_decode_kvarn_hot` or an equivalent explicit KVarN mode;
+   - consume hot packed KVarN records directly through hot global indices;
+   - add BDR/on-read dequant in the sparse MLA producer load path;
+   - propagate resolve/plan/copy/commit/build row status into attention before
+     any row can read hot storage;
    - keep sink/tail resident policy separate from committed packed blocks;
    - remove any need for full-working-set restore of committed cold blocks.
-3. Prove and harden NIXL direct-to-host on live B200 VMs:
+4. Prove and harden NIXL direct-to-host on live B200 VMs:
    - decode publishes writable host-pinned slots;
    - prefill writes exact packed KVarN records into those slots;
    - commit coverage is multi-rank and partial-slice safe;
    - decode admission remains blocked until all reserved prompt blocks commit.
-4. Prove and harden cancellation/retraction/recycle:
+5. Prove and harden cancellation/retraction/recycle:
    - no host or hot slot is freed while a DRAM write can still complete;
    - failed/partial writes never become selectable;
    - request recycle invalidates KVarN host/hot records and pin metadata.
-5. Compose with the custom stack:
+6. Compose with the custom stack:
    - LayerSplit owner-local prefill and CP1 decode first, CP>1 decode guarded
      or implemented explicitly;
    - SMC-SD row geometry maps every speculative row to the base request host
@@ -1092,14 +1136,14 @@ production ABI:
    - Moondream pinning stays tied to the same `disagg_request_id`,
      `ctx_dp_rank`, and `ctx_info_endpoint`;
    - FSSS reuse keeps scoring reuse but reruns per-layer hot mapping.
-6. Add production tests:
+7. Add production tests:
    - unit tests for block dedupe, hit/miss/LRU, commit coverage, admission,
      cancel, recycle, and FSSS reuse;
    - VM E2E for generation-first NIXL direct-to-host, LayerSplit prefill,
      TP4/EP4 decode, SMC-SD accept/reject, and Moondream pin preservation;
    - correctness comparison against the existing production full-HBM KVarN path
      within KVarN tolerance, with no FP16 serving oracle.
-7. Optimize before promotion:
+8. Optimize before promotion:
    - precompile SM100 buckets for `index_topk=1024`, `tokens_per_block=64`, and
      hot blocks/request `{32,64,96,128}`;
    - publish request-table lifecycle changes through batched native kernels or
@@ -1108,7 +1152,7 @@ production ABI:
      memory fraction;
    - add hit/miss, swap latency, host-write, admission wait, and cleanup
      counters.
-8. Promote only after A/B:
+9. Promote only after A/B:
    - target concurrency 16;
    - input lengths 1k through 128k;
    - compare full-HBM sparse, production KVarN-only, HiSparse packed KVarN with
