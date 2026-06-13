@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -449,6 +450,46 @@ def test_hisparse_request_table_syncs_host_rows_to_device_rows_cpu():
     assert bool(tensors.request_admitted_device[slot]) is False
     assert tensors.request_block_host_slots_device[slot].tolist() == [-1] * 4
     assert tensors.request_block_commit_gen_device[slot].tolist() == [-1] * 4
+
+
+def test_hisparse_enabled_cuda_request_table_publish_requires_native_op(
+        monkeypatch):
+    coordinator = OPTRTHiSparseCoordinator(_cfg(enabled=True))
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=1024,
+                                       logical_host_capacity_blocks=2,
+                                       hot_device_capacity_blocks=1,
+                                       request_slot_capacity=1,
+                                       max_blocks_per_request=2)
+    calls = []
+    coordinator.allocate_packed_tensors(device="cuda:0",
+                                        host_pinned=True,
+                                        tensor_factory=_fake_tensor_factory(calls))
+    monkeypatch.setattr(coordinator, "_request_table_device_is_cuda",
+                        lambda: True)
+    monkeypatch.setattr(coordinator, "_torch_cuda_op_registered",
+                        lambda name: False)
+
+    with pytest.raises(NotImplementedError,
+                       match="hisparse_publish_request_table_slots"):
+        coordinator.reserve_request(req_pool_idx=101, num_prompt_blocks=1)
+
+
+def test_hisparse_request_table_native_publisher_is_registered_in_sources():
+    root = Path(__file__).resolve().parents[5]
+    thop = root / "cpp/tensorrt_llm/thop/hisparseRequestTableOp.cpp"
+    cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
+    fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
+
+    thop_source = thop.read_text()
+    assert "hisparse_publish_request_table_slots" in thop_source
+    assert "cudaMemcpyAsync" in thop_source
+    assert "request_ids_host" in thop_source
+    assert "request_block_commit_gen_device" in thop_source
+    assert "request_admitted_device" in thop_source
+    assert "hisparseRequestTableOp.cpp" in cmake.read_text()
+    assert "hisparse_publish_request_table_slots" in fake.read_text()
 
 
 def test_hisparse_request_table_slots_are_stable_and_reused():

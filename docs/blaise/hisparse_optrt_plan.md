@@ -82,12 +82,13 @@ hot-block planning ABI are implemented. A device-visible request table now
 publishes disaggregated request ids, request-relative block-to-host-slot rows,
 host commit generations, and admission flags for the future native hot-slot
 planner. This table is the required production ABI shape, and request-table
-lifecycle updates now publish through host-side rows followed by row/slot
-copies to the device mirror instead of per-cell device scalar writes. That is
-still not the final serving publication mechanism; before the startup guard is
-relaxed, request-table updates must be batched, stream-ordered, and native or
-async-copy driven so decode does not pay Python lifecycle overhead. The sender
-now returns explicit
+lifecycle updates now publish through host-side rows followed by native,
+stream-ordered row/slot copies to the device mirror instead of per-cell device
+scalar writes. Enabled CUDA HiSparse now rejects request-table publication if
+`trtllm::hisparse_publish_request_table_slots` is unavailable. A future
+multi-slot batcher can still coalesce lifecycle events further, but the device
+mirror is no longer updated through Python scalar writes. The sender now returns
+explicit
 `(local_layer, request_block_pos)` commit coverage only after the normal KV
 write and typed host write both succeed, and the receiver accumulates that
 coverage before marking host records committed. Admission is explicit: a
@@ -808,10 +809,11 @@ Current branch status:
   `request_ids`, `request_block_host_slots`, `request_block_commit_gen`, and
   `request_admitted`;
 - kept that request table in the final CUDA-planner ABI shape, and changed
-  lifecycle publication to update host rows first, then copy the affected
-  slot/row to the device mirror. This removes per-cell device scalar writes;
-  a later batched/native metadata writer is still required before enabled
-  serving so publication is stream-ordered and not Python-driven;
+  lifecycle publication to update host rows first, then publish the affected
+  slot/row to the CUDA mirror with
+  `trtllm::hisparse_publish_request_table_slots`. This removes per-cell device
+  scalar writes and makes enabled CUDA HiSparse fail closed if the native
+  publisher is missing;
 - bounded direct `configure_packed_tiers()` request-table defaults to avoid
   quadratic host-block allocation, while production `configure_from_kv_cache_manager()`
   derives table capacity from `max_batch_size` and width from
@@ -945,9 +947,9 @@ Still pending before serving enablement:
   ```bash
   pytest tests/unittest/_torch/attention/sparse/test_kvarn_k2v2.py -k mla_bdr_write_kvarn_record_cuda_layout_smoke -q
   ```
-- replacement of row-level Python request-table publication with a
-  stream-ordered batched/native path for admission, commit-generation, and
-  cleanup updates;
+- optional coalescing of native request-table publication across multiple
+  lifecycle events. Correctness no longer depends on Python scalar writes, but
+  multi-slot batching may still reduce Python call overhead before promotion;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
@@ -1291,8 +1293,8 @@ production ABI:
 8. Optimize before promotion:
    - precompile SM100 buckets for `index_topk=1024`, `tokens_per_block=64`, and
      hot blocks/request `{32,64,96,128}`;
-   - publish request-table lifecycle changes through batched native kernels or
-     stream-ordered async copies, not per-block Python tensor writes;
+   - optionally coalesce request-table lifecycle events into multi-slot native
+     publishes if profiling shows Python call overhead is measurable;
    - tune host/device ratio, NIXL plugin, NUMA placement, graph buckets, and
      memory fraction;
    - add hit/miss, swap latency, host-write, admission wait, and cleanup

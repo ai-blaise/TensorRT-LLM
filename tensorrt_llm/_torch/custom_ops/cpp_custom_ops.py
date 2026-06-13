@@ -228,6 +228,19 @@ def _register_fake():
         del packed_bytes_per_block
         pass
 
+    @torch.library.register_fake("trtllm::hisparse_publish_request_table_slots")
+    def _(request_ids_host, request_ids_device, request_block_host_slots_host,
+          request_block_host_slots_device, request_block_commit_gen_host,
+          request_block_commit_gen_device, request_admitted_host,
+          request_admitted_device, table_slots, sync_blocks):
+        # In-place host request-table rows -> device request-table mirror publish.
+        del request_ids_host, request_ids_device
+        del request_block_host_slots_host, request_block_host_slots_device
+        del request_block_commit_gen_host, request_block_commit_gen_device
+        del request_admitted_host, request_admitted_device
+        del table_slots, sync_blocks
+        pass
+
     @torch.library.register_fake(
         "trtllm::hisparse_submit_packed_kvarn_copy_schedule")
     def _(host_packed, hot_packed, compact_host_slots, compact_hot_slots,

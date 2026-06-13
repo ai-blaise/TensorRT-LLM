@@ -506,6 +506,54 @@ class OPTRTHiSparseCoordinator:
         except (AttributeError, TypeError, IndexError):
             return False
 
+    def _request_table_device_is_cuda(self) -> bool:
+        tensors = self._tensors
+        if tensors is None:
+            return False
+        tensor = tensors.request_ids_device
+        if bool(getattr(tensor, "is_cuda", False)):
+            return True
+        return str(getattr(tensor, "device", "")).startswith("cuda")
+
+    def _native_publish_request_table_slots(
+        self,
+        table_slots,
+        *,
+        sync_blocks: bool,
+    ) -> bool:
+        tensors = self._tensors
+        if tensors is None or not self._request_table_device_is_cuda():
+            return False
+        if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_publish_request_table_slots"):
+            if self.enabled:
+                raise NotImplementedError(
+                    "trtllm::hisparse_publish_request_table_slots is not "
+                    "registered with a CUDA kernel. Enabled HiSparse must "
+                    "publish request-table lifecycle updates through a native "
+                    "stream-ordered path before device hot planning can read "
+                    "request ids, host slots, commit generations, or admission "
+                    "flags.")
+            return False
+        import torch
+
+        slots = torch.as_tensor([int(slot) for slot in table_slots],
+                                dtype=torch.int64,
+                                device="cpu")
+        torch.ops.trtllm.hisparse_publish_request_table_slots(
+            tensors.request_ids_host,
+            tensors.request_ids_device,
+            tensors.request_block_host_slots_host,
+            tensors.request_block_host_slots_device,
+            tensors.request_block_commit_gen_host,
+            tensors.request_block_commit_gen_device,
+            tensors.request_admitted_host,
+            tensors.request_admitted_device,
+            slots,
+            bool(sync_blocks),
+        )
+        return True
+
     def _sync_request_table_slot_to_device(
         self,
         table_slot: int,
@@ -523,6 +571,9 @@ class OPTRTHiSparseCoordinator:
         if tensors is None:
             return
         table_slot = int(table_slot)
+        if self._native_publish_request_table_slots([table_slot],
+                                                    sync_blocks=sync_blocks):
+            return
         self._copy_tensor_index(tensors.request_ids_device,
                                 tensors.request_ids_host, table_slot)
         self._copy_tensor_index(tensors.request_admitted_device,
