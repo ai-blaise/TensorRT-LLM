@@ -669,6 +669,10 @@ Current branch status:
 - added coordinator helpers that compute exact writable host-packed block
   destinations for `(layer_idx, req_pool_idx, block_pos)` without changing the
   existing Indexer/HISA or sparse MLA path;
+- added idempotent request host-row reservation plus request-relative
+  `hisparse_host_slots` publication in receiver request metadata;
+- wired receive-session cleanup so HiSparse host rows are released on the same
+  safe-close boundary as existing KV receive sessions;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -678,7 +682,6 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- request-level host slot publication through generation-first pin metadata;
 - a dedicated `DRAM` write meta path for prefill-to-decode packed KVarN host
   writes;
 - prefill-side packed KVarN writer and completion/commit handoff;

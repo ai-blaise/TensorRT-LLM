@@ -541,6 +541,50 @@ class OPTRTHiSparseCoordinator:
         self._requests[req_pool_idx] = state
         return state
 
+    def reserve_or_get_request(
+        self,
+        req_pool_idx: int,
+        num_prompt_blocks: int,
+        *,
+        request_epoch: Optional[int] = None,
+    ) -> HiSparseRequestState:
+        """Reserve request host rows once and validate later publications.
+
+        Generation-first receive metadata may be requested more than once for a
+        session as the transfer lifecycle is retried or extended. Reusing the
+        same request-relative host slots keeps direct-to-host descriptors
+        stable; changing the prompt block count for an active request is a
+        correctness error because it would make previously published writable
+        offsets ambiguous.
+        """
+        req_pool_idx = int(req_pool_idx)
+        existing = self._requests.get(req_pool_idx)
+        if existing is None:
+            return self.reserve_request(req_pool_idx,
+                                        num_prompt_blocks,
+                                        request_epoch=request_epoch)
+        existing_blocks = len(existing.host_slots_by_block_pos)
+        if existing_blocks != int(num_prompt_blocks):
+            raise RuntimeError(
+                f"HiSparse request {req_pool_idx} already has "
+                f"{existing_blocks} host block slot(s), cannot republish "
+                f"{num_prompt_blocks}.")
+        return existing
+
+    def host_slots_for_request(
+        self,
+        req_pool_idx: int,
+        *,
+        num_prompt_blocks: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        state = self._requests.get(int(req_pool_idx))
+        if state is None:
+            raise KeyError(f"HiSparse request {req_pool_idx} is not reserved.")
+        if num_prompt_blocks is None:
+            num_prompt_blocks = len(state.host_slots_by_block_pos)
+        return tuple(state.host_slots_by_block_pos[block_pos]
+                     for block_pos in range(int(num_prompt_blocks)))
+
     def mark_host_block_committed(
         self,
         req_pool_idx: int,

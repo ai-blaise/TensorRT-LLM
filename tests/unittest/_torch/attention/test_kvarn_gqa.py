@@ -528,6 +528,7 @@ def test_kvarn_gqa_sparse_kv_and_sparse_attn_cannot_mix():
 
 def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
     torch = _TORCH
+    import numpy as np
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
@@ -584,9 +585,12 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
         block_ids_per_layer_groups=[],
         unique_rid=123,
         kvarn_gqa_side_slot=dst_slot,
+        hisparse_host_slots=np.array([4, 5, 9], dtype=np.int64),
     )
     req_info = RecvReqInfo.from_bytes(req_info.to_bytes())
     assert req_info.kvarn_gqa_side_slot == dst_slot
+    assert req_info.hisparse_host_slots is not None
+    assert req_info.hisparse_host_slots.tolist() == [4, 5, 9]
     task = SimpleNamespace(_unique_rid=123, _slice=SimpleNamespace(is_last_slice=True))
 
     src_ptrs, dst_ptrs, sizes = Sender._collect_kvarn_gqa_side_frags(

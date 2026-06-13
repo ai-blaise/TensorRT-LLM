@@ -77,6 +77,7 @@ class RecvReqInfo:
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
     kvarn_gqa_side_slot: Optional[int] = None
+    hisparse_host_slots: Optional[np.ndarray] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -93,6 +94,10 @@ class RecvReqInfo:
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
                 "kvarn_gqa_side_slot": self.kvarn_gqa_side_slot,
+                "hisparse_host_slots": (
+                    self.hisparse_host_slots.astype(np.int64,
+                                                    copy=False).tobytes()
+                    if self.hisparse_host_slots is not None else None),
             }
         )
 
@@ -103,6 +108,10 @@ class RecvReqInfo:
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
         d.setdefault("kvarn_gqa_side_slot", None)
+        hisparse_host_slots = d.get("hisparse_host_slots")
+        d["hisparse_host_slots"] = (
+            np.frombuffer(hisparse_host_slots, dtype=np.int64).copy()
+            if hisparse_host_slots is not None else None)
         return cls(**d)
 
 
@@ -1349,9 +1358,11 @@ class Receiver(ReceiverBase):
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
         kvarn_gqa_side_pool=None,
+        hisparse_coordinator=None,
     ):
         self._registrar = peer_registrar
         self._kvarn_gqa_side_pool = kvarn_gqa_side_pool
+        self._hisparse_coordinator = hisparse_coordinator
         self._agent = agent
         self._dealers = {}
         self._sender_ep_instance_map = {}
@@ -1416,6 +1427,7 @@ class Receiver(ReceiverBase):
         kvarn_side_slot = None
         if self._kvarn_gqa_side_pool is not None:
             kvarn_side_slot = self._kvarn_gqa_side_pool.slot_for_request(task._unique_rid)
+        hisparse_host_slots = self._reserve_hisparse_host_slots(task)
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
@@ -1427,7 +1439,43 @@ class Receiver(ReceiverBase):
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
             kvarn_gqa_side_slot=kvarn_side_slot,
+            hisparse_host_slots=hisparse_host_slots,
         )
+
+    def _reserve_hisparse_host_slots(
+        self, task: KVRecvTask) -> Optional[np.ndarray]:
+        coordinator = self._hisparse_coordinator
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            return None
+        if task._unique_rid is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires a generation-first request id.")
+        self_ri = self._registrar.self_rank_info
+        if self_ri.attention is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires attention metadata with "
+                "tokens_per_block.")
+        token_range = task._kv_slice.token_range
+        if token_range is None:
+            max_blocks = max((arr.size
+                              for arr in task._kv_slice.block_ids_per_layer_groups),
+                             default=0)
+            num_prompt_blocks = int(max_blocks)
+        else:
+            tpb = int(self_ri.attention.tokens_per_block)
+            num_prompt_blocks = (int(token_range.end) + tpb - 1) // tpb
+        state = coordinator.reserve_or_get_request(task._unique_rid,
+                                                   num_prompt_blocks)
+        return np.asarray([
+            state.host_slots_by_block_pos[block_pos]
+            for block_pos in range(num_prompt_blocks)
+        ],
+                          dtype=np.int64)
+
+    def release_hisparse_request(self, unique_rid: int) -> None:
+        coordinator = self._hisparse_coordinator
+        if coordinator is not None and getattr(coordinator, "enabled", False):
+            coordinator.release_request(int(unique_rid))
 
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
@@ -1878,6 +1926,7 @@ class RxSession(RxSessionBase):
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
+            self._receiver.release_hisparse_request(self.disagg_request_id)
             self._receiver.clear_session(self.disagg_request_id)
 
     def __enter__(self):
@@ -2103,7 +2152,10 @@ class TransferWorker:
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
             self._sender = Sender(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
-            self._receiver = Receiver(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
+            self._receiver = Receiver(self._peer_registrar, self._agent,
+                                      self._kvarn_gqa_side_pool,
+                                      getattr(self._config.kv_cache_manager,
+                                              "hisparse_coordinator", None))
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:

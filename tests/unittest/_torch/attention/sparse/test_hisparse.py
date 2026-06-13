@@ -136,6 +136,28 @@ def test_hisparse_request_allocation_commit_and_release():
     }
 
 
+def test_hisparse_request_reservation_is_idempotent_for_published_slots():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=1024,
+                                       logical_host_capacity_blocks=6,
+                                       hot_device_capacity_blocks=2)
+
+    first = coordinator.reserve_or_get_request(req_pool_idx=17,
+                                               num_prompt_blocks=3)
+    second = coordinator.reserve_or_get_request(req_pool_idx=17,
+                                                num_prompt_blocks=3)
+
+    assert second is first
+    assert coordinator.host_slots_for_request(17) == (0, 1, 2)
+    assert coordinator.host_slots_for_request(17,
+                                              num_prompt_blocks=2) == (0, 1)
+    with pytest.raises(RuntimeError, match="already has 3"):
+        coordinator.reserve_or_get_request(req_pool_idx=17,
+                                           num_prompt_blocks=4)
+
+
 def test_hisparse_configure_from_kv_cache_manager_uses_kvarn_shape():
     coordinator = OPTRTHiSparseCoordinator(_cfg())
     coordinator.kv_cache_manager = SimpleNamespace(
