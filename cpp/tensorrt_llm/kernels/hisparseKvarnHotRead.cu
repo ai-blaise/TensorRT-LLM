@@ -5,10 +5,10 @@
 
 #include "tensorrt_llm/kernels/hisparseKvarnHotRead.h"
 
-#include "tensorrt_llm/common/cudaUtils.h"
-
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+#include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -27,6 +27,22 @@ enum HiSparseKvarnHotReadStatus : uint8_t
     kHotReadLayerMismatch = 5,
     kHotReadTokenOffsetOutOfRange = 6,
 };
+
+void check(bool condition, char const* message)
+{
+    if (!condition)
+    {
+        throw std::runtime_error(message);
+    }
+}
+
+void checkCuda(cudaError_t status, char const* message)
+{
+    if (status != cudaSuccess)
+    {
+        throw std::runtime_error(message);
+    }
+}
 
 template <int BITS>
 __device__ __forceinline__ float readLowBitKvarnValue(
@@ -172,16 +188,14 @@ void invokeHisparseReadKvarnHotBdr(uint8_t const* hotPacked, int32_t const* hotI
     {
         return;
     }
-    TLLM_CHECK_WITH_INFO(indexTopK > 0, "hisparse_read_kvarn_hot_bdr requires index_topk > 0");
-    TLLM_CHECK_WITH_INFO(numLayers > 0, "hisparse_read_kvarn_hot_bdr requires num_layers > 0");
-    TLLM_CHECK_WITH_INFO(hotCapacity > 0, "hisparse_read_kvarn_hot_bdr requires hot_capacity > 0");
-    TLLM_CHECK_WITH_INFO(layerIdx >= 0 && layerIdx < numLayers, "hisparse_read_kvarn_hot_bdr layer_idx out of range");
-    TLLM_CHECK_WITH_INFO(tokensPerBlock == 64, "hisparse_read_kvarn_hot_bdr production path requires tpb=64");
-    TLLM_CHECK_WITH_INFO(kvLoraRank == 512, "hisparse_read_kvarn_hot_bdr production path requires kv_lora_rank=512");
-    TLLM_CHECK_WITH_INFO(qkRopeHeadDim == 64,
-        "hisparse_read_kvarn_hot_bdr production path requires qk_rope_head_dim=64");
-    TLLM_CHECK_WITH_INFO(kvarnBits == 2 || kvarnBits == 4,
-        "hisparse_read_kvarn_hot_bdr supports kvarn_bits=2 or 4");
+    check(indexTopK > 0, "hisparse_read_kvarn_hot_bdr requires index_topk > 0");
+    check(numLayers > 0, "hisparse_read_kvarn_hot_bdr requires num_layers > 0");
+    check(hotCapacity > 0, "hisparse_read_kvarn_hot_bdr requires hot_capacity > 0");
+    check(layerIdx >= 0 && layerIdx < numLayers, "hisparse_read_kvarn_hot_bdr layer_idx out of range");
+    check(tokensPerBlock == 64, "hisparse_read_kvarn_hot_bdr production path requires tpb=64");
+    check(kvLoraRank == 512, "hisparse_read_kvarn_hot_bdr production path requires kv_lora_rank=512");
+    check(qkRopeHeadDim == 64, "hisparse_read_kvarn_hot_bdr production path requires qk_rope_head_dim=64");
+    check(kvarnBits == 2 || kvarnBits == 4, "hisparse_read_kvarn_hot_bdr supports kvarn_bits=2 or 4");
 
     constexpr int32_t kThreads = 256;
     if (kvarnBits == 2)
@@ -196,7 +210,7 @@ void invokeHisparseReadKvarnHotBdr(uint8_t const* hotPacked, int32_t const* hotI
             inputRowStatus, latentOut, outputRowStatus, numRows, indexTopK, numLayers, hotCapacity, hotLayerStride,
             hotSlotStride, hotRecordStride, layerIdx, tokensPerBlock, kvLoraRank, qkRopeHeadDim);
     }
-    TLLM_CUDA_CHECK(cudaGetLastError());
+    checkCuda(cudaGetLastError(), "hisparse_read_kvarn_hot_bdr kernel launch failed");
 }
 
 } // namespace kernels
