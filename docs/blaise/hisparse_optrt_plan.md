@@ -1738,7 +1738,11 @@ Current branch status:
 - sender-side HiSparse fragments are intentionally not appended to the normal
   `WriteMetaType.KV` `VRAM -> VRAM` request. They are carried on `WriteMeta`,
   validated against request-relative host slots, and submitted as a separate
-  typed `WriteMetaType.HISPARSE_HOST` request with `VRAM -> DRAM` descriptors.
+  typed `WriteMetaType.HISPARSE_HOST` request with `VRAM -> DRAM` descriptors;
+- `test_hisparse_nixl_write_mode_host_transfer_source_contract` now guards the
+  source-level write-mode contract: typed `HISPARSE_HOST` memory inference,
+  generation-first request ids, pending-write begin/finish, success-before-result
+  ordering, commit-coverage payloads, and admit-only-after-commit behavior.
 
 Still pending before serving enablement:
 

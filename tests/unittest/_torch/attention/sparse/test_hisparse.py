@@ -908,6 +908,28 @@ def test_hisparse_layersplit_broadcast_uses_global_kv_indices_source_contract():
     assert "_layersplit_topk_global_block_ids(\n                layersplit_topk_indices_global" in source
 
 
+def test_hisparse_nixl_write_mode_host_transfer_source_contract():
+    root = Path(__file__).resolve().parents[5]
+    transfer = root / "tensorrt_llm/_torch/disaggregation/native/transfer.py"
+
+    source = transfer.read_text()
+    assert "HISPARSE_HOST = \"HISPARSE_HOST\"" in source
+    assert "if meta_type == WriteMetaType.HISPARSE_HOST:" in source
+    assert "return MemoryType.VRAM, MemoryType.DRAM" in source
+    assert "HiSparse direct-to-host requires a generation-first request id" in source
+    assert "coordinator.begin_host_write(task._unique_rid)" in source
+    assert "HISPARSE_HOST transfer before KV_AGENT_RESULT is sent" in source
+    assert "src_memory_type=MemoryType.VRAM" in source
+    assert "dst_memory_type=MemoryType.DRAM" in source
+    assert "meta_type=WriteMetaType.HISPARSE_HOST" in source
+    assert "agent_result == AgentResult.SUCCESS and write_meta.hisparse_src_ptrs is not None" in source
+    assert "_pack_hisparse_commit_payload(" in source
+    assert "successful host-write commit coverage" in source
+    assert "coordinator.mark_host_write_committed" in source
+    assert "coordinator.finish_host_write(task._unique_rid)" in source
+    assert "coordinator.mark_request_admitted" in source
+
+
 def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():
     root = Path(__file__).resolve().parents[5]
     kernel = root / "cpp/tensorrt_llm/kernels/hisparseTopkToBlocks.cu"
