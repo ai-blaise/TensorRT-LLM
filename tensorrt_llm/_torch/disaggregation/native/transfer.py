@@ -153,6 +153,9 @@ class WriteMeta:
     slice_id: Optional[int] = None
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    hisparse_src_ptrs: Optional[np.ndarray] = None
+    hisparse_dst_ptrs: Optional[np.ndarray] = None
+    hisparse_sizes: Optional[np.ndarray] = None
 
 
 class MessageType:
@@ -575,6 +578,41 @@ class Sender(SenderBase):
             if not self._agent.submit_transfer_requests(request).wait():
                 agent_result = AgentResult.FAILED
                 task.fail(RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}"))
+        if agent_result == AgentResult.SUCCESS and write_meta.hisparse_src_ptrs is not None:
+            if (write_meta.hisparse_dst_ptrs is None
+                    or write_meta.hisparse_sizes is None):
+                agent_result = AgentResult.FAILED
+                task.fail(
+                    RuntimeError(
+                        "HiSparse host transfer metadata is incomplete for "
+                        f"request {write_meta.unique_rid}"))
+            elif write_meta.hisparse_src_ptrs.size > 0:
+                hisparse_meta = WriteMeta(
+                    task=write_meta.task,
+                    expected_transfers=write_meta.expected_transfers,
+                    peer_name=write_meta.peer_name,
+                    peer_rank=write_meta.peer_rank,
+                    peer_endpoint=write_meta.peer_endpoint,
+                    unique_rid=write_meta.unique_rid,
+                    src_ptrs=write_meta.hisparse_src_ptrs,
+                    dst_ptrs=write_meta.hisparse_dst_ptrs,
+                    sizes=write_meta.hisparse_sizes,
+                    src_device_id=self._device_id,
+                    dst_device_id=0,
+                    src_memory_type=MemoryType.VRAM,
+                    dst_memory_type=MemoryType.DRAM,
+                    slice_id=write_meta.slice_id,
+                    is_last_slice=write_meta.is_last_slice,
+                    meta_type=WriteMetaType.HISPARSE_HOST,
+                )
+                request = Sender._make_agent_request(
+                    hisparse_meta, device_id=self._device_id)
+                if not self._agent.submit_transfer_requests(request).wait():
+                    agent_result = AgentResult.FAILED
+                    task.fail(
+                        RuntimeError(
+                            "HiSparse host transfer failed for request "
+                            f"{write_meta.unique_rid}"))
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
@@ -900,6 +938,9 @@ class Sender(SenderBase):
         hisparse_src_parts: list[np.ndarray] = []
         hisparse_dst_parts: list[np.ndarray] = []
         hisparse_size_parts: list[np.ndarray] = []
+        hisparse_src_frags: Optional[np.ndarray] = None
+        hisparse_dst_frags: Optional[np.ndarray] = None
+        hisparse_sizes: Optional[np.ndarray] = None
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -1035,18 +1076,18 @@ class Sender(SenderBase):
             kv_sizes = np.concatenate([kv_sizes, s_sizes])
         if hisparse_src_parts:
             # Source/destination descriptors are validated here, but not
-            # appended to the VRAM KV write. HiSparse host writes need a
-            # separate DRAM WriteMeta once the host-write completion path is
-            # wired into the session result semantics.
-            _hisparse_src = np.concatenate(hisparse_src_parts)
-            _hisparse_dst = np.concatenate(hisparse_dst_parts)
-            _hisparse_sizes = np.concatenate(hisparse_size_parts)
-            if not (_hisparse_src.size == _hisparse_dst.size
-                    == _hisparse_sizes.size):
+            # appended to the VRAM KV write. They are submitted as a typed
+            # HISPARSE_HOST transfer before KV_AGENT_RESULT is sent.
+            hisparse_src_frags = np.concatenate(hisparse_src_parts)
+            hisparse_dst_frags = np.concatenate(hisparse_dst_parts)
+            hisparse_sizes = np.concatenate(hisparse_size_parts)
+            if not (hisparse_src_frags.size == hisparse_dst_frags.size
+                    == hisparse_sizes.size):
                 raise RuntimeError(
                     "HiSparse packed host-write fragment count mismatch: "
-                    f"src={_hisparse_src.size}, dst={_hisparse_dst.size}, "
-                    f"sizes={_hisparse_sizes.size}.")
+                    f"src={hisparse_src_frags.size}, "
+                    f"dst={hisparse_dst_frags.size}, "
+                    f"sizes={hisparse_sizes.size}.")
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1065,6 +1106,9 @@ class Sender(SenderBase):
             unique_rid=task._unique_rid,
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
+            hisparse_src_ptrs=hisparse_src_frags,
+            hisparse_dst_ptrs=hisparse_dst_frags,
+            hisparse_sizes=hisparse_sizes,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:

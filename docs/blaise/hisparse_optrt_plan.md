@@ -685,6 +685,9 @@ Current branch status:
   writes can use distinct source and destination memory types
   (`VRAM -> DRAM` or `DRAM -> DRAM`) instead of overloading uniform KV/AUX
   descriptor assumptions;
+- wired packed HiSparse `VRAM -> DRAM` host writes into the KV sender path so
+  the receiver is not notified of KV success until the normal KV write and the
+  HiSparse host write have both completed;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -696,8 +699,6 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- a dedicated `DRAM` write meta path for prefill-to-decode packed KVarN host
-  writes, submitted before the receiver sees KV transfer completion;
 - completion/commit handoff that marks host `valid` and `commit_gen` only after
   the HiSparse host write succeeds;
 - cancel/abort handling that keeps host slots pinned until in-flight DRAM
