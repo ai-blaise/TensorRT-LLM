@@ -114,6 +114,25 @@ __device__ __forceinline__ int readPacked2(PackedRecordView view, std::int64_t b
     return (recordByte(view, blockId, kvHead, byteIdx) >> shift) & 0x3;
 }
 
+// Cooperatively stage one 4096-byte packed code plane (K or V) for a block into
+// shared memory so the score/value loops unpack codes from smem instead of issuing
+// strided/page-addressed global byte loads.
+__device__ __forceinline__ void stageCodePlane(
+    PackedRecordView view, std::int64_t blockId, int kvHead, int baseOffset, std::uint8_t* dst)
+{
+    constexpr int kPlaneBytes = Layout::kHeadDim * Layout::kGroupSize / 4;  // 4096
+    for (int i = threadIdx.x; i < kPlaneBytes; i += blockDim.x)
+    {
+        dst[i] = recordByte(view, blockId, kvHead, baseOffset + i);
+    }
+}
+
+__device__ __forceinline__ int readPacked2Smem(std::uint8_t const* plane, int valueIdx)
+{
+    int bit = valueIdx * 2;
+    return (plane[bit >> 3] >> (bit & 7)) & 0x3;
+}
+
 __device__ __forceinline__ float dequantKRot(PackedRecordView view, std::int64_t blockId, int kvHead, int token, int dim)
 {
     int q = readPacked2(view, blockId, kvHead, kKPackedOffset, dim * Layout::kGroupSize + token);
@@ -488,6 +507,42 @@ __device__ float loadVRotatedForLogicalToken(T const* sinkV, T const* tailV, Pac
     return loadSideRotated(tailV, query, tailBatch, tailToken, kvHead, dim, tailTokens, numKvHeads);
 }
 
+// Factored K score for one logical token: returns sum_d qRot[d]*Krot[d,token].
+// For packed tokens the per-token sCol scalar is read once (outside the dim loop)
+// instead of once per dim as the elementwise dequantKRot path did.
+template <typename T>
+__device__ float scoreKLogicalTokenFactored(float const* qRot, T const* sinkK, T const* tailK,
+    PackedRecordView records, std::int64_t const* blockIds, int query, int kvHead, int logicalToken, int sinkCount,
+    int packedCount, int sinkTokens, int sinkBatch, int tailTokens, int tailBatch, int numKvHeads)
+{
+    int afterSink = logicalToken - sinkCount;
+    if (logicalToken >= sinkCount && afterSink < packedCount)
+    {
+        int block = afterSink / Layout::kGroupSize;
+        int token = afterSink - block * Layout::kGroupSize;
+        std::int64_t blockId = blockIds[block];
+        float sCol = readPackedFp16(records, blockId, kvHead, kKSColOffset + token * 2);
+        float dot = 0.0f;
+        for (int d = 0; d < Layout::kHeadDim; ++d)
+        {
+            int code = readPacked2(records, blockId, kvHead, kKPackedOffset, d * Layout::kGroupSize + token);
+            float sRowAbs = readPackedFp16(records, blockId, kvHead, kKSRowAbsOffset + d * 2);
+            float zpAbs = readPackedFp16(records, blockId, kvHead, kKZpAbsOffset + d * 2);
+            dot += qRot[d] * (static_cast<float>(code) * sRowAbs + zpAbs);
+        }
+        return dot * sCol;
+    }
+    // sink/tail tokens: elementwise rotated path.
+    float dot = 0.0f;
+    for (int d = 0; d < Layout::kHeadDim; ++d)
+    {
+        dot += qRot[d]
+            * loadKRotatedForLogicalToken(sinkK, tailK, records, blockIds, query, kvHead, d, logicalToken, sinkCount,
+                packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
+    }
+    return dot;
+}
+
 template <bool IsKey, typename T>
 __device__ void dequantReadableTileFromShared(PackedRecordView records, std::int64_t blockId, int kvHead,
     T* readable, int numKvHeads, float* rotTile)
@@ -835,12 +890,8 @@ __global__ void kvarnGqaDecodeSparseTopkKernel(T const* q, PackedRecordView reco
         {
             continue;
         }
-        float dot = 0.0f;
-        for (int d = 0; d < Layout::kHeadDim; ++d)
-        {
-            dot += qRot[d] * loadKRotatedForLogicalToken(sinkK, tailK, records, blockIds, query, kvHead, d,
-                linearToken, sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
-        }
+        float dot = scoreKLogicalTokenFactored(qRot, sinkK, tailK, records, blockIds, query, kvHead, linearToken,
+            sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
         float logit = dot * kHadamardScale;
         logits[i] = logit;
         localMax = fmaxf(localMax, logit);
@@ -1026,6 +1077,346 @@ __global__ void kvarnGqaDecodeParallelKernel(T const* q, PackedRecordView record
 
 }
 
+// Dynamic-shared-memory dense decode for arbitrary token counts. Each block owns
+// one (query, head). The per-token logit/weight is cached in dynamic shared
+// memory, so the value-accumulation pass reuses it instead of re-dequantizing K,
+// and the value accumulation is parallelized over head dims (no atomics).
+template <typename T, int THREADS>
+__global__ void kvarnGqaDecodeDynKernel(T const* q, PackedRecordView records, std::int64_t const* blockIds,
+    T const* sinkK, T const* sinkV, T const* tailK, T const* tailV, std::int32_t const* seqLens, T* output,
+    int numQueries, int numBlocks, int numHeads, int numKvHeads, int seqLensCount, int sinkTokens, int sinkBatch,
+    int tailTokens, int tailBatch)
+{
+    int query = blockIdx.x;
+    int head = blockIdx.y;
+    int tid = threadIdx.x;
+    if (query >= numQueries || head >= numHeads)
+    {
+        return;
+    }
+
+    extern __shared__ float dynSmem[];
+    float* weights = dynSmem;                  // [totalTokens] cached logits then weights
+    __shared__ float qRot[Layout::kHeadDim];
+    __shared__ float accRot[Layout::kHeadDim];
+    __shared__ float red[THREADS];
+
+    int groups = numHeads / numKvHeads;
+    int kvHead = head / groups;
+    int seqLen = seqLensCount == 1 ? seqLens[0] : seqLens[query];
+    int cappedSeqLen = seqLen > 0 ? seqLen : 0;
+    int sinkCount = sinkTokens > 0 ? (cappedSeqLen < sinkTokens ? cappedSeqLen : sinkTokens) : 0;
+    int remainingAfterSink = cappedSeqLen - sinkCount;
+    int maxPackedTokens = numBlocks * Layout::kGroupSize;
+    int packedCount = remainingAfterSink < maxPackedTokens ? remainingAfterSink : maxPackedTokens;
+    int remainingAfterPacked = remainingAfterSink - packedCount;
+    int tailCount = tailTokens > 0 ? (remainingAfterPacked < tailTokens ? remainingAfterPacked : tailTokens) : 0;
+    int totalTokens = sinkCount + packedCount + tailCount;
+    T const* qBase = q + (static_cast<std::int64_t>(query) * numHeads + head) * Layout::kHeadDim;
+    T* outBase = output + (static_cast<std::int64_t>(query) * numHeads + head) * Layout::kHeadDim;
+
+    for (int d = tid; d < Layout::kHeadDim; d += THREADS)
+    {
+        float acc = 0.0f;
+        for (int j = 0; j < Layout::kHeadDim; ++j)
+        {
+            acc += loadScalar(qBase + j) * static_cast<float>(hadamardSign(j, d));
+        }
+        qRot[d] = acc * kHadamardScale;
+        accRot[d] = 0.0f;
+    }
+    __syncthreads();
+
+    if (totalTokens <= 0)
+    {
+        for (int d = tid; d < Layout::kHeadDim; d += THREADS)
+        {
+            storeScalar(outBase + d, 0.0f);
+        }
+        return;
+    }
+
+    // Pass 1: dequant K once per (token, dim), score, cache the logit, track block max.
+    float localMax = -FLT_MAX;
+    for (int linearToken = tid; linearToken < totalTokens; linearToken += THREADS)
+    {
+        float dot = 0.0f;
+        for (int d = 0; d < Layout::kHeadDim; ++d)
+        {
+            dot += qRot[d] * loadKRotatedForLogicalToken(sinkK, tailK, records, blockIds, query, kvHead, d,
+                linearToken, sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
+        }
+        float logit = dot * kHadamardScale;
+        weights[linearToken] = logit;
+        localMax = fmaxf(localMax, logit);
+    }
+    red[tid] = localMax;
+    __syncthreads();
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            red[tid] = fmaxf(red[tid], red[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float maxLogit = red[0];
+    __syncthreads();
+
+    // Convert cached logits to weights and reduce the denominator (reuse cached
+    // logits; no second K dequant).
+    float localDenom = 0.0f;
+    for (int linearToken = tid; linearToken < totalTokens; linearToken += THREADS)
+    {
+        float weight = expf(weights[linearToken] - maxLogit);
+        weights[linearToken] = weight;
+        localDenom += weight;
+    }
+    red[tid] = localDenom;
+    __syncthreads();
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            red[tid] += red[tid + stride];
+        }
+        __syncthreads();
+    }
+    float invDenom = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+
+    // Pass 2: value accumulation parallel over head dims; each thread owns a set of
+    // rotated dims and dequants V once per (token, dim). No atomics.
+    for (int d = tid; d < Layout::kHeadDim; d += THREADS)
+    {
+        float acc = 0.0f;
+        for (int linearToken = 0; linearToken < totalTokens; ++linearToken)
+        {
+            acc += weights[linearToken] * loadVRotatedForLogicalToken(sinkV, tailV, records, blockIds, query, kvHead, d,
+                linearToken, sinkCount, packedCount, sinkTokens, sinkBatch, tailTokens, tailBatch, numKvHeads);
+        }
+        accRot[d] = acc;
+    }
+    __syncthreads();
+
+    for (int j = tid; j < Layout::kHeadDim; j += THREADS)
+    {
+        float out = 0.0f;
+        for (int d = 0; d < Layout::kHeadDim; ++d)
+        {
+            out += accRot[d] * invDenom * static_cast<float>(hadamardSign(j, d));
+        }
+        storeScalar(outBase + j, out * kHadamardScale);
+    }
+}
+
+// Factored pure-packed dense decode (no sink/tail). Algebraically identical to the
+// generic dyn kernel but hoists the per-dim / per-token fp16 scale unpacking out of
+// the hot per-element loops:
+//   logit(t)  = sCol_K[t] * ( sum_d (qRot[d]*sRowAbs_K[d]) * code_K(d,t) + sum_d qRot[d]*zpAbs_K[d] )
+//   accRot(d) = sCol_V[d] * ( sum_t (w[t]*sRowAbs_V[t]) * code_V(t,d) + sum_t w[t]*zpAbs_V[t] )
+// so each packed sub-block reads its fp16 scales once and the inner loops touch only
+// 2-bit codes and precomputed shared-memory floats.
+template <typename T, int THREADS>
+__global__ void kvarnGqaDecodePackedFactoredKernel(T const* q, PackedRecordView records,
+    std::int64_t const* blockIds, std::int32_t const* seqLens, T* output, int numQueries, int numBlocks, int numHeads,
+    int numKvHeads, int seqLensCount)
+{
+    int query = blockIdx.x;
+    int head = blockIdx.y;
+    int tid = threadIdx.x;
+    if (query >= numQueries || head >= numHeads)
+    {
+        return;
+    }
+
+    constexpr int HD = Layout::kHeadDim;
+    constexpr int GS = Layout::kGroupSize;
+    extern __shared__ float dynSmem[];
+    float* weights = dynSmem;                  // [totalTokens]
+    std::uint8_t* codeSmem = reinterpret_cast<std::uint8_t*>(weights + ((numBlocks * GS + 3) & ~3));
+    __shared__ float qRot[HD];
+    __shared__ float accRot[HD];
+    __shared__ float qScaled[HD];              // qRot[d]*sRowAbs_K[block][d]
+    __shared__ float sColCache[GS];            // per-block K sCol[token] or V sCol[dim]
+    __shared__ float wScaled[GS];              // weight[t]*sRowAbs_V[block][t]
+    __shared__ float red[THREADS];
+
+    int groups = numHeads / numKvHeads;
+    int kvHead = head / groups;
+    int seqLen = seqLensCount == 1 ? seqLens[0] : seqLens[query];
+    int cappedSeqLen = seqLen > 0 ? seqLen : 0;
+    int maxPackedTokens = numBlocks * GS;
+    int totalTokens = cappedSeqLen < maxPackedTokens ? cappedSeqLen : maxPackedTokens;
+    int numFullBlocks = totalTokens / GS;
+    int tailInBlock = totalTokens - numFullBlocks * GS;  // partial trailing packed block
+    T const* qBase = q + (static_cast<std::int64_t>(query) * numHeads + head) * HD;
+    T* outBase = output + (static_cast<std::int64_t>(query) * numHeads + head) * HD;
+
+    for (int d = tid; d < HD; d += THREADS)
+    {
+        float acc = 0.0f;
+        for (int j = 0; j < HD; ++j)
+        {
+            acc += loadScalar(qBase + j) * static_cast<float>(hadamardSign(j, d));
+        }
+        qRot[d] = acc * kHadamardScale;
+        accRot[d] = 0.0f;
+    }
+    __syncthreads();
+
+    if (totalTokens <= 0)
+    {
+        for (int d = tid; d < HD; d += THREADS)
+        {
+            storeScalar(outBase + d, 0.0f);
+        }
+        return;
+    }
+
+    // ---- Score pass: per packed sub-block, factor K scales, then score tokens. ----
+    float localMax = -FLT_MAX;
+    int scoreBlocks = numFullBlocks + (tailInBlock > 0 ? 1 : 0);
+    for (int b = 0; b < scoreBlocks; ++b)
+    {
+        std::int64_t blockId = blockIds[b];
+        int tokensInBlock = (b < numFullBlocks) ? GS : tailInBlock;
+        // Precompute qScaled[d] = qRot[d]*sRowAbs_K[d] and per-thread partial of
+        // qZpConst = sum_d qRot[d]*zpAbs_K[d]; also cache sCol_K[token].
+        float partialZp = 0.0f;
+        for (int d = tid; d < HD; d += THREADS)
+        {
+            float sRowAbs = readPackedFp16(records, blockId, kvHead, kKSRowAbsOffset + d * 2);
+            float zpAbs = readPackedFp16(records, blockId, kvHead, kKZpAbsOffset + d * 2);
+            qScaled[d] = qRot[d] * sRowAbs;
+            partialZp += qRot[d] * zpAbs;
+        }
+        for (int t = tid; t < tokensInBlock; t += THREADS)
+        {
+            sColCache[t] = readPackedFp16(records, blockId, kvHead, kKSColOffset + t * 2);
+        }
+        red[tid] = partialZp;
+        __syncthreads();
+        for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride)
+            {
+                red[tid] += red[tid + stride];
+            }
+            __syncthreads();
+        }
+        float qZpConst = red[0];
+        // Stage K code plane to smem (overlaps with the zp reduction sync above).
+        stageCodePlane(records, blockId, kvHead, kKPackedOffset, codeSmem);
+        __syncthreads();
+
+        for (int t = tid; t < tokensInBlock; t += THREADS)
+        {
+            float dot = 0.0f;
+            for (int d = 0; d < HD; ++d)
+            {
+                int code = readPacked2Smem(codeSmem, d * GS + t);
+                dot += qScaled[d] * static_cast<float>(code);
+            }
+            float logit = (dot + qZpConst) * sColCache[t] * kHadamardScale;
+            int globalT = b * GS + t;
+            weights[globalT] = logit;
+            localMax = fmaxf(localMax, logit);
+        }
+        __syncthreads();
+    }
+    red[tid] = localMax;
+    __syncthreads();
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            red[tid] = fmaxf(red[tid], red[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float maxLogit = red[0];
+    __syncthreads();
+
+    float localDenom = 0.0f;
+    for (int t = tid; t < totalTokens; t += THREADS)
+    {
+        float w = expf(weights[t] - maxLogit);
+        weights[t] = w;
+        localDenom += w;
+    }
+    red[tid] = localDenom;
+    __syncthreads();
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            red[tid] += red[tid + stride];
+        }
+        __syncthreads();
+    }
+    float invDenom = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    __syncthreads();
+
+    // ---- Value pass: per packed sub-block, factor V scales, accumulate over dims. ----
+    for (int b = 0; b < scoreBlocks; ++b)
+    {
+        std::int64_t blockId = blockIds[b];
+        int tokensInBlock = (b < numFullBlocks) ? GS : tailInBlock;
+        // Precompute wScaled[t] = weight[t]*sRowAbs_V[t]; per-thread partial of
+        // wZpConst = sum_t weight[t]*zpAbs_V[t]; cache sCol_V[dim].
+        float partialZp = 0.0f;
+        for (int t = tid; t < tokensInBlock; t += THREADS)
+        {
+            int globalT = b * GS + t;
+            float w = weights[globalT];
+            float sRowAbs = readPackedFp16(records, blockId, kvHead, kVSRowAbsOffset + t * 2);
+            float zpAbs = readPackedFp16(records, blockId, kvHead, kVZpAbsOffset + t * 2);
+            wScaled[t] = w * sRowAbs;
+            partialZp += w * zpAbs;
+        }
+        for (int d = tid; d < HD; d += THREADS)
+        {
+            sColCache[d] = readPackedFp16(records, blockId, kvHead, kVSColOffset + d * 2);
+        }
+        red[tid] = partialZp;
+        __syncthreads();
+        for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride)
+            {
+                red[tid] += red[tid + stride];
+            }
+            __syncthreads();
+        }
+        float wZpConst = red[0];
+        // Stage V code plane to smem (overlaps with the zp reduction sync above).
+        stageCodePlane(records, blockId, kvHead, kVPackedOffset, codeSmem);
+        __syncthreads();
+
+        for (int d = tid; d < HD; d += THREADS)
+        {
+            float acc = 0.0f;
+            for (int t = 0; t < tokensInBlock; ++t)
+            {
+                int code = readPacked2Smem(codeSmem, t * HD + d);
+                acc += wScaled[t] * static_cast<float>(code);
+            }
+            accRot[d] += (acc + wZpConst) * sColCache[d];
+        }
+        __syncthreads();
+    }
+
+    for (int j = tid; j < HD; j += THREADS)
+    {
+        float out = 0.0f;
+        for (int d = 0; d < HD; ++d)
+        {
+            out += accRot[d] * invDenom * static_cast<float>(hadamardSign(j, d));
+        }
+        storeScalar(outBase + j, out * kHadamardScale);
+    }
+}
+
 } // namespace
 
 bool kvarnGqaBackendReady()
@@ -1160,12 +1551,51 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
     TLLM_CHECK_WITH_INFO(numBlocks >= 0 && numQueries >= 0, "kvarn_gqa_decode got negative sizes");
     PackedRecordView view{packedRecords, pageLayout, strideBlock, strideToken, strideHead, strideByte};
     dim3 grid(numQueries, numHeads);
-    bool useSmallDecode = (sinkTokens + numBlocks * Layout::kGroupSize + tailTokens) <= 256;
+    constexpr int kThreads = 256;
+    int maxTotalTokens = sinkTokens + numBlocks * Layout::kGroupSize + tailTokens;
+    bool useSmallDecode = maxTotalTokens <= 256;
+    // Dynamic-shared-memory decode caches per-token weights so the value pass does
+    // not re-dequant K and accumulates without atomics. Opt in up to the SM100 cap.
+    std::size_t dynSmemBytes = static_cast<std::size_t>(maxTotalTokens) * sizeof(float);
+    constexpr std::size_t kMaxDynSmem = 200u * 1024u;
+    bool useDynDecode = !useSmallDecode && dynSmemBytes <= kMaxDynSmem;
+    // Pure-packed reads (no fp16 sink/tail side state) use the factored kernel that
+    // hoists scale unpacking out of the hot loops and stages one 4096-byte code plane
+    // in smem (weights region is padded to a 4-float boundary). It handles any token
+    // count incl. partial trailing blocks, so it also serves the <=256-token case and
+    // takes priority over the (slower, unfactored) small kernel.
+    constexpr std::size_t kCodePlaneBytes = 4096;
+    std::size_t factoredSmemBytes
+        = static_cast<std::size_t>((maxTotalTokens + 3) & ~3) * sizeof(float) + kCodePlaneBytes;
+    bool usePackedFactored
+        = sinkTokens == 0 && tailTokens == 0 && maxTotalTokens > 0 && factoredSmemBytes <= kMaxDynSmem;
+    // Small kernel now only handles the <=256 case that still carries fp16 sink/tail state.
+    useSmallDecode = useSmallDecode && !usePackedFactored;
     if (useBf16)
     {
         if (useSmallDecode)
         {
-            kvarnGqaDecodeSmallKernel<__nv_bfloat16, 256, 256><<<grid, 256, 0, stream>>>(
+            kvarnGqaDecodeSmallKernel<__nv_bfloat16, 256, 256><<<grid, kThreads, 0, stream>>>(
+                static_cast<__nv_bfloat16 const*>(q), view, blockIds, static_cast<__nv_bfloat16 const*>(sinkK),
+                static_cast<__nv_bfloat16 const*>(sinkV), static_cast<__nv_bfloat16 const*>(tailK),
+                static_cast<__nv_bfloat16 const*>(tailV), seqLens, static_cast<__nv_bfloat16*>(output), numQueries,
+                numBlocks, numHeads, numKvHeads, seqLensCount, sinkTokens, sinkBatch, tailTokens, tailBatch);
+        }
+        else if (usePackedFactored)
+        {
+            checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaDecodePackedFactoredKernel<__nv_bfloat16, kThreads>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(factoredSmemBytes)),
+                "kvarn_gqa_decode bf16 factored smem attribute");
+            kvarnGqaDecodePackedFactoredKernel<__nv_bfloat16, kThreads><<<grid, kThreads, factoredSmemBytes, stream>>>(
+                static_cast<__nv_bfloat16 const*>(q), view, blockIds, seqLens, static_cast<__nv_bfloat16*>(output),
+                numQueries, numBlocks, numHeads, numKvHeads, seqLensCount);
+        }
+        else if (useDynDecode)
+        {
+            checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaDecodeDynKernel<__nv_bfloat16, kThreads>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(dynSmemBytes)),
+                "kvarn_gqa_decode bf16 dyn smem attribute");
+            kvarnGqaDecodeDynKernel<__nv_bfloat16, kThreads><<<grid, kThreads, dynSmemBytes, stream>>>(
                 static_cast<__nv_bfloat16 const*>(q), view, blockIds, static_cast<__nv_bfloat16 const*>(sinkK),
                 static_cast<__nv_bfloat16 const*>(sinkV), static_cast<__nv_bfloat16 const*>(tailK),
                 static_cast<__nv_bfloat16 const*>(tailV), seqLens, static_cast<__nv_bfloat16*>(output), numQueries,
@@ -1173,7 +1603,7 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
         }
         else
         {
-            kvarnGqaDecodeParallelKernel<__nv_bfloat16, 256><<<grid, 256, 0, stream>>>(
+            kvarnGqaDecodeParallelKernel<__nv_bfloat16, 256><<<grid, kThreads, 0, stream>>>(
                 static_cast<__nv_bfloat16 const*>(q), view, blockIds, static_cast<__nv_bfloat16 const*>(sinkK),
                 static_cast<__nv_bfloat16 const*>(sinkV), static_cast<__nv_bfloat16 const*>(tailK),
                 static_cast<__nv_bfloat16 const*>(tailV), seqLens, static_cast<__nv_bfloat16*>(output), numQueries,
@@ -1184,14 +1614,34 @@ void invokeKvarnGqaDecodeK2V2G128(void const* q, std::uint8_t const* packedRecor
     {
         if (useSmallDecode)
         {
-            kvarnGqaDecodeSmallKernel<__half, 256, 256><<<grid, 256, 0, stream>>>(static_cast<__half const*>(q),
+            kvarnGqaDecodeSmallKernel<__half, 256, 256><<<grid, kThreads, 0, stream>>>(static_cast<__half const*>(q),
                 view, blockIds, static_cast<__half const*>(sinkK), static_cast<__half const*>(sinkV),
                 static_cast<__half const*>(tailK), static_cast<__half const*>(tailV), seqLens, static_cast<__half*>(output),
                 numQueries, numBlocks, numHeads, numKvHeads, seqLensCount, sinkTokens, sinkBatch, tailTokens, tailBatch);
         }
+        else if (usePackedFactored)
+        {
+            checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaDecodePackedFactoredKernel<__half, kThreads>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(factoredSmemBytes)),
+                "kvarn_gqa_decode fp16 factored smem attribute");
+            kvarnGqaDecodePackedFactoredKernel<__half, kThreads><<<grid, kThreads, factoredSmemBytes, stream>>>(
+                static_cast<__half const*>(q), view, blockIds, seqLens, static_cast<__half*>(output),
+                numQueries, numBlocks, numHeads, numKvHeads, seqLensCount);
+        }
+        else if (useDynDecode)
+        {
+            checkKvarnGqaCuda(cudaFuncSetAttribute(kvarnGqaDecodeDynKernel<__half, kThreads>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(dynSmemBytes)),
+                "kvarn_gqa_decode fp16 dyn smem attribute");
+            kvarnGqaDecodeDynKernel<__half, kThreads><<<grid, kThreads, dynSmemBytes, stream>>>(
+                static_cast<__half const*>(q), view, blockIds, static_cast<__half const*>(sinkK),
+                static_cast<__half const*>(sinkV), static_cast<__half const*>(tailK), static_cast<__half const*>(tailV),
+                seqLens, static_cast<__half*>(output), numQueries, numBlocks, numHeads, numKvHeads, seqLensCount,
+                sinkTokens, sinkBatch, tailTokens, tailBatch);
+        }
         else
         {
-            kvarnGqaDecodeParallelKernel<__half, 256><<<grid, 256, 0, stream>>>(static_cast<__half const*>(q),
+            kvarnGqaDecodeParallelKernel<__half, 256><<<grid, kThreads, 0, stream>>>(static_cast<__half const*>(q),
                 view, blockIds, static_cast<__half const*>(sinkK), static_cast<__half const*>(sinkV),
                 static_cast<__half const*>(tailK), static_cast<__half const*>(tailV), seqLens, static_cast<__half*>(output),
                 numQueries, numBlocks, numHeads, numKvHeads, seqLensCount, sinkTokens, sinkBatch, tailTokens, tailBatch);
