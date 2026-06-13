@@ -247,6 +247,20 @@ was built from source SHA `c6143d16492f4dde16375eb28f68e43298e10d7e`, imported
 `/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs/libth_common.so`
 through the normal package loader, and completed
 `native_planner_copy_smoke.py` without an explicit `--library` path.
+The same serving-layout proof was rerun after the June 13 final plan/helper
+sweep at source SHA `aba720ca642256ec710daf1bd4e2a2409cb1e8a6`:
+`localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-aba720ca6422-hisparse-serving-import-proof-v2-20260613T131600Z`
+overlays branch Python into deployment-runtime site-packages, loads
+`site-packages/tensorrt_llm/libs/libth_common.so` through normal import, and
+passes `native_planner_copy_smoke.py` without `--library`. That proof image
+also carried the cached branch-built NIXL and UCX wrapper libraries alongside
+`libtensorrt_llm.so`, `libpg_utils.so`, and decoder-attention native siblings.
+`package_root_files` and `package_lib_files` were empty because a current diff
+audit against `origin/op-trt` found no branch changes under
+`cpp/tensorrt_llm/nanobind`, `cpp/tensorrt_llm/plugins`, or the transfer-agent
+binding source; the branch-generated Python binding/plugin artifacts are
+therefore not a current-head correctness delta. If those sources change later,
+the generated-artifact proof remains mandatory before promotion.
 The repo-level pytest harness still requires the full Python bindings, so the
 proof script intentionally bypassed `tests/unittest/conftest.py` while
 executing the same native ops and tensor contracts.
@@ -1425,8 +1439,12 @@ Still pending before serving enablement:
 
 - build the full deployment image/wheel with these exact-clean fixes and rerun
   the same native-op smoke through the image that DSA will load in serving.
-  The exact-clean `th_hisparse_smoke` proof is complete, but it deliberately
-  avoids the full Python bindings and deployment packaging;
+  The exact-clean `th_hisparse_smoke` proof and the serving-layout
+  branch-Python + branch-`libth_common.so` proof are complete, but they still
+  avoid a full generated-bindings rebuild. A June 13 diff audit shows generated
+  binding/plugin source did not change on this branch head, so this is not a
+  current-head correctness delta; if those sources change, full generated
+  artifact proof becomes mandatory before promotion;
 - use `scripts/blaise_build_hisparse_thop.sh` for the current VM-side native
   thop proof loop. The June 13 build sweep established the required
   non-disruptive recipe: run inside the `hisa-buildtools-20260531` image, keep
@@ -1444,9 +1462,14 @@ Still pending before serving enablement:
   cache can build generated binding/plugin proof targets without a fresh
   fullsource loop. Use that only to build real CMake targets from the branch
   cache; do not introduce an ad hoc import shim or a runtime substitute for the
-  generated artifacts. It still pulls the shared TRT-LLM internal CUTLASS
-  dependency graph, so the first build remains large; the persistent build dir
-  is part of the recipe, not an optional convenience. The helper supports
+  generated artifacts. A broad attempt to build `bindings
+  nvinfer_plugin_tensorrt_llm tensorrt_llm_transfer_agent_binding` confirmed
+  that `bindings` pulls thousands of shared TRT-LLM CUTLASS/MoE objects
+  (3k-plus Ninja steps) even with the persistent cache. Do not put that broad
+  rebuild on the critical path unless generated binding/plugin sources changed
+  or the full wheel/image gate is being run deliberately on a build lane. The
+  persistent build dir is part of the recipe, not an optional convenience. The
+  helper supports
   `TARGETS=...` for narrow proof builds during downtime, and the swap-in copy
   bridge now builds as `hisparseSwapInPackedKvarnOp.cu` because it owns the
   mapped-host CUDA copy kernel and launch syntax. The helper exports the CUTLASS
@@ -1737,9 +1760,14 @@ production ABI:
      branch Python from deployment-runtime site-packages, loads
      `site-packages/tensorrt_llm/libs/libth_common.so` through the normal
      TensorRT-LLM package loader, and reruns the native planner/copy smoke
-     without `--library`;
-   - next, use the persistent VM cache to build the remaining generated serving
-     artifacts from the same branch head. The intended non-disruptive loop is:
+     without `--library`. The latest proof image for
+     `aba720ca642256ec710daf1bd4e2a2409cb1e8a6` is
+     `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-aba720ca6422-hisparse-serving-import-proof-v2-20260613T131600Z`;
+   - current branch-head generated binding/plugin proof is not required because
+     the source diff does not touch nanobind, plugin source, or transfer-agent
+     binding source. If any of those sources change later, use the persistent
+     VM cache to build the remaining generated serving artifacts from the same
+     branch head. The intended non-disruptive loop is:
      1. verify exact target names with the existing CMake/Ninja cache;
      2. run `scripts/blaise_build_hisparse_thop.sh` with `WHEEL_TARGETS=...`
         and `TARGETS=...` for the real generated binding, plugin, and
