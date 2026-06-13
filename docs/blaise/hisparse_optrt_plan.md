@@ -837,6 +837,11 @@ Current branch status:
   HiSparse-enabled runs. It owns BDR byte-record storage, destination/source
   fragments, commit generations, and recycle invalidation, but deliberately
   does not add a Python FP16-to-BDR serving writer;
+- added DSA writer-facing hooks:
+  `kvarn_bdr_record_destination_fragments()` returns layer-major writable BDR
+  record destinations for the native writer, and
+  `mark_kvarn_bdr_records_committed()` publishes those records only after the
+  native write succeeds;
 - guarded `kvarn_packed_source_fragments()` with the same production-layout
   requirement so NIXL direct-to-host cannot transfer legacy KVarN records into
   the HiSparse host tier;
@@ -878,10 +883,11 @@ Still pending before serving enablement:
   `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission,
   including proof that the host tier is mapped/device-addressable on the B200
   deployment image;
-- native dense-MLA BDR writer integration that fills `KVarNBDRSourcePool`
-  records at block commit time, marks commit generations only after the native
-  write succeeds, and keeps the legacy `KVarNLatentPool` restore path separate
-  until it can be retired;
+- native dense-MLA BDR writer integration that consumes
+  `kvarn_bdr_record_destination_fragments()` at block commit time, fills
+  `KVarNBDRSourcePool` records, calls `mark_kvarn_bdr_records_committed()` only
+  after the native write succeeds, and keeps the legacy `KVarNLatentPool`
+  restore path separate until it can be retired;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;

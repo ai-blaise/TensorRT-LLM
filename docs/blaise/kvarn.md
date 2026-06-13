@@ -262,7 +262,10 @@ current 8-bit PE storage used by this BDR hot-record contract. HiSparse must
 not feed the legacy side-pool record into a BDR sparse-MLA hot-read kernel;
 current code allocates a separate `KVarNBDRSourcePool` for HiSparse-enabled
 runs and fails closed until a native BDR writer fills that pool and
-`sparse_mla_decode_kvarn_hot` consumes it.
+`sparse_mla_decode_kvarn_hot` consumes it. The writer-facing DSA hooks are
+`kvarn_bdr_record_destination_fragments()` for layer-major writable BDR record
+destinations and `mark_kvarn_bdr_records_committed()` for post-write commit
+publication.
 
 ### Focused validation commands
 

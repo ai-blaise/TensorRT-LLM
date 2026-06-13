@@ -196,6 +196,46 @@ def test_hisparse_direct_to_host_uses_bdr_source_pool():
     assert sizes.tolist() == [pool.bytes_per_block]
 
 
+def test_hisparse_bdr_writer_destination_and_commit_hooks():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    layout = cfg.hisparse_bdr_layout(group=64)
+    pools = [
+        KVarNBDRSourcePool(num_blocks=4, layout=layout,
+                           device=torch.device("cpu"))
+        for _ in range(2)
+    ]
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = [object()]
+    mgr.kvarn_hisparse_bdr_pool_per_layer = pools
+    mgr.kvarn_hisparse_source_layout = KVARN_BDR_HISPARSE_LAYOUT
+    mgr.layer_offsets = {5: 0, 6: 1}
+
+    ptrs, sizes = DSACacheManager.kvarn_bdr_record_destination_fragments(
+        mgr, [5, 6], [1, 3])
+
+    expected_ptrs = [
+        pools[0].store.data_ptr() + pools[0].bytes_per_block,
+        pools[0].store.data_ptr() + 3 * pools[0].bytes_per_block,
+        pools[1].store.data_ptr() + pools[1].bytes_per_block,
+        pools[1].store.data_ptr() + 3 * pools[1].bytes_per_block,
+    ]
+    assert ptrs.tolist() == expected_ptrs
+    assert sizes.tolist() == [pools[0].bytes_per_block] * 4
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        DSACacheManager.kvarn_packed_source_fragments(mgr, [5], [1])
+
+    DSACacheManager.mark_kvarn_bdr_records_committed(mgr, [5, 6], [1, 3])
+
+    src_ptrs, src_sizes = DSACacheManager.kvarn_packed_source_fragments(
+        mgr, [5, 6], [1, 3])
+    assert src_ptrs.tolist() == expected_ptrs
+    assert src_sizes.tolist() == [pools[0].bytes_per_block] * 4
+
+
 class _FakeNonLocalKVarNManager:
     kvarn_enabled = True
     tokens_per_block = 64

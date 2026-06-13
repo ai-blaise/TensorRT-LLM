@@ -6146,6 +6146,52 @@ class DSACacheManager(KVCacheManager):
             return None
         return pool.load_block(int(block_id))
 
+    def kvarn_bdr_record_destination_fragments(
+        self,
+        layer_indices,
+        block_ids,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Layer-major writable destinations for native BDR KVarN records."""
+        if getattr(self, "kvarn_hisparse_source_layout",
+                   None) != KVARN_BDR_HISPARSE_LAYOUT:
+            raise NotImplementedError(
+                "HiSparse BDR destinations require the production "
+                f"{KVARN_BDR_HISPARSE_LAYOUT} source pool.")
+        ptr_parts = []
+        size_parts = []
+        for layer_idx in layer_indices:
+            pool = self.get_kvarn_hisparse_bdr_pool(int(layer_idx))
+            if pool is None:
+                raise RuntimeError(
+                    "HiSparse native BDR writer cannot target non-local KVarN "
+                    f"layer {int(layer_idx)} from this rank.")
+            ptrs, sizes = pool.record_destination_fragments(block_ids)
+            ptr_parts.append(ptrs)
+            size_parts.append(sizes)
+        if not ptr_parts:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        return (np.concatenate(ptr_parts).astype(np.int64, copy=False),
+                np.concatenate(size_parts).astype(np.int64, copy=False))
+
+    def mark_kvarn_bdr_records_committed(self, layer_indices,
+                                         block_ids) -> None:
+        """Publish native-written BDR source records after the write succeeds."""
+        if getattr(self, "kvarn_hisparse_source_layout",
+                   None) != KVARN_BDR_HISPARSE_LAYOUT:
+            raise NotImplementedError(
+                "HiSparse BDR commit marking requires the production "
+                f"{KVARN_BDR_HISPARSE_LAYOUT} source pool.")
+        blocks = [int(block_id) for block_id in block_ids]
+        for layer_idx in layer_indices:
+            pool = self.get_kvarn_hisparse_bdr_pool(int(layer_idx))
+            if pool is None:
+                raise RuntimeError(
+                    "HiSparse native BDR writer cannot commit non-local KVarN "
+                    f"layer {int(layer_idx)} from this rank.")
+            for block_id in blocks:
+                pool.mark_record_committed(block_id)
+
     def kvarn_packed_source_fragments(self, layer_indices,
                                       block_ids) -> Tuple[np.ndarray, np.ndarray]:
         """Layer-major source fragments for production BDR KVarN records."""
