@@ -228,6 +228,15 @@ def _register_fake():
         del packed_bytes_per_block
         pass
 
+    @torch.library.register_fake(
+        "trtllm::hisparse_submit_packed_kvarn_copy_schedule")
+    def _(host_packed, hot_packed, compact_host_slots, compact_hot_slots,
+          compact_row_ids, copy_count, compact_row_status, layer_idx,
+          packed_bytes_per_block):
+        del host_packed, hot_packed, compact_host_slots, compact_hot_slots
+        del compact_row_ids, copy_count, layer_idx, packed_bytes_per_block
+        return compact_row_status.new_empty(compact_row_status.shape)
+
     @torch.library.register_fake("trtllm::hisparse_topk_to_block_positions")
     def _(topk_indices, tokens_per_block, max_blocks_per_row):
         del tokens_per_block
@@ -274,6 +283,7 @@ def _register_fake():
         rows = miss_host_slots.shape[0]
         return (miss_host_slots.new_empty((capacity, )),
                 miss_host_slots.new_empty((capacity, )),
+                miss_host_slots.new_empty((capacity, ), dtype=torch.int32),
                 miss_host_slots.new_empty((1, ), dtype=torch.int32),
                 miss_host_slots.new_empty((rows, ), dtype=torch.uint8))
 

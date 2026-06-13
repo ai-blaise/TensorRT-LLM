@@ -94,11 +94,16 @@ hot-slot planner now consumes those resolved rows and layer-local hot metadata
 to produce hit/miss/LRU slot decisions, copy schedules, and row status without
 publishing residency before packed copies succeed. A native compact miss
 schedule op now turns row-major device miss tensors into contiguous device
-`(host_slot, hot_slot)` vectors plus a device copy count for the future
-stream-ordered copy bridge. A native post-copy hot metadata commit op now
-publishes `hot_host_slot`, `hot_commit_gen`, and `hot_lru_tick` on device only
-after the packed-copy stage has accepted the plan. The branch also has a native
-hot-index builder that preserves the existing
+`(host_slot, hot_slot, row_id)` vectors plus a device copy count. A native
+`trtllm::hisparse_submit_packed_kvarn_copy_schedule` bridge now consumes that
+compact device schedule directly and copies from mapped pinned host KVarN
+storage into hot HBM in stream order, returning per-row copy status for the
+post-copy commit stage. It intentionally fails closed if the host tier is not
+device-addressable; it does not use a CUDA host callback to enqueue copies and
+does not synchronously read the schedule back to Python. A native post-copy hot
+metadata commit op now publishes `hot_host_slot`, `hot_commit_gen`, and
+`hot_lru_tick` on device only after the packed-copy stage has accepted the plan.
+The branch also has a native hot-index builder that preserves the existing
 `base * stride_factor + layer_idx * tokens_per_block + token_offset` sparse-MLA
 index contract while targeting HiSparse hot slots instead of full-pool blocks.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
@@ -143,10 +148,22 @@ same ABI shape as the final serving path. The following are hard invariants:
 - The miss-copy boundary must be explicit. CUDA kernels must not pretend that
   CPU pinned host KVarN storage is ordinary device memory. The production path
   dedupes and plans misses on device, then hands a compact miss schedule to a
-  native stream-ordered copy bridge that schedules host-to-device copy-engine
-  transfers and only then commits hot metadata. Python-side token extraction,
-  Python request-table extraction, synchronous schedule reads, and hidden
-  mapped-host-memory kernel reads are not valid serving paths.
+  native stream-ordered copy bridge and only then commits hot metadata.
+  Python-side token extraction, Python request-table extraction, synchronous
+  schedule reads, and CUDA host callbacks that enqueue CUDA work are not valid
+  serving paths. The current bridge is a mapped pinned-host kernel path; a
+  future copy-engine variant may replace it only if it consumes the same compact
+  device schedule without host synchronization.
+
+CUDA API note: NVIDIA documents `cudaMemcpyBatchAsync()` as a host API over
+host-visible source pointer, destination pointer, and size arrays, and documents
+that `cudaLaunchHostFunc()` callbacks must not make CUDA API calls. Therefore a
+callback that waits for device schedule compaction and then enqueues copy-engine
+work would be invalid, and a schedule readback before copy submission would
+violate the no-sync production path. CUDA also documents mapped registered host
+memory as device-addressable when the device supports
+`cudaDevAttrCanUseHostPointerForRegisteredMem`; the current bridge uses exactly
+that stream-ordered mapped-host path and fails closed otherwise.
 
 ## Relevant SGLang Facts
 
@@ -757,7 +774,11 @@ Current branch status:
 - added `trtllm::hisparse_compact_miss_schedule`, a native CUDA schedule
   compactor that consumes planner miss tensors and row status, validates
   upstream rows/counts/slots, and emits contiguous device `host_slot` and
-  `hot_slot` vectors plus a device copy count for the future copy bridge;
+  `hot_slot` vectors, row ids, and a device copy count for the copy bridge;
+- added `trtllm::hisparse_submit_packed_kvarn_copy_schedule`, a native mapped
+  pinned-host copy bridge that consumes the compact device schedule, copies
+  packed KVarN records into the hot HBM tier in stream order, and returns
+  per-row copy status so post-copy metadata commit can remain fail-closed;
 - added `trtllm::hisparse_commit_hot_slots`, a native post-copy CUDA metadata
   commit op that mutates device `hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick` only for rows whose native plan succeeded;
@@ -799,9 +820,11 @@ Still pending before serving enablement:
   `trtllm::hisparse_commit_hot_slots` post-copy metadata commit op;
 - VM compile and live validation of the native
   `trtllm::hisparse_build_hot_indices` hot global-index builder;
-- implementation and VM proof of the native device-plan-to-copy bridge,
+- VM compile and live validation of the native device-plan-to-copy bridge,
   `trtllm::hisparse_submit_packed_kvarn_copy_schedule`, between
-  `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission;
+  `hisparse_compact_miss_schedule` and packed KVarN host-to-hot copy submission,
+  including proof that the host tier is mapped/device-addressable on the B200
+  deployment image;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;

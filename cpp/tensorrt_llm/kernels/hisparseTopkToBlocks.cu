@@ -460,8 +460,8 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
 __global__ void hisparseCompactMissScheduleKernel(int64_t const* __restrict__ missHostSlots,
     int64_t const* __restrict__ missHotSlots, int32_t const* __restrict__ missCounts,
     uint8_t const* __restrict__ planRowStatus, int64_t* __restrict__ compactHostSlots,
-    int64_t* __restrict__ compactHotSlots, int32_t* __restrict__ copyCount, uint8_t* __restrict__ rowStatus,
-    int32_t numRows, int32_t maxBlocksPerRow)
+    int64_t* __restrict__ compactHotSlots, int32_t* __restrict__ compactRowIds, int32_t* __restrict__ copyCount,
+    uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t maxBlocksPerRow)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0)
     {
@@ -505,6 +505,7 @@ __global__ void hisparseCompactMissScheduleKernel(int64_t const* __restrict__ mi
         {
             compactHostSlots[dst] = missHostSlots[rowOffset + i];
             compactHotSlots[dst] = missHotSlots[rowOffset + i];
+            compactRowIds[dst] = row;
             ++dst;
         }
         rowStatus[row] = kCompactOk;
@@ -729,7 +730,8 @@ void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitG
 
 void invokeHisparseCompactMissSchedule(int64_t const* missHostSlots, int64_t const* missHotSlots,
     int32_t const* missCounts, uint8_t const* planRowStatus, int64_t* compactHostSlots, int64_t* compactHotSlots,
-    int32_t* copyCount, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow, cudaStream_t stream)
+    int32_t* compactRowIds, int32_t* copyCount, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
+    cudaStream_t stream)
 {
     if (numRows <= 0)
     {
@@ -738,7 +740,7 @@ void invokeHisparseCompactMissSchedule(int64_t const* missHostSlots, int64_t con
     TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_compact_miss_schedule requires max_blocks_per_row > 0");
 
     hisparseCompactMissScheduleKernel<<<1, 1, 0, stream>>>(missHostSlots, missHotSlots, missCounts, planRowStatus,
-        compactHostSlots, compactHotSlots, copyCount, rowStatus, numRows, maxBlocksPerRow);
+        compactHostSlots, compactHotSlots, compactRowIds, copyCount, rowStatus, numRows, maxBlocksPerRow);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

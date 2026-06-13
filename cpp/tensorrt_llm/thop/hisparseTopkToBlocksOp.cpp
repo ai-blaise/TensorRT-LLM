@@ -252,7 +252,7 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tenso
     return {plannedHotSlots, plannedLruTick, missHostSlots, missHotSlots, missCounts, hitFlags, rowStatus};
 }
 
-std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> hisparseCompactMissSchedule(
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor, th::Tensor> hisparseCompactMissSchedule(
     th::Tensor const& missHostSlots, th::Tensor const& missHotSlots, th::Tensor const& missCounts,
     th::Tensor const& planRowStatus)
 {
@@ -294,15 +294,16 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> hisparseCompactMissSc
     auto planStatus = planRowStatus.contiguous();
     auto compactHost = th::empty({rows * maxBlocksPerRow}, missHost.options());
     auto compactHot = th::empty({rows * maxBlocksPerRow}, missHot.options());
+    auto compactRows = th::empty({rows * maxBlocksPerRow}, counts.options());
     auto copyCount = th::zeros({1}, counts.options());
     auto rowStatus = th::empty({rows}, missHost.options().dtype(torch::kUInt8));
 
     tk::invokeHisparseCompactMissSchedule(missHost.data_ptr<int64_t>(), missHot.data_ptr<int64_t>(),
         counts.data_ptr<int32_t>(), planStatus.data_ptr<uint8_t>(), compactHost.data_ptr<int64_t>(),
-        compactHot.data_ptr<int64_t>(), copyCount.data_ptr<int32_t>(), rowStatus.data_ptr<uint8_t>(),
-        static_cast<int32_t>(rows), static_cast<int32_t>(maxBlocksPerRow),
+        compactHot.data_ptr<int64_t>(), compactRows.data_ptr<int32_t>(), copyCount.data_ptr<int32_t>(),
+        rowStatus.data_ptr<uint8_t>(), static_cast<int32_t>(rows), static_cast<int32_t>(maxBlocksPerRow),
         at::cuda::getCurrentCUDAStream(missHost.get_device()).stream());
-    return {compactHost, compactHot, copyCount, rowStatus};
+    return {compactHost, compactHot, compactRows, copyCount, rowStatus};
 }
 
 th::Tensor hisparseCommitHotSlots(th::Tensor const& hostSlots, th::Tensor const& commitGens,
@@ -491,7 +492,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int layer_idx, int lru_tick_base) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "hisparse_compact_miss_schedule(Tensor miss_host_slots, Tensor miss_hot_slots, Tensor miss_counts, "
-        "Tensor plan_row_status) -> (Tensor, Tensor, Tensor, Tensor)");
+        "Tensor plan_row_status) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "hisparse_commit_hot_slots(Tensor host_slots, Tensor commit_gens, Tensor planned_hot_slots, "
         "Tensor planned_lru_tick, Tensor block_counts, Tensor plan_row_status, Tensor(a!) hot_host_slot, "
