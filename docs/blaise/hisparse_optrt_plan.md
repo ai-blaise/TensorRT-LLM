@@ -9,7 +9,7 @@ stack. It is based on direct review of:
 - SGLang HiSparse guide:
   https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/hisparse_guide.md
 - SGLang implementation, re-checked against `sgl-project/sglang` main
-  `eb18416` on June 13, 2026:
+  `f7041c9dee2263824a128ef4941448e41c500789` on June 13, 2026:
   - `python/sglang/srt/managers/hisparse_coordinator.py`
   - `python/sglang/srt/mem_cache/allocator/hisparse.py`
   - `python/sglang/srt/mem_cache/hisparse_memory_pool.py`
@@ -240,6 +240,20 @@ full-HBM, FP16, or independent references are test/baseline boundaries only:
 they may be used to measure correctness from outside serving, but they must not
 be wired into the coordinator, transceiver, attention dispatch, kernel ABI, or
 deployment configuration as an executable alternative.
+
+The final current-head SGLang sweep (`f7041c9d`) did not change the OP-TRT
+design target. SGLang's production shape is still: decode-side HiSparse,
+host-pinned full KV, a small hot device buffer, raw/request-relative top-k
+capture, one-request-per-block swap-in with shared-memory hit/miss/LRU, newest
+token reservation, eager decode backup, and PD direct-to-host admission. The
+parts to preserve are the ownership/lifecycle algorithm and the direct-to-host
+admission model. The parts not to copy are SGLang's token-slot BF16/FP8 hot
+layout, naive/debug top-k loader, and staging admission as an executable OP-TRT
+serving alternative. OP-TRT's first runtime-reachable candidate must remain the
+target model's production dense-MLA/DSA path: packed `kvarn_k2v2` BDR blocks,
+FP4 Indexer/HISA state, LayerSplit owner-local prefill, typed NIXL
+direct-to-host writes, explicit sink/tail resident normal-KV reads, and
+fail-closed row/status propagation.
 
 ## Final Correctness Sweep
 
@@ -1283,20 +1297,28 @@ Current branch status:
   language. Remaining references are explicit prohibitions or external
   baseline/test-fixture boundaries. The new resident-padding smoke compiles
   locally and passes the bounded B200 container syntax/source-contract check.
-  The B200 proof build now links `libth_common.so`, and a driver-attached
-  registration probe confirms the HiSparse thops are present; full
-  pytest/runtime execution still requires a rebuilt deployment image with
-  `tensorrt_llm.bindings`, the native op, CUDA exposed, and live DSA/NIXL
-  metadata;
+  The first B200 proof build linked `libth_common.so` from the persistent dirty
+  smoke tree, and a driver-attached registration probe confirmed the HiSparse
+  thops are present. The exact-clean runtime checkout then exposed a real
+  SM100-only build issue: context FMHA v2 cubin archives can be filtered out
+  entirely while `fmhaDispatcher.cpp` still includes `cubin/fmha_cubin.h`.
+  The branch now carries a CMake-side empty FMHA v2 cubin metadata/header
+  generator for that architecture-filtered case, with the generated include
+  directory propagated to `kernels_src`. This is a build-proof fix only; it
+  does not add an attention fallback or change HiSparse serving behavior. Full
+  pytest/runtime execution still requires the exact-clean B200 build to finish,
+  the native op to load with CUDA exposed, and live DSA/NIXL metadata;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
-- run the CUDA smoke tests in a safe B200 runtime window; current verification
-  has compiled the translation units, linked `libth_common.so`, and loaded the
-  HiSparse registrations, but has not executed the CUDA runtime op under the
-  deployed image;
+- finish the exact-clean B200 `th_common` proof build from
+  `/home/spencer/work/TensorRT-LLM-hisparse-runtime` using the persistent
+  `/home/spencer/work/build-cache/hisparse-thop` cache, then run the CUDA smoke
+  tests in a safe runtime window. Current verification has compiled the
+  translation units and proved registration loading from the prior persistent
+  smoke tree, but exact-clean CUDA runtime execution remains pending;
 - use `scripts/blaise_build_hisparse_thop.sh` for the current VM-side native
   thop proof loop. The June 13 build sweep established the required
   non-disruptive recipe: run inside the `hisa-buildtools-20260531` image, keep
@@ -1338,8 +1360,13 @@ Still pending before serving enablement:
   architecture-filtered dispatch implementation rather than a CMake-only
   shortcut;
 - optimize `sparse_mla_decode_kvarn_hot` beyond the direct per-row/head kernel
-  by importing the compatible FlashMLA split scheduler/combine structure while
-  preserving the packed KVarN-hot BDR producer load;
+  by importing only the compatible FlashMLA split scheduler/combine structure
+  while preserving the packed KVarN-hot BDR producer load. The intended shape is
+  to reuse the scheduler metadata and bf16 combine path, add a new KVarN-hot
+  split producer that reads packed `kvarn_k2v2` records through
+  `hisparseKvarnBdrRead.cuh`, writes per-split accumulators/LSE, and then lets
+  the existing combine logic reduce them. Do not reuse the NVFP4 producer or
+  its `[block, token, hkv, 288]` plus scale layout as a compatibility backend;
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;

@@ -101,10 +101,10 @@ function(tllm_add_cubin_archive_sources TARGET ARCHIVE_DIR)
 
   # Selective build by SM. filter_source_cuda_architectures matches the
   # `sm_?<arch>` substring in each filename and removes cubins for archs that
-  # the current build doesn't enable. It also stamps EXCLUDE_SM_<arch> on
-  # ${TARGET}, which keeps the consumer .cpp's `#ifndef EXCLUDE_SM_<n>` gates
-  # honest. Skipped entirely when ARCHS is empty -- in that case all globbed
-  # cubins are embedded (existing trtllmGen behavior).
+  # the current build doesn't enable. The matching EXCLUDE_SM_<arch> macros are
+  # emitted by setup_cuda_architectures, which keeps the consumer .cpp's
+  # `#ifndef EXCLUDE_SM_<n>` gates honest. Skipped entirely when ARCHS is empty
+  # -- in that case all globbed cubins are embedded (existing trtllmGen behavior).
   if(_ARG_ARCHS)
     include(cuda_configuration)
     if(_ARG_IMPLICIT_FAMILY)

@@ -79,6 +79,11 @@ endif()
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+if(CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR)
+  target_include_directories(kernels_src
+                             BEFORE PRIVATE
+                                    "${CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR}")
+endif()
 target_include_directories(
   kernels_src
   PUBLIC
