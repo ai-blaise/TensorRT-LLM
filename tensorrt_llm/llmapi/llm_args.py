@@ -481,6 +481,50 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "owner-local layer counts and decode reassembles the CP shards before "
         "generation. Keep this enabled only when the LayerSplit broadcast and "
         "cache-transfer path are both active and validated.")
+    hisparse_enabled: bool = Field(
+        default=False,
+        description=
+        "Enable the OP-TRT HiSparse packed dense-MLA KVarN host/hot path. "
+        "This is fail-closed until the packed KVarN hot-pool swap-in and "
+        "NIXL direct-to-host path are proven.")
+    hisparse_mode: Literal["dense_mla_kvarn"] = Field(
+        default="dense_mla_kvarn",
+        description="HiSparse storage mode. Production starts with dense MLA KVarN.")
+    hisparse_direct_to_host: bool = Field(
+        default=True,
+        description=
+        "Require generation-first NIXL write-mode transfer directly into the "
+        "decode host-pinned HiSparse pool.")
+    hisparse_indexer_host_tier: bool = Field(
+        default=False,
+        description=
+        "Keep Indexer K resident on device. The first OP-TRT HiSparse path "
+        "tiers only dense MLA latent KV, not Indexer K.")
+    hisparse_topk: Optional[int] = Field(
+        default=None,
+        description=
+        "HiSparse swap-in top-k. Defaults to index_topk and must match it for "
+        "the production path.")
+    hisparse_hot_blocks_per_req: PositiveInt = Field(
+        default=64,
+        description="Hot packed KVarN block slots per request and layer.")
+    hisparse_host_to_device_ratio: PositiveInt = Field(
+        default=8,
+        description="Target logical host blocks to hot device blocks ratio.")
+    hisparse_min_seq_len: PositiveInt = Field(
+        default=65536,
+        description="Minimum sequence length where HiSparse may be used.")
+    hisparse_block_lru: bool = Field(
+        default=True,
+        description="Use block-level LRU for hot packed KVarN residency.")
+    hisparse_eager_backup: bool = Field(
+        default=True,
+        description="Back up committed decode KV into the host tier eagerly.")
+    hisparse_fail_closed: bool = Field(
+        default=True,
+        description=
+        "Reject invalid or incomplete HiSparse setup instead of silently using "
+        "a full-HBM or staging fallback.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -567,7 +611,69 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                 raise ValueError(
                     "layersplit_all_cp_ranks_transfer must remain true until "
                     "partial-rank LayerSplit transfer is implemented.")
+        if self.hisparse_topk is None and self.index_topk is not None:
+            self.hisparse_topk = self.index_topk
+        if self.hisparse_enabled:
+            self._validate_hisparse_sparse_config()
         return self
+
+    def _validate_hisparse_sparse_config(self) -> None:
+        if self.index_topk is None:
+            raise ValueError("hisparse_enabled requires index_topk to be set.")
+        if self.hisparse_topk != self.index_topk:
+            raise ValueError(
+                "hisparse_topk must match index_topk for the production "
+                f"HiSparse path; got hisparse_topk={self.hisparse_topk}, "
+                f"index_topk={self.index_topk}.")
+        if self.hisparse_mode != "dense_mla_kvarn":
+            raise ValueError(
+                "Only hisparse_mode='dense_mla_kvarn' is supported.")
+        if not (self.mla_latent_kv_dtype or "").startswith("kvarn_"):
+            raise ValueError(
+                "hisparse_enabled requires mla_latent_kv_dtype to select "
+                "dense MLA KVarN, for example 'kvarn_k2v2'.")
+        if self.hisparse_indexer_host_tier:
+            raise ValueError(
+                "hisparse_indexer_host_tier must remain false: Indexer K "
+                "stays device-resident and is not KVarN.")
+        if not self.hisparse_direct_to_host:
+            raise ValueError(
+                "hisparse_enabled requires hisparse_direct_to_host=true; "
+                "direct-to-host-off runs are separate baselines, not a "
+                "HiSparse production fallback.")
+        if not self.hisparse_block_lru:
+            raise ValueError(
+                "hisparse_block_lru must remain true for the production "
+                "block-oriented hot pool.")
+        if not self.hisparse_eager_backup:
+            raise ValueError(
+                "hisparse_eager_backup must remain true so committed decode "
+                "KV is mirrored into the host tier.")
+        if not self.hisparse_fail_closed:
+            raise ValueError(
+                "hisparse_fail_closed must remain true; HiSparse cannot "
+                "silently fall back to full-HBM or staging paths.")
+
+    def validate_hisparse_runtime_config(
+        self,
+        *,
+        kv_cache_config: Optional["KvCacheConfig"] = None,
+        cache_transceiver_config: Optional["CacheTransceiverConfig"] = None,
+    ) -> None:
+        if not self.hisparse_enabled:
+            return
+        if (kv_cache_config is not None
+                and getattr(kv_cache_config, "enable_block_reuse", False)):
+            raise ValueError(
+                "hisparse_enabled requires kv_cache_config.enable_block_reuse=false "
+                "until HiSparse-aware block reuse is implemented.")
+        backend = getattr(cache_transceiver_config, "backend", None)
+        runtime = getattr(cache_transceiver_config, "transceiver_runtime", None)
+        if backend != "NIXL" or runtime != "PYTHON":
+            raise ValueError(
+                "hisparse_enabled requires cache_transceiver_config.backend='NIXL' "
+                "and transceiver_runtime='PYTHON' for generation-first "
+                "direct-to-host transfer.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -3660,6 +3766,16 @@ class BaseLlmArgs(StrictBaseModel):
                 logger.warning(
                     f"max_batch_size [{self.max_batch_size}] should be less than or equal to max_num_tokens [{self.max_num_tokens}]"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_hisparse_runtime_config(self):
+        sparse_config = self.sparse_attention_config
+        validate = getattr(sparse_config, "validate_hisparse_runtime_config",
+                           None)
+        if validate is not None:
+            validate(kv_cache_config=self.kv_cache_config,
+                     cache_transceiver_config=self.cache_transceiver_config)
         return self
 
     @model_validator(mode="after")

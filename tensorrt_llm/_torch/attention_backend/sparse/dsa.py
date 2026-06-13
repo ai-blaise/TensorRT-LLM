@@ -19,6 +19,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
     LayerSplitOwnership, LayerSplitRuntimeState, ensure_cp_process_group)
+from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
+    OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
     KVarNLatentPool, kvarn_latent_bytes_per_token, resolve_kvarn_config)
 
@@ -1214,6 +1216,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Per-step memo for the LayerSplit indexer-K read set (candidate L2);
         # same lifecycle as the HISA slots above.
         self._layersplit_step_read_set = None
+        self.hisparse_coordinator = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
@@ -1225,6 +1228,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super().__post_init__()
         assert isinstance(self.kv_cache_manager, DSACacheManager), \
             f"DSAtrtllmAttentionMetadata requires DSACacheManager, got {type(self.kv_cache_manager)}"
+        self.hisparse_coordinator = getattr(self.kv_cache_manager,
+                                            "hisparse_coordinator", None)
 
         self.num_sparse_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
@@ -1734,6 +1739,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.reset_step()
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -2031,6 +2038,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._hisa_step_invariants = None
         self._hisa_step_rowspan = None
         self._layersplit_step_read_set = None
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.reset_step()
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -4944,10 +4953,23 @@ class DSATrtllmAttention(TrtllmAttention):
         # Transform the local topk indices to global topk indices in paged kv cache
         is_generation = (forward_args.attention_input_type ==
                          AttentionInputType.generation_only)
-        topk_indices_global, _ = transform_local_topk_reuse_or_compute(
-            forward_args.topk_indices, metadata,
-            self.get_local_layer_idx(metadata), self.indexer.skip_topk,
-            is_generation)
+        local_layer_idx = self.get_local_layer_idx(metadata)
+        hisparse_mapping = None
+        hisparse_coordinator = getattr(metadata, "hisparse_coordinator", None)
+        if hisparse_coordinator is not None:
+            hisparse_mapping = hisparse_coordinator.map_topk_to_hot_pool(
+                topk_indices=forward_args.topk_indices,
+                metadata=metadata,
+                layer_idx=local_layer_idx,
+                skip_topk=self.indexer.skip_topk,
+                is_generation=is_generation,
+            )
+        if hisparse_mapping is not None:
+            topk_indices_global = hisparse_mapping.topk_indices_global
+        else:
+            topk_indices_global, _ = transform_local_topk_reuse_or_compute(
+                forward_args.topk_indices, metadata, local_layer_idx,
+                self.indexer.skip_topk, is_generation)
 
         # LayerSplit dense-KV + NVFP4-scale READ-SET broadcast. The indexer-K
         # broadcast (the full prefix) ran in Indexer.forward; the dense read
@@ -5600,6 +5622,20 @@ class DSACacheManager(KVCacheManager):
                 / self.kvarn_cfg.packed_bytes(self.tokens_per_block),
                 self.kvarn_cfg.fp8_bytes(self.tokens_per_block)
                 / self.kvarn_cfg.packed_bytes(self.tokens_per_block))
+
+        self.hisparse_coordinator = OPTRTHiSparseCoordinator(
+            sparse_attn_config, kv_cache_manager=self)
+        self.hisparse_coordinator.assert_startup_ready()
+        if self.hisparse_coordinator.enabled:
+            logger.info(
+                "OP-TRT HiSparse enabled: mode=%s, topk=%s, hot_blocks_per_req=%s, "
+                "host_to_device_ratio=%s. Startup passed production guardrails.",
+                getattr(sparse_attn_config, "hisparse_mode", None),
+                getattr(sparse_attn_config, "hisparse_topk", None),
+                getattr(sparse_attn_config, "hisparse_hot_blocks_per_req", None),
+                getattr(sparse_attn_config, "hisparse_host_to_device_ratio",
+                        None),
+            )
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]

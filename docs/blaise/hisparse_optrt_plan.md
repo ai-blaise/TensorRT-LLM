@@ -556,6 +556,23 @@ Deliverables:
 - no-op disabled path;
 - fail-closed startup validation.
 
+Current branch status:
+
+- implemented config fields and sparse-config validation for
+  `hisparse_enabled`, `hisparse_mode`, direct-to-host, Indexer device
+  residency, KVarN dense MLA storage, hot-block sizing, eager backup, and
+  fail-closed policy;
+- implemented outer runtime validation requiring
+  `cache_transceiver_config.backend="NIXL"`,
+  `transceiver_runtime="PYTHON"`, and
+  `kv_cache_config.enable_block_reuse=false`;
+- added `OPTRTHiSparseCoordinator` as the DSA-owned extension point;
+- wired coordinator ownership into `DSACacheManager`, per-step metadata reset,
+  and the `sparse_attn_predict()` TopK mapping seam;
+- disabled HiSparse remains a no-op and preserves current behavior;
+- enabled HiSparse intentionally raises before serving until Phase 2/3 provide
+  packed KVarN host/hot allocation, swap-in, and sparse MLA read support.
+
 ### Phase 2: Production Packed KVarN Cold/Hot Tiers
 
 Deliverables:
