@@ -1425,6 +1425,14 @@ class OPTRTHiSparseCoordinator:
                 "TopK into paged block positions on device before hot-slot "
                 "planning; no Python token extraction path is allowed.")
         if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_resolve_blocks_to_host_slots"):
+            raise NotImplementedError(
+                "trtllm::hisparse_resolve_blocks_to_host_slots is not "
+                "registered with a CUDA kernel. HiSparse must resolve "
+                "request-relative block rows through the device-mirrored "
+                "request table and admission metadata before hot-slot "
+                "planning; no Python request-table extraction path is allowed.")
+        if not self._torch_cuda_op_registered(
                 "trtllm::hisparse_swap_in_packed_kvarn"):
             raise NotImplementedError(
                 "trtllm::hisparse_swap_in_packed_kvarn is not registered with "

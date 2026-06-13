@@ -236,6 +236,22 @@ def _register_fake():
                 topk_indices.new_empty((rows, )),
                 topk_indices.new_empty((rows, ), dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::hisparse_resolve_blocks_to_host_slots")
+    def _(row_request_ids, block_positions, block_counts, request_ids,
+          request_block_host_slots, request_block_commit_gen,
+          request_admitted):
+        del row_request_ids, block_counts, request_ids
+        del request_block_host_slots, request_block_commit_gen
+        del request_admitted
+        return (block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.int64),
+                block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.int64),
+                block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.uint8),
+                block_positions.new_empty((block_positions.shape[0], ),
+                                          dtype=torch.uint8))
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.

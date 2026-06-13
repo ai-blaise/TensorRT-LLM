@@ -20,6 +20,12 @@ void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blo
     uint8_t* overflowFlags, int32_t numRows, int32_t indexTopK, int32_t tokensPerBlock, int32_t maxBlocksPerRow,
     int32_t hashCapacity, cudaStream_t stream);
 
+void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_t const* blockPositions,
+    int32_t const* blockCounts, int64_t const* requestIds, int64_t const* requestBlockHostSlots,
+    int64_t const* requestBlockCommitGen, bool const* requestAdmitted, int64_t* hostSlots, int64_t* commitGens,
+    uint8_t* blockStatus, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
+    int32_t requestSlotCapacity, int32_t maxBlocksPerRequest, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

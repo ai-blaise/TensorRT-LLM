@@ -18,6 +18,16 @@ namespace kernels
 namespace
 {
 
+enum HiSparseResolveStatus : uint8_t
+{
+    kResolveOk = 0,
+    kResolveMissingRequest = 1,
+    kResolveNotAdmitted = 2,
+    kResolveBlockOutOfRange = 3,
+    kResolveUncommittedBlock = 4,
+    kResolveBadBlockCount = 5,
+};
+
 __device__ __forceinline__ uint32_t hisparseHash32(uint32_t value)
 {
     value ^= value >> 16;
@@ -114,6 +124,100 @@ __global__ void hisparseTopkToBlockPositionsKernel(int32_t const* __restrict__ t
     }
 }
 
+__global__ void hisparseResolveBlocksToHostSlotsKernel(int64_t const* __restrict__ rowRequestIds,
+    int32_t const* __restrict__ blockPositions, int32_t const* __restrict__ blockCounts,
+    int64_t const* __restrict__ requestIds, int64_t const* __restrict__ requestBlockHostSlots,
+    int64_t const* __restrict__ requestBlockCommitGen, bool const* __restrict__ requestAdmitted,
+    int64_t* __restrict__ hostSlots, int64_t* __restrict__ commitGens, uint8_t* __restrict__ blockStatus,
+    uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t maxBlocksPerRow, int32_t requestSlotCapacity,
+    int32_t maxBlocksPerRequest)
+{
+    int32_t const row = blockIdx.x;
+    if (row >= numRows)
+    {
+        return;
+    }
+
+    __shared__ int32_t tableSlot;
+    __shared__ int32_t rowCode;
+
+    int32_t const rowOffset = row * maxBlocksPerRow;
+    if (threadIdx.x == 0)
+    {
+        int32_t const count = blockCounts[row];
+        tableSlot = -1;
+        rowCode = kResolveOk;
+        if (count < 0 || count > maxBlocksPerRow)
+        {
+            rowCode = kResolveBadBlockCount;
+        }
+        else
+        {
+            int64_t const reqId = rowRequestIds[row];
+            for (int32_t slot = 0; slot < requestSlotCapacity; ++slot)
+            {
+                if (requestIds[slot] == reqId)
+                {
+                    tableSlot = slot;
+                    break;
+                }
+            }
+            if (tableSlot < 0)
+            {
+                rowCode = kResolveMissingRequest;
+            }
+            else if (!requestAdmitted[tableSlot])
+            {
+                rowCode = kResolveNotAdmitted;
+            }
+        }
+    }
+    __syncthreads();
+
+    int32_t const count = rowCode == kResolveBadBlockCount ? maxBlocksPerRow : blockCounts[row];
+    for (int32_t i = threadIdx.x; i < maxBlocksPerRow; i += blockDim.x)
+    {
+        int64_t resolvedHostSlot = -1;
+        int64_t resolvedCommitGen = -1;
+        int32_t code = kResolveOk;
+        if (i < count)
+        {
+            code = rowCode;
+            if (code == kResolveOk)
+            {
+                int32_t const blockPos = blockPositions[rowOffset + i];
+                if (blockPos < 0 || blockPos >= maxBlocksPerRequest)
+                {
+                    code = kResolveBlockOutOfRange;
+                    atomicCAS(&rowCode, kResolveOk, code);
+                }
+                else
+                {
+                    int64_t const tableOffset = static_cast<int64_t>(tableSlot) * maxBlocksPerRequest + blockPos;
+                    resolvedHostSlot = requestBlockHostSlots[tableOffset];
+                    resolvedCommitGen = requestBlockCommitGen[tableOffset];
+                    if (resolvedHostSlot < 0 || resolvedCommitGen < 0)
+                    {
+                        resolvedHostSlot = -1;
+                        resolvedCommitGen = -1;
+                        code = kResolveUncommittedBlock;
+                        atomicCAS(&rowCode, kResolveOk, code);
+                    }
+                }
+            }
+        }
+        hostSlots[rowOffset + i] = resolvedHostSlot;
+        commitGens[rowOffset + i] = resolvedCommitGen;
+        blockStatus[rowOffset + i] = static_cast<uint8_t>(code);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        rowStatus[row] = static_cast<uint8_t>(rowCode);
+    }
+}
+
 } // namespace
 
 void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blockPositions, int32_t* blockCounts,
@@ -136,6 +240,29 @@ void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blo
     size_t const smemBytes = static_cast<size_t>(hashCapacity + maxBlocksPerRow + 2) * sizeof(int32_t);
     hisparseTopkToBlockPositionsKernel<<<numRows, kThreads, smemBytes, stream>>>(topkIndices, blockPositions,
         blockCounts, overflowFlags, numRows, indexTopK, tokensPerBlock, maxBlocksPerRow, hashCapacity);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_t const* blockPositions,
+    int32_t const* blockCounts, int64_t const* requestIds, int64_t const* requestBlockHostSlots,
+    int64_t const* requestBlockCommitGen, bool const* requestAdmitted, int64_t* hostSlots, int64_t* commitGens,
+    uint8_t* blockStatus, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
+    int32_t requestSlotCapacity, int32_t maxBlocksPerRequest, cudaStream_t stream)
+{
+    if (numRows <= 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_resolve_blocks_to_host_slots requires max_blocks_per_row > 0");
+    TLLM_CHECK_WITH_INFO(
+        requestSlotCapacity > 0, "hisparse_resolve_blocks_to_host_slots requires request_slot_capacity > 0");
+    TLLM_CHECK_WITH_INFO(
+        maxBlocksPerRequest > 0, "hisparse_resolve_blocks_to_host_slots requires max_blocks_per_request > 0");
+
+    constexpr int32_t kThreads = 128;
+    hisparseResolveBlocksToHostSlotsKernel<<<numRows, kThreads, 0, stream>>>(rowRequestIds, blockPositions,
+        blockCounts, requestIds, requestBlockHostSlots, requestBlockCommitGen, requestAdmitted, hostSlots, commitGens,
+        blockStatus, rowStatus, numRows, maxBlocksPerRow, requestSlotCapacity, maxBlocksPerRequest);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
