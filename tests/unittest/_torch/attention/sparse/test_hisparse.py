@@ -143,7 +143,12 @@ def test_hisparse_host_write_commit_waits_for_all_local_layers():
                                        packed_bytes_per_block=2048,
                                        logical_host_capacity_blocks=4,
                                        hot_device_capacity_blocks=2)
-    coordinator.reserve_request(req_pool_idx=7, num_prompt_blocks=2)
+    state = coordinator.reserve_request(req_pool_idx=7, num_prompt_blocks=2)
+    coordinator.begin_host_write(7)
+    assert state.pending_writes == 1
+    assert coordinator.request_ready_for_admission(7) is False
+    with pytest.raises(RuntimeError, match="pending host writes"):
+        coordinator.release_request(7)
 
     newly_full = coordinator.mark_host_write_committed(
         7,
@@ -157,16 +162,22 @@ def test_hisparse_host_write_commit_waits_for_all_local_layers():
         coordinator.select_hot_blocks(layer_idx=0,
                                       req_pool_idx=7,
                                       block_positions=[1])
+    coordinator.finish_host_write(7)
+    assert state.pending_writes == 0
+    assert coordinator.request_ready_for_admission(7) is False
+    with pytest.raises(RuntimeError, match="cannot be admitted"):
+        coordinator.mark_request_admitted(7)
 
     newly_full = coordinator.mark_host_write_committed(
         7,
-        layer_indices=[1, 1],
-        block_positions=[1, 1],
+        layer_indices=[0, 1, 1],
+        block_positions=[0, 0, 1],
     )
 
-    assert len(newly_full) == 1
-    assert newly_full[0].valid is True
-    assert newly_full[0].commit_gen == 1
+    assert len(newly_full) == 2
+    assert [record.block_pos for record in newly_full] == [0, 1]
+    assert all(record.valid for record in newly_full)
+    assert all(record.commit_gen == 1 for record in newly_full)
     assert coordinator.host_block_committed(7, 1) is True
 
     duplicate = coordinator.mark_host_write_committed(
@@ -177,6 +188,9 @@ def test_hisparse_host_write_commit_waits_for_all_local_layers():
 
     assert duplicate == ()
     assert newly_full[0].commit_gen == 1
+    assert coordinator.request_ready_for_admission(7) is True
+    admitted = coordinator.mark_request_admitted(7)
+    assert admitted.admitted is True
 
 
 def test_hisparse_request_reservation_is_idempotent_for_published_slots():

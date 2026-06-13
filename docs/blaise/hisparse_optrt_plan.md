@@ -70,7 +70,9 @@ source/destination fragment derivation, and typed `HISPARSE_HOST` write
 submission are implemented. The sender now returns explicit
 `(local_layer, request_block_pos)` commit coverage only after the normal KV
 write and typed host write both succeed, and the receiver accumulates that
-coverage before marking host records committed. Startup still intentionally
+coverage before marking host records committed. Admission is explicit: a
+request cannot be marked HiSparse-ready unless all reserved prompt host blocks
+are committed and no host writes are pending. Startup still intentionally
 rejects `hisparse_enabled=true` before serving because live NIXL E2E proof,
 live cancel/retraction proof, host-to-hot swap-in, sparse MLA hot-pool reading,
 and BDR/on-read dequant are not complete. This is the correct failure mode: no
@@ -715,6 +717,11 @@ Current branch status:
 - added a fail-closed receiver guard so a HiSparse-enabled request that
   reserved host slots cannot complete without successful host-write commit
   coverage;
+- added explicit pending-write and admission state to the coordinator:
+  request host writes begin when decode publishes host slots, finish on
+  terminal host-write result, block request release while writes are pending,
+  and mark a request admitted only after every reserved prompt block is
+  committed;
 - hardened disaggregated receive cleanup so cancelled/failed sessions are not
   treated as processable while KV/HiSparse writes are still `TRANSFERRING`, and
   `RxSession.close()` refuses to release HiSparse host rows until those writes
@@ -732,7 +739,7 @@ Still pending before serving enablement:
 
 - live E2E validation of the completion/commit handoff, including multi-rank
   and partial-slice cases;
-- decode-admission gating that proves the request-visible host slots are
+- live decode-admission validation that proves request-visible host slots are
   committed before sparse MLA can select them;
 - live cancel/abort testing that proves host slots remain pinned until
   in-flight DRAM writes finish;

@@ -609,6 +609,29 @@ class OPTRTHiSparseCoordinator:
                                          valid=True)
         return record
 
+    def begin_host_write(self, req_pool_idx: int) -> HiSparseRequestState:
+        state = self._request_state(req_pool_idx)
+        state.pending_writes += 1
+        state.admitted = False
+        return state
+
+    def finish_host_write(self, req_pool_idx: int) -> HiSparseRequestState:
+        state = self._request_state(req_pool_idx)
+        if state.pending_writes <= 0:
+            raise RuntimeError(
+                f"HiSparse request {req_pool_idx} has no pending host writes "
+                "to finish.")
+        state.pending_writes -= 1
+        return state
+
+    def abort_request(self, req_pool_idx: int) -> None:
+        """Clear admission state after a terminal failed/cancelled transfer."""
+        state = self._requests.get(int(req_pool_idx))
+        if state is None:
+            return
+        state.pending_writes = 0
+        state.admitted = False
+
     def mark_host_write_committed(
         self,
         req_pool_idx: int,
@@ -669,11 +692,49 @@ class OPTRTHiSparseCoordinator:
     def host_block_committed(self, req_pool_idx: int, block_pos: int) -> bool:
         return self._host_record(req_pool_idx, block_pos).valid
 
-    def release_request(self, req_pool_idx: int) -> None:
+    def request_ready_for_admission(
+        self,
+        req_pool_idx: int,
+        *,
+        num_prompt_blocks: Optional[int] = None,
+    ) -> bool:
+        state = self._request_state(req_pool_idx)
+        if state.pending_writes != 0:
+            return False
+        if num_prompt_blocks is None:
+            num_prompt_blocks = len(state.host_slots_by_block_pos)
+        return all(
+            self.host_block_committed(state.req_pool_idx, block_pos)
+            for block_pos in range(int(num_prompt_blocks)))
+
+    def mark_request_admitted(
+        self,
+        req_pool_idx: int,
+        *,
+        num_prompt_blocks: Optional[int] = None,
+    ) -> HiSparseRequestState:
+        state = self._request_state(req_pool_idx)
+        if not self.request_ready_for_admission(
+                req_pool_idx, num_prompt_blocks=num_prompt_blocks):
+            raise RuntimeError(
+                "HiSparse request cannot be admitted until all reserved prompt "
+                "host blocks are committed and no host writes are pending: "
+                f"req={req_pool_idx}, pending_writes={state.pending_writes}.")
+        state.admitted = True
+        return state
+
+    def release_request(self, req_pool_idx: int, *, force: bool = False) -> None:
         req_pool_idx = int(req_pool_idx)
-        state = self._requests.pop(req_pool_idx, None)
+        state = self._requests.get(req_pool_idx)
         if state is None:
             return
+        if state.pending_writes and not force:
+            raise RuntimeError(
+                "Cannot release HiSparse request with pending host writes: "
+                f"req={req_pool_idx}, pending_writes={state.pending_writes}.")
+        if force:
+            self.abort_request(req_pool_idx)
+        state = self._requests.pop(req_pool_idx)
         released_slots = sorted(state.host_slots_by_block_pos.values())
         released_set = set(released_slots)
         for records in self._hot_records_by_layer.values():
@@ -785,9 +846,7 @@ class OPTRTHiSparseCoordinator:
 
     def _host_record(self, req_pool_idx: int,
                      block_pos: int) -> HiSparseHostBlockRecord:
-        state = self._requests.get(int(req_pool_idx))
-        if state is None:
-            raise KeyError(f"HiSparse request {req_pool_idx} is not reserved.")
+        state = self._request_state(req_pool_idx)
         try:
             host_slot = state.host_slots_by_block_pos[int(block_pos)]
         except KeyError as exc:
@@ -795,6 +854,12 @@ class OPTRTHiSparseCoordinator:
                 f"HiSparse request {req_pool_idx} has no block_pos "
                 f"{block_pos}.") from exc
         return self._host_records[host_slot]
+
+    def _request_state(self, req_pool_idx: int) -> HiSparseRequestState:
+        state = self._requests.get(int(req_pool_idx))
+        if state is None:
+            raise KeyError(f"HiSparse request {req_pool_idx} is not reserved.")
+        return state
 
     @staticmethod
     def _find_hot_hit(

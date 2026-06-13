@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
-from tensorrt_llm._torch.disaggregation.base.transfer import SessionArgsBase
+from tensorrt_llm._torch.disaggregation.base.transfer import (
+    SessionArgsBase,
+    SessionStatus,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TaskStatus,
@@ -31,8 +34,8 @@ class _FakeReceiver:
         self.released = []
         self.cleared = []
 
-    def release_hisparse_request(self, rid):
-        self.released.append(rid)
+    def release_hisparse_request(self, rid, *, force=False):
+        self.released.append((rid, force))
 
     def clear_session(self, rid):
         self.cleared.append(rid)
@@ -65,6 +68,10 @@ def test_rx_session_close_defers_hisparse_release_while_transferring():
     session.request_id = 123
     session._base_args = SessionArgsBase(params)
     session._kv_tasks = [SimpleNamespace(status=TaskStatus.TRANSFERRING)]
+    session._terminal_status = None
+    session._exception = None
+    session._need_aux = False
+    session._aux_status = TaskStatus.INIT
 
     assert session.close() is False
     assert session._closed is False
@@ -72,7 +79,8 @@ def test_rx_session_close_defers_hisparse_release_while_transferring():
     assert receiver.cleared == []
 
     session._kv_tasks[0].status = TaskStatus.ERROR
+    session._terminal_status = SessionStatus.ERROR
     assert session.close() is True
     assert session._closed is True
-    assert receiver.released == [123]
+    assert receiver.released == [(123, True)]
     assert receiver.cleared == [123]

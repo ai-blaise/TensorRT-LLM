@@ -1647,6 +1647,7 @@ class KVRecvTask:
         self.expected_transfers = 0
         self.last_slice_count = 0
         self.hisparse_host_slots: Optional[np.ndarray] = None
+        self.hisparse_pending_write_started = False
         self.hisparse_commit_layer_parts: list[np.ndarray] = []
         self.hisparse_commit_block_parts: list[np.ndarray] = []
 
@@ -1802,16 +1803,22 @@ class Receiver(ReceiverBase):
             num_prompt_blocks = (int(token_range.end) + tpb - 1) // tpb
         state = coordinator.reserve_or_get_request(task._unique_rid,
                                                    num_prompt_blocks)
+        if num_prompt_blocks > 0 and not task.hisparse_pending_write_started:
+            coordinator.begin_host_write(task._unique_rid)
+            task.hisparse_pending_write_started = True
         return np.asarray([
             state.host_slots_by_block_pos[block_pos]
             for block_pos in range(num_prompt_blocks)
         ],
                           dtype=np.int64)
 
-    def release_hisparse_request(self, unique_rid: int) -> None:
+    def release_hisparse_request(self,
+                                 unique_rid: int,
+                                 *,
+                                 force: bool = False) -> None:
         coordinator = self._hisparse_coordinator
         if coordinator is not None and getattr(coordinator, "enabled", False):
-            coordinator.release_request(int(unique_rid))
+            coordinator.release_request(int(unique_rid), force=force)
 
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
@@ -2114,33 +2121,35 @@ class RxSession(RxSessionBase):
             )
             task = self._kv_tasks[sender_slice_id]
             if status == AgentResult.SUCCESS:
-                self._record_hisparse_commit_coverage(
-                    task,
-                    hisparse_commit_layer_indices,
-                    hisparse_commit_block_positions,
-                )
-                if is_last_slice:
-                    task.last_slice_count += 1
-                    if task.last_slice_count == task.expected_transfers:
-                        try:
+                try:
+                    self._record_hisparse_commit_coverage(
+                        task,
+                        hisparse_commit_layer_indices,
+                        hisparse_commit_block_positions,
+                    )
+                    if is_last_slice:
+                        task.last_slice_count += 1
+                        if task.last_slice_count == task.expected_transfers:
                             self._commit_hisparse_host_writes(task)
-                        except Exception as exc:
-                            task.fail(exc)
-                            if self._terminal_status is None:
-                                self._terminal_status = SessionStatus.ERROR
-                            logger.error(str(exc))
-                            return
-                        task.complete()
+                            task.complete()
 
-                        logger.debug(
-                            f"KV transfer complete for request {self.request_id} "
-                            f"slice={sender_slice_id}"
-                        )
-                        if task._perf_timer is not None:
-                            task._perf_timer.record_task_end(peer_rank)
-                        ri = self._receiver._registrar.self_rank_info
-                        task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+                            logger.debug(
+                                f"KV transfer complete for request {self.request_id} "
+                                f"slice={sender_slice_id}"
+                            )
+                            if task._perf_timer is not None:
+                                task._perf_timer.record_task_end(peer_rank)
+                            ri = self._receiver._registrar.self_rank_info
+                            task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+                except Exception as exc:
+                    self._finish_hisparse_host_write(task)
+                    task.fail(exc)
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    logger.error(str(exc))
+                    return
             elif status == AgentResult.FAILED:
+                self._finish_hisparse_host_write(task)
                 task.fail(
                     RuntimeError(
                         f"KV transfer failed for request {self.request_id} slice={sender_slice_id}"
@@ -2184,32 +2193,51 @@ class RxSession(RxSessionBase):
         has_slots = slots is not None and int(slots.size) > 0
         has_coverage = bool(task.hisparse_commit_layer_parts)
         if has_slots and not has_coverage:
+            self._finish_hisparse_host_write(task)
             raise RuntimeError(
                 "HiSparse direct-to-host reserved host slots but received no "
                 f"successful host-write commit coverage for request "
                 f"{self.disagg_request_id}, slice={task.slice_id}.")
         if not has_coverage:
+            self._finish_hisparse_host_write(task)
             return
         layers = np.concatenate(task.hisparse_commit_layer_parts)
         blocks = np.concatenate(task.hisparse_commit_block_parts)
-        coordinator.mark_host_write_committed(
-            task._unique_rid,
-            layer_indices=layers,
-            block_positions=blocks,
-        )
-        incomplete = sorted({
-            int(block_pos)
-            for block_pos in blocks
-            if not coordinator.host_block_committed(task._unique_rid,
-                                                   int(block_pos))
-        })
+        try:
+            coordinator.mark_host_write_committed(
+                task._unique_rid,
+                layer_indices=layers,
+                block_positions=blocks,
+            )
+        finally:
+            self._finish_hisparse_host_write(task)
+        incomplete = []
+        if slots is not None:
+            incomplete = [
+                block_pos for block_pos in range(int(slots.size))
+                if not coordinator.host_block_committed(task._unique_rid,
+                                                       block_pos)
+            ]
         if incomplete:
             sample = ", ".join(str(block_pos) for block_pos in incomplete[:8])
             raise RuntimeError(
                 "HiSparse host-write coverage completed without committing "
-                "all local layers for block position(s): "
+                "all reserved prompt block position(s): "
                 f"{sample}; request={self.disagg_request_id}, "
                 f"slice={task.slice_id}.")
+        if slots is not None:
+            coordinator.mark_request_admitted(task._unique_rid,
+                                             num_prompt_blocks=int(slots.size))
+
+    def _finish_hisparse_host_write(self, task: KVRecvTask) -> None:
+        if not getattr(task, "hisparse_pending_write_started", False):
+            return
+        coordinator = getattr(self._receiver, "_hisparse_coordinator", None)
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            task.hisparse_pending_write_started = False
+            return
+        coordinator.finish_host_write(task._unique_rid)
+        task.hisparse_pending_write_started = False
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
         # Aux is session-level (not per-slice); expected_transfers is identical
@@ -2357,7 +2385,10 @@ class RxSession(RxSessionBase):
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
-            self._receiver.release_hisparse_request(self.disagg_request_id)
+            force_release = self.status in (SessionStatus.ERROR,
+                                            SessionStatus.CANCELLED)
+            self._receiver.release_hisparse_request(self.disagg_request_id,
+                                                    force=force_release)
             self._receiver.clear_session(self.disagg_request_id)
         return True
 
