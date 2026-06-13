@@ -1721,18 +1721,26 @@ class OPTRTHiSparseCoordinator:
                 "CUDA kernel. HiSparse must consume packed KVarN hot records "
                 "through the production sparse MLA path; no NVFP4 or full-HBM "
                 "fallback is allowed.")
+        import torch
+
         if not getattr(topk_indices, "is_cuda", False):
             raise NotImplementedError(
                 "HiSparse native orchestration requires CUDA TopK tensors from "
                 "the Indexer/HISA path. Serving remains fail-closed until native "
                 "planner/copy orchestration and sparse MLA hot-pool read are "
                 "wired to real CUDA metadata.")
+        if topk_indices.dim() != 2:
+            raise RuntimeError(
+                "HiSparse native orchestration requires 2-D TopK indices with "
+                "shape [rows, index_topk].")
+        if topk_indices.dtype != torch.int32:
+            raise RuntimeError(
+                "HiSparse native orchestration requires int32 TopK indices "
+                "from the Indexer/HISA path.")
         if not hasattr(metadata, "_ensure_pool_view_cached"):
             raise NotImplementedError(
                 "HiSparse native orchestration requires DSA metadata with cached "
                 "row geometry. Serving remains fail-closed for non-DSA metadata.")
-
-        import torch
 
         tier = self._require_configured()
         tensors = self._require_tensors()
@@ -1744,6 +1752,12 @@ class OPTRTHiSparseCoordinator:
             raise RuntimeError(
                 "HiSparse native orchestration requires cached request-row "
                 "indices from DSA metadata.")
+        if int(topk_indices.shape[0]) != int(req_idx.numel()):
+            raise RuntimeError(
+                "HiSparse native orchestration requires TopK rows to match "
+                "cached DSA request-row geometry: got topk rows "
+                f"{int(topk_indices.shape[0])}, request rows "
+                f"{int(req_idx.numel())}.")
         request_id_tensor = request_ids
         if not torch.is_tensor(request_id_tensor):
             request_id_tensor = torch.as_tensor(request_id_tensor,

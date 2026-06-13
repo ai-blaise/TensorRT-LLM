@@ -638,6 +638,10 @@ def test_hisparse_native_mapping_allows_hot_capacity_larger_than_topk_source_con
     hisparse = root / "tensorrt_llm/_torch/attention_backend/sparse/hisparse.py"
 
     source = hisparse.read_text()
+    assert "topk_indices.dim() != 2" in source
+    assert "topk_indices.dtype != torch.int32" in source
+    assert "TopK rows to match" in source
+    assert "req_idx.numel()" in source
     assert "index_topk = int(topk_indices.shape[1])" in source
     assert "min(int(tier.hot_device_capacity_blocks)," in source
     assert "index_topk)" in source

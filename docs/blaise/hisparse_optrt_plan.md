@@ -269,6 +269,9 @@ same ABI shape as the final serving path. The following are hard invariants:
   tiers larger than TopK are valid configurations and must not be rejected by
   the native block-dedupe stage; the full hot capacity still remains available
   to the LRU/hit/miss planner.
+- Native mapping accepts only 2-D int32 CUDA TopK tensors whose row count
+  matches cached DSA request-row geometry. A mismatched row set would bind
+  TopK rows to the wrong request ids and must fail before native planning.
 - The hot planner counts unique missing `(host_slot, commit_gen)` pairs per
   row. Duplicate references to the same committed block in a row must reuse the
   first planned hot slot instead of consuming another victim or false-failing
@@ -1112,6 +1115,8 @@ Current branch status:
   submission, post-copy metadata commit, and hot global-index construction;
 - the TopK-to-block stage now plans at `min(index_topk, hot_capacity)` so
   feasible oversized hot-tier configurations do not fail before LRU planning;
+- the coordinator now validates TopK rank/dtype and row count against cached
+  DSA request-row geometry before constructing native request ids;
 - the native hot planner's capacity pre-check now matches its slot-selection
   pass by counting duplicate missing host/commit pairs once per row;
 - added `trtllm::hisparse_read_kvarn_hot_bdr`, a native production BDR
