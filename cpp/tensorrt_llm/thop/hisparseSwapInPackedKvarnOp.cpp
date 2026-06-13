@@ -42,10 +42,18 @@ void checkByteTensor(th::Tensor const& tensor, char const* name)
 void checkLayeredPackedTensor(th::Tensor const& tensor, char const* name, int64_t packedBytesPerBlock)
 {
     TORCH_CHECK(tensor.dim() == 3, name, " must have shape [num_layers, num_slots, packed_bytes]");
+    TORCH_CHECK(tensor.size(0) > 0, name, " must have at least one layer");
+    TORCH_CHECK(tensor.size(1) > 0, name, " must have at least one packed slot");
     TORCH_CHECK(tensor.size(2) >= packedBytesPerBlock,
         name, " last dimension must be at least packed_bytes_per_block=", packedBytesPerBlock,
         ", got ", tensor.size(2));
     TORCH_CHECK(tensor.stride(2) == 1, name, " records must be byte-contiguous in the last dimension");
+    TORCH_CHECK(tensor.stride(1) >= packedBytesPerBlock,
+        name, " slot stride must be at least packed_bytes_per_block=", packedBytesPerBlock,
+        " to prevent overlapping packed records; got ", tensor.stride(1));
+    TORCH_CHECK(tensor.stride(0) >= tensor.size(1) * tensor.stride(1),
+        name, " layer stride must cover all packed slots to prevent overlapping layers; got stride(0)=",
+        tensor.stride(0), ", required at least ", tensor.size(1) * tensor.stride(1));
 }
 
 void checkSlots(th::Tensor const& slots, char const* name)

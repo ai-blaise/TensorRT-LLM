@@ -285,6 +285,10 @@ same ABI shape as the final serving path. The following are hard invariants:
   serving paths. The current bridge is a mapped pinned-host kernel path; a
   future copy-engine variant may replace it only if it consumes the same compact
   device schedule without host synchronization.
+- Host and hot packed tiers must have non-overlapping records: last-dimension
+  bytes are contiguous, slot stride covers a full packed record, and layer
+  stride covers all slots in the layer. A strided aliasing view is not a valid
+  HiSparse copy source or destination.
 - Compact copy schedules must fail closed. Any impossible compact row id means
   the schedule is corrupt and no row in that batch may publish hot metadata.
 
@@ -1135,6 +1139,8 @@ Current branch status:
 - tightened the schedule-driven packed KVarN copy bridge so a compact schedule
   with an invalid row id marks every row invalid, preventing post-copy hot
   metadata publication after a skipped miss copy;
+- tightened the packed copy bridge tensor ABI so host/hot packed tiers must
+  have non-overlapping slot and layer strides before copy submission;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;

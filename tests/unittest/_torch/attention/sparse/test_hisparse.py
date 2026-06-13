@@ -629,6 +629,10 @@ def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
     assert "statusRow < numRows" in source
     assert "rowStatus[statusRow] = kCopyInvalidRow" in source
     assert "commit stage cannot" in source
+    assert "slot stride must be at least packed_bytes_per_block" in source
+    assert "prevent overlapping packed records" in source
+    assert "layer stride must cover all packed slots" in source
+    assert "prevent overlapping layers" in source
     assert "hisparseSwapInPackedKvarnOp.cpp" in cmake.read_text()
     assert "hisparse_submit_packed_kvarn_copy_schedule" in fake.read_text()
 
