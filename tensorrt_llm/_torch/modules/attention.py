@@ -2732,6 +2732,7 @@ class MLA(nn.Module):
             return (resident.row_kv_lens.device == expected_device
                     and resident.row_request_ids.device == expected_device
                     and resident.row_req_idx.device == expected_device
+                    and resident.kv_pool.device == fused_q.device
                     and resident.block_table.device == expected_device
                     and resident.tail_block_pos.device == expected_device
                     and resident.tail_token_count.device == expected_device
@@ -2801,6 +2802,7 @@ class MLA(nn.Module):
             resident.row_kv_lens,
             resident.row_req_idx,
             resident.row_request_ids,
+            resident.kv_pool,
             resident.block_table,
             resident.tail_block_pos,
             resident.tail_token_count,

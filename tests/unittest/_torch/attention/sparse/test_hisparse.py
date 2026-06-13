@@ -330,6 +330,7 @@ def test_hisparse_resident_token_descriptor_derives_sink_tail_geometry():
                                           dtype=torch.int32),
         num_contexts=1,
         num_generations=3,
+        _cached_pool_view=torch.empty((32, 1, 576), dtype=torch.bfloat16),
         _cached_block_table_gen=torch.arange(12,
                                              dtype=torch.int32).view(3, 4),
     )
@@ -350,6 +351,7 @@ def test_hisparse_resident_token_descriptor_derives_sink_tail_geometry():
     assert desc.sink_tokens == 128
     assert desc.sink_blocks == 2
     assert desc.tokens_per_block == 64
+    assert desc.kv_pool is metadata._cached_pool_view
     assert desc.block_table is metadata._cached_block_table_gen
     assert desc.row_kv_lens.tolist() == [130, 192, 192, 257]
     assert desc.row_req_idx.tolist() == [0, 1, 1, 2]
@@ -726,20 +728,25 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "checkHotPackedStrides" in thop_source
     assert "checkResidentTokenAbi" in thop_source
     assert "explicit_sink_tail_v1 requires resident_kv_lens" in thop_source
+    assert "resident_kv_pool must be bf16 or fp16 normal decode KV" in thop_source
+    assert "resident_kv_pool must have shape [global_tokens, 1, 576]" in thop_source
     assert "resident_tail_valid must be bool" in thop_source
     assert "resident_sink_blocks must equal resident_sink_tokens" in thop_source
     assert "resident_block_table must have shape [seqs, blocks]" in thop_source
     assert "resident_kv_lens=None" in thop_source
+    assert "resident_kv_pool=None" in thop_source
     assert "prevent overlapping hot records" in thop_source
     assert "prevent overlapping layers" in thop_source
     assert "stride_factor must cover all layer token ranges" in thop_source
     assert "residentKvLens" in header.read_text()
+    assert "residentKvPool" in header.read_text()
     assert "residentTailTokenCount" in header.read_text()
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     fake_source = fake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake_source
     assert "resident_kv_lens=None" in fake_source
+    assert "resident_kv_pool=None" in fake_source
     assert "resident_tail_valid=None" in fake_source
 
 
@@ -811,10 +818,12 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
     assert "resident = getattr(descriptor, \"resident_tokens\", None)" in source
     assert "explicit_sink_tail_v1" in source
     assert "resident.row_kv_lens.shape[0]" in source
+    assert "resident.kv_pool.device" in source
     assert "resident.block_table.device" in source
     assert "resident.tail_token_count.device" in source
     assert "resident.row_req_idx" in source
     assert "resident.row_request_ids" in source
+    assert "resident.kv_pool" in source
     assert "resident.tail_block_pos" in source
     assert "resident.tail_valid" in source
     assert "resident.sink_blocks" in source

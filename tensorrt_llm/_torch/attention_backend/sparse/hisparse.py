@@ -40,6 +40,7 @@ class HiSparseResidentTokenDescriptor:
     row_kv_lens: "torch.Tensor"
     row_request_ids: "torch.Tensor"
     row_req_idx: "torch.Tensor"
+    kv_pool: "torch.Tensor"
     block_table: "torch.Tensor"
     tail_block_pos: "torch.Tensor"
     tail_token_count: "torch.Tensor"
@@ -1094,6 +1095,12 @@ class OPTRTHiSparseCoordinator:
             raise RuntimeError(
                 "HiSparse resident-token ABI requires cached DSA block-table "
                 "metadata for the normal resident KV source.")
+        kv_pool = getattr(metadata, "_cached_pool_view", None)
+        if kv_pool is None:
+            raise RuntimeError(
+                "HiSparse resident-token ABI requires the cached normal KV "
+                "pool view so fused producer loads can read resident sink/tail "
+                "tokens without a staging pool.")
 
         if not torch.is_tensor(req_idx):
             req_idx = torch.as_tensor(req_idx, dtype=torch.int64)
@@ -1142,6 +1149,7 @@ class OPTRTHiSparseCoordinator:
             row_request_ids=row_request_ids.to(device=target_device,
                                                dtype=torch.int64),
             row_req_idx=req_idx_i64,
+            kv_pool=kv_pool,
             block_table=block_table,
             tail_block_pos=tail_block_pos,
             tail_token_count=tail_token_count,

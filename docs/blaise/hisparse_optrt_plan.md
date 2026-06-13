@@ -1197,18 +1197,19 @@ Current branch status:
 - the sparse MLA KVarN-hot descriptor now records the coordinator `step_id`
   and carries production-shaped sink/tail resident metadata:
   row kv-lens, row request ids, row request indices, the cached normal-KV
-  block table source, sink token/block counts, tail block position, tail token
-  count, and tail validity. The fused attention dispatch rejects same-shape
-  cached descriptors from older request steps or descriptors missing matching
-  resident-token metadata before they can consume stale hot-slot state;
+  pool view, the cached normal-KV block table source, sink token/block counts,
+  tail block position, tail token count, and tail validity. The fused
+  attention dispatch rejects same-shape cached descriptors from older request
+  steps or descriptors missing matching resident-token metadata before they
+  can consume stale hot-slot state;
 - the `trtllm::sparse_mla_decode_kvarn_hot` native op schema now accepts the
   same `explicit_sink_tail_v1` resident-token tensors and validates them as a
   complete set when provided: row kv-lens, row request indices, row request
-  ids, normal-KV block table, tail block positions, tail token counts, tail
-  validity, and sink token/block counts. The production attention call passes
-  these fields from the descriptor into the op. The kernel still fails closed
-  at the readiness guard until the CUDA producer-load path actually selects
-  resident normal-KV reads for sink/tail hits;
+  ids, normal-KV pool view, normal-KV block table, tail block positions, tail
+  token counts, tail validity, and sink token/block counts. The production
+  attention call passes these fields from the descriptor into the op. The
+  kernel still fails closed at the readiness guard until the CUDA producer-load
+  path actually selects resident normal-KV reads for sink/tail hits;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1495,7 +1496,8 @@ production ABI:
      - per-row tail block position/validity derived from the generation
        `kv_lens` visible to DSA metadata;
      - source references to the normal resident decode KV path for valid
-       sink/tail hits, not copies through an FP16 hot tier;
+       sink/tail hits, including the cached KV pool view and block table, not
+       copies through an FP16 hot tier;
      - row/token status that distinguishes committed-hot hits, resident
        sink/tail hits, uncommitted invalid hits, and stale-planner failures;
      - fused producer-load consumption that selects packed-hot BDR reads for

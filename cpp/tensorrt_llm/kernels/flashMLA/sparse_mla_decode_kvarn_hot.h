@@ -25,6 +25,7 @@ struct SparseMlaDecodeKvarnHotParams
     int64_t* residentKvLens;
     int64_t* residentReqIdx;
     int64_t* residentRequestIds;
+    void* residentKvPool;
     int32_t* residentBlockTable;
     int32_t* residentTailBlockPos;
     int32_t* residentTailTokenCount;
@@ -61,6 +62,8 @@ struct SparseMlaDecodeKvarnHotParams
     int64_t strideHotRecord;
     int64_t strideIndicesB;
     int64_t strideIndicesSQ;
+    int64_t strideResidentKvPoolToken;
+    int64_t strideResidentKvPoolHead;
     int64_t strideResidentBlockTableB;
     int64_t strideResidentBlockTableBlock;
     int64_t strideLseB;

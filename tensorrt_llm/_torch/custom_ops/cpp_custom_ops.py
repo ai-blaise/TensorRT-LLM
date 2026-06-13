@@ -337,14 +337,15 @@ def _register_fake():
           layer_idx=0, tokens_per_block=64, stride_factor=64, kvarn_bits=2,
           kv_lora_rank=512, qk_rope_head_dim=64, sm_scale=1.0,
           resident_kv_lens=None, resident_req_idx=None,
-          resident_request_ids=None, resident_block_table=None,
+          resident_request_ids=None, resident_kv_pool=None,
+          resident_block_table=None,
           resident_tail_block_pos=None, resident_tail_token_count=None,
           resident_tail_valid=None, resident_sink_tokens=0,
           resident_sink_blocks=0):
         del hot_packed, row_status, topk_length, attn_sink, layer_idx
         del tokens_per_block, stride_factor, kvarn_bits, kv_lora_rank
         del qk_rope_head_dim, sm_scale, resident_kv_lens, resident_req_idx
-        del resident_request_ids, resident_block_table
+        del resident_request_ids, resident_kv_pool, resident_block_table
         del resident_tail_block_pos, resident_tail_token_count
         del resident_tail_valid, resident_sink_tokens, resident_sink_blocks
         return (q.new_empty((*q.shape[:3], 512)),
