@@ -263,7 +263,7 @@ class OPTRTHiSparseCoordinator:
                 "path.")
 
     def assert_sparse_mla_reader_ready(self) -> None:
-        """Fail closed until KVarN-hot sparse MLA is actually wired in."""
+        """Require the production KVarN-hot sparse MLA chain."""
         if not self.enabled:
             return
         self.assert_native_planner_ready()
@@ -276,12 +276,6 @@ class OPTRTHiSparseCoordinator:
                 f"{_HISPARSE_FUSED_SPARSE_MLA_OP}. Do not route enabled "
                 "HiSparse through sparse_mla_decode_nvfp4, full-HBM restore, "
                 "or an executable dense hot pre-dequant placeholder.")
-        raise NotImplementedError(
-            "HiSparse KVarN-hot sparse MLA is registered but not integrated "
-            "through the DSA attention dispatch path on this branch. This "
-            "startup guard remains closed until the coordinator output, row "
-            "status, sink/tail descriptors, and sparse MLA call site are "
-            "live-validated together.")
 
     def reset_step(self) -> None:
         self.step_id += 1
@@ -1720,6 +1714,13 @@ class OPTRTHiSparseCoordinator:
                 "global indices from request-relative TopK and planned hot "
                 "slots on device; no Python hot-index construction path is "
                 "allowed for enabled serving.")
+        self.assert_hot_reader_validation_ready()
+        if not self._torch_cuda_op_registered(_HISPARSE_FUSED_SPARSE_MLA_OP):
+            raise NotImplementedError(
+                "trtllm::sparse_mla_decode_kvarn_hot is not registered with a "
+                "CUDA kernel. HiSparse must consume packed KVarN hot records "
+                "through the production sparse MLA path; no NVFP4 or full-HBM "
+                "fallback is allowed.")
         if not getattr(topk_indices, "is_cuda", False):
             raise NotImplementedError(
                 "HiSparse native orchestration requires CUDA TopK tensors from "
@@ -1751,6 +1752,15 @@ class OPTRTHiSparseCoordinator:
         else:
             request_id_tensor = request_id_tensor.to(device=topk_indices.device,
                                                      dtype=torch.int64)
+        if is_generation:
+            num_contexts = int(getattr(metadata, "num_contexts", 0) or 0)
+            num_generations = int(
+                getattr(metadata, "num_generations", 0) or 0)
+            num_seqs = int(getattr(metadata, "num_seqs", 0) or 0)
+            if (num_contexts > 0 and num_generations > 0 and num_seqs > 0
+                    and request_id_tensor.shape[0] >= num_seqs):
+                request_id_tensor = request_id_tensor[
+                    num_contexts:num_contexts + num_generations]
         row_request_ids = request_id_tensor.index_select(
             0, req_idx.to(device=topk_indices.device, dtype=torch.int64))
 
@@ -1837,10 +1847,7 @@ class OPTRTHiSparseCoordinator:
             max_blocks_per_row=max_blocks_per_row,
             stride_factor=stride_factor,
         )
-        raise NotImplementedError(
-            "HiSparse native planner/copy orchestration produced hot global "
-            f"indices with shape {tuple(sparse_mla_descriptor.hot_indices.shape)} "
-            "and a typed KVarN-hot sparse MLA descriptor, but sparse MLA "
-            "hot-pool read with packed KVarN BDR/on-read dequant is not wired "
-            "or live-validated. Serving remains fail-closed; do not fall back "
-            "to full-HBM, FP16 staging, or direct-to-host-off paths.")
+        return HiSparseTopKMapping(
+            topk_indices_global=hot_indices,
+            sparse_mla_kvarn_hot=sparse_mla_descriptor,
+        )

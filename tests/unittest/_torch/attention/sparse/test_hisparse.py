@@ -199,6 +199,8 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
             "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
             "trtllm::hisparse_commit_hot_slots",
             "trtllm::hisparse_build_hot_indices",
+            "trtllm::hisparse_read_kvarn_hot_bdr",
+            "trtllm::sparse_mla_decode_kvarn_hot",
         })
     with pytest.raises(NotImplementedError,
                        match="native orchestration"):
@@ -251,9 +253,7 @@ def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
                             hot_reader,
                             sparse_mla,
                         })
-    with pytest.raises(NotImplementedError,
-                       match="registered but not integrated"):
-        coordinator.assert_startup_ready()
+    coordinator.assert_startup_ready()
 
 
 def test_hisparse_sparse_mla_descriptor_is_production_k2v2_contract():
@@ -611,6 +611,20 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     assert "sparse_mla_decode_kvarn_hot" in fake.read_text()
+
+
+def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
+    root = Path(__file__).resolve().parents[5]
+    attention = root / "tensorrt_llm/_torch/modules/attention.py"
+    source = attention.read_text()
+
+    assert "def _sparse_mla_decode_kvarn_hot" in source
+    assert "map_topk_to_hot_pool" in source
+    assert "torch.ops.trtllm.sparse_mla_decode_kvarn_hot" in source
+    assert "getattr(attn_metadata, \"num_generations\", 0)" in source
+    assert "hisparse_sparse_mla_kvarn_hot" in source
+    assert "refusing to route through NVFP4 or full-HBM sparse MLA" in source
+    assert "HiSparse readiness returned unexpectedly" not in source
 
 
 def test_hisparse_request_table_slots_are_stable_and_reused():

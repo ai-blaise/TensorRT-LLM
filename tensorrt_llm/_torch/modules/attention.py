@@ -2666,6 +2666,93 @@ class MLA(nn.Module):
         return out.reshape(
             [num_tokens, self.num_heads_tp_cp * self.kv_lora_rank])
 
+    def _hisparse_local_layer_idx(self, attn_metadata) -> int:
+        get_local_layer_idx = getattr(self.mqa, "get_local_layer_idx", None)
+        if callable(get_local_layer_idx):
+            return int(get_local_layer_idx(attn_metadata))
+        return int(self.layer_idx)
+
+    def _sparse_mla_decode_kvarn_hot(
+        self,
+        fused_q: torch.Tensor,
+        attn_metadata: "DSAtrtllmAttentionMetadata",
+        topk_indices: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Sparse MLA decode against HiSparse packed KVarN-hot BDR records."""
+        hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
+                                       None)
+        if hisparse_coordinator is None or not hisparse_coordinator.enabled:
+            raise RuntimeError(
+                "HiSparse KVarN-hot sparse MLA requested without an enabled "
+                "coordinator.")
+        hisparse_coordinator.assert_sparse_mla_reader_ready()
+        descriptor = getattr(attn_metadata, "hisparse_sparse_mla_kvarn_hot",
+                             None)
+        if (descriptor is not None
+                and int(descriptor.hot_indices.shape[0]) != int(num_tokens)):
+            descriptor = None
+        if descriptor is None:
+            mapping = hisparse_coordinator.map_topk_to_hot_pool(
+                topk_indices=topk_indices,
+                metadata=attn_metadata,
+                layer_idx=self._hisparse_local_layer_idx(attn_metadata),
+                skip_topk=False,
+                is_generation=True,
+            )
+            descriptor = None if mapping is None else mapping.sparse_mla_kvarn_hot
+        if descriptor is None:
+            raise RuntimeError(
+                "HiSparse KVarN-hot sparse MLA did not receive a native "
+                "hot-pool descriptor; refusing to route through NVFP4 or "
+                "full-HBM sparse MLA.")
+        attn_metadata.hisparse_sparse_mla_kvarn_hot = descriptor
+
+        head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        q_concat = fused_q.view([num_tokens, self.num_heads_tp, head_dim])
+        padding = 128
+        assert self.num_heads_tp <= padding, (
+            f"sparse_mla_decode_kvarn_hot supports up to {padding} heads, got "
+            f"{self.num_heads_tp}")
+        if self.num_heads_tp != padding:
+            q_padded = q_concat.new_zeros((num_tokens, padding, head_dim))
+            q_padded[:, :self.num_heads_tp, :] = q_concat
+            q_concat = q_padded
+
+        num_seqs = int(
+            getattr(attn_metadata, "num_generations", 0)
+            or attn_metadata.num_seqs)
+        assert num_seqs > 0, (
+            "HiSparse sparse MLA decode requires at least one generation row.")
+        assert num_tokens % num_seqs == 0, (
+            "HiSparse sparse MLA decode requires a uniform number of query "
+            f"tokens per sequence (num_tokens={num_tokens}, "
+            f"num_seqs={num_seqs})")
+        s_q = num_tokens // num_seqs
+        q_concat = q_concat.view([num_seqs, s_q, padding, head_dim])
+        indices = descriptor.hot_indices.reshape(num_seqs, s_q,
+                                                 -1).contiguous()
+
+        out = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
+            q_concat,
+            descriptor.hot_packed,
+            indices,
+            descriptor.row_status,
+            descriptor.topk_length,
+            None,
+            descriptor.layer_idx,
+            descriptor.tokens_per_block,
+            descriptor.stride_factor,
+            descriptor.kvarn_bits,
+            descriptor.kv_lora_rank,
+            descriptor.qk_rope_head_dim,
+            self.softmax_scale,
+        )[0]
+        out = out.view([num_tokens, padding, self.kv_lora_rank])
+        out = out[:, :self.num_heads_tp_cp, :]
+        return out.reshape(
+            [num_tokens, self.num_heads_tp_cp * self.kv_lora_rank])
+
     def _run_sparse_mla_decode_nvfp4_op(
         self,
         q_concat: torch.Tensor,
@@ -2876,12 +2963,9 @@ class MLA(nn.Module):
         hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
                                        None)
         if bool(getattr(hisparse_coordinator, "enabled", False)):
-            hisparse_coordinator.assert_sparse_mla_reader_ready()
-            raise NotImplementedError(
-                "HiSparse readiness returned unexpectedly before DSA attention "
-                "was rewired to sparse_mla_decode_kvarn_hot.")
-
-        if has_nvfp4_kv_cache:
+            attn_out_latent = self._sparse_mla_decode_kvarn_hot(
+                fused_q, attn_metadata, topk_indices, num_tokens)
+        elif has_nvfp4_kv_cache:
             # The K write inside mla_rope_generation has already quantized the
             # 576-wide latent into the NVFP4 data + block-scale pools. Read it
             # back with the dedicated FlashMLA NVFP4 sparse-decode kernel.

@@ -1220,6 +1220,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._layersplit_step_read_set = None
         self.hisparse_coordinator = None
         self.hisparse_request_ids = None
+        self.hisparse_sparse_mla_kvarn_hot = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
@@ -1742,6 +1743,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
+        self.hisparse_sparse_mla_kvarn_hot = None
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.reset_step()
 
@@ -2041,6 +2043,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._hisa_step_invariants = None
         self._hisa_step_rowspan = None
         self._layersplit_step_read_set = None
+        self.hisparse_sparse_mla_kvarn_hot = None
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.reset_step()
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
@@ -4958,6 +4961,7 @@ class DSATrtllmAttention(TrtllmAttention):
                          AttentionInputType.generation_only)
         local_layer_idx = self.get_local_layer_idx(metadata)
         hisparse_mapping = None
+        metadata.hisparse_sparse_mla_kvarn_hot = None
         hisparse_coordinator = getattr(metadata, "hisparse_coordinator", None)
         if hisparse_coordinator is not None:
             hisparse_mapping = hisparse_coordinator.map_topk_to_hot_pool(
@@ -4969,6 +4973,8 @@ class DSATrtllmAttention(TrtllmAttention):
             )
         if hisparse_mapping is not None:
             topk_indices_global = hisparse_mapping.topk_indices_global
+            metadata.hisparse_sparse_mla_kvarn_hot = (
+                hisparse_mapping.sparse_mla_kvarn_hot)
         else:
             topk_indices_global, _ = transform_local_topk_reuse_or_compute(
                 forward_args.topk_indices, metadata, local_layer_idx,

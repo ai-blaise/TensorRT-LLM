@@ -139,24 +139,30 @@ final sweep tightened this primitive to require `kvarn_bits=2`; there is no
 4-bit KVarN-hot validation branch for the production HiSparse path.
 The BDR address decode, hot-index validation, 2-bit C-KV unpack, scale/zp
 application, and E4M3 RoPE byte read now live in
-`hisparseKvarnBdrRead.cuh`. The standalone hot-reader smoke op and the future
-fused sparse MLA kernel must use that same device helper layer so the
-validated CUDA smoke path and serving producer-load path cannot drift.
+`hisparseKvarnBdrRead.cuh`. The standalone hot-reader smoke op and fused
+sparse MLA kernel use that same device helper layer so the validated CUDA smoke
+path and serving producer-load path cannot drift.
 The coordinator also now constructs a typed
 `HiSparseSparseMlaKvarnHotDescriptor` at the native-chain boundary. That
 descriptor carries `hot_packed`, hot global indices, row status, fixed-top-k
 semantics, layer, stride, capacity, packed-record size, and the production
 `kvarn_k2v2` dense-MLA dimensions. It is built only from real native outputs
-and the function still raises immediately afterward; it is an ABI target for
-`sparse_mla_decode_kvarn_hot`, not a serving fallback.
+and is returned to the absorption-generation dispatch path; it is not a serving
+fallback and does not reconstruct loose hot-pool tensors.
 The branch now has the first native `trtllm::sparse_mla_decode_kvarn_hot`
 operator. It is not a wrapper over `sparse_mla_decode_nvfp4`: the CUDA kernel
 reads packed `kvarn_k2v2` BDR hot records through `hisparseKvarnBdrRead.cuh`,
 computes scores against the 576-wide dense-MLA key, applies softmax, and emits
 the 512-wide latent value output. This is a real KVarN-hot producer-load path,
-but it is not yet promoted: it uses a direct per-row/head kernel while the
-optimized FlashMLA-style split scheduler, DSA call-site wiring, row-status
-promotion checks, and live B200 profiling are still pending.
+and the HiSparse absorption-generation branch now calls it through the typed
+descriptor before any NVFP4 or full-HBM path can run. It is not yet promoted:
+it uses a direct per-row/head kernel while the optimized FlashMLA-style split
+scheduler, CUDA smoke execution, E2E DSA/SMC/Moondream validation, and live
+B200 profiling are still pending.
+The dispatch keys generation sparse-MLA shape on `num_generations`, not total
+mixed-batch sequence count, and the coordinator slices generation request IDs
+before resolving hot host slots. That keeps mixed prefill+decode batches from
+binding generation rows to context request IDs.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
@@ -1088,30 +1094,15 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- the startup/mapping guard must remain closed until the sparse MLA KVarN-hot
-  reader is wired in the same production chain as the native planner/copy
-  stages. Removing the guard before that point would create a hidden fallback
-  to full-HBM or NVFP4 sparse MLA behavior;
-- sparse MLA KVarN-hot read ABI that consumes the constructed hot global
-  indices against packed KVarN hot storage instead of the full dense pool;
-- a `sparse_mla_decode_kvarn_hot` implementation, or an equivalent explicit
-  KVarN mode, that does not route through the current
-  `sparse_mla_decode_nvfp4` tensor contract. Initial native op registration is
-  present, but DSA dispatch wiring and optimized split scheduling remain
-  pending. The existing NVFP4 op is still a useful scheduler/combine reference,
-  but its `kv [num_pages,64,1,288]` plus `kv_scales [num_pages,64,1,36]`
-  layout is not the production KVarN-hot ABI;
-- BDR/on-read dequant for packed hot KVarN records at the sparse MLA producer
-  load point, using `kvarn_bits=2` and production field offsets. The native
-  standalone hot-reader primitive now calls the shared
-  `hisparseKvarnBdrRead.cuh` device helpers that the fused sparse MLA producer
-  must include, but promotion still requires fusing those helpers into sparse
-  MLA rather than launching a separate dense scratch prepass;
-- attention dispatch must consume `HiSparseSparseMlaKvarnHotDescriptor`
-  directly rather than reconstructing loose hot-pool tensors or allocating a
-  side top-k-length tensor inside the CUDA graph path;
-- final row-status propagation into the sparse MLA hot-read stage so rows with
-  resolve/plan/copy/commit/build errors cannot be consumed;
+- run the CUDA smoke tests and a full native-library build in a safe B200
+  window; current verification has compiled translation units but has not
+  executed the CUDA runtime op under the deployed image;
+- optimize `sparse_mla_decode_kvarn_hot` beyond the direct per-row/head kernel
+  by importing the compatible FlashMLA split scheduler/combine structure while
+  preserving the packed KVarN-hot BDR producer load;
+- prove final row-status behavior under resolve/plan/copy/commit/build errors
+  with runtime tests, including invalid-row rejection before any stale hot-slot
+  read can influence output;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;
