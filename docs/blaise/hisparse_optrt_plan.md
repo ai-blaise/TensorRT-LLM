@@ -120,6 +120,15 @@ requirements are carried into this plan:
   signal. It does not replace the CZS/IKP/NSys promotion evidence above, and it
   does not authorize a split-producer/CuTe rewrite before the serving-layout
   import proof and live DSA/NIXL proof are complete.
+- The June 13 build-wait audit also re-read the direct NVIDIA CuTe DSL docs,
+  the CUTE layout algebra preprint, Veitner's CuTeDSL/TopK/Blackwell posts,
+  and the Colfax Blackwell CLC/block-scaling/FA-4/CUTLASS posts directly. The
+  concrete action items are: use AOT/JIT executor caching for iteration speed;
+  preserve structured-control CuTe DSL mode for kernels with real branches;
+  treat scale-factor/TMEM/128B-swizzle layouts as proof obligations rather than
+  flat byte arrays; avoid CLC/dynamic persistent scheduling unless CZS proves
+  race-freeness; and keep radix/cluster TopK changes behind measured
+  production-live-KV gates.
 
 ## Executive Decision
 
@@ -1703,8 +1712,12 @@ Still pending before serving enablement:
   sink, resident tail, padding-only, invalid upstream row, stale hot slot, and
   stale layer cases. The June 13 audit found it promising but not merge-ready:
   scheduler/split sizing must be rechecked for per-row `topk_length`, the fake
-  op metadata shape must stop being a placeholder before graph/export use, and
-  the candidate needs IKP timing artifacts before it replaces the direct kernel.
+  op metadata shape must stop being a placeholder before graph/export use, the
+  combine kernel's fixed `splitScale[128]` shared array must become dynamic or
+  chunked because the candidate heuristic can create more than 128 splits per
+  batch, and the worktree must be rebased over the resident sink/tail dtype
+  fail-closed guard. The candidate needs IKP timing artifacts before it
+  replaces the direct kernel.
   This candidate still needs main-branch audit, merge, and proof through the
   same serving-layout `libth_common.so` path before it can count as integrated
   production optimization;
