@@ -786,6 +786,9 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "decodeResidentTokenAddress" in kernel_source
     assert "readResidentLatentValue" in kernel_source
     assert "readRequestTopkToken" in kernel_source
+    assert "params.residentKvPoolDtype != kResidentKvPoolBf16" in kernel_source
+    assert "sparse MLA KVarN-hot decode requires resident KV pool dtype bf16 or fp16" in kernel_source
+    assert "return 0.0F;" in kernel_source
     assert "bool activeToken = false" in kernel_source
     assert "requestToken >= 0" in kernel_source
     assert "scores[k] = (rowCode == kHotReadOk && k < rowTopK && activeToken)" in kernel_source

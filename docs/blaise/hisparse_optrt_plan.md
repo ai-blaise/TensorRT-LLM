@@ -450,6 +450,10 @@ against NIXL source reads, live NIXL/cancel E2E proof, CUDA graph lifecycle
 proof, and profiling. This is the correct failure mode: no manifest should get
 an implicit full-HBM, FP16-staging, Python TopK extraction, or
 direct-to-host-off substitute.
+The resident sink/tail reader also fails closed on its normal-KV dtype at both
+the THOP wrapper and CUDA launcher/device-address guard: only BF16 and FP16
+resident pools are valid, and unknown dtype ids cannot silently reinterpret the
+pool as BF16.
 The June 13 cancellation audit also hardened the receiver side of that live
 NIXL gate: if an `RxSession` is already `ERROR` or `CANCELLED`, a late
 `KV_AGENT_RESULT SUCCESS` from a transferring task now finishes the pending

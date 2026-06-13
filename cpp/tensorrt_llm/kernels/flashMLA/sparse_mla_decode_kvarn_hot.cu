@@ -57,8 +57,7 @@ __device__ __forceinline__ float readResidentLatentValue(
         auto const* pool = reinterpret_cast<__half const*>(params.residentKvPool);
         return __half2float(pool[offset]);
     }
-    auto const* pool = reinterpret_cast<__nv_bfloat16 const*>(params.residentKvPool);
-    return __bfloat162float(pool[offset]);
+    return 0.0F;
 }
 
 struct HiSparseResidentTokenAddress
@@ -88,6 +87,11 @@ __device__ __forceinline__ HiSparseResidentTokenAddress decodeResidentTokenAddre
         || params.residentKvPool == nullptr || params.residentBlockTable == nullptr
         || params.residentTailBlockPos == nullptr || params.residentTailTokenCount == nullptr
         || params.residentTailValid == nullptr)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+    if (params.residentKvPoolDtype != kResidentKvPoolBf16 && params.residentKvPoolDtype != kResidentKvPoolFp16)
     {
         address.status = kHotReadInvalidIndex;
         return address;
@@ -431,6 +435,12 @@ void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& params, 
     if (params.b <= 0 || params.sQ <= 0 || params.topK <= 0 || params.numLayers <= 0 || params.hotCapacity <= 0)
     {
         throw std::runtime_error("sparse MLA KVarN-hot decode requires positive batch, s_q, topk, layers, and hot capacity");
+    }
+    if (params.residentKvPool != nullptr
+        && params.residentKvPoolDtype != kResidentKvPoolBf16
+        && params.residentKvPoolDtype != kResidentKvPoolFp16)
+    {
+        throw std::runtime_error("sparse MLA KVarN-hot decode requires resident KV pool dtype bf16 or fp16");
     }
     if (params.topK > 2048)
     {
