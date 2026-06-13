@@ -2012,12 +2012,14 @@ class TransferWorker:
             if self._kvarn_gqa_side_pool is not None
             else None
         )
+        hisparse_host_meta = self._make_hisparse_host_meta(kvm)
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
             kvarn_gqa_side_meta=kvarn_gqa_side_meta,
+            hisparse_host_meta=hisparse_host_meta,
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
@@ -2035,6 +2037,15 @@ class TransferWorker:
         return get_or_create_kvarn_gqa_side_pool_for_manager(
             kvm, dtype=dtype, device=torch.device("cuda", device_id)
         )
+
+    @staticmethod
+    def _make_hisparse_host_meta(kvm: KVCacheManager):
+        coordinator = getattr(kvm, "hisparse_coordinator", None)
+        if coordinator is None:
+            return None
+        if not getattr(coordinator, "packed_tensors_allocated", False):
+            return None
+        return coordinator.transfer_meta()
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -2119,6 +2130,22 @@ class TransferWorker:
             self._agent.register_memory(reg_side_desc)
             logger.debug(f"Registered KVarN GQA side-state memory: {side_descs}")
             self._registered_mem.append(reg_side_desc)
+        hisparse_meta = self._rank_info.hisparse_host_meta
+        if hisparse_meta is not None and hisparse_meta.ptrs.size > 0:
+            names = hisparse_meta.names or [
+                f"hisparse_host{i}" for i in range(hisparse_meta.ptrs.size)
+            ]
+            hisparse_descs = [
+                (int(ptr), int(size), 0, f"hisparse_host.{name}")
+                for ptr, size, name in zip(hisparse_meta.ptrs,
+                                           hisparse_meta.size, names)
+            ]
+            reg_hisparse_desc = RegMemoryDescs("DRAM", hisparse_descs)
+            self._agent.register_memory(reg_hisparse_desc)
+            logger.debug(
+                "Registered HiSparse host-tier memory with transfer agent: "
+                f"{hisparse_descs}")
+            self._registered_mem.append(reg_hisparse_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None

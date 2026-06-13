@@ -73,6 +73,50 @@ class KVarNGQASidePoolMeta:
         )
 
 
+@dataclass
+class HiSparseHostTierMeta:
+    """NIXL registration metadata for HiSparse host-pinned packed KVarN tiers.
+
+    Entries are layer-local host memory regions. ``host_packed`` entries use
+    one item per host block slot; metadata entries use one item per host block
+    slot for validity and commit-generation state.
+    """
+
+    ptrs: np.ndarray  # dtype=np.int64, base pointer for slot 0 of each entry
+    size: np.ndarray  # dtype=np.int64, total bytes registered for each entry
+    item_sizes: np.ndarray  # dtype=np.int64, bytes for one host slot
+    names: list[str] = field(default_factory=list)
+    num_layers: int = 0
+    host_slots: int = 0
+    packed_bytes_per_block: int = 0
+    device: str = "cpu"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ptrs": self.ptrs.tolist(),
+            "size": self.size.tolist(),
+            "item_sizes": self.item_sizes.tolist(),
+            "names": list(self.names),
+            "num_layers": int(self.num_layers),
+            "host_slots": int(self.host_slots),
+            "packed_bytes_per_block": int(self.packed_bytes_per_block),
+            "device": self.device,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HiSparseHostTierMeta":
+        return cls(
+            ptrs=np.array(data["ptrs"], dtype=np.int64),
+            size=np.array(data["size"], dtype=np.int64),
+            item_sizes=np.array(data["item_sizes"], dtype=np.int64),
+            names=[str(x) for x in data.get("names", [])],
+            num_layers=int(data.get("num_layers", 0)),
+            host_slots=int(data.get("host_slots", 0)),
+            packed_bytes_per_block=int(data.get("packed_bytes_per_block", 0)),
+            device=data.get("device", "cpu"),
+        )
+
+
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
 

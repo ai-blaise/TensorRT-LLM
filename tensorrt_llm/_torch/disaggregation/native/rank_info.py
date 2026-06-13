@@ -5,6 +5,7 @@ import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
+    HiSparseHostTierMeta,
     KVarNGQASidePoolMeta,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
@@ -37,6 +38,7 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     kvarn_gqa_side_meta: Optional[KVarNGQASidePoolMeta] = None
+    hisparse_host_meta: Optional[HiSparseHostTierMeta] = None
     page_table: Optional[KVCachePageTable] = None
 
     @property
@@ -54,6 +56,11 @@ class RankInfo:
             if self.kvarn_gqa_side_meta is not None
             else None
         )
+        data["hisparse_host_meta"] = (
+            self.hisparse_host_meta.to_dict()
+            if self.hisparse_host_meta is not None
+            else None
+        )
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
         return msgpack.packb(data)
 
@@ -65,6 +72,7 @@ class RankInfo:
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
         kvarn_gqa_side_meta: Optional[KVarNGQASidePoolMeta] = None,
+        hisparse_host_meta: Optional[HiSparseHostTierMeta] = None,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
@@ -96,6 +104,7 @@ class RankInfo:
             ),
             aux_meta=aux_buffer_meta,
             kvarn_gqa_side_meta=kvarn_gqa_side_meta,
+            hisparse_host_meta=hisparse_host_meta,
             page_table=build_page_table_from_manager(kvm),
         )
 
@@ -111,5 +120,9 @@ class RankInfo:
         if unpacked.get("kvarn_gqa_side_meta") is not None:
             unpacked["kvarn_gqa_side_meta"] = KVarNGQASidePoolMeta.from_dict(
                 unpacked["kvarn_gqa_side_meta"]
+            )
+        if unpacked.get("hisparse_host_meta") is not None:
+            unpacked["hisparse_host_meta"] = HiSparseHostTierMeta.from_dict(
+                unpacked["hisparse_host_meta"]
             )
         return cls(**unpacked)

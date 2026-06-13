@@ -17,21 +17,42 @@ def _cfg(enabled=False):
 
 class FakeTensor:
 
-    def __init__(self, shape, dtype, device, pin_memory):
+    def __init__(self, shape, dtype, device, pin_memory, base_ptr):
         self.shape = tuple(shape)
         self.dtype = dtype
         self.device = device
         self.pin_memory = pin_memory
         self.fill_value = None
+        self._base_ptr = int(base_ptr)
 
     def fill_(self, value):
         self.fill_value = value
         return self
 
+    def data_ptr(self):
+        return self._base_ptr
+
+    def element_size(self):
+        dtype = str(self.dtype)
+        if "int64" in dtype:
+            return 8
+        return 1
+
+    @property
+    def nbytes(self):
+        numel = 1
+        for dim in self.shape:
+            numel *= dim
+        return numel * self.element_size()
+
 
 def _fake_tensor_factory(calls):
+    next_ptr = {"value": 0x100000}
+
     def factory(shape, *, dtype, device, pin_memory=False):
-        tensor = FakeTensor(shape, dtype, device, pin_memory)
+        tensor = FakeTensor(shape, dtype, device, pin_memory,
+                            next_ptr["value"])
+        next_ptr["value"] += tensor.nbytes + 0x1000
         calls.append(tensor)
         return tensor
     return factory
@@ -163,6 +184,43 @@ def test_hisparse_allocate_packed_tensors_shapes_and_initializers():
     assert tensors.hot_packed.device == "cuda:1"
     assert [tensor.fill_value for tensor in calls] == [0, 0, 0, 0, -1, -1, 0]
     assert coordinator.stats()["tensors_allocated"] == 1
+
+
+def test_hisparse_host_registration_descs_and_slot_ptrs():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=2,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=16,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2)
+    calls = []
+    tensors = coordinator.allocate_packed_tensors(
+        device="cuda:1",
+        host_pinned=True,
+        tensor_factory=_fake_tensor_factory(calls),
+    )
+
+    descs = coordinator.host_registration_descs()
+
+    host_packed_layer_bytes = 4 * 16
+    assert descs[:2] == [
+        (tensors.host_packed.data_ptr(), host_packed_layer_bytes, 0,
+         "hisparse_host.host_packed.layer0"),
+        (tensors.host_packed.data_ptr() + host_packed_layer_bytes,
+         host_packed_layer_bytes, 0, "hisparse_host.host_packed.layer1"),
+    ]
+    assert len(descs) == 6
+
+    coordinator.reserve_request(req_pool_idx=5, num_prompt_blocks=3)
+    ptrs, sizes = coordinator.host_packed_ptrs_for_blocks(
+        layer_idx=1,
+        req_pool_idx=5,
+        block_positions=[0, 2],
+    )
+
+    layer_one_base = tensors.host_packed.data_ptr() + host_packed_layer_bytes
+    assert ptrs.tolist() == [layer_one_base, layer_one_base + 2 * 16]
+    assert sizes.tolist() == [16, 16]
 
 
 def test_hisparse_hot_selection_hits_misses_and_lru_eviction():

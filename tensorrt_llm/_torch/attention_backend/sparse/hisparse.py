@@ -6,10 +6,13 @@ writer are wired. This module gives DSA a stable extension point without
 introducing an FP16 staging path or a silent full-HBM fallback.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 if TYPE_CHECKING:
+    import numpy as np
     import torch
 
 
@@ -342,6 +345,158 @@ class OPTRTHiSparseCoordinator:
         zero = getattr(tensor, "zero_", None)
         if value == 0 and zero is not None:
             zero()
+
+    def host_registration_descs(
+        self,
+        *,
+        prefix: str = "hisparse_host",
+        include_metadata: bool = True,
+    ) -> List[Tuple[int, int, int, str]]:
+        """Return DRAM registration descriptors for NIXL writable host tiers.
+
+        The descriptors intentionally describe CPU host-pinned memory only. The
+        transfer path must keep these DRAM regions out of the existing VRAM KV
+        write batch until a dedicated HiSparse host-write meta path is added.
+        """
+        entries = self._host_tier_entries(include_metadata=include_metadata)
+        descs: List[Tuple[int, int, int, str]] = []
+        for name, tensor, item_size in entries:
+            base_ptr = self._tensor_data_ptr(tensor)
+            for layer in range(self._require_configured().num_layers):
+                layer_ptr = base_ptr + layer * self._host_layer_stride_bytes(
+                    name, item_size)
+                descs.append(
+                    (layer_ptr, self._host_layer_stride_bytes(name, item_size),
+                     0, f"{prefix}.{name}.layer{layer}"))
+        return descs
+
+    def transfer_meta(self):
+        """Build serializable transfer metadata for the HiSparse host tier."""
+        import numpy as np
+
+        from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+            HiSparseHostTierMeta,
+        )
+
+        entries = self._host_tier_entries(include_metadata=True)
+        ptrs: List[int] = []
+        sizes: List[int] = []
+        item_sizes: List[int] = []
+        names: List[str] = []
+        for name, tensor, item_size in entries:
+            base_ptr = self._tensor_data_ptr(tensor)
+            for layer in range(self._require_configured().num_layers):
+                ptrs.append(base_ptr +
+                            layer * self._host_layer_stride_bytes(
+                                name, item_size))
+                sizes.append(self._host_layer_stride_bytes(name, item_size))
+                item_sizes.append(item_size)
+                names.append(f"{name}.layer{layer}")
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        return HiSparseHostTierMeta(
+            ptrs=np.array(ptrs, dtype=np.int64),
+            size=np.array(sizes, dtype=np.int64),
+            item_sizes=np.array(item_sizes, dtype=np.int64),
+            names=names,
+            num_layers=tier.num_layers,
+            host_slots=tier.logical_host_capacity_blocks,
+            packed_bytes_per_block=tier.packed_bytes_per_block,
+            device=str(getattr(tensors.host_packed, "device", "cpu")),
+        )
+
+    def host_packed_ptrs_for_blocks(
+        self,
+        *,
+        layer_idx: int,
+        req_pool_idx: int,
+        block_positions: Iterable[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return host-pinned packed-KVarN destinations for request blocks."""
+        import numpy as np
+
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        layer_idx = int(layer_idx)
+        if layer_idx < 0 or layer_idx >= tier.num_layers:
+            raise IndexError(
+                f"layer_idx {layer_idx} outside configured HiSparse layer "
+                f"range [0, {tier.num_layers}).")
+        base_ptr = self._tensor_data_ptr(tensors.host_packed)
+        layer_base = (
+            base_ptr +
+            layer_idx * tier.logical_host_capacity_blocks
+            * tier.packed_bytes_per_block)
+        ptrs = []
+        sizes = []
+        for block_pos in block_positions:
+            record = self._host_record(req_pool_idx, int(block_pos))
+            ptrs.append(layer_base +
+                        record.host_slot * tier.packed_bytes_per_block)
+            sizes.append(tier.packed_bytes_per_block)
+        return (np.array(ptrs, dtype=np.int64),
+                np.array(sizes, dtype=np.int64))
+
+    def _require_tensors(self) -> HiSparsePackedTierTensors:
+        if self._tensors is None:
+            raise RuntimeError(
+                "HiSparse packed tensors are not allocated. Call "
+                "allocate_packed_tensors() before requesting transfer "
+                "descriptors.")
+        return self._tensors
+
+    def _host_tier_entries(
+        self,
+        *,
+        include_metadata: bool,
+    ) -> List[Tuple[str, object, int]]:
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        entries = [("host_packed", tensors.host_packed,
+                    tier.packed_bytes_per_block)]
+        if include_metadata:
+            entries.extend([
+                ("host_valid", tensors.host_valid,
+                 self._tensor_element_size(tensors.host_valid)),
+                ("host_commit_gen", tensors.host_commit_gen,
+                 self._tensor_element_size(tensors.host_commit_gen)),
+            ])
+        for name, tensor, _item_size in entries:
+            device = str(getattr(tensor, "device", "cpu"))
+            if not device.startswith("cpu"):
+                raise RuntimeError(
+                    f"HiSparse host tier tensor {name} must be CPU memory, got "
+                    f"device={device!r}.")
+        return entries
+
+    def _host_layer_stride_bytes(self, name: str, item_size: int) -> int:
+        tier = self._require_configured()
+        if name == "host_packed":
+            return tier.logical_host_capacity_blocks * tier.packed_bytes_per_block
+        return tier.logical_host_capacity_blocks * int(item_size)
+
+    @staticmethod
+    def _tensor_data_ptr(tensor) -> int:
+        data_ptr = getattr(tensor, "data_ptr", None)
+        if data_ptr is None:
+            raise RuntimeError(
+                "HiSparse host tensor does not expose data_ptr(); cannot build "
+                "NIXL descriptors.")
+        return int(data_ptr())
+
+    @staticmethod
+    def _tensor_element_size(tensor) -> int:
+        element_size = getattr(tensor, "element_size", None)
+        if element_size is not None:
+            return int(element_size())
+        dtype = str(getattr(tensor, "dtype", ""))
+        if "int64" in dtype:
+            return 8
+        if "int32" in dtype or "float32" in dtype:
+            return 4
+        if "float16" in dtype or "bfloat16" in dtype:
+            return 2
+        return 1
 
     def _require_configured(self) -> HiSparsePackedTierDescriptor:
         if self._tier is None:

@@ -57,9 +57,10 @@ architecture from the first executable serving path. That means dense MLA
 `kvarn_k2v2` cold/hot storage, FP4 Indexer K + HISA scoring, sparse MLA with
 BDR/on-read dequant, NIXL generation-first direct-to-host, and the r20
 LayerSplit/SMC/Moondream wiring. Do not implement FP16 host/hot tiers in
-serving code. Independent tests may allocate reference tensors outside the
-HiSparse coordinator/transceiver path, but those references are not an
-implementation phase, runtime fallback, config mode, or deployment candidate.
+serving code. Independent test fixtures may compare against reference tensors
+outside the HiSparse coordinator/transceiver path, but there is no
+intermediate FP16 block-hot oracle implementation phase, runtime fallback,
+config mode, or deployment candidate.
 
 ## Relevant SGLang Facts
 
@@ -409,16 +410,19 @@ Use Dynamo/NIXL write-mode semantics:
 
 OP-TRT changes:
 
-1. Extend `KVRegionExtractorV1` or add `HiSparseRegionExtractor` so the transfer
-   worker can describe host-pinned HiSparse pools, not just GPU KV pools.
-2. Extend `get_unique_pool_memory_descs()` to distinguish device memory from
-   host-pinned memory. The current tuple `(ptr, size, device_id, name)` is not
-   expressive enough if the native NIXL wrapper needs memory type.
-3. Add request-level host slot allocation before `prepare_context_requests()`
+1. Publish HiSparse host-pinned pool metadata through `RankInfo` separately
+   from the existing GPU page-table metadata.
+2. Register HiSparse host-pinned pools with the transfer agent as `DRAM`
+   descriptors, not as part of the existing `VRAM` KV-cache descriptor set.
+3. Add a dedicated HiSparse host-write meta path, or another explicit
+   `DRAM`-typed write batch, before scheduling prefill writes into host slots.
+   The current `WriteMetaType.KV` path is VRAM-only and must not silently mix
+   host-pinned descriptors into a GPU KV transfer.
+4. Add request-level host slot allocation before `prepare_context_requests()`
    promotes a generation-first context request.
-4. Include host block rows in aux metadata so prefill writes exact destination
-   offsets.
-5. Keep cancel behavior strict: if any NIXL task is mid-write, do not free host
+5. Include host block rows in request-pin/sideband metadata so prefill writes
+   exact destination offsets.
+6. Keep cancel behavior strict: if any NIXL task is mid-write, do not free host
    or hot slots until `cancel_request()` reports safe.
 
 Fallback policy:
@@ -505,8 +509,9 @@ Correctness tests:
 - sparse MLA output within KVarN quant tolerance versus the existing production
   full-HBM KVarN path.
 - KVarN full restore vs HiSparse hot restore block equivalence.
-- optional offline FP16 references prove numerical ceilings, but are not wired
-  into the coordinator, transceiver, or deployment config.
+- independent offline references may be used only as test fixtures; no FP16
+  block-hot oracle path may be wired into the coordinator, transceiver, kernel
+  ABI, or deployment config.
 - LayerSplit TP2xCP2 prefill to TP4/CP1 decode E2E.
 - generation-first NIXL direct-to-host E2E.
 - streaming cancel/cleanup E2E.
@@ -610,7 +615,7 @@ Current branch status:
 
 Still pending before serving enablement:
 
-- NIXL writable descriptors for host slots;
+- request-scoped NIXL write scheduling into the registered host slots;
 - host-to-hot packed record copy kernel;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
@@ -653,6 +658,34 @@ Deliverables:
 - prefill write operation into decode host pool;
 - generation-first pin proof;
 - cancel safety.
+
+Current branch status:
+
+- added `HiSparseHostTierMeta` for serializing host-pinned packed KVarN tier
+  pointers, per-slot item sizes, names, layer count, host-slot count, and
+  packed bytes per block;
+- added coordinator helpers that expose DRAM registration descriptors for
+  host `uint8` packed KVarN blocks plus host validity/commit metadata;
+- added coordinator helpers that compute exact writable host-packed block
+  destinations for `(layer_idx, req_pool_idx, block_pos)` without changing the
+  existing Indexer/HISA or sparse MLA path;
+- extended `RankInfo` serialization so peers can publish/consume HiSparse host
+  tier metadata through the existing rank-info handshake;
+- extended `TransferWorker` so allocated HiSparse host tiers are registered
+  with NIXL as a separate `DRAM` registration group;
+- intentionally did not append HiSparse host fragments to `WriteMetaType.KV`,
+  because that path still constructs uniform `VRAM` transfer requests.
+
+Still pending before serving enablement:
+
+- request-level host slot publication through generation-first pin metadata;
+- a dedicated `DRAM` write meta path for prefill-to-decode packed KVarN host
+  writes;
+- prefill-side packed KVarN writer and completion/commit handoff;
+- cancel/abort handling that keeps host slots pinned until in-flight DRAM
+  writes finish;
+- E2E proof that NIXL writes land directly in decode host slots before decode
+  admits the request.
 
 ### Phase 6: LayerSplit, SMC, Moondream Hardening
 
@@ -722,14 +755,19 @@ Promotion requires:
    `hisparse_min_seq_len` should prevent low-concurrency/short-context overhead
    from hurting the default path.
 
-## First Code Change To Make
+## Next Code Changes
 
-Start with Phase 1 and the production Phase 2 skeleton:
+The next implementation work should continue from the current fail-closed
+packed-tier and host-registration skeleton:
 
-1. add config fields and validation;
-2. add coordinator skeleton and disabled no-op path;
-3. allocate packed KVarN cold/hot metadata and fail closed until the hot read
-   path is complete;
-4. hook `sparse_attn_predict()` so local top-k maps through the coordinator;
-5. validate against external references and the existing production KVarN path,
-   without adding an intermediate serving fallback.
+1. add request-scoped HiSparse host-slot publication to the generation-first
+   request pin metadata;
+2. add a dedicated `DRAM` write-meta path for prefill-to-decode HiSparse host
+   writes rather than mixing host fragments into `WriteMetaType.KV`;
+3. implement the prefill-side packed KVarN writer and completion-to-commit
+   transition for host `valid` and `commit_gen`;
+4. implement the SM100 host-to-hot packed record swap-in kernel and hot global
+   index mapping;
+5. wire sparse MLA to consume the hot packed KVarN pool with BDR/on-read dequant;
+6. add LayerSplit owner-local, SMC-SD row geometry, Moondream pinning, cancel,
+   and recycle tests before relaxing startup fail-closed behavior.
