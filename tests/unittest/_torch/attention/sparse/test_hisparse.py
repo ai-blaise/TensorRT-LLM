@@ -875,7 +875,7 @@ def test_hisparse_schedule_copy_bridge_fails_closed_on_bad_row_ids():
     assert "hisparse_submit_packed_kvarn_copy_schedule" in fake.read_text()
 
 
-def test_hisparse_native_mapping_allows_hot_capacity_larger_than_topk_source_contract():
+def test_hisparse_native_mapping_budgets_resident_blocks_source_contract():
     root = Path(__file__).resolve().parents[5]
     hisparse = root / "tensorrt_llm/_torch/attention_backend/sparse/hisparse.py"
 
@@ -884,9 +884,11 @@ def test_hisparse_native_mapping_allows_hot_capacity_larger_than_topk_source_con
     assert "topk_indices.dtype != torch.int32" in source
     assert "TopK rows to match" in source
     assert "req_idx.numel()" in source
+    assert "resident_tokens = self._make_resident_token_descriptor" in source
     assert "index_topk = int(topk_indices.shape[1])" in source
-    assert "min(int(tier.hot_device_capacity_blocks)," in source
-    assert "index_topk)" in source
+    assert "hot_capacity_blocks = int(tier.hot_device_capacity_blocks)" in source
+    assert "resident_block_budget = int(resident_tokens.sink_blocks) + 1" in source
+    assert "hot_capacity_blocks + resident_block_budget" in source
     assert "positive TopK width " in source
     assert "and hot capacity." in source
     assert "index_topk=index_topk" in source

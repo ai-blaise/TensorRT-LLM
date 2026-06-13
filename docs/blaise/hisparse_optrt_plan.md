@@ -30,6 +30,68 @@ stack. It is based on direct review of:
   - `docs/api/nixl-connect/writable-operation.md`
   - `docs/api/nixl-connect/write-operation.md`
 
+## Source-Of-Truth Correction
+
+Some older AgentMemory notes use `HISA` and `HiSparse` interchangeably. Do not
+use those notes as implementation targets. In this branch, the current
+`op-trt` code is the source of truth for serving semantics:
+
+- `HISA` is the existing Indexer-side candidate scoring/index-cache path and
+  keeps its current FP4/device-resident contracts;
+- `HiSparse` is the new hierarchical host/hot KV transfer and sparse-MLA
+  consumption path being added around that existing scoring output;
+- CuTe, CZS, IKP, CUTLASS, `cutest`, and related AgentMemory materials are
+  only optimization/proof-process inputs: use them to decide how to compile,
+  prove, profile, and promote kernels, not to replace the branch's production
+  ABI or dataflow;
+- any optimization candidate that changes request identity, row-status,
+  KVarN BDR layout, Indexer/HISA output semantics, NIXL write-mode ordering, or
+  LayerSplit ownership must be rejected unless the current `op-trt` production
+  path and tests are updated explicitly and proved end to end.
+
+## CuTe, CZS, And IKP Optimization Gate
+
+The June 13 audit re-read the relevant AgentMemory entries directly from the
+canonical memory file behind port `3811`. Only the CuTe/CZS/IKP process
+requirements are carried into this plan:
+
+- CZS is the required compiler/proof path for CuTe candidates. The active
+  memory entry points to `ai-blaise/CZS` at
+  `148ed9fadc886617f1473249994a4279170eb98e` with `czs prove --json FILE`,
+  `czs walk FILE`, JSON round-trip coverage for Layout, Swizzle,
+  SwizzledLayout, TMA, `ldmatrix`, vectorization, mbarrier, Tensor Memory,
+  distributed shared memory, barrier elision, MMA overlap, and CLC sites, plus
+  recorded build/ctest/pytest/thread-pool validation.
+- IKP evidence is required before promoting any kernel optimization beyond
+  correctness/proof smoke. A promoted candidate must archive source, benchmark
+  JSON, ptxas register/spill output, occupancy/shared-memory notes, IKP trace
+  summaries, and NCU or CUPTI stall evidence for both accepted and rejected
+  variants.
+- Blackwell/CuTe material should guide layout only when it matches the
+  production data layout. The current KVarN-hot reader keeps packed global
+  `kvarn_k2v2` BDR records and byte-addressed scale/zp fields; a CuTe/UMMA
+  candidate cannot assume NVF4 hardware block-scale layout unless it introduces
+  and proves an explicit conversion that preserves the production ABI.
+- The current direct `sparse_mla_decode_kvarn_hot` kernel is acceptable as a
+  fail-closed production-ABI proof path. The next performance candidate should
+  first import only the compatible FlashMLA split-scheduler/combine structure
+  while preserving KVarN BDR producer loads and resident sink/tail reads. Any
+  later CuTe rewrite must pass the same serving-layout import proof and add CZS
+  proof plus IKP artifacts before it can replace the direct path.
+- Whole-system optimization remains higher priority than isolated instruction
+  polish until serving proof closes: request-table lifecycle batching,
+  NIXL write-mode ordering, host/hot admission, compact miss scheduling,
+  row-status fail-closed behavior, and sparse-MLA hot-index construction are
+  part of the same performance target as the CUDA kernel.
+- On `a4-us-001`, the available proof/profiling tools are
+  `/home/spencer/work/CZS/build/src/czs` (`czs 0.4.1`),
+  `/home/spencer/work/intra-kernel-profiler` (use
+  `docs/integration_existing_kernels.md` and `docs/trace_tips.md` for region
+  placement/capacity), and `/home/spencer/work/cutest` for simple CuTe DSL
+  fusion experiments. CZS source there is an exported source tree without
+  `.git`; the authoritative CZS commit remains the AgentMemory/GitHub
+  `148ed9fadc886617f1473249994a4279170eb98e` record above.
+
 ## Executive Decision
 
 Do not copy SGLang HiSparse wholesale. Build an OP-TRT HiSparse subsystem that
@@ -131,6 +193,12 @@ metadata commit op now publishes `hot_host_slot`, `hot_commit_gen`, and
 The branch also has a native hot-index builder that preserves the existing
 `base * stride_factor + layer_idx * tokens_per_block + token_offset` sparse-MLA
 index contract while targeting HiSparse hot slots instead of full-pool blocks.
+The June 13 continuation corrected the native block-dedupe row budget so
+resident sink/tail blocks are admitted before hot-slot planning: dedupe now
+budgets hot capacity plus configured sink blocks plus one possible tail block,
+while the planner still fails closed if committed-hot blocks exceed hot
+capacity. This avoids prematurely rejecting valid sink/tail-heavy rows without
+creating a hidden fallback or overcommitting hot HBM.
 The coordinator now chains those native stages through hot-index construction
 when real CUDA TopK/request metadata is present, then fails closed at the
 remaining sparse MLA hot-pool read/BDR dequant gate.
@@ -264,6 +332,30 @@ the generated-artifact proof remains mandatory before promotion.
 The repo-level pytest harness still requires the full Python bindings, so the
 proof script intentionally bypassed `tests/unittest/conftest.py` while
 executing the same native ops and tensor contracts.
+The June 13 final correctness sweep strengthened the serving-layout proof so
+`serving_import_smoke.py` now runs both the native planner/copy chain and the
+fused sparse MLA KVarN-hot CUDA smoke through the normal package import path.
+The added `blaise_perf/hisparse/sparse_mla_kvarn_hot_smoke.py` directly
+exercises `trtllm::mla_bdr_write_kvarn_record` plus
+`trtllm::sparse_mla_decode_kvarn_hot` over production `kvarn_k2v2` constants,
+including an odd packed-record stride to prove byte-addressed scale/zp fields
+and an explicit sink/tail resident-token row, all-padding row, and invalid
+resident-request-id row. This is a production-layout native smoke, not an FP16
+block-hot oracle and not a serving fallback. The
+exact-clean `libth_hisparse_smoke.so` still passes that stronger smoke on B200
+GPU 7. The same strengthened script was rerun on `a4-us-001` against the
+resident narrow `libth_hisparse_smoke.so` in
+`/home/spencer/work/build-cache/hisparse-splitprod/cpp-build/tensorrt_llm/thop`
+and passed committed-hot, resident sink/tail, all-padding, invalid resident
+request id, stale layer, and stale hot-slot cases. This is still a narrow
+native-op proof, not the serving-layout `libth_common.so` proof. The older
+cached package `libth_common.so` failed the stronger smoke
+with a CUDA misaligned-address error, which is now treated as a stale-library
+finding rather than a source-level BDR-layout failure because the exact-clean
+library uses the current byte-addressed BDR helpers successfully. A rebuilt
+`libth_common.so` plus a rerun of
+`deploy/disagg_pd_r20/build_hisparse_serving_import_proof_image.sh` is required
+before the stronger serving-import proof can be marked complete.
 The June 13 continuation re-ran this non-disruptive compile for both
 `sparse_mla_decode_kvarn_hot.cu` and `hisparseKvarnHotRead.cu` with
 `/usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_100 -dc`; both produced
@@ -1423,15 +1515,21 @@ Current branch status:
   cubin archives can be filtered out entirely while `fmhaDispatcher.cpp` still
   includes `cubin/fmha_cubin.h`. The branch now carries a CMake-side empty
   FMHA v2 cubin metadata/header generator for that architecture-filtered case,
-  with the generated include directory propagated to both `kernels_src` and
-  `common_src`. This is a build-proof fix only; it does not add an attention
-  fallback or change HiSparse serving behavior. The follow-up exact-clean
+  and the empty metadata struct now matches the runtime source ABI, including
+  the optional direct launcher pointer used by current FMHA code. The generated
+  include directory is propagated to `kernels_src`, `common_src`, and the later
+  `thop`/plugin build scopes that include FMHA runner headers. This is a
+  build-proof fix only; it does not add an attention fallback or change
+  HiSparse serving behavior. The follow-up exact-clean
   target, `th_hisparse_smoke`, links the real HiSparse registrations and
   production CUDA kernels without `common_src`/`th_common`; its direct smoke
   proved BDR writer layout, byte-strided scale/zp, inverse BDR hot read,
-  sparse MLA KVarN-hot decode, and resident padding behavior. Full deployment
-  proof still requires live DSA/NIXL metadata rather than the isolated thop
-  script;
+  sparse MLA KVarN-hot decode, and resident padding behavior. The final sweep
+  added the same fused KVarN-hot smoke to the serving-import proof helper; the
+  exact-clean library passes it, while the cached serving-layout
+  `libth_common.so` must be rebuilt and reproved before this stronger
+  serving-import gate can be closed. Full deployment proof still requires live
+  DSA/NIXL metadata rather than the isolated thop script;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1439,19 +1537,22 @@ Still pending before serving enablement:
 
 - build the full deployment image/wheel with these exact-clean fixes and rerun
   the same native-op smoke through the image that DSA will load in serving.
-  The exact-clean `th_hisparse_smoke` proof and the serving-layout
-  branch-Python + branch-`libth_common.so` proof are complete, but they still
-  avoid a full generated-bindings rebuild. A June 13 diff audit shows generated
+  The exact-clean `th_hisparse_smoke` proof is complete, and the earlier
+  serving-layout branch-Python + branch-`libth_common.so` proof is complete for
+  the planner/copy chain. The stronger serving-layout proof that also runs
+  fused `sparse_mla_decode_kvarn_hot` remains pending on a fresh
+  `libth_common.so` rebuild and proof-image rerun. These proofs still avoid a
+  full generated-bindings rebuild. A June 13 diff audit shows generated
   binding/plugin source did not change on this branch head, so this is not a
   current-head correctness delta; if those sources change, full generated
   artifact proof becomes mandatory before promotion;
 - use `scripts/blaise_build_hisparse_thop.sh` for the current VM-side native
   thop proof loop. The June 13 build sweep established the required
-  non-disruptive recipe: run inside the `hisa-buildtools-20260531` image, keep
-  `/home/spencer/work/build-cache/hisparse-thop` as the persistent build/cache
-  mount, pass NCCL include/library paths explicitly from the Python NCCL wheel
-  and system `libnccl.so`, add the real CUTLASS FetchContent Python source dir
-  to `PYTHONPATH`, disable DeepEP/DeepGEMM/FlashMLA for the thop-only proof,
+  non-disruptive recipe: use a resident toolchain image, keep a persistent
+  build/cache mount, pass NCCL include/library paths explicitly from the Python
+  NCCL wheel and system `libnccl.so`, add the real CUTLASS FetchContent Python
+  source dir to `PYTHONPATH`, disable DeepEP/DeepGEMM/FlashMLA for the
+  thop-only proof,
   disable the OSS CUTLASS GEMM feature families that are not needed for this
   native-op proof, force dynamic NVRTC linking, and clear the missing `ccache`
   compiler launchers. That recipe configures cleanly for
@@ -1475,7 +1576,14 @@ Still pending before serving enablement:
   mapped-host CUDA copy kernel and launch syntax. The helper exports the CUTLASS
   FetchContent Python path inside the container shell as well as at Docker
   launch, avoiding the disabled-user-site `cutlass_library` import trap during
-  repeated configure loops. The CUTLASS kernel-generation CMake step also now
+  repeated configure loops. The helper now forces `--entrypoint /bin/bash` so
+  resident runtime images that already set `/bin/bash` as their entrypoint can
+  run the build command instead of trying to execute `bash` as a script. On
+  `a4-us-001`, the current serving-layout proof build uses
+  `local/dynamo-trtllm-optrt-custom:optrt-34fe7aaec-fixed-20260611011615`
+  with `/home/spencer/work/build-cache/hisparse-thop-001`; the older
+  `hisa-buildtools-20260531` image was not resident there. The CUTLASS
+  kernel-generation CMake step also now
   passes the FetchContent CUTLASS Python root directly into its Python
   subprocess, so native proof builds do not depend on deprecated `develop
   --user` behavior or user-site activation. The same build sweep found that
@@ -1503,6 +1611,21 @@ Still pending before serving enablement:
   `hisparseKvarnBdrRead.cuh`, writes per-split accumulators/LSE, and then lets
   the existing combine logic reduce them. Do not reuse the NVFP4 producer or
   its `[block, token, hkv, 288]` plus scale layout as a compatibility backend;
+  Confucius has produced a bounded VM worktree candidate at
+  `a4-us-001-rl9:/home/spencer/work/op-trt-hisparse-splitprod-wt` on branch
+  `op-trt-hisparse-splitprod`. It registers
+  `trtllm::sparse_mla_decode_kvarn_hot_split`, reuses only the FlashMLA sparse
+  scheduler metadata, keeps packed `kvarn_k2v2` BDR producer loads and
+  explicit sink/tail resident reads, and validates split output/LSE parity
+  against the current direct KVarN-hot op for committed hot records, resident
+  sink, resident tail, padding-only, invalid upstream row, stale hot slot, and
+  stale layer cases. The June 13 audit found it promising but not merge-ready:
+  scheduler/split sizing must be rechecked for per-row `topk_length`, the fake
+  op metadata shape must stop being a placeholder before graph/export use, and
+  the candidate needs IKP timing artifacts before it replaces the direct kernel.
+  This candidate still needs main-branch audit, merge, and proof through the
+  same serving-layout `libth_common.so` path before it can count as integrated
+  production optimization;
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;

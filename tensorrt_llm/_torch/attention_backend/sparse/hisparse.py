@@ -1979,9 +1979,17 @@ class OPTRTHiSparseCoordinator:
         row_request_ids = request_id_tensor.index_select(
             0, req_idx.to(device=topk_indices.device, dtype=torch.int64))
 
+        resident_tokens = self._make_resident_token_descriptor(
+            metadata=metadata,
+            req_idx=req_idx,
+            row_request_ids=row_request_ids,
+            is_generation=is_generation,
+        )
         index_topk = int(topk_indices.shape[1])
-        max_blocks_per_row = min(int(tier.hot_device_capacity_blocks),
-                                 index_topk)
+        hot_capacity_blocks = int(tier.hot_device_capacity_blocks)
+        resident_block_budget = int(resident_tokens.sink_blocks) + 1
+        max_blocks_per_row = min(index_topk,
+                                 hot_capacity_blocks + resident_block_budget)
         if max_blocks_per_row <= 0:
             raise RuntimeError(
                 "HiSparse native orchestration requires positive TopK width "
@@ -1992,12 +2000,6 @@ class OPTRTHiSparseCoordinator:
                 int(tier.tokens_per_block),
                 max_blocks_per_row,
             ))
-        resident_tokens = self._make_resident_token_descriptor(
-            metadata=metadata,
-            req_idx=req_idx,
-            row_request_ids=row_request_ids,
-            is_generation=is_generation,
-        )
         resident_block_flags, resident_block_status = (
             torch.ops.trtllm.hisparse_classify_resident_blocks(
                 blocks,

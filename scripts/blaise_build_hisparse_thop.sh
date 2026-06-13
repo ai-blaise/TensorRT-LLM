@@ -27,6 +27,7 @@ USER_SITE="/home/dynamo/.local/lib/python3.12/site-packages"
 mkdir -p "${BUILD_DIR}" "${HOME_LOCAL}/lib/python3.12/site-packages"
 
 docker run --rm \
+  --entrypoint /bin/bash \
   --cpus="${CPUS}" \
   --memory="${MEMORY}" \
   -e HISPARSE_WHEEL_TARGETS="${WHEEL_TARGETS}" \
@@ -36,7 +37,7 @@ docker run --rm \
   -v "${HOME_LOCAL}:/home/dynamo/.local" \
   -w /build/cpp-build \
   "${IMAGE}" \
-  bash -lc "
+  -lc "
 set -euo pipefail
 export PYTHONPATH=${USER_SITE}:${CUTLASS_PY}:\${PYTHONPATH:-}
 cmake \

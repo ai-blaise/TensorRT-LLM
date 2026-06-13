@@ -56,6 +56,7 @@ def main() -> None:
     script_dir = Path(__file__).resolve().parent
     sys.path.insert(0, str(script_dir))
     import native_planner_copy_smoke
+    import sparse_mla_kvarn_hot_smoke
 
     sys.argv = [
         str(script_dir / "native_planner_copy_smoke.py"),
@@ -65,6 +66,12 @@ def main() -> None:
         str(args.record_bytes),
     ]
     native_planner_copy_smoke.main()
+    sys.argv = [
+        str(script_dir / "sparse_mla_kvarn_hot_smoke.py"),
+        "--device",
+        args.device,
+    ]
+    sparse_mla_kvarn_hot_smoke.main()
     print(f"serving import smoke used package={package_root}")
     print(f"serving import smoke used libth_common={expected_th_common}")
 

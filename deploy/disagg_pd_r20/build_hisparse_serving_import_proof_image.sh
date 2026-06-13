@@ -142,8 +142,9 @@ if [[ -z "$PACKAGE_LIB_FILES" ]]; then
 fi
 
 SMOKE_SCRIPT="blaise_perf/hisparse/native_planner_copy_smoke.py"
+SPARSE_MLA_SMOKE_SCRIPT="blaise_perf/hisparse/sparse_mla_kvarn_hot_smoke.py"
 SERVING_SMOKE_SCRIPT="blaise_perf/hisparse/serving_import_smoke.py"
-for script in "$SMOKE_SCRIPT" "$SERVING_SMOKE_SCRIPT"; do
+for script in "$SMOKE_SCRIPT" "$SPARSE_MLA_SMOKE_SCRIPT" "$SERVING_SMOKE_SCRIPT"; do
   if [[ ! -f "$script" ]]; then
     echo "missing smoke script: $script" >&2
     exit 2
@@ -183,6 +184,7 @@ copy_colon_files "$EXTRA_LIBS" "$CTX/libs" "extra native library"
 copy_colon_files "$PACKAGE_LIB_FILES" "$CTX/libs" "package library"
 copy_colon_files "$PACKAGE_ROOT_FILES" "$CTX/tensorrt_llm" "package root artifact"
 cp "$SMOKE_SCRIPT" "$CTX/smoke/native_planner_copy_smoke.py"
+cp "$SPARSE_MLA_SMOKE_SCRIPT" "$CTX/smoke/sparse_mla_kvarn_hot_smoke.py"
 cp "$SERVING_SMOKE_SCRIPT" "$CTX/smoke/serving_import_smoke.py"
 
 cat >"$CTX/Dockerfile" <<'DOCKERFILE'
@@ -198,10 +200,12 @@ COPY --chown=dynamo:0 tensorrt_llm/ ${SITE_PACKAGES}/tensorrt_llm/
 COPY --chown=dynamo:0 libs/ ${SITE_PACKAGES}/tensorrt_llm/libs/
 COPY --chown=dynamo:0 smoke/ /opt/ai-blaise/hisparse/
 RUN chmod 0755 /opt/ai-blaise/hisparse/native_planner_copy_smoke.py \
+    /opt/ai-blaise/hisparse/sparse_mla_kvarn_hot_smoke.py \
     /opt/ai-blaise/hisparse/serving_import_smoke.py \
     && echo "${OPTRT_SOURCE_SHA}" > /opt/ai-blaise/optrt_hisparse_serving_import_source_sha \
     && /opt/dynamo/venv/bin/python3 -m py_compile \
       /opt/ai-blaise/hisparse/native_planner_copy_smoke.py \
+      /opt/ai-blaise/hisparse/sparse_mla_kvarn_hot_smoke.py \
       /opt/ai-blaise/hisparse/serving_import_smoke.py
 
 LABEL ai.blaise.hisparse.serving_import_proof="true"

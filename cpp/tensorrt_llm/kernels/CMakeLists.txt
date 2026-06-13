@@ -87,6 +87,9 @@ if(CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR)
         "${CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR}")
     endif()
   endforeach()
+  set(CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR
+      "${CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR}"
+      PARENT_SCOPE)
 endif()
 target_include_directories(
   kernels_src

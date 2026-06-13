@@ -28,6 +28,10 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+if(CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR)
+  include_directories(BEFORE "${CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR}")
+endif()
+
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
