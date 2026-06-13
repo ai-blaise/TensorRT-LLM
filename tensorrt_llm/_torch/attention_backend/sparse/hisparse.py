@@ -1469,11 +1469,118 @@ class OPTRTHiSparseCoordinator:
                 "global indices from request-relative TopK and planned hot "
                 "slots on device; no Python hot-index construction path is "
                 "allowed for enabled serving.")
+        if not getattr(topk_indices, "is_cuda", False):
+            raise NotImplementedError(
+                "HiSparse native orchestration requires CUDA TopK tensors from "
+                "the Indexer/HISA path. Serving remains fail-closed until native "
+                "planner/copy orchestration and sparse MLA hot-pool read are "
+                "wired to real CUDA metadata.")
+        if not hasattr(metadata, "_ensure_pool_view_cached"):
+            raise NotImplementedError(
+                "HiSparse native orchestration requires DSA metadata with cached "
+                "row geometry. Serving remains fail-closed for non-DSA metadata.")
+
+        import torch
+
+        tier = self._require_configured()
+        tensors = self._require_tensors()
+        metadata._ensure_pool_view_cached()
+        req_idx = (getattr(metadata, "_cached_req_idx_gen", None)
+                   if is_generation else
+                   getattr(metadata, "_cached_req_idx_ctx", None))
+        if req_idx is None:
+            raise RuntimeError(
+                "HiSparse native orchestration requires cached request-row "
+                "indices from DSA metadata.")
+        request_id_tensor = request_ids
+        if not torch.is_tensor(request_id_tensor):
+            request_id_tensor = torch.as_tensor(request_id_tensor,
+                                                dtype=torch.int64,
+                                                device=topk_indices.device)
+        else:
+            request_id_tensor = request_id_tensor.to(device=topk_indices.device,
+                                                     dtype=torch.int64)
+        row_request_ids = request_id_tensor.index_select(
+            0, req_idx.to(device=topk_indices.device, dtype=torch.int64))
+
+        max_blocks_per_row = int(tier.hot_device_capacity_blocks)
+        blocks, block_counts, _overflow = (
+            torch.ops.trtllm.hisparse_topk_to_block_positions(
+                topk_indices,
+                int(tier.tokens_per_block),
+                max_blocks_per_row,
+            ))
+        host_slots, commit_gens, _block_status, resolve_status = (
+            torch.ops.trtllm.hisparse_resolve_blocks_to_host_slots(
+                row_request_ids,
+                blocks,
+                block_counts,
+                tensors.request_ids_device,
+                tensors.request_block_host_slots_device,
+                tensors.request_block_commit_gen_device,
+                tensors.request_admitted_device,
+            ))
+        lru_tick_base = int(self._lru_clock)
+        self._lru_clock += max(1, int(topk_indices.shape[0]) *
+                               max_blocks_per_row)
+        planned_hot_slots, planned_lru_tick, miss_host_slots, miss_hot_slots, \
+            miss_counts, _hit_flags, plan_status = (
+                torch.ops.trtllm.hisparse_plan_hot_slots(
+                    host_slots,
+                    commit_gens,
+                    block_counts,
+                    resolve_status,
+                    tensors.hot_host_slot,
+                    tensors.hot_commit_gen,
+                    tensors.hot_lru_tick,
+                    int(layer_idx),
+                    lru_tick_base,
+                ))
+        compact_host_slots, compact_hot_slots, compact_row_ids, copy_count, \
+            compact_status = torch.ops.trtllm.hisparse_compact_miss_schedule(
+                miss_host_slots,
+                miss_hot_slots,
+                miss_counts,
+                plan_status,
+            )
+        copy_status = torch.ops.trtllm.hisparse_submit_packed_kvarn_copy_schedule(
+            tensors.host_packed,
+            tensors.hot_packed,
+            compact_host_slots,
+            compact_hot_slots,
+            compact_row_ids,
+            copy_count,
+            compact_status,
+            int(layer_idx),
+            int(tier.packed_bytes_per_block),
+        )
+        commit_status = torch.ops.trtllm.hisparse_commit_hot_slots(
+            host_slots,
+            commit_gens,
+            planned_hot_slots,
+            planned_lru_tick,
+            block_counts,
+            copy_status,
+            tensors.hot_host_slot,
+            tensors.hot_commit_gen,
+            tensors.hot_lru_tick,
+            int(layer_idx),
+        )
+        stride_factor = int(tier.num_layers * tier.tokens_per_block)
+        hot_indices, _build_status = torch.ops.trtllm.hisparse_build_hot_indices(
+            topk_indices,
+            blocks,
+            planned_hot_slots,
+            block_counts,
+            commit_status,
+            int(tier.hot_device_capacity_blocks),
+            int(tier.tokens_per_block),
+            stride_factor,
+            int(layer_idx),
+        )
         raise NotImplementedError(
-            "HiSparse hot-pool TopK mapping still needs native orchestration "
-            "across TopK block rows, request-table resolution, hot-slot "
-            "planning, compact miss scheduling, packed-copy submission, "
-            "post-copy metadata commit, hot global-index construction, and "
-            "sparse MLA hot-pool read. The coordinator ABI is production-shaped, "
-            "but serving remains fail-closed until those pieces are wired and "
-            "validated.")
+            "HiSparse native planner/copy orchestration produced hot global "
+            f"indices with shape {tuple(hot_indices.shape)}, but sparse MLA "
+            "hot-pool read with packed KVarN BDR/on-read dequant is not wired "
+            "or live-validated. Serving remains fail-closed; do not fall back "
+            "to full-HBM, FP16 staging, or direct-to-host-off paths.")

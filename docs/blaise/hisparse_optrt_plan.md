@@ -106,9 +106,12 @@ metadata commit op now publishes `hot_host_slot`, `hot_commit_gen`, and
 The branch also has a native hot-index builder that preserves the existing
 `base * stride_factor + layer_idx * tokens_per_block + token_offset` sparse-MLA
 index contract while targeting HiSparse hot slots instead of full-pool blocks.
+The coordinator now chains those native stages through hot-index construction
+when real CUDA TopK/request metadata is present, then fails closed at the
+remaining sparse MLA hot-pool read/BDR dequant gate.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
-before serving because the full mapping orchestration, sparse MLA hot-pool
-reading, BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete.
+before serving because sparse MLA hot-pool reading, BDR/on-read dequant, final
+row-status consumption, and live NIXL/cancel E2E proofs are not complete.
 This is the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
 
@@ -865,18 +868,20 @@ Current branch status:
   `trtllm::hisparse_submit_packed_kvarn_copy_schedule`,
   `trtllm::hisparse_commit_hot_slots`, and
   `trtllm::hisparse_build_hot_indices` ops before it can proceed;
+- when those ops and real CUDA metadata are present, the coordinator now runs
+  the native chain through device TopK block dedupe, request-table resolution,
+  hot-slot planning, compact miss scheduling, mapped packed KVarN copy
+  submission, post-copy metadata commit, and hot global-index construction;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
-- full mapping orchestration that chains device TopK block rows, request-table
-  resolution, hot-slot planning, packed copy, and hot global-index construction
-  without Python-side token or table extraction;
-- full native orchestration that passes planner miss schedules into packed-copy
-  scheduling without synchronous host readback, calls post-copy hot metadata
-  commit, rejects stale generations, validates row status across every native
-  stage, and returns the hot-index output to sparse MLA;
+- sparse MLA hot-pool read ABI that consumes the constructed hot global indices
+  against packed KVarN hot storage instead of the full dense pool;
+- BDR/on-read dequant for packed hot KVarN records;
+- final row-status propagation into the sparse MLA hot-read stage so rows with
+  resolve/plan/copy/commit/build errors cannot be consumed;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;
