@@ -41,7 +41,7 @@ RUN /opt/dynamo/venv/bin/python3 scripts/build_wheel.py \
     --use-3rdparty-cache \
     --extra-cmake-vars BUILD_TESTS=OFF \
     --extra-cmake-vars BUILD_BENCHMARKS=OFF \
-    --extra-cmake-vars BUILD_DEEP_EP=OFF \
+    --extra-cmake-vars BUILD_DEEP_EP=ON \
     --extra-cmake-vars NCCL_INCLUDE_DIR=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/include \
     --extra-cmake-vars NCCL_LIBRARY=/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 \
     --extra-cmake-vars USING_OSS_CUTLASS_ALLREDUCE_GEMM=ON \
@@ -50,7 +50,7 @@ RUN /opt/dynamo/venv/bin/python3 scripts/build_wheel.py \
 RUN cmake --build /workspace/TensorRT-LLM/cpp/build \
     --config Release \
     --parallel ${FULL_BUILD_JOBS} \
-    --target tensorrt_llm th_common bindings
+    --target tensorrt_llm th_common bindings deep_ep
 
 FROM ${RUNTIME_BASE}
 USER root
@@ -75,6 +75,22 @@ RUN set -eux; \
     fi; \
     if [ -f /tmp/tensorrt_llm_build_artifacts/thop/libth_common.so ]; then \
       cp -v /tmp/tensorrt_llm_build_artifacts/thop/libth_common.so "${SITE_PACKAGES}/tensorrt_llm/libs/"; \
+    fi; \
+    deep_ep_binding="$(find /tmp/tensorrt_llm_build_artifacts/deep_ep -maxdepth 1 -type f -name 'deep_ep_cpp_tllm*.so' | head -n1)"; \
+    if [ -n "${deep_ep_binding}" ]; then \
+      cp -v "${deep_ep_binding}" "${SITE_PACKAGES}/tensorrt_llm/"; \
+      mkdir -p "${SITE_PACKAGES}/tensorrt_llm/libs/nvshmem"; \
+      find /tmp/tensorrt_llm_build_artifacts/deep_ep/nvshmem-build/src/lib -maxdepth 1 -type f -name 'nvshmem_bootstrap_uid.so.*' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/nvshmem/" \;; \
+      find /tmp/tensorrt_llm_build_artifacts/deep_ep/nvshmem-build/src/lib -maxdepth 1 -type f -name 'nvshmem_transport_ibgda.so.*' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/nvshmem/" \;; \
+      if [ -f /tmp/tensorrt_llm_build_artifacts/deep_ep/nvshmem-build/License.txt ]; then \
+        cp -v /tmp/tensorrt_llm_build_artifacts/deep_ep/nvshmem-build/License.txt "${SITE_PACKAGES}/tensorrt_llm/libs/nvshmem/"; \
+      fi; \
+      rm -rf "${SITE_PACKAGES}/tensorrt_llm/deep_ep"; \
+      cp -rv /tmp/tensorrt_llm_build_artifacts/deep_ep/python/deep_ep "${SITE_PACKAGES}/tensorrt_llm/deep_ep"; \
+      ln -sfn tensorrt_llm/deep_ep "${SITE_PACKAGES}/deep_ep"; \
+    else \
+      echo "ERROR: deep_ep_cpp_tllm*.so not found under build artifacts; DeepEP build did not produce the binding" >&2; \
+      exit 1; \
     fi; \
     echo "${OPTRT_SOURCE_SHA}" > /opt/ai-blaise/optrt_source_sha; \
     rm -rf /tmp/tensorrt_llm_build_artifacts; \

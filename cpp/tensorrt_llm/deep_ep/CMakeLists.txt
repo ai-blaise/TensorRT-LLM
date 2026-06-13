@@ -22,12 +22,16 @@ foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
     # The FP4-related conversion instructions in DeepEP require SM100a, SM110a,
     # or SM120a.
     if(${CUDA_ARCH_MAJOR} EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
-      if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.31)
-        list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100f${CUDA_ARCH_POSTFIX}")
-      else()
-        list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100a${CUDA_ARCH_POSTFIX}"
-             "103a${CUDA_ARCH_POSTFIX}")
-      endif()
+      # Use the concrete "100a" arch rather than the "100f" family form. The
+      # family form is only emitted on CMake >= 3.31, but the bundled NVSHMEM
+      # ExternalProject's project() call runs cmake_cuda_architectures_validate,
+      # which rejects "100f-real" ("is not one of the following ... integers
+      # optionally followed by -real/-virtual"). Worse, mixing arches breaks the
+      # deep_ep_cpp_tllm device link: NVSHMEM compiled for one arch leaves the
+      # DeepEP device objects with undefined nvshmemi_* device symbols at nvlink.
+      # "100a" passes validation and keeps deep_ep_cpp_tllm and NVSHMEM on the
+      # same arch (SM100a is what the DeepEP FP4 conversion path targets).
+      list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100a${CUDA_ARCH_POSTFIX}")
     elseif(${CUDA_ARCH_MAJOR} GREATER_EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
       list(APPEND DEEP_EP_CUDA_ARCHITECTURES
            "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}a${CUDA_ARCH_POSTFIX}")
