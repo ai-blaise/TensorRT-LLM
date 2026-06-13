@@ -5004,8 +5004,17 @@ class DSATrtllmAttention(TrtllmAttention):
             pass
         elif layersplit_state is not None and layersplit_state.enabled:
             stride_factor = getattr(metadata, "_cached_stride_factor", None)
+            layersplit_topk_indices_global = topk_indices_global
+            if hisparse_mapping is not None:
+                # HiSparse remaps the attention read-set into hot-slot index
+                # space. LayerSplit still broadcasts dense normal-KV blocks,
+                # so its read-set must stay in global paged-KV index space.
+                layersplit_topk_indices_global, _ = (
+                    transform_local_topk_reuse_or_compute(
+                        forward_args.topk_indices, metadata, local_layer_idx,
+                        self.indexer.skip_topk, is_generation))
             dense_block_ids = _layersplit_topk_global_block_ids(
-                topk_indices_global, stride_factor)
+                layersplit_topk_indices_global, stride_factor)
 
             # M5f dense KV broadcast. get_buffers may raise for layers outside
             # the current manager (PP-partitioned drafts etc.) — skip the dense

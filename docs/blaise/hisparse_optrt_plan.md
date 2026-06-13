@@ -199,6 +199,16 @@ budgets hot capacity plus configured sink blocks plus one possible tail block,
 while the planner still fails closed if committed-hot blocks exceed hot
 capacity. This avoids prematurely rejecting valid sink/tail-heavy rows without
 creating a hidden fallback or overcommitting hot HBM.
+The same sweep also separated HiSparse's hot-slot attention index space from
+LayerSplit's dense normal-KV broadcast index space. When HiSparse mapping is
+active, `sparse_attn_predict()` still returns hot-pool indices to sparse MLA,
+but the LayerSplit legacy dense read-set is recomputed from the original TopK
+through the normal local-to-global KV transform before calling
+`_layersplit_topk_global_block_ids()`. This prevents hot-slot ids from being
+interpreted as global KV block ids. It is conservative and correct; after live
+proof, the next optimization is to shrink that broadcast read-set to resident
+sink/tail blocks only, because committed full blocks should be consumed from
+the HiSparse hot tier rather than dense normal KV.
 The coordinator now chains those native stages through hot-index construction
 when real CUDA TopK/request metadata is present, then fails closed at the
 remaining sparse MLA hot-pool read/BDR dequant gate.

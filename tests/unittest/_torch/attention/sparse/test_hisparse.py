@@ -894,6 +894,20 @@ def test_hisparse_native_mapping_budgets_resident_blocks_source_contract():
     assert "index_topk=index_topk" in source
 
 
+def test_hisparse_layersplit_broadcast_uses_global_kv_indices_source_contract():
+    root = Path(__file__).resolve().parents[5]
+    dsa = root / "tensorrt_llm/_torch/attention_backend/sparse/dsa.py"
+
+    source = dsa.read_text()
+    assert "layersplit_topk_indices_global = topk_indices_global" in source
+    assert "if hisparse_mapping is not None:" in source
+    assert "HiSparse remaps the attention read-set into hot-slot index" in source
+    assert "LayerSplit still broadcasts dense normal-KV blocks" in source
+    assert "transform_local_topk_reuse_or_compute(" in source
+    assert "forward_args.topk_indices, metadata, local_layer_idx" in source
+    assert "_layersplit_topk_global_block_ids(\n                layersplit_topk_indices_global" in source
+
+
 def test_hisparse_hot_planner_counts_duplicate_misses_once_source_contract():
     root = Path(__file__).resolve().parents[5]
     kernel = root / "cpp/tensorrt_llm/kernels/hisparseTopkToBlocks.cu"
