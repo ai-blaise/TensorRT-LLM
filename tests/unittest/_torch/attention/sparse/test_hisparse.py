@@ -784,6 +784,8 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "decodeResidentTokenAddress" in kernel_source
     assert "readResidentLatentValue" in kernel_source
     assert "requestTopkIndices" in kernel_source
+    assert "params.residentRequestIds == nullptr" in kernel_source
+    assert "params.residentRequestIds[row] < 0" in kernel_source
     assert "residentKvPoolDtype" in kernel_source
     assert "residentBlockTableRows" in kernel_source
     assert "residentKvPoolTokens" in kernel_source

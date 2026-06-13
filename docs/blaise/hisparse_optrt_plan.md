@@ -1255,7 +1255,10 @@ Current branch status:
   table and read bf16/fp16 latent K/V directly from the normal resident KV
   pool. The resident path checks row kv-lens, sink coverage, tail validity,
   block-table bounds, and resident KV-pool bounds before either score or value
-  producer load can use the token;
+  producer load can use the token. The resident reader also rejects missing or
+  negative per-row request ids before resolving through the normal KV block
+  table, keeping request-pinning metadata in the ABI rather than treating the
+  block-table row index as sufficient identity;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 

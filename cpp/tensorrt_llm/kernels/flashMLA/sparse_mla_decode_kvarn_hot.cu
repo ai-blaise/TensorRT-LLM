@@ -72,13 +72,19 @@ __device__ __forceinline__ HiSparseResidentTokenAddress decodeResidentTokenAddre
 {
     HiSparseResidentTokenAddress address{kHotReadOk, -1};
     if (params.requestTopkIndices == nullptr || params.residentKvLens == nullptr || params.residentReqIdx == nullptr
-        || params.residentKvPool == nullptr || params.residentBlockTable == nullptr || params.residentTailBlockPos == nullptr
-        || params.residentTailTokenCount == nullptr || params.residentTailValid == nullptr)
+        || params.residentRequestIds == nullptr || params.residentKvPool == nullptr || params.residentBlockTable == nullptr
+        || params.residentTailBlockPos == nullptr || params.residentTailTokenCount == nullptr
+        || params.residentTailValid == nullptr)
     {
         address.status = kHotReadInvalidIndex;
         return address;
     }
     if (row < 0 || row >= params.residentRows)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+    if (params.residentRequestIds[row] < 0)
     {
         address.status = kHotReadInvalidIndex;
         return address;
