@@ -623,10 +623,18 @@ def test_hisparse_attention_dispatch_consumes_kvarn_hot_descriptor():
 
     assert "def _sparse_mla_decode_kvarn_hot" in source
     assert "map_topk_to_hot_pool" in source
+    assert "expected_layer_idx" in source
+    assert "descriptor_is_current" in source
+    assert "int(descriptor.layer_idx) != expected_layer_idx" in source
+    assert "descriptor.row_status.shape[0]" in source
+    assert "descriptor.hot_indices.shape[1]" in source
     assert "torch.ops.trtllm.sparse_mla_decode_kvarn_hot" in source
     assert "getattr(attn_metadata, \"num_generations\", 0)" in source
     assert "hisparse_sparse_mla_kvarn_hot" in source
-    assert "refusing to route through NVFP4 or full-HBM sparse MLA" in source
+    assert "for the current layer, row set, TopK " in source
+    assert "width, and CUDA device; refusing" in source
+    assert "refusing to route through NVFP4 or " in source
+    assert "full-HBM sparse MLA" in source
     assert "HiSparse readiness returned unexpectedly" not in source
 
 

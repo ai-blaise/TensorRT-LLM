@@ -165,7 +165,11 @@ the C++ wrapper instead of allowing a CUDA out-of-record read.
 The dispatch keys generation sparse-MLA shape on `num_generations`, not total
 mixed-batch sequence count, and the coordinator slices generation request IDs
 before resolving hot host slots. That keeps mixed prefill+decode batches from
-binding generation rows to context request IDs.
+binding generation rows to context request IDs. The absorption-generation
+dispatch also treats cached sparse-MLA descriptors as layer-local: a descriptor
+is reused only when the layer id, row count, row-status count, TopK width, and
+CUDA devices match the current call. Otherwise it remaps through the
+coordinator and still fails closed rather than consuming stale hot-slot state.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
@@ -258,6 +262,9 @@ same ABI shape as the final serving path. The following are hard invariants:
 - Fused sparse MLA KVarN-hot decode must validate the production BDR ABI before
   launch: every hot record must contain the full 2-bit C-KV, C-KV scale/zp, and
   E4M3 RoPE payload for a 64-token, 512+64 latent block.
+- Sparse-MLA hot descriptors are layer-local. Reusing a descriptor across
+  layers, rows, TopK widths, devices, or request steps is a stale-hot-slot
+  correctness bug.
 - The miss-copy boundary must be explicit. CUDA kernels must not pretend that
   CPU pinned host KVarN storage is ordinary device memory. The production path
   dedupes and plans misses on device, then hands a compact miss schedule to a
@@ -1103,7 +1110,9 @@ Current branch status:
   generation dispatch wiring. Enabled HiSparse now routes through the typed
   KVarN-hot descriptor before the NVFP4/full-HBM path can run. The fused op
   also checks the production BDR record byte size in the host wrapper before
-  launch, matching the standalone hot-reader guard;
+  launch, matching the standalone hot-reader guard. The attention dispatch
+  refuses to reuse a cached descriptor unless it matches the current local
+  layer, row count, row-status count, TopK width, and devices;
 - the enabled-startup readiness ladder now checks native planner/copy ops,
   the standalone BDR hot-reader primitive, and fused
   `sparse_mla_decode_kvarn_hot` as separate fail-closed gates;

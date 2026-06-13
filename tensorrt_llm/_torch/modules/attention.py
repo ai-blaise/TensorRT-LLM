@@ -2687,24 +2687,47 @@ class MLA(nn.Module):
                 "HiSparse KVarN-hot sparse MLA requested without an enabled "
                 "coordinator.")
         hisparse_coordinator.assert_sparse_mla_reader_ready()
+        expected_layer_idx = self._hisparse_local_layer_idx(attn_metadata)
+
+        def descriptor_is_current(descriptor) -> bool:
+            if descriptor is None:
+                return False
+            if int(descriptor.layer_idx) != expected_layer_idx:
+                return False
+            if int(descriptor.hot_indices.shape[0]) != int(num_tokens):
+                return False
+            if int(descriptor.row_status.shape[0]) != int(num_tokens):
+                return False
+            if len(descriptor.hot_indices.shape) < 2:
+                return False
+            if len(topk_indices.shape) < 2:
+                return False
+            if int(descriptor.hot_indices.shape[1]) != int(
+                    topk_indices.shape[1]):
+                return False
+            expected_device = topk_indices.device
+            return (descriptor.hot_indices.device == expected_device
+                    and descriptor.row_status.device == expected_device
+                    and descriptor.hot_packed.device == fused_q.device)
+
         descriptor = getattr(attn_metadata, "hisparse_sparse_mla_kvarn_hot",
                              None)
-        if (descriptor is not None
-                and int(descriptor.hot_indices.shape[0]) != int(num_tokens)):
+        if not descriptor_is_current(descriptor):
             descriptor = None
         if descriptor is None:
             mapping = hisparse_coordinator.map_topk_to_hot_pool(
                 topk_indices=topk_indices,
                 metadata=attn_metadata,
-                layer_idx=self._hisparse_local_layer_idx(attn_metadata),
+                layer_idx=expected_layer_idx,
                 skip_topk=False,
                 is_generation=True,
             )
             descriptor = None if mapping is None else mapping.sparse_mla_kvarn_hot
-        if descriptor is None:
+        if not descriptor_is_current(descriptor):
             raise RuntimeError(
                 "HiSparse KVarN-hot sparse MLA did not receive a native "
-                "hot-pool descriptor; refusing to route through NVFP4 or "
+                "hot-pool descriptor for the current layer, row set, TopK "
+                "width, and CUDA device; refusing to route through NVFP4 or "
                 "full-HBM sparse MLA.")
         attn_metadata.hisparse_sparse_mla_kvarn_hot = descriptor
 
