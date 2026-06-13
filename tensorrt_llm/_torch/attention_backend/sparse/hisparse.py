@@ -17,6 +17,20 @@ if TYPE_CHECKING:
     import torch
 
 
+_HISPARSE_NATIVE_PLANNER_OPS = (
+    "trtllm::hisparse_publish_request_table_slots",
+    "trtllm::hisparse_topk_to_block_positions",
+    "trtllm::hisparse_resolve_blocks_to_host_slots",
+    "trtllm::hisparse_plan_hot_slots",
+    "trtllm::hisparse_compact_miss_schedule",
+    "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
+    "trtllm::hisparse_commit_hot_slots",
+    "trtllm::hisparse_build_hot_indices",
+)
+_HISPARSE_KVARN_HOT_READER_OP = "trtllm::hisparse_read_kvarn_hot_bdr"
+_HISPARSE_FUSED_SPARSE_MLA_OP = "trtllm::sparse_mla_decode_kvarn_hot"
+
+
 @dataclass(frozen=True)
 class HiSparseTopKMapping:
     """Result of mapping request-relative TopK through the HiSparse hot pool."""
@@ -201,11 +215,51 @@ class OPTRTHiSparseCoordinator:
                 "HiSparse is enabled and packed tier metadata is configured, "
                 "but host-pinned/device packed KVarN tensors are not allocated "
                 "yet. This remains fail-closed for serving.")
+        self.assert_sparse_mla_reader_ready()
+
+    def _missing_cuda_ops(self, op_names: Iterable[str]) -> Tuple[str, ...]:
+        return tuple(op for op in op_names
+                     if not self._torch_cuda_op_registered(op))
+
+    def assert_native_planner_ready(self) -> None:
+        """Require the native CUDA planner/copy chain, or fail closed."""
+        missing = self._missing_cuda_ops(_HISPARSE_NATIVE_PLANNER_OPS)
+        if missing:
+            raise NotImplementedError(
+                "HiSparse packed tiers are configured, but the production "
+                "native planner/copy chain is incomplete. Missing CUDA op(s): "
+                f"{', '.join(missing)}. This remains fail-closed for serving.")
+
+    def assert_hot_reader_validation_ready(self) -> None:
+        """Require the production BDR hot-reader primitive, or fail closed."""
+        if not self._torch_cuda_op_registered(_HISPARSE_KVARN_HOT_READER_OP):
+            raise NotImplementedError(
+                "HiSparse native planner/copy is available, but the production "
+                "KVarN-hot BDR reader primitive is not registered. Missing "
+                f"CUDA op: {_HISPARSE_KVARN_HOT_READER_OP}. Do not substitute "
+                "an FP16 hot staging path or NVFP4 sparse MLA compatibility "
+                "path.")
+
+    def assert_sparse_mla_reader_ready(self) -> None:
+        """Fail closed until KVarN-hot sparse MLA is actually wired in."""
+        if not self.enabled:
+            return
+        self.assert_native_planner_ready()
+        self.assert_hot_reader_validation_ready()
+        if not self._torch_cuda_op_registered(_HISPARSE_FUSED_SPARSE_MLA_OP):
+            raise NotImplementedError(
+                "HiSparse has native planner/copy and KVarN-hot BDR producer "
+                "load validation, but sparse MLA is not fused to read packed "
+                "KVarN hot records. Missing CUDA op: "
+                f"{_HISPARSE_FUSED_SPARSE_MLA_OP}. Do not route enabled "
+                "HiSparse through sparse_mla_decode_nvfp4, full-HBM restore, "
+                "or an executable dense hot pre-dequant placeholder.")
         raise NotImplementedError(
-            "HiSparse packed tiers are configured, but the production packed "
-            "KVarN swap-in planner and sparse MLA hot-pool read path are not "
-            "complete and live-validated. This remains fail-closed for "
-            "serving.")
+            "HiSparse KVarN-hot sparse MLA is registered but not integrated "
+            "through the DSA attention dispatch path on this branch. This "
+            "startup guard remains closed until the coordinator output, row "
+            "status, sink/tail descriptors, and sparse MLA call site are "
+            "live-validated together.")
 
     def reset_step(self) -> None:
         self.step_id += 1

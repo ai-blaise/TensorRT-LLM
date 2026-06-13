@@ -63,6 +63,13 @@ outside the HiSparse coordinator/transceiver path, but there is no FP16
 block-hot oracle in the serving implementation, runtime fallback, config mode,
 or deployment candidate.
 
+The startup/mapping guard is intentionally granular: enabled HiSparse first
+requires the native planner/copy ops, then the production BDR hot-reader
+primitive, then a fused `sparse_mla_decode_kvarn_hot` sparse MLA dispatch. Even
+if the fused op symbol appears, this branch still fails closed until DSA
+attention is explicitly rewired to call that path and the coordinator output,
+row status, and sink/tail descriptors are live-proven together.
+
 Serving acceptance is binary: if `hisparse_enabled=true` can answer a request
 before dense-MLA KVarN BDR source writes, typed NIXL direct-to-host, native
 device-side hot planning, stream-ordered packed host-to-hot copy, post-copy hot
@@ -128,6 +135,9 @@ the C-KV low-bit bytes, scale/zp fields, and E4M3 RoPE payload, and returns a
 bf16 scratch tensor for kernel validation. This is a producer-load building
 block and CUDA smoke hook, not a serving path: the coordinator still fails
 closed until the same KVarN-hot reader is fused into sparse MLA.
+The kernel translation unit has been non-disruptively compiled on the B200 VM
+with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
+library build and CUDA smoke tests remain pending for a safe runtime window.
 The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
 `mlaKernels.cu`: the paged MLA KVarN read launcher validated `kvarn_bits` but
 did not pass it into the CUDA kernel, which meant `kvarn_k2v2` could be read
@@ -1047,6 +1057,10 @@ Current branch status:
   low-bit scale/zp layout, reads the E4M3 RoPE payload, and rejects wrong
   row/status/index/layer layout. It is intentionally not wired as a serving
   pre-dequant pass;
+- tightened the enabled-startup readiness ladder so the branch reports the
+  exact remaining gap: native planner/copy ops, standalone BDR hot-reader
+  primitive, fused `sparse_mla_decode_kvarn_hot`, and final DSA dispatch
+  integration are separate fail-closed gates;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 

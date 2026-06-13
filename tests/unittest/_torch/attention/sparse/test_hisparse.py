@@ -95,7 +95,7 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
     coordinator.allocate_packed_tensors(device="cuda:0",
                                         host_pinned=True,
                                         tensor_factory=_fake_tensor_factory(calls))
-    with pytest.raises(NotImplementedError, match="swap-in kernel"):
+    with pytest.raises(NotImplementedError, match="Missing CUDA op"):
         coordinator.assert_startup_ready()
     with pytest.raises(NotImplementedError):
         coordinator.map_topk_to_hot_pool(topk_indices=None,
@@ -206,6 +206,53 @@ def test_hisparse_coordinator_enabled_path_fails_closed_until_kernel_ready():
                                          layer_idx=0,
                                          skip_topk=False,
                                          is_generation=True)
+
+
+def test_hisparse_sparse_mla_readiness_ladder(monkeypatch):
+    coordinator = OPTRTHiSparseCoordinator(_cfg(enabled=True))
+    coordinator.configure_packed_tiers(num_layers=1,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=2048,
+                                       logical_host_capacity_blocks=4,
+                                       hot_device_capacity_blocks=2)
+    calls = []
+    coordinator.allocate_packed_tensors(device="cuda:0",
+                                        host_pinned=True,
+                                        tensor_factory=_fake_tensor_factory(calls))
+
+    planner_ops = {
+        "trtllm::hisparse_publish_request_table_slots",
+        "trtllm::hisparse_topk_to_block_positions",
+        "trtllm::hisparse_resolve_blocks_to_host_slots",
+        "trtllm::hisparse_plan_hot_slots",
+        "trtllm::hisparse_compact_miss_schedule",
+        "trtllm::hisparse_submit_packed_kvarn_copy_schedule",
+        "trtllm::hisparse_commit_hot_slots",
+        "trtllm::hisparse_build_hot_indices",
+    }
+    hot_reader = "trtllm::hisparse_read_kvarn_hot_bdr"
+    sparse_mla = "trtllm::sparse_mla_decode_kvarn_hot"
+
+    monkeypatch.setattr(coordinator, "_torch_cuda_op_registered",
+                        lambda name: name in planner_ops)
+    with pytest.raises(NotImplementedError,
+                       match="KVarN-hot BDR reader primitive"):
+        coordinator.assert_startup_ready()
+
+    monkeypatch.setattr(coordinator, "_torch_cuda_op_registered",
+                        lambda name: name in planner_ops | {hot_reader})
+    with pytest.raises(NotImplementedError,
+                       match="sparse_mla_decode_kvarn_hot"):
+        coordinator.assert_startup_ready()
+
+    monkeypatch.setattr(coordinator, "_torch_cuda_op_registered",
+                        lambda name: name in planner_ops | {
+                            hot_reader,
+                            sparse_mla,
+                        })
+    with pytest.raises(NotImplementedError,
+                       match="registered but not integrated"):
+        coordinator.assert_startup_ready()
 
 
 def test_hisparse_request_allocation_commit_and_release():

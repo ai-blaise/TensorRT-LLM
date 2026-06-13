@@ -2876,11 +2876,10 @@ class MLA(nn.Module):
         hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
                                        None)
         if bool(getattr(hisparse_coordinator, "enabled", False)):
+            hisparse_coordinator.assert_sparse_mla_reader_ready()
             raise NotImplementedError(
-                "HiSparse requires sparse MLA to read the packed KVarN hot "
-                "tier through the explicit KVarN-hot BDR path. Do not route "
-                "enabled HiSparse decode through sparse_mla_decode_nvfp4 or "
-                "the restored full-pool TRTLLM MLA path.")
+                "HiSparse readiness returned unexpectedly before DSA attention "
+                "was rewired to sparse_mla_decode_kvarn_hot.")
 
         if has_nvfp4_kv_cache:
             # The K write inside mla_rope_generation has already quantized the
