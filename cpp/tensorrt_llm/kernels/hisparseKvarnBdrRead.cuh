@@ -122,8 +122,14 @@ __device__ __forceinline__ HiSparseKvarnHotAddress decodeHisparseKvarnHotIndex(
     return address;
 }
 
+__device__ __forceinline__ __half readHisparseHalfUnaligned(uint8_t const* src)
+{
+    uint16_t const raw = static_cast<uint16_t>(src[0]) | (static_cast<uint16_t>(src[1]) << 8);
+    return __ushort_as_half(raw);
+}
+
 __device__ __forceinline__ float readHisparseKvarnK2v2PackedCkvValue(
-    uint8_t const* tokenPacked, __half const* tokenScaleZp, int dim)
+    uint8_t const* tokenPacked, uint8_t const* tokenScaleZpBytes, int dim)
 {
     constexpr int32_t kBits = 2;
     constexpr int32_t kValuesPerByte = 8 / kBits;
@@ -132,9 +138,29 @@ __device__ __forceinline__ float readHisparseKvarnK2v2PackedCkvValue(
     int32_t const shift = (dim % kValuesPerByte) * kBits;
     int32_t const q = (tokenPacked[byteIdx] >> shift) & kMask;
     int32_t const subblock = dim / 128;
-    float const scale = __half2float(tokenScaleZp[subblock]);
-    float const zp = __half2float(tokenScaleZp[4 + subblock]);
+    float const scale
+        = __half2float(readHisparseHalfUnaligned(tokenScaleZpBytes + static_cast<int64_t>(subblock) * sizeof(__half)));
+    float const zp = __half2float(
+        readHisparseHalfUnaligned(tokenScaleZpBytes + static_cast<int64_t>(4 + subblock) * sizeof(__half)));
     return static_cast<float>(q) * scale + zp;
+}
+
+__device__ __forceinline__ float readHisparseKvarnK2v2PackedCkvOriginalValue(
+    uint8_t const* tokenPacked, uint8_t const* tokenScaleZpBytes, int dim)
+{
+    constexpr int32_t kBdrOrder = 128;
+    constexpr float kInvSqrtHadamard128 = 0.088388347648318f;
+    int32_t const subblockBase = (dim / kBdrOrder) * kBdrOrder;
+    int32_t const localDim = dim - subblockBase;
+    float acc = 0.0F;
+#pragma unroll 1
+    for (int32_t j = 0; j < kBdrOrder; ++j)
+    {
+        float const value = readHisparseKvarnK2v2PackedCkvValue(tokenPacked, tokenScaleZpBytes, subblockBase + j);
+        int32_t const parity = __popc(static_cast<unsigned>(localDim & j)) & 1;
+        acc += parity ? -value : value;
+    }
+    return acc * kInvSqrtHadamard128;
 }
 
 __device__ __forceinline__ float readHisparseFp8E4m3Byte(uint8_t byte)
@@ -153,9 +179,9 @@ __device__ __forceinline__ __nv_bfloat16 readHisparseKvarnK2v2BdrLatentValue(
     if (dim < layout.kvLoraRank)
     {
         uint8_t const* tokenPacked = ckvData + static_cast<int64_t>(tokenOffset) * layout.ckvBytesPerToken;
-        auto const* tokenScaleZp = reinterpret_cast<__half const*>(
-            ckvScaleZpBytes + static_cast<int64_t>(tokenOffset) * layout.scaleZpBytesPerToken);
-        return __float2bfloat16_rn(readHisparseKvarnK2v2PackedCkvValue(tokenPacked, tokenScaleZp, dim));
+        uint8_t const* tokenScaleZpBytes
+            = ckvScaleZpBytes + static_cast<int64_t>(tokenOffset) * layout.scaleZpBytesPerToken;
+        return __float2bfloat16_rn(readHisparseKvarnK2v2PackedCkvOriginalValue(tokenPacked, tokenScaleZpBytes, dim));
     }
 
     int32_t const peDim = dim - layout.kvLoraRank;

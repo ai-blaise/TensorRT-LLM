@@ -144,10 +144,13 @@ candidate now uses the same reader helpers directly at producer load. The June
 13 final sweep tightened this primitive to require `kvarn_bits=2`; there is no
 4-bit KVarN-hot validation branch for the production HiSparse path.
 The BDR address decode, hot-index validation, 2-bit C-KV unpack, scale/zp
-application, and E4M3 RoPE byte read now live in
-`hisparseKvarnBdrRead.cuh`. The standalone hot-reader smoke op and fused
-sparse MLA kernel use that same device helper layer so the validated CUDA smoke
-path and serving producer-load path cannot drift.
+application, inverse 128-wide BDR/Hadamard readback, and E4M3 RoPE byte read
+now live in `hisparseKvarnBdrRead.cuh`. The scale/zp payload is treated as a
+byte-addressed BDR record field rather than a half-aligned tensor field, so
+odd byte strides in the packed slot layout cannot fault or silently corrupt
+reads. The standalone hot-reader smoke op and fused sparse MLA kernel use that
+same device helper layer so the validated CUDA smoke path and serving
+producer-load path cannot drift.
 The coordinator also now constructs a typed
 `HiSparseSparseMlaKvarnHotDescriptor` at the native-chain boundary. That
 descriptor carries `hot_packed`, hot global indices, row status, fixed-top-k
@@ -158,6 +161,7 @@ fallback and does not reconstruct loose hot-pool tensors.
 The branch now has the first native `trtllm::sparse_mla_decode_kvarn_hot`
 operator. It is not a wrapper over `sparse_mla_decode_nvfp4`: the CUDA kernel
 reads packed `kvarn_k2v2` BDR hot records through `hisparseKvarnBdrRead.cuh`,
+reconstructs dense-MLA C-KV values from the BDR/Hadamard-domain record on read,
 computes scores against the 576-wide dense-MLA key, applies softmax, and emits
 the 512-wide latent value output. It also consumes the `explicit_sink_tail_v1`
 resident-read sentinel: committed blocks read packed-hot BDR records, while
@@ -172,11 +176,12 @@ absorption-generation branch now calls it through the typed descriptor before
 any NVFP4 or full-HBM path can run. It is not yet promoted: the new
 `torch.ops.trtllm.hisparse_sparse_mla_resident_v1_ready()` readiness surface
 currently returns false until live runtime proof and profiling are complete,
-and the kernel still uses a direct per-row/head schedule before the optimized
-FlashMLA-style split scheduler is imported. The June 13 final sweep tightened
-the fused operator ABI guard so `hot_packed` records must be at least the
-production `kvarn_k2v2` BDR byte size before launch; a too-short hot record now
-fails in the C++ wrapper instead of allowing a CUDA out-of-record read.
+and the kernel still uses a direct per-row/head schedule plus scalar inverse
+BDR readback before the optimized FlashMLA-style split scheduler/query-fold
+implementation is imported. The June 13 final sweep tightened the fused
+operator ABI guard so `hot_packed` records must be at least the production
+`kvarn_k2v2` BDR byte size before launch; a too-short hot record now fails in
+the C++ wrapper instead of allowing a CUDA out-of-record read.
 The dispatch keys generation sparse-MLA shape on `num_generations`, not total
 mixed-batch sequence count, and the coordinator slices generation request IDs
 before resolving hot host slots. That keeps mixed prefill+decode batches from
@@ -187,11 +192,18 @@ CUDA devices match the current call. Otherwise it remaps through the
 coordinator and still fails closed rather than consuming stale hot-slot state.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory. The June 13
-final sweep also linked the full `th_common` native library in the persistent
-B200 build cache and loaded it through `torch.ops.load_library` with a
-single-device driver exposure; the targeted HiSparse registrations were all
-present. CUDA runtime smoke tests against the deployed image remain pending for
-a safe runtime window.
+final sweep also added and proved a narrow exact-clean `th_hisparse_smoke`
+target that links the real HiSparse torch registrations and production CUDA
+kernels without pulling the unrelated generated CUTLASS/MoE tail of
+`th_common`. That target was built in
+`/home/spencer/work/TensorRT-LLM-hisparse-runtime` with the persistent
+`/home/spencer/work/build-cache/hisparse-thop` cache, then loaded on B200 GPU 7
+through `torch.ops.load_library`. A direct CUDA smoke using the production
+constants passed for native BDR record write, byte-strided scale/zp layout,
+hot BDR readback, sparse MLA KVarN-hot decode, and resident sink/tail padding.
+The repo-level pytest harness still requires the full Python bindings, so the
+proof script intentionally bypassed `tests/unittest/conftest.py` while
+executing the same native ops and tensor contracts.
 The June 13 continuation re-ran this non-disruptive compile for both
 `sparse_mla_decode_kvarn_hot.cu` and `hisparseKvarnHotRead.cu` with
 `/usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_100 -dc`; both produced
@@ -217,22 +229,25 @@ The branch now also registers `torch.ops.trtllm.mla_bdr_write_kvarn_record` and
 calls it from the full-block KVarN commit walk when the HiSparse BDR source pool
 is active. That native writer consumes the production paged latent block view
 and fills C-KV low-bit bytes, C-KV scale/zp bytes, and the current 8-bit RoPE
-payload in `KVarNBDRSourcePool`. Blocks that were already committed to the
-legacy side-pool are backfilled into the BDR source pool instead of being
-skipped.
+payload in `KVarNBDRSourcePool`. The writer now emits C-KV scale/zp as bytes
+using CUDA's public half raw-conversion intrinsics, so a packed record remains
+valid even when the slot stride is not half-aligned. Blocks that were already
+committed to the legacy side-pool are backfilled into the BDR source pool
+instead of being skipped.
 The dense MLA decode branch also fails closed when a HiSparse coordinator is
 enabled, so an accidentally relaxed planner guard cannot route KVarN-hot
 indices through `sparse_mla_decode_nvfp4` or the restored full-pool TRTLLM MLA
 path.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
 before serving because the resident-v1 sparse MLA readiness probe remains
-false until live DSA/NIXL/B200 proof is complete. The sparse MLA hot-pool read,
-BDR/on-read dequant, and resident sink/tail producer-load paths are now present
-in the production-layout direct kernel, but promotion still requires runtime
-row-status proof, CUDA smoke execution, native BDR writer proof, writer stream
-ordering against NIXL source reads, live NIXL/cancel E2E proof, and profiling.
-This is the correct failure mode: no manifest should get an implicit full-HBM,
-FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
+false until live DSA/NIXL/B200 deployment proof is complete. The sparse MLA
+hot-pool read, BDR/on-read dequant, native BDR writer, and resident sink/tail
+producer-load paths are now present and smoke-proven at the native op level,
+but promotion still requires live DSA row-status proof, writer stream ordering
+against NIXL source reads, live NIXL/cancel E2E proof, CUDA graph lifecycle
+proof, and profiling. This is the correct failure mode: no manifest should get
+an implicit full-HBM, FP16-staging, Python TopK extraction, or
+direct-to-host-off substitute.
 
 The final June 13 thoroughness sweep did not identify an accepted runtime
 fallback or serving oracle in the HiSparse path. Remaining references to
@@ -687,9 +702,14 @@ Implementation sequence:
 4. Make sparse MLA consume the hot packed KVarN view through BDR/on-read dequant
    in the producer load path. This must be a real KVarN-hot producer read:
    decode hot global index -> `(hot_slot, token_offset)` -> BDR byte fields ->
-   2-bit C-KV dequant with scale/zp -> RoPE payload read -> existing sparse MLA
-   math/combine where compatible. Reuse scheduler/combine pieces only where
-   their memory-layout assumptions still match the KVarN-hot ABI.
+   2-bit C-KV dequant with byte-addressed scale/zp -> inverse 128-wide BDR
+   readback to the original dense MLA latent frame -> RoPE payload read ->
+   existing sparse MLA math/combine where compatible. Reuse scheduler/combine
+   pieces only where their memory-layout assumptions still match the
+   KVarN-hot ABI. The optimized version may fold the inverse BDR algebra into
+   query/value accumulation, but it must remain mathematically equivalent to
+   the native packed BDR reader and must not introduce an intermediate dense
+   hot staging tier.
 5. Keep external FP16/KVarN references in tests only; do not add a serving
    staging path that dequants committed cold blocks into a hot FP16 pool, and
    do not add an executable "correctness" placeholder that can answer requests
@@ -1139,18 +1159,17 @@ Still pending before serving enablement:
   including proof that the host tier is mapped/device-addressable on the B200
   deployment image;
 - B200 compile/live validation of `torch.ops.trtllm.mla_bdr_write_kvarn_record`
-  and proof that its current-stream writes are ordered before any NIXL source
-  read. The commit walk now fills `KVarNBDRSourcePool` records beside the legacy
-  restore side-pool, but promotion still requires the stream-order proof and
-  end-to-end validation. The first command to run in a safe B200 window is:
-
-  ```bash
-  pytest tests/unittest/_torch/attention/sparse/test_kvarn_k2v2.py -k mla_bdr_write_kvarn_record_cuda_layout_smoke -q
-  ```
+  is complete at the native-op level through `th_hisparse_smoke`: the writer
+  fills the production BDR byte layout, supports byte-strided records, and the
+  shared reader reconstructs the original dense MLA latent through inverse BDR
+  readback. Promotion still requires proof that those current-stream writes are
+  ordered before any NIXL source read in the live DSA/NIXL deployment image;
 - optional coalescing of native request-table publication across multiple
   lifecycle events. Correctness no longer depends on Python scalar writes, but
   multi-slot batching may still reduce Python call overhead before promotion;
-- sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
+- sparse MLA hot-pool ABI and BDR/on-read dequant hookup are present and
+  native-op smoke-proven; the remaining work is live DSA/NIXL/deployment proof
+  plus optimized split scheduling/query-fold for throughput.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
 
@@ -1296,29 +1315,32 @@ Current branch status:
   block-hot oracle, full-HBM serving fallback, and executable placeholder
   language. Remaining references are explicit prohibitions or external
   baseline/test-fixture boundaries. The new resident-padding smoke compiles
-  locally and passes the bounded B200 container syntax/source-contract check.
-  The first B200 proof build linked `libth_common.so` from the persistent dirty
-  smoke tree, and a driver-attached registration probe confirmed the HiSparse
-  thops are present. The exact-clean runtime checkout then exposed a real
-  SM100-only build issue: context FMHA v2 cubin archives can be filtered out
-  entirely while `fmhaDispatcher.cpp` still includes `cubin/fmha_cubin.h`.
-  The branch now carries a CMake-side empty FMHA v2 cubin metadata/header
-  generator for that architecture-filtered case, with the generated include
-  directory propagated to `kernels_src`. This is a build-proof fix only; it
-  does not add an attention fallback or change HiSparse serving behavior. Full
-  pytest/runtime execution still requires the exact-clean B200 build to finish,
-  the native op to load with CUDA exposed, and live DSA/NIXL metadata;
+  locally and now passes as a direct B200 CUDA smoke against the exact-clean
+  `th_hisparse_smoke` target. The first B200 proof build linked
+  `libth_common.so` from the persistent dirty smoke tree, and a driver-attached
+  registration probe confirmed the HiSparse thops are present. The exact-clean
+  runtime checkout then exposed a real SM100-only build issue: context FMHA v2
+  cubin archives can be filtered out entirely while `fmhaDispatcher.cpp` still
+  includes `cubin/fmha_cubin.h`. The branch now carries a CMake-side empty
+  FMHA v2 cubin metadata/header generator for that architecture-filtered case,
+  with the generated include directory propagated to both `kernels_src` and
+  `common_src`. This is a build-proof fix only; it does not add an attention
+  fallback or change HiSparse serving behavior. The follow-up exact-clean
+  target, `th_hisparse_smoke`, links the real HiSparse registrations and
+  production CUDA kernels without `common_src`/`th_common`; its direct smoke
+  proved BDR writer layout, byte-strided scale/zp, inverse BDR hot read,
+  sparse MLA KVarN-hot decode, and resident padding behavior. Full deployment
+  proof still requires live DSA/NIXL metadata rather than the isolated thop
+  script;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
-- finish the exact-clean B200 `th_common` proof build from
-  `/home/spencer/work/TensorRT-LLM-hisparse-runtime` using the persistent
-  `/home/spencer/work/build-cache/hisparse-thop` cache, then run the CUDA smoke
-  tests in a safe runtime window. Current verification has compiled the
-  translation units and proved registration loading from the prior persistent
-  smoke tree, but exact-clean CUDA runtime execution remains pending;
+- build the full deployment image/wheel with these exact-clean fixes and rerun
+  the same native-op smoke through the image that DSA will load in serving.
+  The exact-clean `th_hisparse_smoke` proof is complete, but it deliberately
+  avoids the full Python bindings and deployment packaging;
 - use `scripts/blaise_build_hisparse_thop.sh` for the current VM-side native
   thop proof loop. The June 13 build sweep established the required
   non-disruptive recipe: run inside the `hisa-buildtools-20260531` image, keep
@@ -1625,7 +1647,8 @@ production ABI:
    - consume hot packed KVarN records directly through hot global indices,
      decoding `(hot_slot, token_offset)` into production BDR field addresses;
    - add BDR/on-read dequant in the sparse MLA producer load path, including
-     2-bit C-KV unpack, scale/zp apply, and RoPE payload read without an
+     2-bit C-KV unpack, byte-addressed scale/zp apply, inverse BDR readback to
+     the original dense MLA latent frame, and RoPE payload read without an
      intermediate dense/FP16 hot staging pass;
    - include the shared `hisparseKvarnBdrRead.cuh` helper layer for hot-index
      decode and BDR field reads so the validation op and serving producer path
@@ -1661,7 +1684,8 @@ production ABI:
      - fused producer-load consumption that selects packed-hot BDR reads for
        committed blocks and resident normal-KV reads for sink/tail tokens
        before any row can emit output. This path is now implemented in the
-       direct kernel, but promotion still requires live DSA runtime proof and
+       direct kernel and native-op smoke-proven on B200, but promotion still
+       requires live DSA/NIXL runtime proof, performance profiling, and
        flipping the readiness op from false to true;
    - remove any need for full-working-set restore of committed cold blocks;
    - do not introduce an FP16 block-hot oracle, an NVFP4 sparse-MLA

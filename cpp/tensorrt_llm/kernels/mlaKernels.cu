@@ -1531,92 +1531,6 @@ void invokeMLABdrQuantizeLatent(
     }
 }
 
-// Write a complete production HiSparse BDR record from the dense MLA latent
-// block. Unlike invokeMLABdrQuantizeLatent(), this consumes the [tpb, 576]
-// paged-cache block view directly, supports non-contiguous token strides, and
-// fills the RoPE byte payload that sparse_mla_decode_kvarn_hot will consume.
-template <typename T, int DCKV, int HORDER, int BITS>
-__global__ void mlaBdrWriteKvarnRecordKernel(T const* __restrict__ latent_block,
-    int64_t latent_token_stride, int64_t latent_dim_stride, uint8_t* __restrict__ bdr_records,
-    int64_t bdr_record_stride, int block_id, int tokens_per_block, int qk_rope_head_dim)
-{
-    static_assert(BITS == 2 || BITS == 4, "KVarN BDR supports 2-bit or 4-bit packing");
-    constexpr int kNSub = DCKV / HORDER;
-    constexpr int kVecPerSub = HORDER / 8;
-    constexpr int kBytesPerVec = 8 * BITS / 8;
-    constexpr int kCkvBytesPerToken = DCKV * BITS / 8;
-    int const tok = blockIdx.x;
-    if (tok >= tokens_per_block)
-    {
-        return;
-    }
-
-    uint8_t* record = bdr_records + static_cast<int64_t>(block_id) * bdr_record_stride;
-    uint8_t* ckvData = record;
-    uint8_t* ckvScaleZpBytes = ckvData + static_cast<int64_t>(tokens_per_block) * kCkvBytesPerToken;
-    uint8_t* peBytes = ckvScaleZpBytes + static_cast<int64_t>(tokens_per_block) * (2 * kNSub * sizeof(__half));
-    int const lane = threadIdx.x;
-    int const sub = lane / kVecPerSub;
-    int const laneInBlk = lane % kVecPerSub;
-    unsigned const mask = 0xFFFFu << ((sub % 2) * 16);
-
-    float reg[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-    {
-        int const c = lane * 8 + i;
-        reg[i] = cuda_cast<float>(latent_block[static_cast<int64_t>(tok) * latent_token_stride
-            + static_cast<int64_t>(c) * latent_dim_stride]);
-    }
-    bdrFwhtSubblockWarp<8>(reg, laneInBlk, mask);
-    float lo, hi;
-    bdrSubblockMinMax<8>(reg, laneInBlk, mask, lo, hi);
-    constexpr int kQMax = (1 << BITS) - 1;
-    float const sc = fmaxf((hi - lo) / static_cast<float>(kQMax), 1e-10f);
-    __half const hsc = __float2half(sc), hzp = __float2half(lo);
-    uint8_t* tokData = ckvData + static_cast<int64_t>(tok) * kCkvBytesPerToken;
-    bdrPackLowBitVec<8, BITS>(tokData + lane * kBytesPerVec, reg, __half2float(hsc), __half2float(hzp));
-    if (laneInBlk == 0)
-    {
-        auto* tokScale = reinterpret_cast<__half*>(ckvScaleZpBytes + static_cast<int64_t>(tok) * (2 * kNSub * sizeof(__half)));
-        tokScale[sub] = hsc;
-        tokScale[kNSub + sub] = hzp;
-    }
-
-    if (lane < qk_rope_head_dim)
-    {
-        float const pe = cuda_cast<float>(latent_block[static_cast<int64_t>(tok) * latent_token_stride
-            + static_cast<int64_t>(DCKV + lane) * latent_dim_stride]);
-        __nv_fp8_e4m3 const pe8 = cuda_cast<__nv_fp8_e4m3>(pe);
-        peBytes[static_cast<int64_t>(tok) * qk_rope_head_dim + lane] = pe8.__x;
-    }
-}
-
-template <typename T>
-void invokeMLABdrWriteKvarnRecord(T const* latent_block, int64_t latent_token_stride, int64_t latent_dim_stride,
-    uint8_t* bdr_records, int64_t bdr_record_stride, int block_id, int tokens_per_block, int kv_lora_rank,
-    int qk_rope_head_dim, int bits, cudaStream_t stream)
-{
-    TLLM_CHECK_WITH_INFO(kv_lora_rank == 512, "KVarN BDR record writer currently supports DCKV=512.");
-    TLLM_CHECK_WITH_INFO(qk_rope_head_dim > 0 && qk_rope_head_dim <= 64,
-        "KVarN BDR record writer currently supports 1 <= qk_rope_head_dim <= 64.");
-    TLLM_CHECK_WITH_INFO(bits == 2 || bits == 4, "KVarN BDR record writer supports bits=2 or bits=4, got %d.", bits);
-    TLLM_CHECK_WITH_INFO(tokens_per_block > 0, "KVarN BDR record writer requires tokens_per_block > 0.");
-    TLLM_CHECK_WITH_INFO(block_id >= 0, "KVarN BDR record writer requires a non-negative block id.");
-    constexpr int kVecs = 512 / 8;
-    if (bits == 2)
-    {
-        mlaBdrWriteKvarnRecordKernel<T, 512, 128, 2><<<tokens_per_block, kVecs, 0, stream>>>(latent_block,
-            latent_token_stride, latent_dim_stride, bdr_records, bdr_record_stride, block_id, tokens_per_block,
-            qk_rope_head_dim);
-    }
-    else
-    {
-        mlaBdrWriteKvarnRecordKernel<T, 512, 128, 4><<<tokens_per_block, kVecs, 0, stream>>>(latent_block,
-            latent_token_stride, latent_dim_stride, bdr_records, bdr_record_stride, block_id, tokens_per_block,
-            qk_rope_head_dim);
-    }
-}
 // ===========================================================================
 
 template <typename T, typename TCache>
@@ -1691,14 +1605,6 @@ INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
 INSTANTIATE_MLA_BDR_QUANTIZE(float);
 INSTANTIATE_MLA_BDR_QUANTIZE(half);
 INSTANTIATE_MLA_BDR_QUANTIZE(__nv_bfloat16);
-
-#define INSTANTIATE_MLA_BDR_WRITE_KVARN_RECORD(T)                                                                       \
-    template void invokeMLABdrWriteKvarnRecord<T>(T const* latent_block, int64_t latent_token_stride,                    \
-        int64_t latent_dim_stride, uint8_t* bdr_records, int64_t bdr_record_stride, int block_id, int tokens_per_block,  \
-        int kv_lora_rank, int qk_rope_head_dim, int bits, cudaStream_t stream);
-INSTANTIATE_MLA_BDR_WRITE_KVARN_RECORD(float);
-INSTANTIATE_MLA_BDR_WRITE_KVARN_RECORD(half);
-INSTANTIATE_MLA_BDR_WRITE_KVARN_RECORD(__nv_bfloat16);
 
 // In-place MLA RoPE: apply RoPE to the last rope_dim elements of each [nope_dim + rope_dim] head.
 // Uses 16-byte vectorized load/store (VecType) and mmha::rotary_embedding_transform for the

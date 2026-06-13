@@ -130,6 +130,45 @@ add_library(
   convertReqIndexToGlobalOp.cpp
   indexerAffineReuseOp.cpp
   trtllmGenQKVProcessOp.cpp)
+
+# Narrow proof target for the OP-TRT HiSparse native path. It compiles the real
+# torch registrations and production CUDA kernels used by the HiSparse smoke
+# tests without linking the full tensorrt_llm shared library and its unrelated
+# generated CUTLASS/MoE targets. Production wheels still use th_common.
+add_library(
+  th_hisparse_smoke SHARED
+  mlaBdrKvarnOp.cpp
+  hisparseRequestTableOp.cpp
+  hisparseSwapInPackedKvarnOp.cu
+  hisparseKvarnHotReadOp.cpp
+  hisparseTopkToBlocksOp.cpp
+  SparseMlaDecodeKvarnHotOp.cpp
+  ../common/assert.cpp
+  ../common/logger.cpp
+  ../common/stringUtils.cpp
+  ../common/tllmException.cpp
+  ../kernels/mlaBdrKvarnRecordKernels.cu
+  ../kernels/hisparseTopkToBlocks.cu
+  ../kernels/hisparseKvarnHotRead.cu
+  ../kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu)
+set_property(TARGET th_hisparse_smoke PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET th_hisparse_smoke PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD 20)
+set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD_REQUIRED ON)
+target_link_libraries(
+  th_hisparse_smoke PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                            ${CUDA_DRV_LIB} ${CUBLAS_LIB} ${CURAND_LIB})
+target_compile_options(
+  th_hisparse_smoke
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math>)
+if(NOT WIN32)
+  set_target_properties(
+    th_hisparse_smoke
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../nvidia/nccl/lib"
+               LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+endif()
+
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
