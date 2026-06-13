@@ -45,6 +45,10 @@ struct SparseMlaDecodeKvarnHotParams
     int32_t topK;
     int32_t topkLengthSize;
     int32_t residentRows;
+    int32_t residentKvPoolTokens;
+    int32_t residentBlockTableRows;
+    int32_t residentBlockTableBlocks;
+    int32_t residentKvPoolDtype;
     int32_t residentSinkTokens;
     int32_t residentSinkBlocks;
     int32_t layerIdx;

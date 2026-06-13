@@ -8,6 +8,7 @@
 #include "tensorrt_llm/kernels/hisparseKvarnBdrRead.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <limits>
@@ -27,6 +28,8 @@ constexpr int32_t kKvLoraRank = 512;
 constexpr int32_t kQkRopeHeadDim = 64;
 constexpr int32_t kThreads = 256;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+constexpr int32_t kResidentKvPoolBf16 = 0;
+constexpr int32_t kResidentKvPoolFp16 = 1;
 
 __device__ __forceinline__ float bf16ToFloat(void const* ptr, int64_t offset)
 {
@@ -38,6 +41,95 @@ __device__ __forceinline__ void writeBf16(void* ptr, int64_t offset, float value
 {
     auto* out = reinterpret_cast<__nv_bfloat16*>(ptr);
     out[offset] = __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ float readResidentLatentValue(
+    SparseMlaDecodeKvarnHotParams const& params, int64_t globalToken, int32_t dim)
+{
+    int64_t const offset = globalToken * params.strideResidentKvPoolToken + dim;
+    if (params.residentKvPoolDtype == kResidentKvPoolBf16)
+    {
+        auto const* pool = reinterpret_cast<__nv_bfloat16 const*>(params.residentKvPool);
+        return __bfloat162float(pool[offset]);
+    }
+    if (params.residentKvPoolDtype == kResidentKvPoolFp16)
+    {
+        auto const* pool = reinterpret_cast<__half const*>(params.residentKvPool);
+        return __half2float(pool[offset]);
+    }
+    auto const* pool = reinterpret_cast<__nv_bfloat16 const*>(params.residentKvPool);
+    return __bfloat162float(pool[offset]);
+}
+
+struct HiSparseResidentTokenAddress
+{
+    uint8_t status;
+    int64_t globalToken;
+};
+
+__device__ __forceinline__ HiSparseResidentTokenAddress decodeResidentTokenAddress(
+    SparseMlaDecodeKvarnHotParams const& params, int32_t row, int32_t batch, int32_t s, int32_t k)
+{
+    HiSparseResidentTokenAddress address{kHotReadOk, -1};
+    if (params.requestTopkIndices == nullptr || params.residentKvLens == nullptr || params.residentReqIdx == nullptr
+        || params.residentKvPool == nullptr || params.residentBlockTable == nullptr || params.residentTailBlockPos == nullptr
+        || params.residentTailTokenCount == nullptr || params.residentTailValid == nullptr)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+    if (row < 0 || row >= params.residentRows)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+
+    int64_t const requestIndexBase = static_cast<int64_t>(batch) * params.strideRequestTopkB
+        + static_cast<int64_t>(s) * params.strideRequestTopkSQ;
+    int32_t const token = params.requestTopkIndices[requestIndexBase + k];
+    int64_t const kvLen = params.residentKvLens[row];
+    if (token < 0 || static_cast<int64_t>(token) >= kvLen)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+
+    int32_t const blockPos = token / params.tokensPerBlock;
+    int32_t const tokenOffset = token % params.tokensPerBlock;
+    bool const isSink = blockPos < params.residentSinkBlocks;
+    bool const isTail = params.residentTailValid[row] && blockPos == params.residentTailBlockPos[row]
+        && tokenOffset < params.residentTailTokenCount[row];
+    if (!isSink && !isTail)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+
+    int64_t const reqIdx = params.residentReqIdx[row];
+    if (reqIdx < 0 || reqIdx >= params.residentBlockTableRows || blockPos < 0
+        || blockPos >= params.residentBlockTableBlocks)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+    int64_t const tableOffset = reqIdx * params.strideResidentBlockTableB
+        + static_cast<int64_t>(blockPos) * params.strideResidentBlockTableBlock;
+    int32_t const blockId = params.residentBlockTable[tableOffset];
+    if (blockId < 0)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+
+    int64_t const globalToken = static_cast<int64_t>(blockId) * params.strideFactor
+        + static_cast<int64_t>(params.layerIdx) * params.tokensPerBlock + tokenOffset;
+    if (globalToken < 0 || globalToken >= params.residentKvPoolTokens)
+    {
+        address.status = kHotReadInvalidIndex;
+        return address;
+    }
+    address.globalToken = globalToken;
+    return address;
 }
 
 __device__ __forceinline__ float blockReduceSum(float value, float* scratch)
@@ -102,22 +194,44 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
         if (rowCode == kHotReadOk && k < rowTopK)
         {
             int32_t const hotIndex = params.indices[indexBase + k];
-            HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-                hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-            if (address.status != kHotReadOk)
+            if (hotIndex < 0)
             {
-                atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(address.status));
+                HiSparseResidentTokenAddress const residentAddress
+                    = decodeResidentTokenAddress(params, row, batch, s, k);
+                if (residentAddress.status != kHotReadOk)
+                {
+                    atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+                }
+                else
+                {
+                    for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                    {
+                        float const qVal = bf16ToFloat(params.q, qBase + dim);
+                        float const kVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
+                        scorePart += qVal * kVal;
+                    }
+                }
             }
             else
             {
-                uint8_t const* record = params.hotPacked + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
-                    + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
-                for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
+                    hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
+                if (address.status != kHotReadOk)
                 {
-                    float const qVal = bf16ToFloat(params.q, qBase + dim);
-                    float const kVal = __bfloat162float(
-                        readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim));
-                    scorePart += qVal * kVal;
+                    atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(address.status));
+                }
+                else
+                {
+                    uint8_t const* record = params.hotPacked
+                        + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
+                        + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
+                    for (int32_t dim = threadIdx.x; dim < params.dQk; dim += blockDim.x)
+                    {
+                        float const qVal = bf16ToFloat(params.q, qBase + dim);
+                        float const kVal = __bfloat162float(
+                            readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim));
+                        scorePart += qVal * kVal;
+                    }
                 }
             }
         }
@@ -182,11 +296,22 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
     for (int32_t k = threadIdx.x; k < rowTopK; k += blockDim.x)
     {
         int32_t const hotIndex = params.indices[indexBase + k];
-        HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-            hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-        if (address.status != kHotReadOk)
+        if (hotIndex < 0)
         {
-            atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(address.status));
+            HiSparseResidentTokenAddress const residentAddress = decodeResidentTokenAddress(params, row, batch, s, k);
+            if (residentAddress.status != kHotReadOk)
+            {
+                atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(residentAddress.status));
+            }
+        }
+        else
+        {
+            HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
+                hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
+            if (address.status != kHotReadOk)
+            {
+                atomicCAS(&valueCode, kHotReadOk, static_cast<int32_t>(address.status));
+            }
         }
     }
     __syncthreads();
@@ -211,12 +336,22 @@ __global__ void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams para
         for (int32_t k = 0; k < rowTopK; ++k)
         {
             int32_t const hotIndex = params.indices[indexBase + k];
-            HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
-                hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
-            uint8_t const* record = params.hotPacked + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
-                + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
-            float const vVal = __bfloat162float(
-                readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim));
+            float vVal = 0.0F;
+            if (hotIndex < 0)
+            {
+                HiSparseResidentTokenAddress const residentAddress
+                    = decodeResidentTokenAddress(params, row, batch, s, k);
+                vVal = readResidentLatentValue(params, residentAddress.globalToken, dim);
+            }
+            else
+            {
+                HiSparseKvarnHotAddress const address = decodeHisparseKvarnHotIndex(
+                    hotIndex, params.strideFactor, params.layerIdx, params.hotCapacity, params.tokensPerBlock);
+                uint8_t const* record = params.hotPacked
+                    + static_cast<int64_t>(params.layerIdx) * params.strideHotLayer
+                    + static_cast<int64_t>(address.hotSlot) * params.strideHotSlot;
+                vVal = __bfloat162float(readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim));
+            }
             acc += scores[k] * vVal;
         }
         writeBf16(params.out, outBase + dim, acc);

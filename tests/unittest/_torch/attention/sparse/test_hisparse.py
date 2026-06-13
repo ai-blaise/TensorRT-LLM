@@ -721,11 +721,13 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     flash_cmake = root / "cpp/tensorrt_llm/kernels/flashMLA/CMakeLists.txt"
     thop_cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
     fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
+    docs = root / "docs/blaise/hisparse_optrt_plan.md"
 
     kernel_source = kernel.read_text()
     planner_source = planner_kernel.read_text()
     thop_source = thop.read_text()
     planner_thop_source = planner_thop.read_text()
+    docs_source = docs.read_text()
     assert "hisparseKvarnBdrRead.cuh" in kernel_source
     assert "hisparseClassifyResidentBlocksKernel" in planner_source
     assert "kResidentBlockSink" in planner_source
@@ -738,6 +740,14 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "residentBlockFlags" in planner_source
     assert "plannedHotSlots[rowOffset + i] = -1" in planner_source
     assert "readHisparseKvarnK2v2BdrLatentValue" in kernel_source
+    assert "decodeResidentTokenAddress" in kernel_source
+    assert "readResidentLatentValue" in kernel_source
+    assert "requestTopkIndices" in kernel_source
+    assert "residentKvPoolDtype" in kernel_source
+    assert "residentBlockTableRows" in kernel_source
+    assert "residentKvPoolTokens" in kernel_source
+    assert "hotIndex < 0" in kernel_source
+    assert "resident normal-KV reads" in docs_source
     assert "decodeHisparseKvarnHotIndex" in kernel_source
     assert "atomicCAS(&rowCode" in kernel_source
     assert "__shared__ int32_t valueCode" in kernel_source
@@ -778,6 +788,8 @@ def test_hisparse_sparse_mla_kvarn_hot_op_is_registered_in_sources():
     assert "residentKvPool" in header.read_text()
     assert "requestTopkIndices" in header.read_text()
     assert "residentTailTokenCount" in header.read_text()
+    assert "residentKvPoolDtype" in header.read_text()
+    assert "residentBlockTableBlocks" in header.read_text()
     assert "sparse_mla_decode_kvarn_hot.cu" in flash_cmake.read_text()
     assert "SparseMlaDecodeKvarnHotOp.cpp" in thop_cmake.read_text()
     fake_source = fake.read_text()

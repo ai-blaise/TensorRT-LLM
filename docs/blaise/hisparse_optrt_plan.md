@@ -1227,6 +1227,14 @@ Current branch status:
   post-copy commit. Hot-index build emits `-1` as the resident-read sentinel
   for sink/tail token positions and preserves row validity for the future fused
   producer-load path;
+- the fused `sparse_mla_decode_kvarn_hot` producer-load kernel now consumes
+  that resident-read sentinel: committed blocks read packed `kvarn_k2v2` BDR
+  records from the hot tier, while resident sink/tail hits resolve the
+  original request-relative TopK token through the live normal decode block
+  table and read bf16/fp16 latent K/V directly from the normal resident KV
+  pool. The resident path checks row kv-lens, sink coverage, tail validity,
+  block-table bounds, and resident KV-pool bounds before either score or value
+  producer load can use the token;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
@@ -1241,10 +1249,10 @@ Still pending before serving enablement:
 - prove final row-status behavior under resolve/plan/copy/commit/build errors
   with runtime tests, including invalid-row rejection before any stale hot-slot
   read can influence output;
-- implement CUDA producer-load consumption of the explicit sink/tail
-  resident-token ABI so top-k hits on live resident tokens are served through
-  the normal decode KV path rather than invalidating rows or being modeled as
-  committed packed KVarN blocks;
+- live-prove CUDA producer-load consumption of the explicit sink/tail
+  resident-token ABI under real DSA metadata and then relax the final startup
+  guard; until that proof lands, enabled serving remains fail-closed even
+  though the production-shaped kernel path exists;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - runtime proof that the hot global-index output buffers and fused sparse MLA
@@ -1527,7 +1535,9 @@ production ABI:
        sink/tail hits, uncommitted invalid hits, and stale-planner failures;
      - fused producer-load consumption that selects packed-hot BDR reads for
        committed blocks and resident normal-KV reads for sink/tail tokens
-       before any row can emit output;
+       before any row can emit output. This path is now implemented in the
+       direct kernel, but promotion still requires live DSA runtime proof and
+       the final readiness guard update;
    - remove any need for full-working-set restore of committed cold blocks;
    - do not introduce an FP16 block-hot oracle, an NVFP4 sparse-MLA
      compatibility mode, or any executable serving placeholder while wiring

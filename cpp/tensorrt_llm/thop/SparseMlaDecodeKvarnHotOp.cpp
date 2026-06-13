@@ -29,6 +29,8 @@ constexpr int64_t kTokensPerBlock = 64;
 constexpr int64_t kKvarnBits = 2;
 constexpr int64_t kKvLoraRank = 512;
 constexpr int64_t kQkRopeHeadDim = 64;
+constexpr int32_t kResidentKvPoolBf16 = 0;
+constexpr int32_t kResidentKvPoolFp16 = 1;
 
 int32_t checkedInt32(int64_t value, char const* name)
 {
@@ -301,6 +303,16 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_kva
     params.topK = checkedInt32(topK, "topk");
     params.topkLengthSize = topkLength.has_value() ? checkedInt32(topkLength->size(0), "topk_length.size(0)") : 0;
     params.residentRows = residentKvLens.has_value() ? checkedInt32(residentKvLens->size(0), "resident_rows") : 0;
+    params.residentKvPoolTokens
+        = residentKvPool.has_value() ? checkedInt32(residentKvPool->size(0), "resident_kv_pool.size(0)") : 0;
+    params.residentBlockTableRows
+        = residentBlockTable.has_value() ? checkedInt32(residentBlockTable->size(0), "resident_block_table.rows") : 0;
+    params.residentBlockTableBlocks = residentBlockTable.has_value()
+        ? checkedInt32(residentBlockTable->size(1), "resident_block_table.blocks")
+        : 0;
+    params.residentKvPoolDtype = residentKvPool.has_value()
+        ? (residentKvPool->scalar_type() == at::ScalarType::Half ? kResidentKvPoolFp16 : kResidentKvPoolBf16)
+        : kResidentKvPoolBf16;
     params.residentSinkTokens = checkedInt32(residentSinkTokens, "resident_sink_tokens");
     params.residentSinkBlocks = checkedInt32(residentSinkBlocks, "resident_sink_blocks");
     params.layerIdx = checkedInt32(layerIdx, "layer_idx");
