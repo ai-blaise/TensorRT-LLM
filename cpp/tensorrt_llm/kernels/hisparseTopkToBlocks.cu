@@ -28,6 +28,15 @@ enum HiSparseResolveStatus : uint8_t
     kResolveBadBlockCount = 5,
 };
 
+enum HiSparsePlanStatus : uint8_t
+{
+    kPlanOk = 0,
+    kPlanUpstreamInvalid = 1,
+    kPlanBadBlockCount = 2,
+    kPlanInvalidResolvedBlock = 3,
+    kPlanInsufficientHotSlots = 4,
+};
+
 __device__ __forceinline__ uint32_t hisparseHash32(uint32_t value)
 {
     value ^= value >> 16;
@@ -218,6 +227,205 @@ __global__ void hisparseResolveBlocksToHostSlotsKernel(int64_t const* __restrict
     }
 }
 
+__global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots,
+    int64_t const* __restrict__ commitGens, int32_t const* __restrict__ blockCounts,
+    uint8_t const* __restrict__ resolveRowStatus, int64_t const* __restrict__ hotHostSlot,
+    int64_t const* __restrict__ hotCommitGen, int64_t const* __restrict__ hotLruTick,
+    int64_t* __restrict__ plannedHotSlots, int64_t* __restrict__ plannedLruTick,
+    int64_t* __restrict__ missHostSlots, int64_t* __restrict__ missHotSlots, int32_t* __restrict__ missCounts,
+    uint8_t* __restrict__ hitFlags, uint8_t* __restrict__ rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
+    int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase)
+{
+    if (blockIdx.x != 0 || layerIdx < 0 || layerIdx >= numLayers)
+    {
+        return;
+    }
+
+    extern __shared__ int64_t smem64[];
+    int64_t* plannedHost = smem64;
+    int64_t* plannedCommit = plannedHost + hotCapacity;
+    int64_t* plannedLru = plannedCommit + hotCapacity;
+    uint8_t* protectedSlots = reinterpret_cast<uint8_t*>(plannedLru + hotCapacity);
+
+    int64_t const layerOffset = static_cast<int64_t>(layerIdx) * hotCapacity;
+    for (int32_t slot = threadIdx.x; slot < hotCapacity; slot += blockDim.x)
+    {
+        plannedHost[slot] = hotHostSlot[layerOffset + slot];
+        plannedCommit[slot] = hotCommitGen[layerOffset + slot];
+        plannedLru[slot] = hotLruTick[layerOffset + slot];
+        protectedSlots[slot] = 0;
+    }
+    for (int32_t index = threadIdx.x; index < numRows * maxBlocksPerRow; index += blockDim.x)
+    {
+        plannedHotSlots[index] = -1;
+        plannedLruTick[index] = -1;
+        missHostSlots[index] = -1;
+        missHotSlots[index] = -1;
+        hitFlags[index] = 0;
+    }
+    for (int32_t row = threadIdx.x; row < numRows; row += blockDim.x)
+    {
+        missCounts[row] = 0;
+        rowStatus[row] = kPlanOk;
+    }
+    __syncthreads();
+
+    if (threadIdx.x != 0)
+    {
+        return;
+    }
+
+    int64_t nextLru = lruTickBase;
+    for (int32_t row = 0; row < numRows; ++row)
+    {
+        int64_t const rowOffset = static_cast<int64_t>(row) * maxBlocksPerRow;
+        uint8_t const upstreamStatus = resolveRowStatus[row];
+        if (upstreamStatus != kResolveOk)
+        {
+            rowStatus[row] = kPlanUpstreamInvalid;
+            continue;
+        }
+
+        int32_t const count = blockCounts[row];
+        if (count < 0 || count > maxBlocksPerRow)
+        {
+            rowStatus[row] = kPlanBadBlockCount;
+            continue;
+        }
+        if (count > hotCapacity)
+        {
+            rowStatus[row] = kPlanInsufficientHotSlots;
+            continue;
+        }
+
+        bool validResolvedBlocks = true;
+        for (int32_t i = 0; i < count; ++i)
+        {
+            if (hostSlots[rowOffset + i] < 0 || commitGens[rowOffset + i] < 0)
+            {
+                validResolvedBlocks = false;
+                break;
+            }
+        }
+        if (!validResolvedBlocks)
+        {
+            rowStatus[row] = kPlanInvalidResolvedBlock;
+            continue;
+        }
+
+        int32_t requiredMisses = 0;
+        for (int32_t i = 0; i < count; ++i)
+        {
+            int64_t const hostSlot = hostSlots[rowOffset + i];
+            int64_t const commitGen = commitGens[rowOffset + i];
+            bool hit = false;
+            for (int32_t slot = 0; slot < hotCapacity; ++slot)
+            {
+                if (plannedHost[slot] == hostSlot && plannedCommit[slot] == commitGen)
+                {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit)
+            {
+                ++requiredMisses;
+            }
+        }
+        int32_t availableVictims = 0;
+        for (int32_t slot = 0; slot < hotCapacity; ++slot)
+        {
+            if (protectedSlots[slot] == 0)
+            {
+                ++availableVictims;
+            }
+        }
+        if (requiredMisses > availableVictims)
+        {
+            rowStatus[row] = kPlanInsufficientHotSlots;
+            continue;
+        }
+
+        int32_t missCount = 0;
+        for (int32_t i = 0; i < count; ++i)
+        {
+            int64_t const hostSlot = hostSlots[rowOffset + i];
+            int64_t const commitGen = commitGens[rowOffset + i];
+            int32_t selectedHotSlot = -1;
+            bool hit = false;
+
+            for (int32_t slot = 0; slot < hotCapacity; ++slot)
+            {
+                if (plannedHost[slot] == hostSlot && plannedCommit[slot] == commitGen)
+                {
+                    selectedHotSlot = slot;
+                    hit = true;
+                    break;
+                }
+            }
+
+            if (selectedHotSlot < 0)
+            {
+                for (int32_t slot = 0; slot < hotCapacity; ++slot)
+                {
+                    if (protectedSlots[slot] == 0 && plannedHost[slot] < 0)
+                    {
+                        selectedHotSlot = slot;
+                        break;
+                    }
+                }
+            }
+            if (selectedHotSlot < 0)
+            {
+                int64_t bestTick = 0x7fffffffffffffffLL;
+                for (int32_t slot = 0; slot < hotCapacity; ++slot)
+                {
+                    if (protectedSlots[slot] != 0)
+                    {
+                        continue;
+                    }
+                    if (plannedLru[slot] < bestTick)
+                    {
+                        bestTick = plannedLru[slot];
+                        selectedHotSlot = slot;
+                    }
+                }
+            }
+            if (selectedHotSlot < 0)
+            {
+                rowStatus[row] = kPlanInsufficientHotSlots;
+                missCount = 0;
+                for (int32_t clear = 0; clear < count; ++clear)
+                {
+                    plannedHotSlots[rowOffset + clear] = -1;
+                    plannedLruTick[rowOffset + clear] = -1;
+                    hitFlags[rowOffset + clear] = 0;
+                }
+                break;
+            }
+
+            ++nextLru;
+            plannedHotSlots[rowOffset + i] = selectedHotSlot;
+            plannedLruTick[rowOffset + i] = nextLru;
+            hitFlags[rowOffset + i] = static_cast<uint8_t>(hit);
+            protectedSlots[selectedHotSlot] = 1;
+            plannedHost[selectedHotSlot] = hostSlot;
+            plannedCommit[selectedHotSlot] = commitGen;
+            plannedLru[selectedHotSlot] = nextLru;
+            if (!hit)
+            {
+                missHostSlots[rowOffset + missCount] = hostSlot;
+                missHotSlots[rowOffset + missCount] = selectedHotSlot;
+                ++missCount;
+            }
+        }
+        if (rowStatus[row] == kPlanOk)
+        {
+            missCounts[row] = missCount;
+        }
+    }
+}
+
 } // namespace
 
 void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blockPositions, int32_t* blockCounts,
@@ -263,6 +471,32 @@ void invokeHisparseResolveBlocksToHostSlots(int64_t const* rowRequestIds, int32_
     hisparseResolveBlocksToHostSlotsKernel<<<numRows, kThreads, 0, stream>>>(rowRequestIds, blockPositions,
         blockCounts, requestIds, requestBlockHostSlots, requestBlockCommitGen, requestAdmitted, hostSlots, commitGens,
         blockStatus, rowStatus, numRows, maxBlocksPerRow, requestSlotCapacity, maxBlocksPerRequest);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitGens, int32_t const* blockCounts,
+    uint8_t const* resolveRowStatus, int64_t const* hotHostSlot, int64_t const* hotCommitGen,
+    int64_t const* hotLruTick, int64_t* plannedHotSlots, int64_t* plannedLruTick, int64_t* missHostSlots,
+    int64_t* missHotSlots, int32_t* missCounts, uint8_t* hitFlags, uint8_t* rowStatus, int32_t numRows,
+    int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase,
+    cudaStream_t stream)
+{
+    if (numRows <= 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_plan_hot_slots requires max_blocks_per_row > 0");
+    TLLM_CHECK_WITH_INFO(numLayers > 0, "hisparse_plan_hot_slots requires num_layers > 0");
+    TLLM_CHECK_WITH_INFO(hotCapacity > 0, "hisparse_plan_hot_slots requires hot_capacity > 0");
+    TLLM_CHECK_WITH_INFO(layerIdx >= 0 && layerIdx < numLayers, "hisparse_plan_hot_slots layer_idx out of range");
+    TLLM_CHECK_WITH_INFO(hotCapacity <= 4096, "hisparse_plan_hot_slots supports hot_capacity <= 4096");
+
+    constexpr int32_t kThreads = 128;
+    size_t const smemBytes = static_cast<size_t>(hotCapacity) * (3 * sizeof(int64_t) + sizeof(uint8_t));
+    hisparsePlanHotSlotsKernel<<<1, kThreads, smemBytes, stream>>>(hostSlots, commitGens, blockCounts,
+        resolveRowStatus, hotHostSlot, hotCommitGen, hotLruTick, plannedHotSlots, plannedLruTick, missHostSlots,
+        missHotSlots, missCounts, hitFlags, rowStatus, numRows, maxBlocksPerRow, numLayers, hotCapacity, layerIdx,
+        lruTickBase);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -89,9 +89,12 @@ CUDA-side TopK-to-block dedupe primitive now exists for the first planner stage.
 A native request-table resolver now maps device block rows and row request ids
 to committed host slots and commit generations, returning explicit invalid
 status flags for missing, unadmitted, out-of-range, or uncommitted rows rather
-than falling back to Python request-table extraction.
+than falling back to Python request-table extraction. A native non-mutating
+hot-slot planner now consumes those resolved rows and layer-local hot metadata
+to produce hit/miss/LRU slot decisions, copy schedules, and row status without
+publishing residency before packed copies succeed.
 Startup and runtime mapping still intentionally reject `hisparse_enabled=true`
-before serving because the remaining hot-slot planner, sparse MLA hot-pool
+before serving because the remaining hot-slot commit path, sparse MLA hot-pool
 reading, BDR/on-read dequant, and live NIXL/cancel E2E proofs are not complete.
 This is the correct failure mode: no manifest should get an implicit full-HBM,
 FP16-staging, Python TopK extraction, or direct-to-host-off substitute.
@@ -716,6 +719,12 @@ Current branch status:
   request ids, block-to-host-slot rows, commit generations, and admission flags
   to produce host slots, commit generations, per-block status, and per-row
   status without host extraction;
+- added `trtllm::hisparse_plan_hot_slots`, a native non-mutating CUDA planner
+  that consumes resolved host slots/commit generations plus layer-local
+  `hot_host_slot`, `hot_commit_gen`, and `hot_lru_tick` metadata, protects
+  slots selected earlier in the same batch, and emits planned hot slots,
+  planned LRU ticks, miss host/hot copy schedules, hit flags, miss counts, and
+  row status without publishing hot residency;
 - synchronized device hot metadata (`hot_host_slot`, `hot_commit_gen`, and
   `hot_lru_tick`) whenever hot records are committed or cleared;
 - implemented invalidation that clears hot records when host records are
@@ -742,6 +751,8 @@ Still pending before serving enablement:
   `trtllm::hisparse_topk_to_block_positions` planner primitive;
 - VM compile and live validation of the native
   `trtllm::hisparse_resolve_blocks_to_host_slots` request-table resolver;
+- VM compile and live validation of the native
+  `trtllm::hisparse_plan_hot_slots` non-mutating hot-slot planner;
 - replacement of scalar lifecycle request-table writes with a stream-ordered
   batched/native publication path for admission, commit-generation, and cleanup
   updates;
@@ -776,19 +787,20 @@ Current branch status:
 - runtime mapping requires configured packed tiers, allocated tensors,
   admission-compatible request ids, and the native
   `trtllm::hisparse_topk_to_block_positions`,
-  `trtllm::hisparse_resolve_blocks_to_host_slots`, and
+  `trtllm::hisparse_resolve_blocks_to_host_slots`,
+  `trtllm::hisparse_plan_hot_slots`, and
   `trtllm::hisparse_swap_in_packed_kvarn` ops before it can proceed;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
-- hot-slot planner that consumes device block-position rows, request ids,
-  admission metadata, and layer-local hot metadata without Python-side token
-  extraction;
-- integration of the native request-table resolver output with layer-local
-  hit/miss/LRU selection, stale-generation rejection, packed-copy scheduling,
-  and hot global-index output;
+- full mapping orchestration that chains device TopK block rows, request-table
+  resolution, hot-slot planning, packed copy, and hot global-index construction
+  without Python-side token or table extraction;
+- integration of the native hot-slot planner output with native packed-copy
+  scheduling, post-copy hot metadata commit, stale-generation rejection, and
+  hot global-index output;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
   copy plus hot metadata update;
 - hot global-index output buffers for sparse MLA;

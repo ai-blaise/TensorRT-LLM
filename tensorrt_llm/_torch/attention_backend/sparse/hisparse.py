@@ -1433,6 +1433,13 @@ class OPTRTHiSparseCoordinator:
                 "request table and admission metadata before hot-slot "
                 "planning; no Python request-table extraction path is allowed.")
         if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_plan_hot_slots"):
+            raise NotImplementedError(
+                "trtllm::hisparse_plan_hot_slots is not registered with a "
+                "CUDA kernel. HiSparse must choose hit/miss/LRU hot slots from "
+                "resolved host slots on device before scheduling packed KVarN "
+                "copies; no Python hot-slot planner path is allowed.")
+        if not self._torch_cuda_op_registered(
                 "trtllm::hisparse_swap_in_packed_kvarn"):
             raise NotImplementedError(
                 "trtllm::hisparse_swap_in_packed_kvarn is not registered with "
