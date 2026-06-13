@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """KVarN k2v2 dense MLA latent coverage.
 
-These tests stay CPU-only so they can run on protected B200 hosts without
-allocating GPU memory. They exercise the same pack/layout/dequant contracts the
-SMC-SD decode path depends on when ``mla_latent_kv_dtype='kvarn_k2v2'``.
+The default coverage is CPU-only so it can run on protected B200 hosts without
+allocating GPU memory. Guarded CUDA smoke tests exercise the native BDR writer,
+hot-reader, and sparse MLA resident-read hooks when an explicit B200 validation
+environment loads those ops. Together they cover the same pack/layout/dequant
+contracts the SMC-SD decode path depends on when
+``mla_latent_kv_dtype='kvarn_k2v2'``.
 """
 
 from types import SimpleNamespace
@@ -318,6 +321,100 @@ def test_sparse_mla_decode_kvarn_hot_one_token_cuda_smoke():
                           torch.zeros((1, 128, 1)),
                           atol=1e-5,
                           rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for sparse MLA resident decode")
+def test_sparse_mla_decode_kvarn_hot_resident_padding_cuda_smoke():
+    """B200 smoke: resident sink/tail sentinel and padded TopK compose.
+
+    This covers the production `explicit_sink_tail_v1` ABI without relying on a
+    packed hot record. A negative hot index with a nonnegative original TopK
+    token must read the resident normal-KV pool; a negative original TopK token
+    is padding and must not poison softmax/value accumulation.
+    """
+    if not _has_sparse_mla_kvarn_hot_cuda_op():
+        pytest.skip("trtllm::sparse_mla_decode_kvarn_hot CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    q = torch.zeros((2, 1, 128, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device)
+    hot_packed = torch.empty((1, 1, layout.packed_bytes_per_block),
+                             dtype=torch.uint8,
+                             device=device)
+    indices = torch.full((2, 1, 2), -1, dtype=torch.int32, device=device)
+    request_topk_indices = torch.tensor([[[3, -1]], [[-1, -1]]],
+                                        dtype=torch.int32,
+                                        device=device)
+    row_status = torch.zeros((2,), dtype=torch.uint8, device=device)
+    resident_kv_pool = torch.zeros((64, 1,
+                                    cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                                   dtype=torch.bfloat16,
+                                   device=device)
+    resident_kv_pool[3, 0, :cfg.kv_lora_rank] = 0.25
+    resident_kv_lens = torch.tensor([4, 4], dtype=torch.int64, device=device)
+    resident_req_idx = torch.tensor([0, 0], dtype=torch.int64, device=device)
+    resident_request_ids = torch.tensor([7001, 7001],
+                                        dtype=torch.int64,
+                                        device=device)
+    resident_block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
+    resident_tail_block_pos = torch.tensor([0, 0],
+                                           dtype=torch.int32,
+                                           device=device)
+    resident_tail_token_count = torch.tensor([4, 4],
+                                             dtype=torch.int32,
+                                             device=device)
+    resident_tail_valid = torch.tensor([True, True],
+                                       dtype=torch.bool,
+                                       device=device)
+
+    out, lse, metadata, splits = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
+        q,
+        hot_packed,
+        indices,
+        row_status,
+        None,
+        None,
+        0,
+        layout.tokens_per_block,
+        layout.tokens_per_block,
+        layout.ckv_bits,
+        layout.kv_lora_rank,
+        layout.qk_rope_head_dim,
+        1.0,
+        resident_kv_lens,
+        resident_req_idx,
+        resident_request_ids,
+        resident_kv_pool,
+        resident_block_table,
+        resident_tail_block_pos,
+        resident_tail_token_count,
+        resident_tail_valid,
+        0,
+        0,
+        request_topk_indices,
+    )
+    torch.cuda.synchronize()
+
+    assert tuple(out.shape) == (2, 1, 128, cfg.kv_lora_rank)
+    assert tuple(lse.shape) == (2, 128, 1)
+    assert metadata.numel() == 0
+    assert splits.numel() == 0
+    out_cpu = out.float().cpu()
+    lse_cpu = lse.float().cpu()
+    assert torch.allclose(out_cpu[0],
+                          torch.full((1, 128, cfg.kv_lora_rank), 0.25),
+                          atol=1e-4,
+                          rtol=0)
+    assert float(out_cpu[1].abs().max()) == 0.0
+    assert bool(torch.isfinite(out_cpu).all())
+    assert not bool(torch.isnan(lse_cpu).any())
+    assert torch.allclose(lse_cpu[0], torch.zeros((128, 1)), atol=1e-5, rtol=0)
+    assert bool(torch.isneginf(lse_cpu[1]).all())
 
 
 def test_kvarn_latent_pool_k2v2_roundtrip_cpu():

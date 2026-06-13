@@ -1266,6 +1266,20 @@ Current branch status:
   sink/tail resident checks. Padded `-inf` scores are converted to zero weights
   before normalization so all-padding/no-sink rows cannot produce NaNs from
   `-inf * 0`;
+- added
+  `test_sparse_mla_decode_kvarn_hot_resident_padding_cuda_smoke`, a runtime
+  proof hook that exercises `explicit_sink_tail_v1` with one resident tail
+  token plus padding and a separate all-padding row. It skips until the native
+  op is loaded, but once the rebuilt image is available it directly checks that
+  resident reads return the normal-KV value, padded rows return zero output,
+  and neither output nor LSE contain NaNs;
+- the final sweep rechecked the plan and current code for stale FP16
+  block-hot oracle, full-HBM serving fallback, and executable placeholder
+  language. Remaining references are explicit prohibitions or external
+  baseline/test-fixture boundaries. The new resident-padding smoke compiles
+  locally and passes the bounded B200 container syntax/source-contract check;
+  full pytest/runtime execution still requires a rebuilt image with
+  `tensorrt_llm.bindings`, the native op, and CUDA exposed;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
