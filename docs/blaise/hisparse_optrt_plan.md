@@ -186,8 +186,12 @@ is reused only when the layer id, row count, row-status count, TopK width, and
 CUDA devices match the current call. Otherwise it remaps through the
 coordinator and still fails closed rather than consuming stale hot-slot state.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
-with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
-library build and CUDA smoke tests remain pending for a safe runtime window.
+with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory. The June 13
+final sweep also linked the full `th_common` native library in the persistent
+B200 build cache and loaded it through `torch.ops.load_library` with a
+single-device driver exposure; the targeted HiSparse registrations were all
+present. CUDA runtime smoke tests against the deployed image remain pending for
+a safe runtime window.
 The June 13 continuation re-ran this non-disruptive compile for both
 `sparse_mla_decode_kvarn_hot.cu` and `hisparseKvarnHotRead.cu` with
 `/usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_100 -dc`; both produced
@@ -1278,17 +1282,21 @@ Current branch status:
   block-hot oracle, full-HBM serving fallback, and executable placeholder
   language. Remaining references are explicit prohibitions or external
   baseline/test-fixture boundaries. The new resident-padding smoke compiles
-  locally and passes the bounded B200 container syntax/source-contract check;
-  full pytest/runtime execution still requires a rebuilt image with
-  `tensorrt_llm.bindings`, the native op, and CUDA exposed;
+  locally and passes the bounded B200 container syntax/source-contract check.
+  The B200 proof build now links `libth_common.so`, and a driver-attached
+  registration probe confirms the HiSparse thops are present; full
+  pytest/runtime execution still requires a rebuilt deployment image with
+  `tensorrt_llm.bindings`, the native op, CUDA exposed, and live DSA/NIXL
+  metadata;
 - if the native op, CUDA-side planner, or sparse MLA hot-pool read path is
   absent, mapping raises rather than falling back to the full-HBM transform.
 
 Still pending before serving enablement:
 
-- run the CUDA smoke tests and a full native-library build in a safe B200
-  window; current verification has compiled translation units but has not
-  executed the CUDA runtime op under the deployed image;
+- run the CUDA smoke tests in a safe B200 runtime window; current verification
+  has compiled the translation units, linked `libth_common.so`, and loaded the
+  HiSparse registrations, but has not executed the CUDA runtime op under the
+  deployed image;
 - use `scripts/blaise_build_hisparse_thop.sh` for the current VM-side native
   thop proof loop. The June 13 build sweep established the required
   non-disruptive recipe: run inside the `hisa-buildtools-20260531` image, keep
@@ -1312,7 +1320,23 @@ Still pending before serving enablement:
   repeated configure loops. The CUTLASS kernel-generation CMake step also now
   passes the FetchContent CUTLASS Python root directly into its Python
   subprocess, so native proof builds do not depend on deprecated `develop
-  --user` behavior or user-site activation;
+  --user` behavior or user-site activation. The same build sweep found that
+  `cublasFp4ScaledMM.cpp` was compiled even when
+  `ENABLE_CUBLASLT_FP4_GEMM=OFF`, although its wrapper calls exist only behind
+  that option; `th_common` now includes that thop source only when the CUBLASLt
+  FP4 option is enabled, keeping the HiSparse proof build's unrelated FP4
+  disable path honest. The helper still disables unrelated OSS CUTLASS
+  low-latency, FP4, and all-reduce GEMM families, and `th_common` now only
+  compiles `fusedGemmAllreduceOp.cpp` when
+  `USING_OSS_CUTLASS_ALLREDUCE_GEMM=ON`, matching the option that builds the
+  underlying runner implementation. The helper leaves
+  `USING_OSS_CUTLASS_MOE_GEMM=ON` because `moeOp.cpp` expects the OSS MoE
+  interface that provides `MoeGemmId`, dynamic FP4 fc2 scaling, and the current
+  groupwise quantization signature. Generated SM80 CUTLASS instantiations stay
+  enabled in this proof path because the OSS MoE dispatch objects still contain
+  references to SM80 launchers; skipping them would require a separate,
+  architecture-filtered dispatch implementation rather than a CMake-only
+  shortcut;
 - optimize `sparse_mla_decode_kvarn_hot` beyond the direct per-row/head kernel
   by importing the compatible FlashMLA split scheduler/combine structure while
   preserving the packed KVarN-hot BDR producer load;

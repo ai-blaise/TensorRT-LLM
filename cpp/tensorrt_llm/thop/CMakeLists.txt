@@ -47,7 +47,6 @@ add_library(
   cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
-  cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
@@ -128,7 +127,6 @@ add_library(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
   dsv3RopeOp.cpp
-  fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
   indexerAffineReuseOp.cpp
   trtllmGenQKVProcessOp.cpp)
@@ -151,8 +149,14 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_sources(th_common PRIVATE cublasFp4ScaledMM.cpp)
   target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  target_sources(th_common PRIVATE fusedGemmAllreduceOp.cpp)
+  target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 endif()
 
 if(ENABLE_MULTI_DEVICE)
