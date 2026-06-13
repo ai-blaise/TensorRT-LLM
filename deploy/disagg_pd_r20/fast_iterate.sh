@@ -443,11 +443,23 @@ spec:
               "/cache/optrt/tensorrt_llm/llmapi_build",
           ]:
               Path(path).mkdir(parents=True, exist_ok=True)
+          def _exception_chain_contains(exc, needle):
+              seen = set()
+              stack = [exc]
+              while stack:
+                  cur = stack.pop()
+                  if cur is None or id(cur) in seen:
+                      continue
+                  seen.add(id(cur))
+                  if needle in str(cur):
+                      return True
+                  stack.extend([getattr(cur, "__cause__", None), getattr(cur, "__context__", None)])
+              return False
           for module in ["torch", "transformers", "tensorrt_llm"]:
               try:
                   importlib.import_module(module)
               except ImportError as exc:
-                  if module == "tensorrt_llm" and "libcuda.so.1" in str(exc):
+                  if module == "tensorrt_llm" and _exception_chain_contains(exc, "libcuda.so.1"):
                       print(f"prewarm_import_warning={module}: {exc}")
                       continue
                   raise
