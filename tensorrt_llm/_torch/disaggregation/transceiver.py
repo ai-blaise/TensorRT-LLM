@@ -323,7 +323,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid, session in sessions.items():
             if session.is_completed():
                 completed.append(rid)
-            elif session.has_failed():
+            elif session.has_failed() and not session.has_transferring_tasks():
                 failed.append(rid)
         return completed, failed
 
@@ -342,10 +342,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
         for rid in failed:
-            reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
-            sessions[rid].close()
-            del reqs[rid]
-            del sessions[rid]
+            if sessions[rid].close() is not False:
+                reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
+                del reqs[rid]
+                del sessions[rid]
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
@@ -533,10 +533,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         cancelled_reqs = []
         for rid in cancelled:
-            cancelled_reqs.append(self._recv_reqs[rid])
-            self._recv_sessions[rid].close()
-            del self._recv_reqs[rid]
-            del self._recv_sessions[rid]
+            if self._recv_sessions[rid].close() is not False:
+                cancelled_reqs.append(self._recv_reqs[rid])
+                del self._recv_reqs[rid]
+                del self._recv_sessions[rid]
 
         for rid in completed:
             session = self._recv_sessions[rid]

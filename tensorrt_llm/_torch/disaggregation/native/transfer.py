@@ -2343,7 +2343,14 @@ class RxSession(RxSessionBase):
 
     def close(self):
         if getattr(self, "_closed", False):
-            return
+            return True
+        if self.has_transferring_tasks():
+            logger.warning(
+                "RxSession.close deferred for request %s because KV/HiSparse "
+                "writes are still TRANSFERRING; caller must retry cleanup.",
+                self.disagg_request_id,
+            )
+            return False
         self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
@@ -2352,6 +2359,7 @@ class RxSession(RxSessionBase):
         if self._receiver is not None:
             self._receiver.release_hisparse_request(self.disagg_request_id)
             self._receiver.clear_session(self.disagg_request_id)
+        return True
 
     def __enter__(self):
         return self

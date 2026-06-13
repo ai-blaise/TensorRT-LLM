@@ -72,8 +72,8 @@ submission are implemented. The sender now returns explicit
 write and typed host write both succeed, and the receiver accumulates that
 coverage before marking host records committed. Startup still intentionally
 rejects `hisparse_enabled=true` before serving because live NIXL E2E proof,
-cancel-safe admission, host-to-hot swap-in, sparse MLA hot-pool reading, and
-BDR/on-read dequant are not complete. This is the correct failure mode: no
+live cancel/retraction proof, host-to-hot swap-in, sparse MLA hot-pool reading,
+and BDR/on-read dequant are not complete. This is the correct failure mode: no
 manifest should get an implicit full-HBM, FP16-staging, or direct-to-host-off
 substitute.
 
@@ -715,6 +715,10 @@ Current branch status:
 - added a fail-closed receiver guard so a HiSparse-enabled request that
   reserved host slots cannot complete without successful host-write commit
   coverage;
+- hardened disaggregated receive cleanup so cancelled/failed sessions are not
+  treated as processable while KV/HiSparse writes are still `TRANSFERRING`, and
+  `RxSession.close()` refuses to release HiSparse host rows until those writes
+  reach a terminal state;
 - extended `RankInfo` serialization so peers can publish/consume HiSparse host
   tier metadata through the existing rank-info handshake;
 - extended `TransferWorker` so allocated HiSparse host tiers are registered
@@ -730,8 +734,8 @@ Still pending before serving enablement:
   and partial-slice cases;
 - decode-admission gating that proves the request-visible host slots are
   committed before sparse MLA can select them;
-- cancel/abort handling that keeps host slots pinned until in-flight DRAM
-  writes finish;
+- live cancel/abort testing that proves host slots remain pinned until
+  in-flight DRAM writes finish;
 - E2E proof that NIXL writes land directly in decode host slots before decode
   admits the request.
 
@@ -812,9 +816,9 @@ packed-tier and host-registration skeleton:
    with live NIXL: verify multi-rank and partial-slice coverage, ensure failed
    or partial blocks remain invisible to hot selection, and add any missing
    receiver-side admission checks exposed by the E2E run;
-2. harden cancel/abort/retraction so host rows and hot slots remain pinned
-   while any NIXL DRAM write can still complete, and only recycle them after
-   the transfer agent reports a safe terminal state;
+2. prove and harden cancel/abort/retraction on live NIXL so host rows and hot
+   slots remain pinned while any DRAM write can still complete, and only
+   recycle them after the transfer agent reports a safe terminal state;
 3. verify generation-first request pinning end to end with live NIXL metadata:
    decode publishes writable host slots, prefill writes directly into those
    slots, and decode admission is blocked until the commit handoff completes;
