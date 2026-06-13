@@ -144,6 +144,47 @@ bit-exact data movement. Then #3.
 
 ### Next (ranked, for the next rebuild cycles)
 1. **Validate FIFO_DEPTH=8** e2e (rebuild → deploy → tight-c16 A/B + numerical/throughput parity).
-2. **1b: fuse the INPUT gated-norm+quant → kv_a_proj** (the real Lever-1 GPU win, ~0.5ms). Standalone
-   cosine test of the fused gated-norm+quant vs separate first, then wire, then e2e.
+2. **1b: fuse the INPUT gated-norm+quant → kv_a_proj** (the real Lever-1 GPU win, ~0.5ms).
 3. Lever 2 #3 (dispatch field reduction / postquant-alltoall) — bigger a2a win than the FIFO knob.
+
+### 1b — FULL SPEC (scoped 2026-06-13; deliberate cosine-gated cycle, do NOT batch with FIFO_DEPTH)
+
+**Goal:** the INPUT gated norm (`_maybe_apply_gated_norm`, `modeling_deepseekv3.py:1721`) emits a
+swizzled `Fp4QuantizedTensor` for `kv_a_proj_with_mqa`, mirroring the ALREADY-SHIPPED dense
+post-attention path `_apply_post_attention_gated_norm_quant_dense` (`:1682`, uses
+`apply_fused_lowrank_gate_quant_nvfp4_swizzled`). Removes the kv_a_proj input-quant (`linear.py:1432`) ×61.
+
+**Why it's surgery, not a flag:** the gate output feeds BOTH consumers in `forward_dsa_proj`
+(`attention.py:1963` kv_a_proj — wants fp4; `:1992` `indexer.pre_indexer_proj(qr, hidden_states,…)` —
+wants **bf16** for its own fp32/tf32 wk/wp GEMM). And the proj path is a **CUDA-graph custom op**
+`mla_dsa_proj` (`:1035`, `.register_fake` `:1059`). So we must carry both forms (fp4 for kv_a, bf16 for
+indexer) into the graph-captured op.
+
+**Edits (verified file:line):**
+1. `_resolve_prekv_quant_scale(self)` (new, mirror `_resolve_premlp_quant_scale` `:1665`): return
+   `self.self_attn.<…>.kv_a_proj_with_mqa.input_scale` if it `has_nvfp4` + no pre_quant_scale + not
+   force-dynamic; else None. (Confirm the attribute path to kv_a_proj from the decoder.)
+2. `_apply_input_gated_norm_quant(self, hidden_states)` (new, copy of `_apply_post_attention_gated_norm_quant_dense`
+   `:1682-1707` but with `input_gated_norm_down/up` + the prekv scale): returns
+   `(y_bf16, Fp4QuantizedTensor swizzled | None)`.
+3. `forward` (`:1721`): replace the input `_maybe_apply_gated_norm(...)` with
+   `hs_bf16, hs_fp4 = self._apply_input_gated_norm_quant(hidden_states)`; pass BOTH to `self_attn`.
+4. **Thread the fp4 into the graph op** — choose the lower-risk of:
+   - (A) **metadata stash**: decoder stashes `hs_fp4` (data+sf) on the mla metadata before
+     `self_attn`; `forward_dsa_proj` reads it for kv_a_proj, keeps `hidden_states` (bf16) for the
+     indexer. Avoids a custom-op schema change; needs the stash to be a graph-stable buffer.
+   - (B) **custom-op schema**: add optional `kv_fp4: Tensor?, kv_sf: Tensor?` to `mla_dsa_proj` (`:1035`)
+     + its `register_fake` (`:1059`); `forward_dsa_proj` uses them for kv_a_proj. Cleaner data-flow,
+     but a schema change on the hot graph op.
+5. `forward_dsa_proj` (`:1963`): `kv_a_proj_with_mqa(kv_fp4 if kv_fp4 is not None else hidden_states)`;
+   leave `:1992` indexer on bf16 `hidden_states`. (MLA `forward` already types `hidden_states` as
+   `Union[torch.Tensor, Fp4QuantizedTensor]`, `:864` — the consumption side is half-ready.)
+
+**Validation:** (1) standalone cosine — `apply_fused_lowrank_gate_quant_nvfp4_swizzled(gate)` →
+dequant vs `_maybe_apply_gated_norm(gate)` → `fp4_quantize(input_scale)`, ≥0.98 (expect ~1.0, same
+scale). (2) e2e throughput parity + zero errors. **Build/deploy as its OWN image (not batched with
+FIFO_DEPTH) for clean attribution.**
+
+**Caveat:** the input gate output also feeds the indexer with a (likely) different input_scale, so a
+single fp4 cannot serve both — that's why we keep bf16 for the indexer (it re-quantizes as today). Net
+removes only the kv_a_proj quant, not the indexer's.
