@@ -123,6 +123,68 @@ def test_kvarn_bdr_source_pool_fragments_and_recycle_cpu():
         pool.packed_source_fragments([2])
 
 
+def _has_mla_bdr_writer_cuda_op() -> bool:
+    try:
+        return bool(
+            torch._C._dispatch_has_kernel_for_dispatch_key(
+                "trtllm::mla_bdr_write_kvarn_record", "CUDA"))
+    except RuntimeError:
+        return False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for the native BDR writer")
+def test_mla_bdr_write_kvarn_record_cuda_layout_smoke():
+    """B200 smoke: native writer fills exactly the production BDR record.
+
+    This is the small live-proof test for the HiSparse source writer. It does
+    not introduce a Python BDR writer or any serving oracle; it only checks the
+    registered native op's byte layout, block-id targeting, and current-stream
+    completion contract before the record can be copied back for validation.
+    """
+    if not _has_mla_bdr_writer_cuda_op():
+        pytest.skip("trtllm::mla_bdr_write_kvarn_record CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    ckv = torch.arange(64 * cfg.kv_lora_rank,
+                       device=device,
+                       dtype=torch.float32).reshape(64, cfg.kv_lora_rank)
+    ckv = ((ckv.remainder(257) - 128.0) / 128.0).to(torch.float16)
+    pe = torch.linspace(-1.0,
+                        1.0,
+                        steps=64 * cfg.qk_rope_head_dim,
+                        device=device,
+                        dtype=torch.float32).reshape(
+                            64, cfg.qk_rope_head_dim).to(torch.float16)
+    latent = torch.cat([ckv, pe], dim=1).contiguous()
+    bdr_records = torch.full((2, layout.packed_bytes_per_block + 17),
+                             0xA5,
+                             device=device,
+                             dtype=torch.uint8)
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.ops.trtllm.mla_bdr_write_kvarn_record(
+            latent, bdr_records, 1, layout.ckv_bits, layout.kv_lora_rank,
+            layout.qk_rope_head_dim)
+    stream.synchronize()
+
+    record_cpu = bdr_records.cpu()
+    ckv_q0, ckv_q1 = layout.field_offsets["ckv_q"]
+    sc0, sc1 = layout.field_offsets["ckv_scale_zp"]
+    pe0, pe1 = layout.field_offsets["pe_byte"]
+
+    assert bool(torch.all(record_cpu[0] == 0xA5))
+    assert bool(
+        torch.all(record_cpu[1, layout.packed_bytes_per_block:] == 0xA5))
+    assert not bool(torch.all(record_cpu[1, ckv_q0:ckv_q1] == 0xA5))
+    assert not bool(torch.all(record_cpu[1, sc0:sc1] == 0xA5))
+    assert not bool(torch.all(record_cpu[1, pe0:pe1] == 0xA5))
+
+
 def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
     torch.manual_seed(20260606)
     group = 64

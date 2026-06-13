@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
     OPTRTHiSparseCoordinator)
@@ -406,6 +407,48 @@ def test_hisparse_allocate_packed_tensors_shapes_and_initializers():
         0, 0, 0, 0, -1, -1, 0, -1, -1, -1, -1, -1, -1, 0, 0
     ]
     assert coordinator.stats()["tensors_allocated"] == 1
+
+
+def test_hisparse_request_table_syncs_host_rows_to_device_rows_cpu():
+    coordinator = OPTRTHiSparseCoordinator(_cfg())
+    coordinator.configure_packed_tiers(num_layers=2,
+                                       tokens_per_block=64,
+                                       packed_bytes_per_block=1024,
+                                       logical_host_capacity_blocks=6,
+                                       hot_device_capacity_blocks=2,
+                                       request_slot_capacity=2,
+                                       max_blocks_per_request=4)
+    tensors = coordinator.allocate_packed_tensors(device="cpu",
+                                                  host_pinned=False)
+
+    state = coordinator.reserve_request(req_pool_idx=101, num_prompt_blocks=3)
+    slot = state.table_slot
+
+    assert int(tensors.request_ids_host[slot]) == 101
+    assert int(tensors.request_ids_device[slot]) == 101
+    assert tensors.request_block_host_slots_host[slot].tolist() == [0, 1, 2, -1]
+    assert tensors.request_block_host_slots_device[slot].tolist() == [
+        0, 1, 2, -1
+    ]
+    assert torch.equal(tensors.request_block_commit_gen_device[slot],
+                       tensors.request_block_commit_gen_host[slot])
+
+    coordinator.mark_host_block_committed(101, 1)
+    assert int(tensors.request_block_commit_gen_host[slot, 1]) == 1
+    assert int(tensors.request_block_commit_gen_device[slot, 1]) == 1
+    assert bool(tensors.request_admitted_device[slot]) is False
+
+    coordinator.mark_host_block_committed(101, 0)
+    coordinator.mark_host_block_committed(101, 2)
+    coordinator.mark_request_admitted(101)
+    assert bool(tensors.request_admitted_host[slot]) is True
+    assert bool(tensors.request_admitted_device[slot]) is True
+
+    coordinator.release_request(101)
+    assert int(tensors.request_ids_device[slot]) == -1
+    assert bool(tensors.request_admitted_device[slot]) is False
+    assert tensors.request_block_host_slots_device[slot].tolist() == [-1] * 4
+    assert tensors.request_block_commit_gen_device[slot].tolist() == [-1] * 4
 
 
 def test_hisparse_request_table_slots_are_stable_and_reused():

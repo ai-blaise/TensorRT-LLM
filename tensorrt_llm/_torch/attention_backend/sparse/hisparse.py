@@ -491,6 +491,51 @@ class OPTRTHiSparseCoordinator:
         except (AttributeError, TypeError, IndexError):
             return False
 
+    @staticmethod
+    def _copy_tensor(dst, src) -> bool:
+        try:
+            dst.copy_(src, non_blocking=True)
+            return True
+        except (AttributeError, TypeError, IndexError):
+            return False
+
+    @classmethod
+    def _copy_tensor_index(cls, dst, src, index) -> bool:
+        try:
+            return cls._copy_tensor(dst[index], src[index])
+        except (AttributeError, TypeError, IndexError):
+            return False
+
+    def _sync_request_table_slot_to_device(
+        self,
+        table_slot: int,
+        *,
+        sync_blocks: bool = False,
+    ) -> None:
+        """Publish one host-side request-table slot to device-visible rows.
+
+        The planner consumes the device mirrors. Keep Python lifecycle updates
+        on the pinned host rows, then copy the changed slot/row to device in
+        one operation per tensor. This avoids per-cell device scalar writes and
+        keeps the ABI ready for a later native/stream-ordered batch publisher.
+        """
+        tensors = self._tensors
+        if tensors is None:
+            return
+        table_slot = int(table_slot)
+        self._copy_tensor_index(tensors.request_ids_device,
+                                tensors.request_ids_host, table_slot)
+        self._copy_tensor_index(tensors.request_admitted_device,
+                                tensors.request_admitted_host, table_slot)
+        if not sync_blocks:
+            return
+        self._copy_tensor_index(tensors.request_block_host_slots_device,
+                                tensors.request_block_host_slots_host,
+                                table_slot)
+        self._copy_tensor_index(tensors.request_block_commit_gen_device,
+                                tensors.request_block_commit_gen_host,
+                                table_slot)
+
     def _write_request_table_header(self,
                                     state: HiSparseRequestState) -> None:
         tensors = self._tensors
@@ -499,9 +544,10 @@ class OPTRTHiSparseCoordinator:
         slot = int(state.table_slot)
         self._set_tensor_value_1d(tensors.request_ids_host, slot,
                                   int(state.req_pool_idx))
-        self._set_tensor_value_1d(tensors.request_ids_device, slot,
-                                  int(state.req_pool_idx))
-        self._write_request_table_admitted(state, admitted=state.admitted)
+        self._write_request_table_admitted(state,
+                                           admitted=state.admitted,
+                                           sync_device=False)
+        self._sync_request_table_slot_to_device(slot, sync_blocks=False)
 
     def _write_request_table_block(
         self,
@@ -510,6 +556,7 @@ class OPTRTHiSparseCoordinator:
         *,
         host_slot: int,
         commit_gen: int,
+        sync_device: bool = True,
     ) -> None:
         tensors = self._tensors
         if tensors is None:
@@ -521,26 +568,26 @@ class OPTRTHiSparseCoordinator:
             raise IndexError(
                 f"HiSparse request block_pos {block_pos} exceeds request "
                 f"table width {tier.max_blocks_per_request}.")
-        for tensor in (tensors.request_block_host_slots_host,
-                       tensors.request_block_host_slots_device):
-            self._set_tensor_value_2d(tensor, slot, block_pos, int(host_slot))
-        for tensor in (tensors.request_block_commit_gen_host,
-                       tensors.request_block_commit_gen_device):
-            self._set_tensor_value_2d(tensor, slot, block_pos,
-                                      int(commit_gen))
+        self._set_tensor_value_2d(tensors.request_block_host_slots_host, slot,
+                                  block_pos, int(host_slot))
+        self._set_tensor_value_2d(tensors.request_block_commit_gen_host, slot,
+                                  block_pos, int(commit_gen))
+        if sync_device:
+            self._sync_request_table_slot_to_device(slot, sync_blocks=True)
 
     def _write_request_table_admitted(self,
                                       state: HiSparseRequestState,
                                       *,
-                                      admitted: bool) -> None:
+                                      admitted: bool,
+                                      sync_device: bool = True) -> None:
         tensors = self._tensors
         if tensors is None:
             return
         slot = int(state.table_slot)
         self._set_tensor_value_1d(tensors.request_admitted_host, slot,
                                   bool(admitted))
-        self._set_tensor_value_1d(tensors.request_admitted_device, slot,
-                                  bool(admitted))
+        if sync_device:
+            self._sync_request_table_slot_to_device(slot, sync_blocks=False)
 
     def _clear_request_table_slot(self, table_slot: int) -> None:
         tensors = self._tensors
@@ -548,16 +595,11 @@ class OPTRTHiSparseCoordinator:
             return
         table_slot = int(table_slot)
         self._set_tensor_value_1d(tensors.request_ids_host, table_slot, -1)
-        self._set_tensor_value_1d(tensors.request_ids_device, table_slot, -1)
         self._set_tensor_value_1d(tensors.request_admitted_host, table_slot,
-                                  False)
-        self._set_tensor_value_1d(tensors.request_admitted_device, table_slot,
                                   False)
         tier = self._require_configured()
         row_tensors = (tensors.request_block_host_slots_host,
-                       tensors.request_block_host_slots_device,
-                       tensors.request_block_commit_gen_host,
-                       tensors.request_block_commit_gen_device)
+                       tensors.request_block_commit_gen_host)
         pending = [
             tensor for tensor in row_tensors
             if not self._fill_tensor_row(tensor, table_slot, -1)
@@ -565,6 +607,7 @@ class OPTRTHiSparseCoordinator:
         for block_pos in range(tier.max_blocks_per_request):
             for tensor in pending:
                 self._set_tensor_value_2d(tensor, table_slot, block_pos, -1)
+        self._sync_request_table_slot_to_device(table_slot, sync_blocks=True)
 
     def request_table_snapshot(self, req_pool_idx: int) -> Dict[str, object]:
         """Return host-side table metadata for unit/debug validation."""
@@ -915,8 +958,10 @@ class OPTRTHiSparseCoordinator:
             self._write_request_table_block(state,
                                             block_pos,
                                             host_slot=host_slot,
-                                            commit_gen=-1)
+                                            commit_gen=-1,
+                                            sync_device=False)
         self._requests[req_pool_idx] = state
+        self._sync_request_table_slot_to_device(table_slot, sync_blocks=True)
         return state
 
     def reserve_or_get_request(

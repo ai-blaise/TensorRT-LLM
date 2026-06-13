@@ -81,11 +81,13 @@ host-slot sideband, packed KVarN source/destination fragment derivation, typed
 hot-block planning ABI are implemented. A device-visible request table now
 publishes disaggregated request ids, request-relative block-to-host-slot rows,
 host commit generations, and admission flags for the future native hot-slot
-planner. This table is the required production ABI shape, but its current
-Python lifecycle writer is not the final serving publication mechanism; before
-the startup guard is relaxed, request-table updates must be batched,
-stream-ordered, and native or async-copy driven so decode does not pay
-per-block Python synchronization cost. The sender now returns explicit
+planner. This table is the required production ABI shape, and request-table
+lifecycle updates now publish through host-side rows followed by row/slot
+copies to the device mirror instead of per-cell device scalar writes. That is
+still not the final serving publication mechanism; before the startup guard is
+relaxed, request-table updates must be batched, stream-ordered, and native or
+async-copy driven so decode does not pay Python lifecycle overhead. The sender
+now returns explicit
 `(local_layer, request_block_pos)` commit coverage only after the normal KV
 write and typed host write both succeed, and the receiver accumulates that
 coverage before marking host records committed. Admission is explicit: a
@@ -805,9 +807,11 @@ Current branch status:
   coordinator table slots:
   `request_ids`, `request_block_host_slots`, `request_block_commit_gen`, and
   `request_admitted`;
-- kept that request table in the final CUDA-planner ABI shape, while requiring
-  a later batched/native metadata writer before enabled serving so table
-  publication is not a Python per-cell hot path;
+- kept that request table in the final CUDA-planner ABI shape, and changed
+  lifecycle publication to update host rows first, then copy the affected
+  slot/row to the device mirror. This removes per-cell device scalar writes;
+  a later batched/native metadata writer is still required before enabled
+  serving so publication is stream-ordered and not Python-driven;
 - bounded direct `configure_packed_tiers()` request-table defaults to avoid
   quadratic host-block allocation, while production `configure_from_kv_cache_manager()`
   derives table capacity from `max_batch_size` and width from
@@ -879,6 +883,10 @@ Current branch status:
   writer that consumes the paged dense MLA latent block view and fills the
   `KVarNBDRSourcePool` record with low-bit C-KV, C-KV scale/zp, and the current
   8-bit RoPE payload;
+- added `test_mla_bdr_write_kvarn_record_cuda_layout_smoke`, a tiny CUDA smoke
+  test that skips unless the native writer op is loaded and then proves
+  block-id targeting, BDR field writes, padding preservation, and current-stream
+  completion for the production `kvarn_k2v2` BDR record shape;
 - wired the KVarN full-block commit walk to populate the BDR source pool when
   the HiSparse BDR layout is active, including the backfill case where the
   legacy side-pool record was already valid but the BDR source record was not;
@@ -932,10 +940,14 @@ Still pending before serving enablement:
   and proof that its current-stream writes are ordered before any NIXL source
   read. The commit walk now fills `KVarNBDRSourcePool` records beside the legacy
   restore side-pool, but promotion still requires the stream-order proof and
-  end-to-end validation;
-- replacement of scalar lifecycle request-table writes with a stream-ordered
-  batched/native publication path for admission, commit-generation, and cleanup
-  updates;
+  end-to-end validation. The first command to run in a safe B200 window is:
+
+  ```bash
+  pytest tests/unittest/_torch/attention/sparse/test_kvarn_k2v2.py -k mla_bdr_write_kvarn_record_cuda_layout_smoke -q
+  ```
+- replacement of row-level Python request-table publication with a
+  stream-ordered batched/native path for admission, commit-generation, and
+  cleanup updates;
 - sparse MLA hot-pool ABI and BDR/on-read dequant hookup.
 
 ### Gate 3: Swap-In Kernel And Sparse MLA Hook
