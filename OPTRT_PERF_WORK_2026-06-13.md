@@ -117,6 +117,23 @@ bit-exact data movement. Then #3.
 
 ---
 
+## DEFINITIVE CONCLUSION (2026-06-13) — cheap-win space is exhausted; headroom is structural
+After the full profile + all-spots dig + two measured A/Bs, the picture is conclusive:
+- **GPU 96.5% busy steady** (gap_analysis), at-floor kernels (GEMM microbench), cross-stream overlap.
+- **Cheap levers measured NEUTRAL:** cumsum→moveIndice fusion (§9) and FIFO_DEPTH 4→8 (both ~52 tok/s).
+- **a2a already data-optimized:** `TRTLLM_MOE_POST_QUANT_ALLTOALLV=1` by default → dispatch already
+  sends NVFP4 (the `moeAllToAllKernel<1,true>` low-precision path). No config win left there.
+- **1b (~0.5ms) likely neutral too** (cumsum was) — not worth the graph-surgery risk for THROUGHPUT
+  (helps c1 latency / graph-node count only).
+- **The ONLY c16-throughput headroom is large structural kernel work:** (A) **megakernel collapse of
+  the dense GEMM/BMM swarm (~9ms, biggest)** — fuse per-layer projections into persistent kernels to
+  amortize the ~14µs/GEMM fixed floor (the WarpDecode direction, extended to dense MLA); (B) **a2a
+  dispatch↔FC1 pipelining / combine side-stream** to overlap the 2ms comm with expert compute
+  (MegaMoE/`FusedCommMoEScheduler` is the in-tree vehicle). Both are multi-day kernel projects.
+
+The op-trt stack is at its optimization frontier for cheap/config/fusion levers. Spencer's work has
+already captured them; remaining wins need structural megakernel/comm-pipeline engineering.
+
 ## Profile revisit (2026-06-13) — GPU bubble analysis (CORRECTION)
 Built `.bench_runs_claude/gap_analysis.py` (GPU busy-UNION across streams vs span, per-iter
 segmented by cudaGraphLaunch). **Steady-state GPU is 96.5% busy — only ~620µs/iter idle** (3.5%).
