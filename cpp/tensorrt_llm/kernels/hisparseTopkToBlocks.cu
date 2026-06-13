@@ -37,6 +37,15 @@ enum HiSparsePlanStatus : uint8_t
     kPlanInsufficientHotSlots = 4,
 };
 
+enum HiSparseCommitStatus : uint8_t
+{
+    kCommitOk = 0,
+    kCommitUpstreamInvalid = 1,
+    kCommitBadBlockCount = 2,
+    kCommitInvalidPlan = 3,
+    kCommitHotSlotOutOfRange = 4,
+};
+
 __device__ __forceinline__ uint32_t hisparseHash32(uint32_t value)
 {
     value ^= value >> 16;
@@ -426,6 +435,69 @@ __global__ void hisparsePlanHotSlotsKernel(int64_t const* __restrict__ hostSlots
     }
 }
 
+__global__ void hisparseCommitHotSlotsKernel(int64_t const* __restrict__ hostSlots,
+    int64_t const* __restrict__ commitGens, int64_t const* __restrict__ plannedHotSlots,
+    int64_t const* __restrict__ plannedLruTick, int32_t const* __restrict__ blockCounts,
+    uint8_t const* __restrict__ planRowStatus, int64_t* __restrict__ hotHostSlot,
+    int64_t* __restrict__ hotCommitGen, int64_t* __restrict__ hotLruTick, uint8_t* __restrict__ rowStatus,
+    int32_t numRows, int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0 || layerIdx < 0 || layerIdx >= numLayers)
+    {
+        return;
+    }
+
+    int64_t const layerOffset = static_cast<int64_t>(layerIdx) * hotCapacity;
+    for (int32_t row = 0; row < numRows; ++row)
+    {
+        uint8_t const upstreamStatus = planRowStatus[row];
+        if (upstreamStatus != kPlanOk)
+        {
+            rowStatus[row] = kCommitUpstreamInvalid;
+            continue;
+        }
+        int32_t const count = blockCounts[row];
+        if (count < 0 || count > maxBlocksPerRow)
+        {
+            rowStatus[row] = kCommitBadBlockCount;
+            continue;
+        }
+
+        bool valid = true;
+        int64_t const rowOffset = static_cast<int64_t>(row) * maxBlocksPerRow;
+        for (int32_t i = 0; i < count; ++i)
+        {
+            int64_t const hotSlot = plannedHotSlots[rowOffset + i];
+            if (hotSlot < 0 || hotSlot >= hotCapacity)
+            {
+                rowStatus[row] = kCommitHotSlotOutOfRange;
+                valid = false;
+                break;
+            }
+            if (hostSlots[rowOffset + i] < 0 || commitGens[rowOffset + i] < 0 || plannedLruTick[rowOffset + i] < 0)
+            {
+                rowStatus[row] = kCommitInvalidPlan;
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+        {
+            continue;
+        }
+
+        for (int32_t i = 0; i < count; ++i)
+        {
+            int64_t const hotSlot = plannedHotSlots[rowOffset + i];
+            int64_t const dst = layerOffset + hotSlot;
+            hotHostSlot[dst] = hostSlots[rowOffset + i];
+            hotCommitGen[dst] = commitGens[rowOffset + i];
+            hotLruTick[dst] = plannedLruTick[rowOffset + i];
+        }
+        rowStatus[row] = kCommitOk;
+    }
+}
+
 } // namespace
 
 void invokeHisparseTopkToBlockPositions(int32_t const* topkIndices, int32_t* blockPositions, int32_t* blockCounts,
@@ -497,6 +569,26 @@ void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitG
         resolveRowStatus, hotHostSlot, hotCommitGen, hotLruTick, plannedHotSlots, plannedLruTick, missHostSlots,
         missHotSlots, missCounts, hitFlags, rowStatus, numRows, maxBlocksPerRow, numLayers, hotCapacity, layerIdx,
         lruTickBase);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeHisparseCommitHotSlots(int64_t const* hostSlots, int64_t const* commitGens, int64_t const* plannedHotSlots,
+    int64_t const* plannedLruTick, int32_t const* blockCounts, uint8_t const* planRowStatus, int64_t* hotHostSlot,
+    int64_t* hotCommitGen, int64_t* hotLruTick, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
+    int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, cudaStream_t stream)
+{
+    if (numRows <= 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(maxBlocksPerRow > 0, "hisparse_commit_hot_slots requires max_blocks_per_row > 0");
+    TLLM_CHECK_WITH_INFO(numLayers > 0, "hisparse_commit_hot_slots requires num_layers > 0");
+    TLLM_CHECK_WITH_INFO(hotCapacity > 0, "hisparse_commit_hot_slots requires hot_capacity > 0");
+    TLLM_CHECK_WITH_INFO(layerIdx >= 0 && layerIdx < numLayers, "hisparse_commit_hot_slots layer_idx out of range");
+
+    hisparseCommitHotSlotsKernel<<<1, 1, 0, stream>>>(hostSlots, commitGens, plannedHotSlots, plannedLruTick,
+        blockCounts, planRowStatus, hotHostSlot, hotCommitGen, hotLruTick, rowStatus, numRows, maxBlocksPerRow,
+        numLayers, hotCapacity, layerIdx);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

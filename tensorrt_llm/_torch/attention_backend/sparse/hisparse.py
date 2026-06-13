@@ -1447,8 +1447,17 @@ class OPTRTHiSparseCoordinator:
                 "HiSparse must copy packed KVarN miss blocks from NIXL-writable "
                 "host tiers into the hot device tier before sparse MLA reads "
                 "them; no FP16 staging path or full-HBM fallback is allowed.")
+        if not self._torch_cuda_op_registered(
+                "trtllm::hisparse_commit_hot_slots"):
+            raise NotImplementedError(
+                "trtllm::hisparse_commit_hot_slots is not registered with a "
+                "CUDA kernel. HiSparse must publish post-copy hot metadata on "
+                "device before sparse MLA can consume the hot tier; no Python "
+                "hot metadata commit path is allowed for enabled serving.")
         raise NotImplementedError(
-            "HiSparse hot-pool TopK mapping still needs the CUDA-side "
-            "request/topk-to-block planner and sparse MLA hot-pool read path. "
-            "The coordinator ABI is production-shaped, but serving remains "
+            "HiSparse hot-pool TopK mapping still needs native orchestration "
+            "across TopK block rows, request-table resolution, hot-slot "
+            "planning, packed-copy submission, post-copy metadata commit, hot "
+            "global-index construction, and sparse MLA hot-pool read. The "
+            "coordinator ABI is production-shaped, but serving remains "
             "fail-closed until those pieces are wired and validated.")

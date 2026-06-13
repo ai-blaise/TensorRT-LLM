@@ -33,6 +33,11 @@ void invokeHisparsePlanHotSlots(int64_t const* hostSlots, int64_t const* commitG
     int32_t maxBlocksPerRow, int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, int64_t lruTickBase,
     cudaStream_t stream);
 
+void invokeHisparseCommitHotSlots(int64_t const* hostSlots, int64_t const* commitGens, int64_t const* plannedHotSlots,
+    int64_t const* plannedLruTick, int32_t const* blockCounts, uint8_t const* planRowStatus, int64_t* hotHostSlot,
+    int64_t* hotCommitGen, int64_t* hotLruTick, uint8_t* rowStatus, int32_t numRows, int32_t maxBlocksPerRow,
+    int32_t numLayers, int32_t hotCapacity, int32_t layerIdx, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

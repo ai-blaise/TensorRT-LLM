@@ -267,6 +267,16 @@ def _register_fake():
                 host_slots.new_empty(host_slots.shape, dtype=torch.uint8),
                 host_slots.new_empty((rows, ), dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::hisparse_commit_hot_slots")
+    def _(host_slots, commit_gens, planned_hot_slots, planned_lru_tick,
+          block_counts, plan_row_status, hot_host_slot, hot_commit_gen,
+          hot_lru_tick, layer_idx):
+        del host_slots, commit_gens, planned_hot_slots, planned_lru_tick
+        del plan_row_status, hot_host_slot, hot_commit_gen
+        del hot_lru_tick, layer_idx
+        return block_counts.new_empty((block_counts.shape[0], ),
+                                      dtype=torch.uint8)
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.
