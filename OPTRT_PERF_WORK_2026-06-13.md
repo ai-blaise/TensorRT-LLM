@@ -117,6 +117,16 @@ bit-exact data movement. Then #3.
 
 ---
 
+## Profile revisit (2026-06-13) — GPU bubble analysis (CORRECTION)
+Built `.bench_runs_claude/gap_analysis.py` (GPU busy-UNION across streams vs span, per-iter
+segmented by cudaGraphLaunch). **Steady-state GPU is 96.5% busy — only ~620µs/iter idle** (3.5%).
+My earlier "GPU 100% busy" was right for steady state; the global 87.6%/8-10ms gaps were
+inter-round capture artifacts (excluded by median-iter segmentation). So **there is NO recoverable
+bubble** — the `cudaEventSynchronize` (5.1ms) and `cudaGraphLaunch` (2.95ms) host costs overlap GPU
+work and do NOT idle the GPU. Conclusion REINFORCED: throughput is gated by GPU kernel time;
+wins must cut kernels (structural/megakernel) or fuse (1b). The 620µs idle is small
+kernel-to-kernel scheduling gaps (launch-overhead, → fewer kernels = megakernel territory).
+
 ## Findings log
 - 2026-06-13: 3 parallel investigations complete (glue / quant / a2a). Crux confirmed:
   fused norm+quant op exists & wired, just disabled for V3.2 (1b = enablement). a2a is
