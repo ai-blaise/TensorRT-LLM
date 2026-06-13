@@ -91,6 +91,35 @@ requirements are carried into this plan:
   fusion experiments. CZS source there is an exported source tree without
   `.git`; the authoritative CZS commit remains the AgentMemory/GitHub
   `148ed9fadc886617f1473249994a4279170eb98e` record above.
+- The June 13 build-wait audit re-read the local CZS and IKP documents on
+  `a4-us-001` directly, not through summaries. The HiSparse promotion checklist
+  now treats the following CZS obligations as concrete gates for any replacement
+  of the direct KVarN-hot sparse MLA kernel:
+  - `v4_sub_byte_alignment`: prove sub-byte packed runs with 16-byte base
+    alignment and leading dimensions that satisfy the packed operand contract;
+  - `v3_mma_overlap`: prove any shared-SMEM reuse between future-stage
+    operand regions and output regions before reducing pipeline separation;
+  - `v3_clc_race_freeness`: prove each CTA in a CLC cluster issues
+    `try_cancel` exactly once before adopting persistent dynamic scheduling;
+  - `v4_tcgen_cp_scale_staging`: prove scale-factor staging only for kernels
+    that actually use Blackwell block-scale MMA layouts. The current
+    `kvarn_k2v2` BDR record is byte-addressed KVarN storage, not NVFP4
+    hardware block-scale storage, so this proof cannot be used to justify a
+    layout substitution.
+- IKP integration is similarly gate-level, not optional polish. The first
+  instrumented profile must keep the region set small enough to avoid trace
+  perturbation and must cover at least: full kernel, TopK/hot-index decode,
+  BDR read/dequant, resident sink/tail read, score reduction/softmax, value
+  accumulation, and output write. The accepted optimization package must also
+  include an NSys merge so launch latency, NIXL/host-hot copies, CUDA API gaps,
+  and NCCL/LayerSplit traffic are visible on the same timeline as the
+  intra-kernel regions.
+- The active direct CUDA kernel has already compiled in the full `th_common`
+  build with ptxas reporting no spills for
+  `sparse_mla_decode_kvarn_hot.cu` on SM100a, but that is only a compilation
+  signal. It does not replace the CZS/IKP/NSys promotion evidence above, and it
+  does not authorize a split-producer/CuTe rewrite before the serving-layout
+  import proof and live DSA/NIXL proof are complete.
 
 ## Executive Decision
 
@@ -366,12 +395,23 @@ library uses the current byte-addressed BDR helpers successfully. A rebuilt
 `libth_common.so` plus a rerun of
 `deploy/disagg_pd_r20/build_hisparse_serving_import_proof_image.sh` is required
 before the stronger serving-import proof can be marked complete.
-The June 13 continuation re-ran this non-disruptive compile for both
-`sparse_mla_decode_kvarn_hot.cu` and `hisparseKvarnHotRead.cu` with
-`/usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_100 -dc`; both produced
-objects under `/tmp/hisparse-nvcc-check` on `a4-us-002-rl9`. The same audit
-confirmed the live Dynamo deployment is running the NIXL/PYTHON transceiver
-configuration with `--connector none`; the explicit
+The rebuilt `libth_common.so` serving-layout proof is now complete on
+`a4-us-001` for source SHA `4d274bd53338726648d9fa6c05e0d5b70375a3df`:
+`localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-4d274bd53338-hisparse-serving-import-proof-20260613T142136Z`
+was built from the persistent
+`/home/spencer/work/build-cache/hisparse-thop-001` cache, imported branch
+Python from `/opt/dynamo/venv/lib/python3.12/site-packages`, loaded
+`/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/libs/libth_common.so`
+through the normal package loader, and passed both
+`native_planner_copy_smoke.py` and `sparse_mla_kvarn_hot_smoke.py` without an
+explicit `--library` path. This closes the stale-`libth_common.so` serving
+import gap. The remaining gate is live DSA/NIXL deployment proof and
+profiling; this image proof still does not flip
+`hisparse_sparse_mla_resident_v1_ready()` to true. All follow-up VM work for
+this branch should stay on `a4-us-001`; `a4-us-002` is not part of the current
+allowed workflow. The same audit confirmed the live Dynamo deployment is
+running the NIXL/PYTHON transceiver configuration with `--connector none`; the
+explicit
 `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` value is the NIXL plugin backend on the
 current GCP B200 lane, not the legacy/direct UCX cache transceiver.
 The June 13 sweep also fixed a separate dense-MLA KVarN correctness issue in
@@ -1899,10 +1939,10 @@ production ABI:
      `build_hisparse_serving_import_proof_image.sh --run-smoke` image imports
      branch Python from deployment-runtime site-packages, loads
      `site-packages/tensorrt_llm/libs/libth_common.so` through the normal
-     TensorRT-LLM package loader, and reruns the native planner/copy smoke
-     without `--library`. The latest proof image for
-     `aba720ca642256ec710daf1bd4e2a2409cb1e8a6` is
-     `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-aba720ca6422-hisparse-serving-import-proof-v2-20260613T131600Z`;
+     TensorRT-LLM package loader, and reruns the native planner/copy smoke and
+     fused sparse MLA KVarN-hot smoke without `--library`. The latest proof
+     image for `4d274bd53338726648d9fa6c05e0d5b70375a3df` is
+     `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-4d274bd53338-hisparse-serving-import-proof-20260613T142136Z`;
    - current branch-head generated binding/plugin proof is not required because
      the source diff does not touch nanobind, plugin source, or transfer-agent
      binding source. If any of those sources change later, use the persistent
