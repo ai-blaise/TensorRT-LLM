@@ -541,16 +541,23 @@ def test_hisparse_request_table_native_publisher_is_registered_in_sources():
 
 def test_hisparse_kvarn_hot_bdr_reader_is_registered_in_sources():
     root = Path(__file__).resolve().parents[5]
+    device_header = root / "cpp/tensorrt_llm/kernels/hisparseKvarnBdrRead.cuh"
     kernel = root / "cpp/tensorrt_llm/kernels/hisparseKvarnHotRead.cu"
     header = root / "cpp/tensorrt_llm/kernels/hisparseKvarnHotRead.h"
     thop = root / "cpp/tensorrt_llm/thop/hisparseKvarnHotReadOp.cpp"
     cmake = root / "cpp/tensorrt_llm/thop/CMakeLists.txt"
     fake = root / "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"
 
+    device_header_source = device_header.read_text()
     kernel_source = kernel.read_text()
     thop_source = thop.read_text()
-    assert "readLowBitKvarnValue" in kernel_source
-    assert "readFp8E4m3Byte" in kernel_source
+    assert "hisparseKvarnBdrRead.cuh" in kernel_source
+    assert "decodeHisparseKvarnHotIndex" in device_header_source
+    assert "readHisparseKvarnK2v2PackedCkvValue" in device_header_source
+    assert "readHisparseKvarnK2v2BdrLatentValue" in device_header_source
+    assert "hisparseKvarnK2v2BdrRecordBytes" in device_header_source
+    assert "readLowBitKvarnValue" not in kernel_source
+    assert "readFp8E4m3Byte" not in kernel_source
     assert "kvarnBits == 2" in kernel_source
     assert "kvarnBits == 2 || kvarnBits == 4" not in kernel_source
     assert "tokensPerBlock == 64" in kernel_source

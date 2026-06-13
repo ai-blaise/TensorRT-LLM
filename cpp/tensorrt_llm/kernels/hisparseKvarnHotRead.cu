@@ -4,9 +4,7 @@
  */
 
 #include "tensorrt_llm/kernels/hisparseKvarnHotRead.h"
-
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "tensorrt_llm/kernels/hisparseKvarnBdrRead.cuh"
 
 #include <stdexcept>
 
@@ -16,17 +14,6 @@ namespace kernels
 {
 namespace
 {
-
-enum HiSparseKvarnHotReadStatus : uint8_t
-{
-    kHotReadOk = 0,
-    kHotReadUpstreamInvalid = 1,
-    kHotReadBadTopKLength = 2,
-    kHotReadInvalidIndex = 3,
-    kHotReadHotSlotOutOfRange = 4,
-    kHotReadLayerMismatch = 5,
-    kHotReadTokenOffsetOutOfRange = 6,
-};
 
 void check(bool condition, char const* message)
 {
@@ -44,30 +31,6 @@ void checkCuda(cudaError_t status, char const* message)
     }
 }
 
-template <int BITS>
-__device__ __forceinline__ float readLowBitKvarnValue(
-    uint8_t const* tokenPacked, __half const* tokenScaleZp, int dim)
-{
-    static_assert(BITS == 2, "HiSparse KVarN hot reader is production-gated to kvarn_k2v2");
-    constexpr int kValuesPerByte = 8 / BITS;
-    constexpr int kMask = (1 << BITS) - 1;
-    int const byteIdx = dim / kValuesPerByte;
-    int const shift = (dim % kValuesPerByte) * BITS;
-    int const q = (tokenPacked[byteIdx] >> shift) & kMask;
-    int const subblock = dim / 128;
-    float const scale = __half2float(tokenScaleZp[subblock]);
-    float const zp = __half2float(tokenScaleZp[4 + subblock]);
-    return static_cast<float>(q) * scale + zp;
-}
-
-__device__ __forceinline__ float readFp8E4m3Byte(uint8_t byte)
-{
-    __nv_fp8_e4m3 value;
-    value.__x = byte;
-    return static_cast<float>(value);
-}
-
-template <int BITS>
 __global__ void hisparseReadKvarnHotBdrKernel(uint8_t const* __restrict__ hotPacked,
     int32_t const* __restrict__ hotIndices, int32_t const* __restrict__ topkLength,
     uint8_t const* __restrict__ inputRowStatus, __nv_bfloat16* __restrict__ latentOut,
@@ -75,23 +38,17 @@ __global__ void hisparseReadKvarnHotBdrKernel(uint8_t const* __restrict__ hotPac
     int32_t hotCapacity, int64_t hotLayerStride, int64_t hotSlotStride, int64_t hotRecordStride, int32_t layerIdx,
     int32_t tokensPerBlock, int32_t kvLoraRank, int32_t qkRopeHeadDim)
 {
-    static_assert(BITS == 2, "HiSparse KVarN hot reader is production-gated to kvarn_k2v2");
     int32_t const row = static_cast<int32_t>(blockIdx.x);
     if (row >= numRows)
     {
         return;
     }
 
-    constexpr int32_t kBdrOrder = 128;
-    constexpr int32_t kNumSubblocks = 512 / kBdrOrder;
-    int32_t const latentDim = kvLoraRank + qkRopeHeadDim;
+    HiSparseKvarnK2v2BdrLayout const layout
+        = makeHisparseKvarnK2v2BdrLayout(tokensPerBlock, kvLoraRank, qkRopeHeadDim);
+    int32_t const latentDim = layout.latentDim;
     int32_t const rowTopK = topkLength[row];
     int32_t const strideFactor = numLayers * tokensPerBlock;
-    int64_t const ckvBytesPerToken = static_cast<int64_t>(kvLoraRank) * BITS / 8;
-    int64_t const ckvBytesPerBlock = static_cast<int64_t>(tokensPerBlock) * ckvBytesPerToken;
-    int64_t const scaleZpBytesPerToken = static_cast<int64_t>(2 * kNumSubblocks * sizeof(__half));
-    int64_t const scaleZpBytesPerBlock = static_cast<int64_t>(tokensPerBlock) * scaleZpBytesPerToken;
-    int64_t const peBytesPerBlock = static_cast<int64_t>(tokensPerBlock) * qkRopeHeadDim;
 
     __shared__ int32_t rowCode;
     if (threadIdx.x == 0)
@@ -101,8 +58,8 @@ __global__ void hisparseReadKvarnHotBdrKernel(uint8_t const* __restrict__ hotPac
         {
             rowCode = kHotReadBadTopKLength;
         }
-        if (rowCode == kHotReadOk
-            && hotRecordStride < ckvBytesPerBlock + scaleZpBytesPerBlock + peBytesPerBlock)
+        if (rowCode == kHotReadOk && hotRecordStride < hisparseKvarnK2v2BdrRecordBytes(
+                layout.tokensPerBlock, layout.kvLoraRank, layout.qkRopeHeadDim))
         {
             rowCode = kHotReadInvalidIndex;
         }
@@ -121,49 +78,17 @@ __global__ void hisparseReadKvarnHotBdrKernel(uint8_t const* __restrict__ hotPac
         if (rowCode == kHotReadOk && col < rowTopK)
         {
             int32_t const hotIndex = hotIndices[rowIndexOffset + col];
-            if (hotIndex < 0)
+            HiSparseKvarnHotAddress const address
+                = decodeHisparseKvarnHotIndex(hotIndex, strideFactor, layerIdx, hotCapacity, tokensPerBlock);
+            if (address.status != kHotReadOk)
             {
-                atomicCAS(&rowCode, kHotReadOk, kHotReadInvalidIndex);
+                atomicCAS(&rowCode, kHotReadOk, static_cast<int32_t>(address.status));
             }
             else
             {
-                int32_t const hotSlot = hotIndex / strideFactor;
-                int32_t const rem = hotIndex - hotSlot * strideFactor;
-                int32_t const encodedLayer = rem / tokensPerBlock;
-                int32_t const tokenOffset = rem - encodedLayer * tokensPerBlock;
-                if (hotSlot < 0 || hotSlot >= hotCapacity)
-                {
-                    atomicCAS(&rowCode, kHotReadOk, kHotReadHotSlotOutOfRange);
-                }
-                else if (encodedLayer != layerIdx)
-                {
-                    atomicCAS(&rowCode, kHotReadOk, kHotReadLayerMismatch);
-                }
-                else if (tokenOffset < 0 || tokenOffset >= tokensPerBlock)
-                {
-                    atomicCAS(&rowCode, kHotReadOk, kHotReadTokenOffsetOutOfRange);
-                }
-                else
-                {
-                    uint8_t const* record = hotPacked + static_cast<int64_t>(layerIdx) * hotLayerStride
-                        + static_cast<int64_t>(hotSlot) * hotSlotStride;
-                    uint8_t const* ckvData = record;
-                    uint8_t const* ckvScaleZpBytes = ckvData + ckvBytesPerBlock;
-                    uint8_t const* peBytes = ckvScaleZpBytes + scaleZpBytesPerBlock;
-                    if (dim < kvLoraRank)
-                    {
-                        uint8_t const* tokenPacked = ckvData + static_cast<int64_t>(tokenOffset) * ckvBytesPerToken;
-                        auto const* tokenScaleZp = reinterpret_cast<__half const*>(
-                            ckvScaleZpBytes + static_cast<int64_t>(tokenOffset) * scaleZpBytesPerToken);
-                        out = __float2bfloat16_rn(readLowBitKvarnValue<BITS>(tokenPacked, tokenScaleZp, dim));
-                    }
-                    else
-                    {
-                        int32_t const peDim = dim - kvLoraRank;
-                        uint8_t const byte = peBytes[static_cast<int64_t>(tokenOffset) * qkRopeHeadDim + peDim];
-                        out = __float2bfloat16_rn(readFp8E4m3Byte(byte));
-                    }
-                }
+                uint8_t const* record = hotPacked + static_cast<int64_t>(layerIdx) * hotLayerStride
+                    + static_cast<int64_t>(address.hotSlot) * hotSlotStride;
+                out = readHisparseKvarnK2v2BdrLatentValue(record, layout, address.tokenOffset, dim);
             }
         }
         latentOut[rowOutOffset + linear] = out;
@@ -196,11 +121,13 @@ void invokeHisparseReadKvarnHotBdr(uint8_t const* hotPacked, int32_t const* hotI
     check(kvLoraRank == 512, "hisparse_read_kvarn_hot_bdr production path requires kv_lora_rank=512");
     check(qkRopeHeadDim == 64, "hisparse_read_kvarn_hot_bdr production path requires qk_rope_head_dim=64");
     check(kvarnBits == 2, "hisparse_read_kvarn_hot_bdr production path requires kvarn_bits=2");
+    check(hisparseKvarnK2v2BdrLayoutIsProduction(tokensPerBlock, kvLoraRank, qkRopeHeadDim),
+        "hisparse_read_kvarn_hot_bdr requires the production KVarN BDR layout");
 
     constexpr int32_t kThreads = 256;
-    hisparseReadKvarnHotBdrKernel<2><<<numRows, kThreads, 0, stream>>>(hotPacked, hotIndices, topkLength,
-        inputRowStatus, latentOut, outputRowStatus, numRows, indexTopK, numLayers, hotCapacity, hotLayerStride,
-        hotSlotStride, hotRecordStride, layerIdx, tokensPerBlock, kvLoraRank, qkRopeHeadDim);
+    hisparseReadKvarnHotBdrKernel<<<numRows, kThreads, 0, stream>>>(hotPacked, hotIndices, topkLength, inputRowStatus,
+        latentOut, outputRowStatus, numRows, indexTopK, numLayers, hotCapacity, hotLayerStride, hotSlotStride,
+        hotRecordStride, layerIdx, tokensPerBlock, kvLoraRank, qkRopeHeadDim);
     checkCuda(cudaGetLastError(), "hisparse_read_kvarn_hot_bdr kernel launch failed");
 }
 

@@ -137,6 +137,11 @@ block and CUDA smoke hook, not a serving path: the coordinator still fails
 closed until the same KVarN-hot reader is fused into sparse MLA. The June 13
 final sweep tightened this primitive to require `kvarn_bits=2`; there is no
 4-bit KVarN-hot validation branch for the production HiSparse path.
+The BDR address decode, hot-index validation, 2-bit C-KV unpack, scale/zp
+application, and E4M3 RoPE byte read now live in
+`hisparseKvarnBdrRead.cuh`. The standalone hot-reader smoke op and the future
+fused sparse MLA kernel must use that same device helper layer so the
+validated CUDA smoke path and serving producer-load path cannot drift.
 The kernel translation unit has been non-disruptively compiled on the B200 VM
 with CUDA 13 (`nvcc -arch=sm_100`) without allocating GPU memory; full native
 library build and CUDA smoke tests remain pending for a safe runtime window.
@@ -1081,9 +1086,10 @@ Still pending before serving enablement:
   `kv_scales [num_pages,64,1,36]` layout is not the production KVarN-hot ABI;
 - BDR/on-read dequant for packed hot KVarN records at the sparse MLA producer
   load point, using `kvarn_bits=2` and production field offsets. The native
-  standalone hot-reader primitive proves that address/dequant logic for the
-  target BDR layout, but promotion still requires fusing it into sparse MLA
-  rather than launching a separate dense scratch prepass;
+  standalone hot-reader primitive now calls the shared
+  `hisparseKvarnBdrRead.cuh` device helpers that the fused sparse MLA producer
+  must include, but promotion still requires fusing those helpers into sparse
+  MLA rather than launching a separate dense scratch prepass;
 - final row-status propagation into the sparse MLA hot-read stage so rows with
   resolve/plan/copy/commit/build errors cannot be consumed;
 - live validation and microbenchmarking of native packed KVarN host-to-hot
@@ -1338,6 +1344,9 @@ production ABI:
    - add BDR/on-read dequant in the sparse MLA producer load path, including
      2-bit C-KV unpack, scale/zp apply, and RoPE payload read without an
      intermediate dense/FP16 hot staging pass;
+   - include the shared `hisparseKvarnBdrRead.cuh` helper layer for hot-index
+     decode and BDR field reads so the validation op and serving producer path
+     share one production layout implementation;
    - base the first executable serving implementation on the target model's
      production dense-MLA/DSA path and production BDR record layout, not on an
      intermediate correctness-only path;
