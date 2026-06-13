@@ -1,0 +1,13 @@
+{
+  "packed_bytes_per_block": 13312,
+  "packed_bytes_per_token_layer": 208,
+  "bf16_bytes_per_token_layer": 1152,
+  "num_layers": 61,
+  "hot_buffer_bytes_per_req_hb64": 51970048,
+  "per_req_full_bf16_128k_bytes": 9210691584,
+  "per_req_kvarn_only_128k_bytes": 1663041536,
+  "ceiling_lift_vs_kvarn_128k": 32.0,
+  "ceiling_lift_vs_bf16_128k": 177.23076923076923,
+  "effective_bits_per_elem": 2.888888888888889,
+  "density_ratio_vs_bf16": 5.538461538461538
+}
