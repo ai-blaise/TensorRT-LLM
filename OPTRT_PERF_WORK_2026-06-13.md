@@ -121,3 +121,29 @@ bit-exact data movement. Then #3.
 - 2026-06-13: 3 parallel investigations complete (glue / quant / a2a). Crux confirmed:
   fused norm+quant op exists & wired, just disabled for V3.2 (1b = enablement). a2a is
   latency-bound on half the SMs with FIFO_DEPTH=4 (2 cheap C++ knobs). Plans above.
+- 2026-06-13 (verification pass — corrections after reading the code directly):
+  - **1a #3 (latent_cache cat) is NOT removable.** `compressed_kv` is `kv_a_layernorm(compressed_kv)`
+    (`attention.py:1965`) BEFORE the cat (`:1974`) — a fresh normed tensor, no longer adjacent to
+    `k_pe`. The cat assembles normed_kv+k_pe; it's real work, not redundancy. (Agent missed the norm.)
+  - **1a glue is mostly HOST-side and overlaps GPU at c16.** The profile showed GPU ~100% busy with
+    host costs overlapped, so reducing host allocs/casts (1a #1/#2/#4) won't move c16 throughput —
+    they help c1 latency + graph-node count, not the throughput A/B. Deprioritized for throughput.
+  - **The only real GPU-time Lever-1 win is 1b (quant fusion).** But for V3.2-REAP the input norm is a
+    REAP **gated** norm (`_maybe_apply_gated_norm`, `modeling_deepseekv3.py:1721`), and the
+    post-attention gated-norm+quant is ALREADY fused (`apply_fused_lowrank_gate_quant_nvfp4`,
+    `:1702`). So 1b = extend that fused gated-norm+quant to the INPUT gated norm → kv_a_proj
+    (currently un-fused). Multi-step, numerics-gated (cosine ≥0.98). The real win, larger effort.
+  - **Lever 2 #2 (SM count) has a hidden tradeoff:** raising the a2a SM budget steals SMs from the
+    shared experts that already overlap the a2a on `aux_stream` (`modeling_deepseekv3.py:1315`).
+    Net uncertain — NOT a safe bit-exact change. Skipped.
+
+### Implemented
+- **[x] Lever 2 #1 — `FIFO_DEPTH` 4→8** (`fusedMoeCommKernels.h:251`, commit `59e909469`).
+  Bit-exact; workspace auto-scales (+~148MB/rank @ ep4). At c16 ~tens of sends/peer >> depth 4, so
+  it binds. **A/B (throughput + correctness) pending the next rebuild.**
+
+### Next (ranked, for the next rebuild cycles)
+1. **Validate FIFO_DEPTH=8** e2e (rebuild → deploy → tight-c16 A/B + numerical/throughput parity).
+2. **1b: fuse the INPUT gated-norm+quant → kv_a_proj** (the real Lever-1 GPU win, ~0.5ms). Standalone
+   cosine test of the fused gated-norm+quant vs separate first, then wire, then e2e.
+3. Lever 2 #3 (dispatch field reduction / postquant-alltoall) — bigger a2a win than the FIFO knob.
