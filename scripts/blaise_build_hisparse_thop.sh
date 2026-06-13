@@ -14,6 +14,7 @@ MEMORY="${MEMORY:-64g}"
 CPUS="${CPUS:-8}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-100-real}"
 TARGETS="${TARGETS:-th_common}"
+WHEEL_TARGETS="${WHEEL_TARGETS:-th_common}"
 NCCL_INCLUDE_DIR="${NCCL_INCLUDE_DIR:-/opt/dynamo/venv/lib/python3.12/site-packages/nvidia/nccl/include}"
 NCCL_LIBRARY="${NCCL_LIBRARY:-/usr/lib/x86_64-linux-gnu/libnccl.so}"
 TENSORRT_ROOT="${TENSORRT_ROOT:-/usr/local/tensorrt}"
@@ -28,6 +29,7 @@ mkdir -p "${BUILD_DIR}" "${HOME_LOCAL}/lib/python3.12/site-packages"
 docker run --rm \
   --cpus="${CPUS}" \
   --memory="${MEMORY}" \
+  -e HISPARSE_WHEEL_TARGETS="${WHEEL_TARGETS}" \
   -e PYTHONPATH="${USER_SITE}:${CUTLASS_PY}" \
   -v "${REPO_DIR}:/work" \
   -v "${CACHE_DIR}:/build" \
@@ -45,7 +47,7 @@ cmake \
   -DBUILD_FLASH_MLA=OFF \
   -DNVTX_DISABLE=ON \
   -DBUILD_MICRO_BENCHMARKS=OFF \
-  -DBUILD_WHEEL_TARGETS=th_common \
+  -DBUILD_WHEEL_TARGETS=\"\${HISPARSE_WHEEL_TARGETS}\" \
   -DPython_EXECUTABLE=/opt/dynamo/venv/bin/python3 \
   -DPython3_EXECUTABLE=/opt/dynamo/venv/bin/python3 \
   -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \

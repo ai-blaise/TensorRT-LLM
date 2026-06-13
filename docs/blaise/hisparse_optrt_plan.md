@@ -232,9 +232,14 @@ next low-cost gate for that packaging boundary: it overlays the current branch
 branch-built `libth_common.so` under `tensorrt_llm/libs`, imports
 `tensorrt_llm` normally, asserts that the normal package loader used that
 serving-layout library, and then runs the native planner/copy smoke without an
-explicit `--library` path. This narrows the remaining fullsource gap to any
-branch-built generated bindings/plugin artifacts that are not present in the
-cached native proof build.
+explicit `--library` path. The June 13 follow-up sweep extended that helper so
+it can also carry branch-built generated package-root artifacts
+(`bindings*.so`, `tensorrt_llm_transfer_agent_binding*.so`) and package library
+artifacts (`libnvinfer_plugin_tensorrt_llm.so`, transfer wrappers) from the
+persistent VM build cache when those artifacts are present. This narrows the
+remaining fullsource gap to proving those generated artifacts from the same
+branch/cache inside the serving import path, then promoting only after live
+DSA/NIXL deployment proof.
 The committed serving-layout proof now passes on B200 GPU 7:
 `localhost:5000/local/dynamo-trtllm-optrt-custom:optrt-c6143d16492f-hisparse-serving-import-proof-20260613T130103Z`
 was built from source SHA `c6143d16492f4dde16375eb28f68e43298e10d7e`, imported
@@ -1434,12 +1439,17 @@ Still pending before serving enablement:
   compiler launchers. That recipe configures cleanly for
   `BUILD_WHEEL_TARGETS=th_common` and is the fastest known non-invasive path
   to a native library containing the HiSparse `torch.ops.trtllm.*`
-  registrations. It still pulls the shared TRT-LLM internal CUTLASS dependency
-  graph, so the first build remains large; the persistent build dir is part of
-  the recipe, not an optional convenience. The helper supports `TARGETS=...`
-  for narrow proof builds during downtime, and the swap-in copy bridge now
-  builds as `hisparseSwapInPackedKvarnOp.cu` because it owns the mapped-host
-  CUDA copy kernel and launch syntax. The helper exports the CUTLASS
+  registrations. The follow-up sweep parameterized the helper with
+  `WHEEL_TARGETS=...` in addition to `TARGETS=...`, so the same persistent
+  cache can build generated binding/plugin proof targets without a fresh
+  fullsource loop. Use that only to build real CMake targets from the branch
+  cache; do not introduce an ad hoc import shim or a runtime substitute for the
+  generated artifacts. It still pulls the shared TRT-LLM internal CUTLASS
+  dependency graph, so the first build remains large; the persistent build dir
+  is part of the recipe, not an optional convenience. The helper supports
+  `TARGETS=...` for narrow proof builds during downtime, and the swap-in copy
+  bridge now builds as `hisparseSwapInPackedKvarnOp.cu` because it owns the
+  mapped-host CUDA copy kernel and launch syntax. The helper exports the CUTLASS
   FetchContent Python path inside the container shell as well as at Docker
   launch, avoiding the disabled-user-site `cutlass_library` import trap during
   repeated configure loops. The CUTLASS kernel-generation CMake step also now
@@ -1728,8 +1738,22 @@ production ABI:
      `site-packages/tensorrt_llm/libs/libth_common.so` through the normal
      TensorRT-LLM package loader, and reruns the native planner/copy smoke
      without `--library`;
-   - next, build or install the full `op-trt-hisparse` image/wheel when
-     branch-generated bindings or plugin artifacts must be proven too. If that
+   - next, use the persistent VM cache to build the remaining generated serving
+     artifacts from the same branch head. The intended non-disruptive loop is:
+     1. verify exact target names with the existing CMake/Ninja cache;
+     2. run `scripts/blaise_build_hisparse_thop.sh` with `WHEEL_TARGETS=...`
+        and `TARGETS=...` for the real generated binding, plugin, and
+        transfer-agent targets;
+     3. rerun `build_hisparse_serving_import_proof_image.sh --run-smoke`,
+        letting it copy detected `bindings*.so`,
+        `tensorrt_llm_transfer_agent_binding*.so`,
+        `libnvinfer_plugin_tensorrt_llm.so`, and transfer wrappers into the
+        deployment-runtime package layout;
+     4. only then build or install the full `op-trt-hisparse` image/wheel and
+        run the same smoke through the image that DSA will load in serving.
+     If a generated target fails to build, capture the precise CMake/Ninja
+     failure and keep HiSparse fail-closed; do not replace it with a Python
+     import shim, stale base-image binding, or synthetic runtime proof. If the
      full branch-built image cannot use the mapped-host kernel path, replace
      only the copy bridge with a copy-engine variant that consumes the same
      compact device schedule without host sync.

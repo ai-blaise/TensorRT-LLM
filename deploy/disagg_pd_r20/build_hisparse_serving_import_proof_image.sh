@@ -9,13 +9,16 @@
 #
 # This is a low-cost package/import gate. It does not replace the heavier
 # fullsource image gate when branch-built generated bindings or plugin libs are
-# required.
+# required, but it can carry those already-built artifacts from the persistent
+# VM cache when they are available.
 
 set -euo pipefail
 
 BASE_IMAGE="${BASE_IMAGE:-}"
 TH_COMMON_LIB="${TH_COMMON_LIB:-/home/spencer/work/build-cache/hisparse-thop/cpp-build/tensorrt_llm/thop/libth_common.so}"
 EXTRA_LIBS="${EXTRA_LIBS:-}"
+PACKAGE_ROOT_FILES="${PACKAGE_ROOT_FILES:-}"
+PACKAGE_LIB_FILES="${PACKAGE_LIB_FILES:-}"
 PACKAGE_DIR="${PACKAGE_DIR:-}"
 SITE_PACKAGES="${SITE_PACKAGES:-/opt/dynamo/venv/lib/python3.12/site-packages}"
 IMAGE_REPO="${IMAGE_REPO:-localhost:5000/local/dynamo-trtllm-optrt-custom}"
@@ -32,6 +35,11 @@ Options:
   --base-image IMAGE       Deployment runtime base image to extend
   --th-common-lib PATH     Branch-built libth_common.so path
   --extra-libs LIST        Colon-separated native libraries copied to tensorrt_llm/libs
+  --package-root-files LIST
+                            Colon-separated files copied to tensorrt_llm/
+                            (for example bindings*.so or transfer-agent binding)
+  --package-lib-files LIST  Colon-separated files copied to tensorrt_llm/libs
+                            (for example plugin/wrapper libraries)
   --package-dir PATH       Branch tensorrt_llm package dir (default: repo/tensorrt_llm)
   --site-packages PATH     Runtime site-packages root
   --image-repo REPO        Output repository
@@ -42,8 +50,8 @@ Options:
   -h, --help               Show this help
 
 Environment equivalents: BASE_IMAGE, TH_COMMON_LIB, EXTRA_LIBS, PACKAGE_DIR,
-SITE_PACKAGES, IMAGE_REPO, TAG_SUFFIX, PUSH_LOCAL_REGISTRY, RUN_SMOKE,
-GPU_DEVICE.
+PACKAGE_ROOT_FILES, PACKAGE_LIB_FILES, SITE_PACKAGES, IMAGE_REPO, TAG_SUFFIX,
+PUSH_LOCAL_REGISTRY, RUN_SMOKE, GPU_DEVICE.
 EOF
 }
 
@@ -52,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --base-image) BASE_IMAGE="$2"; shift 2 ;;
     --th-common-lib) TH_COMMON_LIB="$2"; shift 2 ;;
     --extra-libs) EXTRA_LIBS="$2"; shift 2 ;;
+    --package-root-files) PACKAGE_ROOT_FILES="$2"; shift 2 ;;
+    --package-lib-files) PACKAGE_LIB_FILES="$2"; shift 2 ;;
     --package-dir) PACKAGE_DIR="$2"; shift 2 ;;
     --site-packages) SITE_PACKAGES="$2"; shift 2 ;;
     --image-repo) IMAGE_REPO="$2"; shift 2 ;;
@@ -84,23 +94,51 @@ if [[ ! -d "$PACKAGE_DIR" ]]; then
   exit 2
 fi
 
+append_colon_file() {
+  local var_name="$1"
+  local path="$2"
+  [[ -s "$path" ]] || return 0
+  local current="${!var_name:-}"
+  if [[ -z "$current" ]]; then
+    printf -v "$var_name" '%s' "$path"
+  else
+    printf -v "$var_name" '%s:%s' "$current" "$path"
+  fi
+}
+
+append_matching_files() {
+  local var_name="$1"
+  local pattern="$2"
+  local match
+  while IFS= read -r match; do
+    append_colon_file "$var_name" "$match"
+  done < <(compgen -G "$pattern" || true)
+}
+
+build_root="$(cd "$(dirname "$TH_COMMON_LIB")/.." && pwd)"
+
 if [[ -z "$EXTRA_LIBS" ]]; then
-  build_root="$(cd "$(dirname "$TH_COMMON_LIB")/.." && pwd)"
   default_libs=(
     "$build_root/libtensorrt_llm.so"
     "$build_root/runtime/utils/libpg_utils.so"
     "$build_root/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so"
     "$build_root/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so"
+    "$build_root/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
+    "$build_root/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
+    "$build_root/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
   )
   for lib in "${default_libs[@]}"; do
-    if [[ -s "$lib" ]]; then
-      if [[ -z "$EXTRA_LIBS" ]]; then
-        EXTRA_LIBS="$lib"
-      else
-        EXTRA_LIBS="$EXTRA_LIBS:$lib"
-      fi
-    fi
+    append_colon_file EXTRA_LIBS "$lib"
   done
+fi
+
+if [[ -z "$PACKAGE_ROOT_FILES" ]]; then
+  append_matching_files PACKAGE_ROOT_FILES "$build_root/nanobind/bindings*.so"
+  append_matching_files PACKAGE_ROOT_FILES "$build_root/executor/cache_transmission/nixl_utils/tensorrt_llm_transfer_agent_binding*.so"
+fi
+
+if [[ -z "$PACKAGE_LIB_FILES" ]]; then
+  append_matching_files PACKAGE_LIB_FILES "$build_root/plugins/libnvinfer_plugin_tensorrt_llm.so"
 fi
 
 SMOKE_SCRIPT="blaise_perf/hisparse/native_planner_copy_smoke.py"
@@ -125,17 +163,25 @@ mkdir -p "$CTX/libs" "$CTX/smoke"
 tar --exclude='__pycache__' --exclude='*.pyc' -C "$(dirname "$PACKAGE_DIR")" \
   -cf - "$(basename "$PACKAGE_DIR")" | tar -C "$CTX" -xf -
 cp "$TH_COMMON_LIB" "$CTX/libs/libth_common.so"
-if [[ -n "$EXTRA_LIBS" ]]; then
-  IFS=':' read -ra extra_libs <<<"$EXTRA_LIBS"
-  for extra_lib in "${extra_libs[@]}"; do
-    [[ -z "$extra_lib" ]] && continue
-    if [[ ! -s "$extra_lib" ]]; then
-      echo "extra native library not found or empty: $extra_lib" >&2
+copy_colon_files() {
+  local files="$1"
+  local dest="$2"
+  local label="$3"
+  [[ -z "$files" ]] && return 0
+  IFS=':' read -ra paths <<<"$files"
+  for path in "${paths[@]}"; do
+    [[ -z "$path" ]] && continue
+    if [[ ! -s "$path" ]]; then
+      echo "$label not found or empty: $path" >&2
       exit 2
     fi
-    cp "$extra_lib" "$CTX/libs/$(basename "$extra_lib")"
+    cp "$path" "$dest/$(basename "$path")"
   done
-fi
+}
+
+copy_colon_files "$EXTRA_LIBS" "$CTX/libs" "extra native library"
+copy_colon_files "$PACKAGE_LIB_FILES" "$CTX/libs" "package library"
+copy_colon_files "$PACKAGE_ROOT_FILES" "$CTX/tensorrt_llm" "package root artifact"
 cp "$SMOKE_SCRIPT" "$CTX/smoke/native_planner_copy_smoke.py"
 cp "$SERVING_SMOKE_SCRIPT" "$CTX/smoke/serving_import_smoke.py"
 
@@ -180,6 +226,8 @@ printf 'base_image=%s\n' "$BASE_IMAGE"
 printf 'site_packages=%s\n' "$SITE_PACKAGES"
 printf 'th_common_lib=%s\n' "$TH_COMMON_LIB"
 printf 'extra_libs=%s\n' "$EXTRA_LIBS"
+printf 'package_lib_files=%s\n' "$PACKAGE_LIB_FILES"
+printf 'package_root_files=%s\n' "$PACKAGE_ROOT_FILES"
 printf 'serving_smoke=/opt/ai-blaise/hisparse/serving_import_smoke.py\n'
 
 if [[ "$RUN_SMOKE" == 1 ]]; then
