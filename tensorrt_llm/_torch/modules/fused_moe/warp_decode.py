@@ -976,6 +976,11 @@ def _run_nvfp4_warp_decode(
     output2_scale = _get_backend_tensor(moe, "fc2_alpha")
     if output1_scale is None:
         output1_scale = output1_gate_scale
+    # Scalar FC2-input requant global scale for the megakernel cursor op. The
+    # trtllm_gen backend carries it as a registered scalar parameter (fc31_scale_c
+    # is derived from it); the cursor op needs it directly so it does NOT fall
+    # back to the per-expert fc31_alpha (which trips the scalar-global_sf assert).
+    fc2_input_scale = _get_backend_tensor(moe, "fc2_input_scale")
     local_num_experts = _backend_int(
         moe.backend, "expert_size_per_partition", _backend_int(moe.backend, "num_slots", 0))
 
@@ -1004,10 +1009,12 @@ def _run_nvfp4_warp_decode(
         _NVFP4_TARGET_SCALING_VECTOR_SIZE,
     )
     if use_cursor:
-        # Cursor megakernel op has a fixed torch-op schema (no out buffer). If M1
-        # one-sided a2a supplied a workspace payload tensor, land the result into
-        # it so the downstream payload_in_workspace=True combine stays valid.
-        output = op(*op_args)
+        # Cursor megakernel op has a fixed torch-op schema (no out buffer). It
+        # takes the scalar fc2_input_scale as a trailing arg (the FC2-input requant
+        # global scale the trtllm_gen overlay otherwise omits). If M1 one-sided a2a
+        # supplied a workspace payload tensor, land the result into it so the
+        # downstream payload_in_workspace=True combine stays valid.
+        output = op(*op_args, fc2_input_scale)
         if moe_output is not None:
             moe_output.view(output.shape).copy_(output)
             output = moe_output.view(output.shape)

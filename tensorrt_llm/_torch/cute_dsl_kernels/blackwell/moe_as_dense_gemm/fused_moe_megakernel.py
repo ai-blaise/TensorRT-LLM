@@ -271,6 +271,7 @@ def _register_cursor_op() -> bool:
         local_expert_offset: int,
         local_num_experts: int,
         scaling_vector_size: int,
+        fc2_input_scale: Optional[torch.Tensor],
     ) -> torch.Tensor:
         mode = megakernel_mode()
         if mode == "jit":
@@ -291,6 +292,11 @@ def _register_cursor_op() -> bool:
             topk_ids, topk_weights, hidden_size, intermediate_size,
             num_experts, local_expert_offset, local_num_experts,
             scaling_vector_size,
+            # WARPDECODE/trtllm_gen overlay omitted the scalar FC2-input requant
+            # global scale, so run_fused_moe_megakernel_op fell back to the
+            # per-expert fc31_alpha (numel>1) and the op's scalar-global_sf
+            # assert fired. Thread the real scalar fc2_input_scale.
+            fc2_input_global_sf=fc2_input_scale,
         )
 
     @torch.library.register_fake("trtllm::warp_decode_nvfp4_cursor_moe")
@@ -312,11 +318,12 @@ def _register_cursor_op() -> bool:
         local_expert_offset: int,
         local_num_experts: int,
         scaling_vector_size: int,
+        fc2_input_scale: Optional[torch.Tensor],
     ) -> torch.Tensor:
         del x_sf, w13, w13_scale, w2, w2_scale, output1_scale
         del output1_gate_scale, output2_scale, topk_ids, topk_weights
         del intermediate_size, num_experts, local_expert_offset
-        del local_num_experts, scaling_vector_size
+        del local_num_experts, scaling_vector_size, fc2_input_scale
         return torch.empty(
             (x.shape[0], hidden_size), dtype=torch.bfloat16, device=x.device)
 
