@@ -293,10 +293,18 @@ The win was an **occupancy insight, not the GEMMs** — and it came from a falsi
   that overhead: nS=10 0.347, nS=5 0.235, **nS=4 0.217**, nS=1 0.589. The split logic now
   auto-targets one wave from the queried SM count (`HISPARSE_TARGET_BLOCKS` override).
 
-**Honest floor:** below ~0.217 needs ≤256 TMEM cols/block for true 2-way concurrency, but
-O[64,512]=256 cols + S=32 > 256 — impossible without 2× dequant passes or a 2-CTA-cluster
-restructure (under investigation). The kernel is otherwise overhead-bound; the precision and
-GEMM levers are exhausted.
+**Proven floor (the TMEM-split was built and rejected):** 0.217 is the ceiling. Going below
+needs ≤256 TMEM cols/block for true 2-way concurrency — which *is* achievable (a co-residency
+probe confirmed two 256-col CTAs co-reside on one SM, ratio 1.00 vs 2.00 at 512). The 2-pass
+O-split kernel (U5: pass-1 dequant+score+softmax+O[0:256) caching scaledScore+V_hi to GMEM,
+pass-2 value-UMMA→O[256:512) only) was built and gates correct (cos 0.999998) but its best is
+0.299 ms/call (+38% over U4). Three-way proof it can't win: (1) adding the 2nd co-resident
+block makes it *slower*, not faster (256-col→0.369, 320→0.405); (2) the kernel is
+**dequant/compute-throughput-bound** (FWHT + 2-bit unpack + PE), **not TMEM-occupancy-bound** —
+the 512-col TMEM cap was *masking* a compute bound, not creating one, so breaking it exposes no
+headroom; (3) the O-split forces a V GMEM round-trip + a serial pass-2 (+66 µs by nsys) U4 never
+pays. The 2-CTA-cluster variant would also lose (it duplicates the compute-bound dequant). The
+precision (fp8), GEMM, and occupancy levers are all exhausted — **U4 (0.217) stands.**
 
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
