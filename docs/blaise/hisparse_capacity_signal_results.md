@@ -347,6 +347,52 @@ as Phase-5/6 concluded.
 compute or TMEM occupancy — which only the IKP + ablation profiling surfaced, after
 fp8/GEMM/occupancy/TMEM-split were all measured-dead in Phases 4-6.
 
+## Systems-level swap-in (post-kernel) — overlap + bulk-coalesce + prefetch + sizing + capacity
+
+With the hot-read at 0.147 ms (Phase-7), the bottleneck moved off the kernel and onto the
+hot/cold swap-in machinery — exactly the capacity-gate's "Rec-5 overlap MANDATORY" item. A
+direct read of the SGLang HiSparse source (`hisparse_coordinator.py`, `mem_cache/allocator/
+hisparse.py`, `jit_kernel/csrc/hisparse.cuh`, `dsa_backend.py`) vs ours found that **nothing in
+SGLang's non-kernel design is algorithmically ahead of ours — its only edge is that its path is
+live while ours is fail-closed**, plus two axes where we can *beat* it (overlap, prefetch —
+SGLang does neither). Implemented in the coordinator (`hisparse.py`, +471/−3, purely additive;
+ABI + `resident_v1_ready()=false` preserved; every path bit-identical on the real coordinator;
+gate probes pass). Committed `5e2d281ac`.
+
+- **P1 — miss-DMA overlap + bulk coalescing (the must-win).** The decisive finding: the swap-in
+  path's per-block `cudaMemcpyAsync` is **100% launch-bound** for scattered misses — 8864 copies
+  at B32/128k ≈ **52 ms / 2.9 GB/s** (the gate's "48 GB/s" was the *other* op, the SM-contending
+  schedule kernel that **can't** overlap with matmul). Added a dedicated copy stream + event join
+  and a **staging-gather bulk fast path** (dense hot run → CPU `index_select` gather into
+  contiguous pinned staging → one bulk H2D at the 55 GB/s copy-engine ceiling, byte-identical),
+  with a per-block fallback for steady-state scatter. Bulk copy alone **52 → 3.2 ms (16×)**;
+  overlapped behind the compute window the exposed swap-in is effectively removed (**40.4 → ~0.02
+  ms** microbench). The copy-engine path is the overlappable winner; the schedule kernel is faster
+  alone but un-hideable (contends for SMs). This is what makes HiSparse viable — 52 ms/step would
+  have blown the 20 ms budget 2.6×.
+- **P2 — adaptive hot-buffer sizing.** Drove the real planner + fan-out op: working set D_p95 =
+  recency 349 / balanced 551 / scattered 752 (matches §1b), so the knee H ≥ D_p95 = **384 / 576 /
+  896**. `hot_blocks=64` is badly undersized (STREAM mode, 154-162% miss); the knee cuts miss-DMA
+  ~50% and flips STREAM→CACHE while keeping a **12.7-29.5× capacity win** vs KVarN-only HBM @128k.
+  `recommend_hot_blocks()` + int / "auto" / 0→regime-knee resolution (default 64, backward-compatible).
+- **P3 — predictive prefetch (`prefetch_swap_in_plan` + `join_prefetch`).** Issue layer L+1's
+  swap-in during L's compute, join (wait + commit) at the read — the clean deferred-overlap path
+  (the synchronous `execute_swap_in_plan_overlapped` keeps an inline wait). Bit-identical across an
+  8-layer pipeline; prefetched blocks == read-needs every layer. ~1-6% when P1's bulk copy already
+  makes the DMA near-free, **1.23-1.38× when the copy exceeds a single layer's window** (scattered
+  / larger batch) — the regime P1+bulk can't cover. SGLang does neither overlap nor prefetch.
+- **P4 — freed-HBM capacity-admission accounting** (`admittable_token_capacity` = SGLang's
+  host-backed `max_total_num_tokens` analogue, `can_admit_request`, `capacity_accounting`):
+  admit-until-budget proven in isolation (host-backed 262144 vs device-resident 24576 tok =
+  **10.7×**), release returns freed blocks + reopens headroom. **Live promotion is NOT done here** —
+  `resident_v1_ready()` is a hardcoded `return false` by design pending a live multi-rank DSA/NIXL
+  forward (Gate-5-7); the mechanism exists, the promotion is documented as needing the model stack.
+
+**Net:** the per-step miss-DMA (~52 ms, which would have made HiSparse unviable as wired) is
+coalesced 16× and overlapped to ~0 exposed; the working-set knee and the freed-HBM admission loop
+are in place; the only residual is the live multi-rank serving proof (Gate-5-7), which needs a
+model forward, not a microbench.
+
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
 Run in parallel (separate worktree/GPU): the SMC-SD GQA-KVarN packed-decode kernel
