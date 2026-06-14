@@ -26,6 +26,14 @@ profile-driven wide-dequant + Hadamard-hoist round then to **0.147 ms/call (B16)
 0.999995 vs the true dense reference with the production ABI frozen. The ≤0.30 ms/call
 (≤18.3 ms/step) target is beaten ~2×.
 
+**Beyond the kernel,** the per-step swap-in machinery is now graph-safe-overlapped (G1 native-op
+fork/join + G2 wide-window hoist before the bmm+rope, both byte-identical, independently GPU7-re-gated),
+the working-set sizing (P2) is wired, and the freed-HBM admission seam (P4) is built + unit-tested
+(no-op without a coordinator). The HiSparse swap-in is thus **maximally optimized in isolation**; the
+entire remaining frontier — the live overlap magnitude, the P4 live wiring, and live promotion
+(`resident_v1_ready()`, left false) — requires the multi-rank DSA/NIXL model forward (Gate-5-7), not a
+microbench. See the "Systems-level swap-in" section for the G1/G2/P4 detail.
+
 ## 1a — Capacity (verified)
 
 Packed `kvarn_k2v2` BDR record = **13312 B / 64-token block = 208 B/token/layer**
@@ -424,11 +432,12 @@ in the realistic decode regime, ~1.0× under a fully SM-saturating kernel.
 
 **Net:** the live per-step swap-in is now a graph-safe, byte-identical kernel **overlapped** on a copy
 stream (the dormant Python staging-gather path is removed); the working-set knee (P2) is wired, and
-the freed-HBM admission loop (P4) is built but needs the scheduler hookup. Honest residual: true
-zero-SM copy-engine swap-in is unreachable graph-safely with a device-resident schedule (would need
-re-architecting `compact_miss_schedule` to emit a host-side run table pre-capture); the cross-layer
-prefetch hoist is seam-ready but deferred; and live promotion still needs the multi-rank serving
-proof (Gate-5-7), a model forward not a microbench.
+the freed-HBM admission loop (P4) is built (its scheduler seam lands in G2 below). Honest residual:
+true zero-SM copy-engine swap-in is unreachable graph-safely with a device-resident schedule (would
+need re-architecting `compact_miss_schedule` to emit a host-side run table pre-capture); the clean
+cross-layer prefetch hoist turns out **dependency-blocked** (per-layer indexer — proven in G2 below),
+so the real lever is widening the in-method overlap window (G2); and live promotion still needs the
+multi-rank serving proof (Gate-5-7), a model forward not a microbench.
 
 ### G2 — wide-window overlap (hoist before bmm+rope) + P4 scheduler seam
 
