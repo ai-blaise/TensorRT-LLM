@@ -302,13 +302,68 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         )
 
 
+def hisparse_num_prompt_blocks(request, tokens_per_block: int) -> int:
+    """Prompt footprint of ``request`` in HiSparse host blocks (ceil division).
+
+    HiSparse holds the full prompt on the host tier; the freed-HBM admission gate
+    sizes a request by how many ``tokens_per_block``-token host blocks its prompt
+    occupies. Reads the prompt length from the common LlmRequest fields, falling back
+    across naming variants; returns 0 when no length is discoverable so the gate
+    never spuriously rejects a request it cannot size.
+    """
+    if tokens_per_block <= 0:
+        return 0
+    prompt_len = None
+    for attr in ("prompt_len", "promptLen", "orig_prompt_len", "input_token_length"):
+        value = getattr(request, attr, None)
+        if isinstance(value, int) and value >= 0:
+            prompt_len = value
+            break
+    if prompt_len is None:
+        tokens = getattr(request, "prompt_tokens", None) or getattr(
+            request, "input_tokens", None)
+        if tokens is not None:
+            try:
+                prompt_len = len(tokens)
+            except TypeError:
+                prompt_len = None
+    if prompt_len is None:
+        return 0
+    return (int(prompt_len) + tokens_per_block - 1) // tokens_per_block
+
+
 class SimpleScheduler(RequestScheduler):
     def __init__(
-        self, capacity_scheduler: CapacityScheduler, micro_batch_scheduler: MicroBatchScheduler
+        self, capacity_scheduler: CapacityScheduler, micro_batch_scheduler: MicroBatchScheduler,
+        hisparse_coordinator=None,
     ):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+        # P4 freed-HBM readmission gate. When a HiSparse coordinator is attached, the
+        # capacity scheduler's fitting set is further filtered so only requests whose
+        # prompt footprint fits the coordinator's free host-block + request-slot
+        # budget are admitted; the rest defer until a finished request is released and
+        # frees host slots. None (the default) makes this a strict no-op, so non-DSA
+        # / non-HiSparse serving is byte-for-byte unchanged.
+        self.hisparse_coordinator = hisparse_coordinator
+
+    def _apply_hisparse_gate(self, fitting_requests: RequestList) -> RequestList:
+        """Filter the fitting set by the HiSparse freed-HBM budget (no-op if unset)."""
+        coordinator = self.hisparse_coordinator
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            return fitting_requests
+        gate = getattr(coordinator, "filter_admissible_requests", None)
+        tier = getattr(coordinator, "tier", None)
+        if gate is None or tier is None:
+            return fitting_requests
+        tokens_per_block = int(getattr(tier, "tokens_per_block", 0) or 0)
+        admitted, _deferred = gate(
+            fitting_requests,
+            num_prompt_blocks_of=lambda r: hisparse_num_prompt_blocks(
+                r, tokens_per_block),
+        )
+        return admitted
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -316,6 +371,8 @@ class SimpleScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
+
+        fitting_requests = self._apply_hisparse_gate(fitting_requests)
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids

@@ -1,0 +1,149 @@
+{
+  "meta": {
+    "labeled_locality_model": true,
+    "real_indexer_topk": false,
+    "reason_no_real_topk": "DSA sparse_attn_indexer needs trained indexer-K + full DSA metadata + long-context KV forward (full-model deploy); out of scope for this no-live-DGD gate. Distinct-block COUNTING is done by the production native op hisparse_topk_to_block_positions.",
+    "index_topk": 1024,
+    "tokens_per_block": 64,
+    "n_sink_tokens": 128,
+    "rows_per_scenario": 512,
+    "churn_steps": 8,
+    "max_theoretical_distinct_blocks": 1024,
+    "native_op_matches_python_set_all_scenarios": true
+  },
+  "scenarios": {
+    "64k_scattered_worstish": {
+      "kv_len": 65536,
+      "recency_frac": 0.1,
+      "sink_frac": 0.02,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 605.748046875,
+        "p50": 606.0,
+        "p95": 622.0,
+        "min": 580.0,
+        "max": 633.0,
+        "token_amplification_mean": 605.748046875
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.5927140412805326,
+        "new_blocks_per_step_mean": 246.81138392857142,
+        "new_blocks_per_step_p95": 263.0
+      }
+    },
+    "64k_recency_heavy": {
+      "kv_len": 65536,
+      "recency_frac": 0.6,
+      "sink_frac": 0.05,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 314.73828125,
+        "p50": 315.0,
+        "p95": 324.45,
+        "min": 300.0,
+        "max": 333.0,
+        "token_amplification_mean": 314.73828125
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.3277406467471869,
+        "new_blocks_per_step_mean": 212.36495535714286,
+        "new_blocks_per_step_p95": 225.0
+      }
+    },
+    "64k_balanced": {
+      "kv_len": 65536,
+      "recency_frac": 0.35,
+      "sink_frac": 0.05,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 470.724609375,
+        "p50": 471.0,
+        "p95": 485.0,
+        "min": 445.0,
+        "max": 494.0,
+        "token_amplification_mean": 470.724609375
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.4661926038301715,
+        "new_blocks_per_step_mean": 251.88839285714286,
+        "new_blocks_per_step_p95": 268.0
+      }
+    },
+    "128k_scattered_worstish": {
+      "kv_len": 131072,
+      "recency_frac": 0.1,
+      "sink_frac": 0.02,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 735.615234375,
+        "p50": 736.0,
+        "p95": 752.0,
+        "min": 707.0,
+        "max": 760.0,
+        "token_amplification_mean": 735.615234375
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.3615866867072891,
+        "new_blocks_per_step_mean": 470.1216517857143,
+        "new_blocks_per_step_p95": 490.0
+      }
+    },
+    "128k_recency_heavy": {
+      "kv_len": 131072,
+      "recency_frac": 0.6,
+      "sink_frac": 0.05,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 341.310546875,
+        "p50": 341.0,
+        "p95": 349.0,
+        "min": 326.0,
+        "max": 355.0,
+        "token_amplification_mean": 341.310546875
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.1935246535353028,
+        "new_blocks_per_step_mean": 276.17075892857144,
+        "new_blocks_per_step_p95": 289.0
+      }
+    },
+    "128k_balanced": {
+      "kv_len": 131072,
+      "recency_frac": 0.35,
+      "sink_frac": 0.05,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 539.984375,
+        "p50": 540.0,
+        "p95": 552.0,
+        "min": 519.0,
+        "max": 559.0,
+        "token_amplification_mean": 539.984375
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.2735222936911274,
+        "new_blocks_per_step_mean": 392.95535714285717,
+        "new_blocks_per_step_p95": 409.25
+      }
+    },
+    "128k_fully_uniform": {
+      "kv_len": 131072,
+      "recency_frac": 0.0,
+      "sink_frac": 0.0,
+      "native_count_matches_python_set": true,
+      "distinct_blocks_per_1024": {
+        "mean": 808.619140625,
+        "p50": 809.0,
+        "p95": 826.0,
+        "min": 778.0,
+        "max": 843.0,
+        "token_amplification_mean": 808.619140625
+      },
+      "cross_step_churn": {
+        "blocks_reused_frac_mean": 0.3947230808472285,
+        "new_blocks_per_step_mean": 489.21316964285717,
+        "new_blocks_per_step_p95": 511.0
+      }
+    }
+  }
+}

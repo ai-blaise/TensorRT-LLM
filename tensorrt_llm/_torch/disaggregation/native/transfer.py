@@ -47,7 +47,14 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    PoolRole,
+    get_pool_role,
+    get_pool_view_global_layer_ids,
+    get_unique_layers,
+    get_unique_pool_memory_descs,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
@@ -77,6 +84,7 @@ class RecvReqInfo:
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
     kvarn_gqa_side_slot: Optional[int] = None
+    hisparse_host_slots: Optional[np.ndarray] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -93,6 +101,10 @@ class RecvReqInfo:
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
                 "kvarn_gqa_side_slot": self.kvarn_gqa_side_slot,
+                "hisparse_host_slots": (
+                    self.hisparse_host_slots.astype(np.int64,
+                                                    copy=False).tobytes()
+                    if self.hisparse_host_slots is not None else None),
             }
         )
 
@@ -103,6 +115,10 @@ class RecvReqInfo:
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
         d.setdefault("kvarn_gqa_side_slot", None)
+        hisparse_host_slots = d.get("hisparse_host_slots")
+        d["hisparse_host_slots"] = (
+            np.frombuffer(hisparse_host_slots, dtype=np.int64).copy()
+            if hisparse_host_slots is not None else None)
         return cls(**d)
 
 
@@ -116,6 +132,7 @@ class ReadMeta:
 class WriteMetaType(Enum):
     KV = "KV"
     AUX = "AUX"
+    HISPARSE_HOST = "HISPARSE_HOST"
 
 
 @dataclass
@@ -129,10 +146,18 @@ class WriteMeta:
     src_ptrs: np.ndarray  # dtype=np.int64
     dst_ptrs: np.ndarray  # dtype=np.int64
     sizes: np.ndarray  # dtype=np.int64
+    src_device_id: Optional[int] = None
     dst_device_id: Optional[int] = None
+    src_memory_type: Optional[str] = None
+    dst_memory_type: Optional[str] = None
     slice_id: Optional[int] = None
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    hisparse_src_ptrs: Optional[np.ndarray] = None
+    hisparse_dst_ptrs: Optional[np.ndarray] = None
+    hisparse_sizes: Optional[np.ndarray] = None
+    hisparse_commit_layer_indices: Optional[np.ndarray] = None
+    hisparse_commit_block_positions: Optional[np.ndarray] = None
 
 
 class MessageType:
@@ -155,6 +180,56 @@ class TaskStatus(Enum):
 class AgentResult(Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+
+
+def _pack_hisparse_commit_payload(
+    layer_indices: Optional[np.ndarray],
+    block_positions: Optional[np.ndarray],
+) -> Optional[bytes]:
+    if layer_indices is None and block_positions is None:
+        return None
+    if layer_indices is None or block_positions is None:
+        raise RuntimeError(
+            "HiSparse commit coverage requires both layer indices and block "
+            "positions.")
+    layers = np.asarray(layer_indices, dtype=np.int64)
+    blocks = np.asarray(block_positions, dtype=np.int64)
+    if layers.ndim != 1 or blocks.ndim != 1:
+        raise RuntimeError("HiSparse commit coverage arrays must be 1D.")
+    if layers.size != blocks.size:
+        raise RuntimeError(
+            "HiSparse commit coverage layer/block count mismatch: "
+            f"layers={layers.size}, blocks={blocks.size}.")
+    if layers.size == 0:
+        return None
+    return msgpack.packb(
+        {
+            "hisparse_commit_layer_indices": layers.tolist(),
+            "hisparse_commit_block_positions": blocks.tolist(),
+        },
+        use_bin_type=True,
+    )
+
+
+def _unpack_hisparse_commit_payload(
+    payload: Optional[bytes],
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if payload is None:
+        return None, None
+    data = msgpack.unpackb(payload, raw=False)
+    layers = np.asarray(data.get("hisparse_commit_layer_indices", []),
+                        dtype=np.int64)
+    blocks = np.asarray(data.get("hisparse_commit_block_positions", []),
+                        dtype=np.int64)
+    if layers.ndim != 1 or blocks.ndim != 1:
+        raise RuntimeError("HiSparse commit coverage payload must be 1D.")
+    if layers.size != blocks.size:
+        raise RuntimeError(
+            "HiSparse commit coverage payload layer/block count mismatch: "
+            f"layers={layers.size}, blocks={blocks.size}.")
+    if layers.size == 0:
+        return None, None
+    return layers, blocks
 
 
 class SendTaskBase:
@@ -231,9 +306,11 @@ class Sender(SenderBase):
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
         kvarn_gqa_side_pool=None,
+        hisparse_kv_cache_manager=None,
     ):
         self._registrar = peer_registrar
         self._kvarn_gqa_side_pool = kvarn_gqa_side_pool
+        self._hisparse_kv_cache_manager = hisparse_kv_cache_manager
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._peer_requests: dict = {}
@@ -419,6 +496,31 @@ class Sender(SenderBase):
                 dealers.clear()
 
     @staticmethod
+    def _infer_memory_type(meta_type: WriteMetaType) -> tuple[str, str]:
+        if meta_type == WriteMetaType.AUX:
+            return MemoryType.DRAM, MemoryType.DRAM
+        if meta_type == WriteMetaType.HISPARSE_HOST:
+            return MemoryType.VRAM, MemoryType.DRAM
+        return MemoryType.VRAM, MemoryType.VRAM
+
+    @staticmethod
+    def _is_vram_memory(mem_type: str) -> bool:
+        return mem_type == MemoryType.VRAM or str(mem_type).upper().endswith("VRAM")
+
+    @staticmethod
+    def _resolve_memory_device_id(
+        *,
+        mem_type: str,
+        explicit_device_id: Optional[int],
+        default_vram_device_id: int,
+    ) -> int:
+        if explicit_device_id is not None:
+            return int(explicit_device_id)
+        if Sender._is_vram_memory(mem_type):
+            return int(default_vram_device_id)
+        return 0
+
+    @staticmethod
     @nvtx_range("_make_agent_request")
     def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
@@ -429,25 +531,35 @@ class Sender(SenderBase):
                 f"{write_meta.sizes.size=}"
             )
         n = write_meta.src_ptrs.size
-        if write_meta.meta_type == WriteMetaType.AUX:
-            src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
-        else:
-            if write_meta.dst_device_id is None:
-                raise RuntimeError(
-                    f"_make_agent_request: dst_device_id is None for KV transfer "
-                    f"unique_rid={write_meta.unique_rid}"
-                )
-            src_dev, dst_dev, mem_type = device_id, write_meta.dst_device_id, MemoryType.VRAM
+        default_src_type, default_dst_type = Sender._infer_memory_type(
+            write_meta.meta_type)
+        src_mem_type = write_meta.src_memory_type or default_src_type
+        dst_mem_type = write_meta.dst_memory_type or default_dst_type
+        if (Sender._is_vram_memory(dst_mem_type)
+                and write_meta.dst_device_id is None):
+            raise RuntimeError(
+                f"_make_agent_request: dst_device_id is None for VRAM "
+                f"transfer unique_rid={write_meta.unique_rid}")
+        src_dev = Sender._resolve_memory_device_id(
+            mem_type=src_mem_type,
+            explicit_device_id=write_meta.src_device_id,
+            default_vram_device_id=device_id,
+        )
+        dst_dev = Sender._resolve_memory_device_id(
+            mem_type=dst_mem_type,
+            explicit_device_id=write_meta.dst_device_id,
+            default_vram_device_id=device_id,
+        )
 
         if n == 0:
-            src_memory_descs = MemoryDescs(mem_type, [])
-            dst_memory_descs = MemoryDescs(mem_type, [])
+            src_memory_descs = MemoryDescs(src_mem_type, [])
+            dst_memory_descs = MemoryDescs(dst_mem_type, [])
         else:
             src_memory_descs = MemoryDescs.from_arrays_uniform_device(
-                mem_type, write_meta.src_ptrs, write_meta.sizes, src_dev
+                src_mem_type, write_meta.src_ptrs, write_meta.sizes, src_dev
             )
             dst_memory_descs = MemoryDescs.from_arrays_uniform_device(
-                mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
+                dst_mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
             )
 
         # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
@@ -518,20 +630,62 @@ class Sender(SenderBase):
             if not self._agent.submit_transfer_requests(request).wait():
                 agent_result = AgentResult.FAILED
                 task.fail(RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}"))
+        if agent_result == AgentResult.SUCCESS and write_meta.hisparse_src_ptrs is not None:
+            if (write_meta.hisparse_dst_ptrs is None
+                    or write_meta.hisparse_sizes is None):
+                agent_result = AgentResult.FAILED
+                task.fail(
+                    RuntimeError(
+                        "HiSparse host transfer metadata is incomplete for "
+                        f"request {write_meta.unique_rid}"))
+            elif write_meta.hisparse_src_ptrs.size > 0:
+                hisparse_meta = WriteMeta(
+                    task=write_meta.task,
+                    expected_transfers=write_meta.expected_transfers,
+                    peer_name=write_meta.peer_name,
+                    peer_rank=write_meta.peer_rank,
+                    peer_endpoint=write_meta.peer_endpoint,
+                    unique_rid=write_meta.unique_rid,
+                    src_ptrs=write_meta.hisparse_src_ptrs,
+                    dst_ptrs=write_meta.hisparse_dst_ptrs,
+                    sizes=write_meta.hisparse_sizes,
+                    src_device_id=self._device_id,
+                    dst_device_id=0,
+                    src_memory_type=MemoryType.VRAM,
+                    dst_memory_type=MemoryType.DRAM,
+                    slice_id=write_meta.slice_id,
+                    is_last_slice=write_meta.is_last_slice,
+                    meta_type=WriteMetaType.HISPARSE_HOST,
+                )
+                request = Sender._make_agent_request(
+                    hisparse_meta, device_id=self._device_id)
+                if not self._agent.submit_transfer_requests(request).wait():
+                    agent_result = AgentResult.FAILED
+                    task.fail(
+                        RuntimeError(
+                            "HiSparse host transfer failed for request "
+                            f"{write_meta.unique_rid}"))
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
+        result_message = [
+            MessageType.KV_AGENT_RESULT,
+            str(self._instance_rank).encode("ascii"),
+            str(write_meta.unique_rid).encode("ascii"),
+            str(write_meta.slice_id).encode("ascii"),
+            str(write_meta.is_last_slice).encode("ascii"),
+            agent_result.value.encode("ascii"),
+        ]
+        if agent_result == AgentResult.SUCCESS:
+            hisparse_payload = _pack_hisparse_commit_payload(
+                write_meta.hisparse_commit_layer_indices,
+                write_meta.hisparse_commit_block_positions,
+            )
+            if hisparse_payload is not None:
+                result_message.append(hisparse_payload)
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
-            [
-                MessageType.KV_AGENT_RESULT,
-                str(self._instance_rank).encode("ascii"),
-                str(write_meta.unique_rid).encode("ascii"),
-                str(write_meta.slice_id).encode("ascii"),
-                str(write_meta.is_last_slice).encode("ascii"),
-                agent_result.value.encode("ascii"),
-            ]
-        )
+            result_message)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -699,6 +853,138 @@ class Sender(SenderBase):
             src_meta.item_sizes.astype(np.int64, copy=False),
         )
 
+    @staticmethod
+    def _collect_hisparse_host_dst_frags(
+        peer_ri: RankInfo,
+        req_info: RecvReqInfo,
+        *,
+        layer_indices: Optional[list[int]] = None,
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        if req_info.hisparse_host_slots is None:
+            return None
+        dst_meta = peer_ri.hisparse_host_meta
+        if dst_meta is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires host-tier metadata on the "
+                "receiver; refusing to send packed KVarN blocks without "
+                "published DRAM destinations.")
+        return dst_meta.packed_destination_fragments(
+            req_info.hisparse_host_slots,
+            layer_indices=layer_indices,
+        )
+
+    def _collect_hisparse_host_frags(
+        self,
+        peer_ri: RankInfo,
+        req_info: RecvReqInfo,
+        *,
+        layer_indices: list[int],
+        dest_layer_indices: list[int],
+        src_block_ids: np.ndarray,
+        dst_block_pos_start: int,
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        if req_info.hisparse_host_slots is None:
+            return None
+        if self._hisparse_kv_cache_manager is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires the sender KV cache manager "
+                "to expose packed KVarN source fragments.")
+        host_slots = req_info.hisparse_host_slots
+        block_count = int(src_block_ids.size)
+        dst_block_pos_start = int(dst_block_pos_start)
+        dst_block_pos_stop = dst_block_pos_start + block_count
+        if dst_block_pos_start < 0 or dst_block_pos_stop > host_slots.size:
+            raise RuntimeError(
+                "HiSparse host-slot publication does not cover aligned "
+                f"destination block range [{dst_block_pos_start}, "
+                f"{dst_block_pos_stop}); slots={host_slots.size}.")
+        dst_slots = host_slots[dst_block_pos_start:dst_block_pos_stop]
+        src_ptrs, src_sizes = (
+            self._hisparse_kv_cache_manager.kvarn_packed_source_fragments(
+                layer_indices, src_block_ids))
+        dst_ptrs, dst_sizes = Sender._collect_hisparse_host_dst_frags(
+            peer_ri,
+            RecvReqInfo(sender_req_id=req_info.sender_req_id,
+                        instance_name=req_info.instance_name,
+                        instance_rank=req_info.instance_rank,
+                        block_ids_per_layer_groups=[],
+                        unique_rid=req_info.unique_rid,
+                        hisparse_host_slots=dst_slots),
+            layer_indices=dest_layer_indices,
+        )
+        if not np.array_equal(src_sizes, dst_sizes):
+            raise RuntimeError(
+                "HiSparse packed source/destination byte sizes do not match: "
+                f"src={src_sizes.tolist()}, dst={dst_sizes.tolist()}.")
+        dst_block_positions = np.arange(dst_block_pos_start,
+                                        dst_block_pos_stop,
+                                        dtype=np.int64)
+        commit_layers = np.repeat(
+            np.asarray(dest_layer_indices, dtype=np.int64), block_count)
+        commit_blocks = np.tile(dst_block_positions, len(dest_layer_indices))
+        if commit_layers.size != src_ptrs.size:
+            raise RuntimeError(
+                "HiSparse commit coverage does not match packed fragments: "
+                f"coverage={commit_layers.size}, fragments={src_ptrs.size}.")
+        return src_ptrs, dst_ptrs, src_sizes, commit_layers, commit_blocks
+
+    def _collect_hisparse_for_pool_pair(
+        self,
+        *,
+        peer_ri: RankInfo,
+        req_info: RecvReqInfo,
+        self_lg: int,
+        self_pi: int,
+        peer_lg: int,
+        peer_pi: int,
+        src_block_ids: np.ndarray,
+        dst_block_pos_start: int,
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        if req_info.hisparse_host_slots is None or src_block_ids.size == 0:
+            return None
+        self_pt = self._registrar.self_extractor.page_table
+        peer_pt = peer_ri.page_table
+        if peer_pt is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires peer page-table metadata.")
+        self_lg_info = self_pt.layer_groups[self_lg]
+        peer_lg_info = peer_pt.layer_groups[peer_lg]
+        if (not isinstance(self_lg_info, AttentionLayerGroup)
+                or not isinstance(peer_lg_info, AttentionLayerGroup)):
+            return None
+        self_pv = self_lg_info.pool_views[self_pi]
+        peer_pv = peer_lg_info.pool_views[peer_pi]
+        if len(self_pv.buffer_entries) == 0 or len(peer_pv.buffer_entries) == 0:
+            return None
+        attention = self._registrar.self_rank_info.attention
+        if attention is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires attention rank metadata.")
+        try:
+            pool_role = get_pool_role(self_pv, kv_factor=attention.kv_factor)
+        except ValueError:
+            return None
+        if pool_role != PoolRole.KV_CACHE:
+            return None
+        source_layers = get_pool_view_global_layer_ids(self_pv, self_lg_info)
+        peer_local_layers = get_unique_layers(peer_pv)
+        dest_layers = [
+            int(layer.local_layer_id) for layer in peer_lg_info.local_layers
+            if int(layer.local_layer_id) in peer_local_layers
+        ]
+        if len(source_layers) != len(dest_layers):
+            raise RuntimeError(
+                "HiSparse source/destination layer count mismatch: "
+                f"src={source_layers}, dst={dest_layers}.")
+        return self._collect_hisparse_host_frags(
+            peer_ri,
+            req_info,
+            layer_indices=source_layers,
+            src_block_ids=src_block_ids,
+            dst_block_pos_start=dst_block_pos_start,
+            dest_layer_indices=dest_layers,
+        )
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -718,6 +1004,16 @@ class Sender(SenderBase):
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
+        hisparse_src_parts: list[np.ndarray] = []
+        hisparse_dst_parts: list[np.ndarray] = []
+        hisparse_size_parts: list[np.ndarray] = []
+        hisparse_commit_layer_parts: list[np.ndarray] = []
+        hisparse_commit_block_parts: list[np.ndarray] = []
+        hisparse_src_frags: Optional[np.ndarray] = None
+        hisparse_dst_frags: Optional[np.ndarray] = None
+        hisparse_sizes: Optional[np.ndarray] = None
+        hisparse_commit_layer_indices: Optional[np.ndarray] = None
+        hisparse_commit_block_positions: Optional[np.ndarray] = None
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -779,6 +1075,7 @@ class Sender(SenderBase):
                     stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
                     src_start = max(stale_end * tpb, src_start)
                     dst_start = max(stale_end * tpb, dst_start)
+                overlap_start = max(src_start, dst_start)
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                     src_block_ids,
                     dst_block_ids,
@@ -800,6 +1097,23 @@ class Sender(SenderBase):
                     src_frag_parts.append(rp.src.memory.ptrs)
                     dst_frag_parts.append(rp.dst.memory.ptrs)
                     size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+                hisparse_frags = self._collect_hisparse_for_pool_pair(
+                    peer_ri=peer_ri,
+                    req_info=req_info,
+                    self_lg=self_lg,
+                    self_pi=self_pi,
+                    peer_lg=peer_lg,
+                    peer_pi=peer_pi,
+                    src_block_ids=src_block_ids,
+                    dst_block_pos_start=overlap_start // tpb,
+                )
+                if hisparse_frags is not None:
+                    h_src, h_dst, h_sizes, h_layers, h_blocks = hisparse_frags
+                    hisparse_src_parts.append(h_src)
+                    hisparse_dst_parts.append(h_dst)
+                    hisparse_size_parts.append(h_sizes)
+                    hisparse_commit_layer_parts.append(h_layers)
+                    hisparse_commit_block_parts.append(h_blocks)
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -835,6 +1149,28 @@ class Sender(SenderBase):
             src_frags = np.concatenate([src_frags, s_src])
             dst_frags = np.concatenate([dst_frags, s_dst])
             kv_sizes = np.concatenate([kv_sizes, s_sizes])
+        if hisparse_src_parts:
+            # Source/destination descriptors are validated here, but not
+            # appended to the VRAM KV write. They are submitted as a typed
+            # HISPARSE_HOST transfer before KV_AGENT_RESULT is sent.
+            hisparse_src_frags = np.concatenate(hisparse_src_parts)
+            hisparse_dst_frags = np.concatenate(hisparse_dst_parts)
+            hisparse_sizes = np.concatenate(hisparse_size_parts)
+            hisparse_commit_layer_indices = np.concatenate(
+                hisparse_commit_layer_parts)
+            hisparse_commit_block_positions = np.concatenate(
+                hisparse_commit_block_parts)
+            if not (hisparse_src_frags.size == hisparse_dst_frags.size
+                    == hisparse_sizes.size
+                    == hisparse_commit_layer_indices.size
+                    == hisparse_commit_block_positions.size):
+                raise RuntimeError(
+                    "HiSparse packed host-write fragment count mismatch: "
+                    f"src={hisparse_src_frags.size}, "
+                    f"dst={hisparse_dst_frags.size}, "
+                    f"sizes={hisparse_sizes.size}, "
+                    f"layers={hisparse_commit_layer_indices.size}, "
+                    f"blocks={hisparse_commit_block_positions.size}.")
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -853,6 +1189,11 @@ class Sender(SenderBase):
             unique_rid=task._unique_rid,
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
+            hisparse_src_ptrs=hisparse_src_frags,
+            hisparse_dst_ptrs=hisparse_dst_frags,
+            hisparse_sizes=hisparse_sizes,
+            hisparse_commit_layer_indices=hisparse_commit_layer_indices,
+            hisparse_commit_block_positions=hisparse_commit_block_positions,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -980,11 +1321,19 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        send_failed_without_session = False
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
-                self._save_peer_req_info(info)
-                return
+                if info.unique_rid in self._pre_cancelled_rids:
+                    send_failed_without_session = True
+                else:
+                    self._save_peer_req_info(info)
+                    return
+        if session is None:
+            if send_failed_without_session:
+                self._send_failed_result_to_receiver(info)
+            return
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
@@ -1305,6 +1654,10 @@ class KVRecvTask:
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
         self.last_slice_count = 0
+        self.hisparse_host_slots: Optional[np.ndarray] = None
+        self.hisparse_pending_write_started = False
+        self.hisparse_commit_layer_parts: list[np.ndarray] = []
+        self.hisparse_commit_block_parts: list[np.ndarray] = []
 
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
@@ -1349,9 +1702,11 @@ class Receiver(ReceiverBase):
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
         kvarn_gqa_side_pool=None,
+        hisparse_coordinator=None,
     ):
         self._registrar = peer_registrar
         self._kvarn_gqa_side_pool = kvarn_gqa_side_pool
+        self._hisparse_coordinator = hisparse_coordinator
         self._agent = agent
         self._dealers = {}
         self._sender_ep_instance_map = {}
@@ -1416,6 +1771,8 @@ class Receiver(ReceiverBase):
         kvarn_side_slot = None
         if self._kvarn_gqa_side_pool is not None:
             kvarn_side_slot = self._kvarn_gqa_side_pool.slot_for_request(task._unique_rid)
+        hisparse_host_slots = self._reserve_hisparse_host_slots(task)
+        task.hisparse_host_slots = hisparse_host_slots
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
@@ -1427,7 +1784,49 @@ class Receiver(ReceiverBase):
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
             kvarn_gqa_side_slot=kvarn_side_slot,
+            hisparse_host_slots=hisparse_host_slots,
         )
+
+    def _reserve_hisparse_host_slots(
+        self, task: KVRecvTask) -> Optional[np.ndarray]:
+        coordinator = self._hisparse_coordinator
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            return None
+        if task._unique_rid is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires a generation-first request id.")
+        self_ri = self._registrar.self_rank_info
+        if self_ri.attention is None:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires attention metadata with "
+                "tokens_per_block.")
+        token_range = task._kv_slice.token_range
+        if token_range is None:
+            max_blocks = max((arr.size
+                              for arr in task._kv_slice.block_ids_per_layer_groups),
+                             default=0)
+            num_prompt_blocks = int(max_blocks)
+        else:
+            tpb = int(self_ri.attention.tokens_per_block)
+            num_prompt_blocks = (int(token_range.end) + tpb - 1) // tpb
+        state = coordinator.reserve_or_get_request(task._unique_rid,
+                                                   num_prompt_blocks)
+        if num_prompt_blocks > 0 and not task.hisparse_pending_write_started:
+            coordinator.begin_host_write(task._unique_rid)
+            task.hisparse_pending_write_started = True
+        return np.asarray([
+            state.host_slots_by_block_pos[block_pos]
+            for block_pos in range(num_prompt_blocks)
+        ],
+                          dtype=np.int64)
+
+    def release_hisparse_request(self,
+                                 unique_rid: int,
+                                 *,
+                                 force: bool = False) -> None:
+        coordinator = self._hisparse_coordinator
+        if coordinator is not None and getattr(coordinator, "enabled", False):
+            coordinator.release_request(int(unique_rid), force=force)
 
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
@@ -1472,11 +1871,18 @@ class Receiver(ReceiverBase):
                 f"dispatch_task: RxSession {task._unique_rid} not found; "
                 "session may have been closed before dispatch"
             )
-        session.mark_transferring(task.slice_id)
         # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
         session._sender_endpoints.update(
             peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks
         )
+        if not session.mark_transferring(task.slice_id):
+            logger.debug(
+                "Receiver.dispatch_task: request %s slice=%s became terminal "
+                "before transfer dispatch; not sending REQUEST_DATA.",
+                task._unique_rid,
+                task.slice_id,
+            )
+            return
         for rank in peer_overlap.ranks:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
@@ -1577,9 +1983,14 @@ class Receiver(ReceiverBase):
             session.cancel()
 
     def _process_kv_agent_result(self, _send_id: bytes, message: list[bytes]):
+        if len(message) < 6:
+            raise RuntimeError(
+                "KV_AGENT_RESULT message must have at least 6 frames, got "
+                f"{len(message)}.")
         msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = decode_message(
-            message
-        )
+            message[:6])
+        hisparse_layers, hisparse_blocks = _unpack_hisparse_commit_payload(
+            message[6] if len(message) > 6 else None)
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         sender_slice_id = int(slice_id_str)
@@ -1595,7 +2006,12 @@ class Receiver(ReceiverBase):
             )
             return
         session.process_kv_agent_result(
-            peer_rank, sender_slice_id, is_last_slice_str == "True", AgentResult(status)
+            peer_rank,
+            sender_slice_id,
+            is_last_slice_str == "True",
+            AgentResult(status),
+            hisparse_commit_layer_indices=hisparse_layers,
+            hisparse_commit_block_positions=hisparse_blocks,
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1685,9 +2101,24 @@ class RxSession(RxSessionBase):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
-    def mark_transferring(self, slice_id: int):
+    def mark_transferring(self, slice_id: int) -> bool:
         with self.lock:
-            self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
+            task = self._kv_tasks[slice_id]
+            terminal_status = self._terminal_status
+            if terminal_status in (SessionStatus.ERROR,
+                                   SessionStatus.CANCELLED):
+                self._finish_hisparse_host_write(task)
+                if not task.is_done:
+                    task.fail(
+                        RuntimeError(
+                            f"RxSession {self.disagg_request_id} is already "
+                            f"{terminal_status.value}; not starting "
+                            f"slice={slice_id}."))
+                return False
+            if task.is_done:
+                return False
+            task.status = TaskStatus.TRANSFERRING
+            return True
 
     def receive(self, slice: KVSlice) -> None:
         params = self._base_args.params
@@ -1703,7 +2134,14 @@ class RxSession(RxSessionBase):
         self._receiver.dispatch_task(task)
 
     def process_kv_agent_result(
-        self, peer_rank: int, sender_slice_id: int, is_last_slice: bool, status: AgentResult
+        self,
+        peer_rank: int,
+        sender_slice_id: int,
+        is_last_slice: bool,
+        status: AgentResult,
+        *,
+        hisparse_commit_layer_indices: Optional[np.ndarray] = None,
+        hisparse_commit_block_positions: Optional[np.ndarray] = None,
     ):
         with self.lock:
             assert sender_slice_id < len(self._kv_tasks), (
@@ -1712,21 +2150,51 @@ class RxSession(RxSessionBase):
                 f"Sender/receiver slice count mismatch."
             )
             task = self._kv_tasks[sender_slice_id]
+            terminal_status = self._terminal_status
+            if terminal_status in (SessionStatus.ERROR,
+                                   SessionStatus.CANCELLED):
+                # A transferring task may complete after cancellation/error.
+                # Do not publish HiSparse host commits or admission for a
+                # request that the receiver has already made terminal.
+                self._finish_hisparse_host_write(task)
+                if not task.is_done:
+                    task.fail(
+                        RuntimeError(
+                            f"RxSession {self.disagg_request_id} is already "
+                            f"{terminal_status.value}; discarding late "
+                            f"KV_AGENT_RESULT {status.value} for "
+                            f"slice={sender_slice_id}."))
+                return
             if status == AgentResult.SUCCESS:
-                if is_last_slice:
-                    task.last_slice_count += 1
-                    if task.last_slice_count == task.expected_transfers:
-                        task.complete()
+                try:
+                    self._record_hisparse_commit_coverage(
+                        task,
+                        hisparse_commit_layer_indices,
+                        hisparse_commit_block_positions,
+                    )
+                    if is_last_slice:
+                        task.last_slice_count += 1
+                        if task.last_slice_count == task.expected_transfers:
+                            self._commit_hisparse_host_writes(task)
+                            task.complete()
 
-                        logger.debug(
-                            f"KV transfer complete for request {self.request_id} "
-                            f"slice={sender_slice_id}"
-                        )
-                        if task._perf_timer is not None:
-                            task._perf_timer.record_task_end(peer_rank)
-                        ri = self._receiver._registrar.self_rank_info
-                        task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+                            logger.debug(
+                                f"KV transfer complete for request {self.request_id} "
+                                f"slice={sender_slice_id}"
+                            )
+                            if task._perf_timer is not None:
+                                task._perf_timer.record_task_end(peer_rank)
+                            ri = self._receiver._registrar.self_rank_info
+                            task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+                except Exception as exc:
+                    self._finish_hisparse_host_write(task)
+                    task.fail(exc)
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    logger.error(str(exc))
+                    return
             elif status == AgentResult.FAILED:
+                self._finish_hisparse_host_write(task)
                 task.fail(
                     RuntimeError(
                         f"KV transfer failed for request {self.request_id} slice={sender_slice_id}"
@@ -1738,6 +2206,83 @@ class RxSession(RxSessionBase):
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"
                 )
+
+    @staticmethod
+    def _record_hisparse_commit_coverage(
+        task: KVRecvTask,
+        layer_indices: Optional[np.ndarray],
+        block_positions: Optional[np.ndarray],
+    ) -> None:
+        if layer_indices is None and block_positions is None:
+            return
+        if layer_indices is None or block_positions is None:
+            raise RuntimeError(
+                "HiSparse commit coverage requires both layer indices and "
+                "block positions.")
+        layers = np.asarray(layer_indices, dtype=np.int64)
+        blocks = np.asarray(block_positions, dtype=np.int64)
+        if layers.ndim != 1 or blocks.ndim != 1 or layers.size != blocks.size:
+            raise RuntimeError(
+                "HiSparse commit coverage must be parallel 1D arrays; "
+                f"layers_shape={layers.shape}, blocks_shape={blocks.shape}.")
+        if layers.size == 0:
+            return
+        task.hisparse_commit_layer_parts.append(layers.copy())
+        task.hisparse_commit_block_parts.append(blocks.copy())
+
+    def _commit_hisparse_host_writes(self, task: KVRecvTask) -> None:
+        coordinator = getattr(self._receiver, "_hisparse_coordinator", None)
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            return
+        slots = task.hisparse_host_slots
+        has_slots = slots is not None and int(slots.size) > 0
+        has_coverage = bool(task.hisparse_commit_layer_parts)
+        if has_slots and not has_coverage:
+            self._finish_hisparse_host_write(task)
+            raise RuntimeError(
+                "HiSparse direct-to-host reserved host slots but received no "
+                f"successful host-write commit coverage for request "
+                f"{self.disagg_request_id}, slice={task.slice_id}.")
+        if not has_coverage:
+            self._finish_hisparse_host_write(task)
+            return
+        layers = np.concatenate(task.hisparse_commit_layer_parts)
+        blocks = np.concatenate(task.hisparse_commit_block_parts)
+        try:
+            coordinator.mark_host_write_committed(
+                task._unique_rid,
+                layer_indices=layers,
+                block_positions=blocks,
+            )
+        finally:
+            self._finish_hisparse_host_write(task)
+        incomplete = []
+        if slots is not None:
+            incomplete = [
+                block_pos for block_pos in range(int(slots.size))
+                if not coordinator.host_block_committed(task._unique_rid,
+                                                       block_pos)
+            ]
+        if incomplete:
+            sample = ", ".join(str(block_pos) for block_pos in incomplete[:8])
+            raise RuntimeError(
+                "HiSparse host-write coverage completed without committing "
+                "all reserved prompt block position(s): "
+                f"{sample}; request={self.disagg_request_id}, "
+                f"slice={task.slice_id}.")
+        if slots is not None:
+            coordinator.mark_request_admitted(task._unique_rid,
+                                             num_prompt_blocks=int(slots.size))
+
+    def _finish_hisparse_host_write(self, task: KVRecvTask) -> None:
+        if not getattr(task, "hisparse_pending_write_started", False):
+            return
+        coordinator = getattr(self._receiver, "_hisparse_coordinator", None)
+        if coordinator is None or not getattr(coordinator, "enabled", False):
+            task.hisparse_pending_write_started = False
+            return
+        coordinator.finish_host_write(task._unique_rid)
+        task.hisparse_pending_write_started = False
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
         # Aux is session-level (not per-slice); expected_transfers is identical
@@ -1820,6 +2365,7 @@ class RxSession(RxSessionBase):
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
             for task in self._kv_tasks:
                 if task.status == TaskStatus.INIT:
+                    self._finish_hisparse_host_write(task)
                     task.fail(exc)
         # Send outside the lock to avoid holding it during I/O.
         self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)
@@ -1871,14 +2417,26 @@ class RxSession(RxSessionBase):
 
     def close(self):
         if getattr(self, "_closed", False):
-            return
+            return True
+        if self.has_transferring_tasks():
+            logger.warning(
+                "RxSession.close deferred for request %s because KV/HiSparse "
+                "writes are still TRANSFERRING; caller must retry cleanup.",
+                self.disagg_request_id,
+            )
+            return False
         self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
+            force_release = self.status in (SessionStatus.ERROR,
+                                            SessionStatus.CANCELLED)
+            self._receiver.release_hisparse_request(self.disagg_request_id,
+                                                    force=force_release)
             self._receiver.clear_session(self.disagg_request_id)
+        return True
 
     def __enter__(self):
         return self
@@ -2012,12 +2570,14 @@ class TransferWorker:
             if self._kvarn_gqa_side_pool is not None
             else None
         )
+        hisparse_host_meta = self._make_hisparse_host_meta(kvm)
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
             kvarn_gqa_side_meta=kvarn_gqa_side_meta,
+            hisparse_host_meta=hisparse_host_meta,
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
@@ -2035,6 +2595,15 @@ class TransferWorker:
         return get_or_create_kvarn_gqa_side_pool_for_manager(
             kvm, dtype=dtype, device=torch.device("cuda", device_id)
         )
+
+    @staticmethod
+    def _make_hisparse_host_meta(kvm: KVCacheManager):
+        coordinator = getattr(kvm, "hisparse_coordinator", None)
+        if coordinator is None:
+            return None
+        if not getattr(coordinator, "packed_tensors_allocated", False):
+            return None
+        return coordinator.transfer_meta()
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -2091,8 +2660,13 @@ class TransferWorker:
             self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
-            self._sender = Sender(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
-            self._receiver = Receiver(self._peer_registrar, self._agent, self._kvarn_gqa_side_pool)
+            self._sender = Sender(self._peer_registrar, self._agent,
+                                  self._kvarn_gqa_side_pool,
+                                  self._config.kv_cache_manager)
+            self._receiver = Receiver(self._peer_registrar, self._agent,
+                                      self._kvarn_gqa_side_pool,
+                                      getattr(self._config.kv_cache_manager,
+                                              "hisparse_coordinator", None))
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
@@ -2119,6 +2693,22 @@ class TransferWorker:
             self._agent.register_memory(reg_side_desc)
             logger.debug(f"Registered KVarN GQA side-state memory: {side_descs}")
             self._registered_mem.append(reg_side_desc)
+        hisparse_meta = self._rank_info.hisparse_host_meta
+        if hisparse_meta is not None and hisparse_meta.ptrs.size > 0:
+            names = hisparse_meta.names or [
+                f"hisparse_host{i}" for i in range(hisparse_meta.ptrs.size)
+            ]
+            hisparse_descs = [
+                (int(ptr), int(size), 0, f"hisparse_host.{name}")
+                for ptr, size, name in zip(hisparse_meta.ptrs,
+                                           hisparse_meta.size, names)
+            ]
+            reg_hisparse_desc = RegMemoryDescs("DRAM", hisparse_descs)
+            self._agent.register_memory(reg_hisparse_desc)
+            logger.debug(
+                "Registered HiSparse host-tier memory with transfer agent: "
+                f"{hisparse_descs}")
+            self._registered_mem.append(reg_hisparse_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None

@@ -95,6 +95,9 @@ if (( ${#DGD_NAME} + 8 > 45 )); then
   exit 2
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
+
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
 

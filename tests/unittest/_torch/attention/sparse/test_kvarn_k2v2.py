@@ -1,17 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """KVarN k2v2 dense MLA latent coverage.
 
-These tests stay CPU-only so they can run on protected B200 hosts without
-allocating GPU memory. They exercise the same pack/layout/dequant contracts the
-SMC-SD decode path depends on when ``mla_latent_kv_dtype='kvarn_k2v2'``.
+The default coverage is CPU-only so it can run on protected B200 hosts without
+allocating GPU memory. Guarded CUDA smoke tests exercise the native BDR writer,
+hot-reader, and sparse MLA resident-read hooks when an explicit B200 validation
+environment loads those ops. Together they cover the same pack/layout/dequant
+contracts the SMC-SD decode path depends on when
+``mla_latent_kv_dtype='kvarn_k2v2'``.
 """
 
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSATrtllmAttention
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
+    KVARN_BDR_HISPARSE_LAYOUT,
+    KVARN_LEGACY_SIDEPOOL_LAYOUT,
+    KVarNBDRSourcePool,
     KVarNLatentPool,
     parse_kvarn_dtype,
 )
@@ -61,6 +69,399 @@ def test_kvarn_k2v2_config_is_dense_mla_only():
     assert sparse_cfg.mla_latent_kv_amortize is True
 
 
+def test_kvarn_k2v2_hisparse_bdr_layout_is_not_legacy_sidepool():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+
+    layout = cfg.hisparse_bdr_layout(group=64)
+
+    assert layout.name == KVARN_BDR_HISPARSE_LAYOUT
+    assert layout.ckv_bits == 2
+    assert layout.requested_pe_bits == 2
+    assert layout.pe_storage_bits == 8
+    assert layout.num_subblocks == 4
+    assert layout.ckv_packed_bytes_per_token == 128
+    assert layout.ckv_scale_zp_bytes_per_token == 16
+    assert layout.pe_payload_bytes_per_token == 64
+    assert layout.packed_bytes_per_block == 64 * (128 + 16 + 64)
+    assert layout.field_offsets == {
+        "ckv_q": (0, 8192),
+        "ckv_scale_zp": (8192, 9216),
+        "pe_byte": (9216, 13312),
+    }
+    assert layout.packed_bytes_per_block != cfg.packed_bytes(64)
+
+
+def test_kvarn_bdr_source_pool_fragments_and_recycle_cpu():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    layout = cfg.hisparse_bdr_layout(group=64)
+    pool = KVarNBDRSourcePool(num_blocks=4, layout=layout,
+                              device=torch.device("cpu"))
+
+    assert pool.storage_layout_name == KVARN_BDR_HISPARSE_LAYOUT
+    assert pool.bytes_per_block == 13312
+    dst_ptrs, dst_sizes = pool.record_destination_fragments([2])
+    assert dst_ptrs.tolist() == [pool.store.data_ptr() +
+                                 2 * pool.bytes_per_block]
+    assert dst_sizes.tolist() == [pool.bytes_per_block]
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        pool.packed_source_fragments([2])
+
+    record = torch.arange(pool.bytes_per_block,
+                          dtype=torch.int64).remainder(256).to(torch.uint8)
+    pool.commit_record_bytes(2, record)
+    assert bool(pool.valid[2])
+    assert int(pool.commit_gen[2]) == 1
+    src_ptrs, src_sizes = pool.packed_source_fragments([2])
+    assert src_ptrs.tolist() == dst_ptrs.tolist()
+    assert src_sizes.tolist() == dst_sizes.tolist()
+
+    pool.invalidate_blocks([2])
+    assert not bool(pool.valid[2])
+    assert not bool(pool.valid_host[2])
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        pool.packed_source_fragments([2])
+
+
+def test_kvarn_bdr_source_pool_recycle_rejects_invalid_ids():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNBDRSourcePool(num_blocks=4,
+                              layout=cfg.hisparse_bdr_layout(group=64),
+                              device=torch.device("cpu"))
+    pool.commit_record_bytes(3, torch.ones(pool.bytes_per_block,
+                                           dtype=torch.uint8))
+
+    with pytest.raises(ValueError, match="out of range"):
+        pool.invalidate_blocks([-1])
+
+    assert bool(pool.valid_host[3])
+
+
+def test_kvarn_bdr_source_fragments_wait_for_write_event():
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNBDRSourcePool(num_blocks=4,
+                              layout=cfg.hisparse_bdr_layout(group=64),
+                              device=torch.device("cpu"))
+    record = torch.ones(pool.bytes_per_block, dtype=torch.uint8)
+    pool.commit_record_bytes(1, record)
+
+    class _FakeWriteEvent:
+
+        def __init__(self):
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    event = _FakeWriteEvent()
+    pool._write_events[1] = event
+
+    src_ptrs, src_sizes = pool.packed_source_fragments([1])
+
+    assert event.synchronized is True
+    assert pool._write_events[1] is None
+    assert src_ptrs.tolist() == [pool.store.data_ptr() + pool.bytes_per_block]
+    assert src_sizes.tolist() == [pool.bytes_per_block]
+
+
+def _has_mla_bdr_writer_cuda_op() -> bool:
+    try:
+        return bool(
+            torch._C._dispatch_has_kernel_for_dispatch_key(
+                "trtllm::mla_bdr_write_kvarn_record", "CUDA"))
+    except RuntimeError:
+        return False
+
+
+def _has_hisparse_hot_reader_cuda_op() -> bool:
+    try:
+        return bool(
+            torch._C._dispatch_has_kernel_for_dispatch_key(
+                "trtllm::hisparse_read_kvarn_hot_bdr", "CUDA"))
+    except RuntimeError:
+        return False
+
+
+def _has_sparse_mla_kvarn_hot_cuda_op() -> bool:
+    try:
+        return bool(
+            torch._C._dispatch_has_kernel_for_dispatch_key(
+                "trtllm::sparse_mla_decode_kvarn_hot", "CUDA"))
+    except RuntimeError:
+        return False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for the native BDR writer")
+def test_mla_bdr_write_kvarn_record_cuda_layout_smoke():
+    """B200 smoke: native writer fills exactly the production BDR record.
+
+    This is the small live-proof test for the HiSparse source writer. It does
+    not introduce a Python BDR writer or any serving oracle; it only checks the
+    registered native op's byte layout, block-id targeting, and current-stream
+    completion contract before the record can be copied back for validation.
+    """
+    if not _has_mla_bdr_writer_cuda_op():
+        pytest.skip("trtllm::mla_bdr_write_kvarn_record CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    ckv = torch.arange(64 * cfg.kv_lora_rank,
+                       device=device,
+                       dtype=torch.float32).reshape(64, cfg.kv_lora_rank)
+    ckv = ((ckv.remainder(257) - 128.0) / 128.0).to(torch.float16)
+    pe = torch.linspace(-1.0,
+                        1.0,
+                        steps=64 * cfg.qk_rope_head_dim,
+                        device=device,
+                        dtype=torch.float32).reshape(
+                            64, cfg.qk_rope_head_dim).to(torch.float16)
+    latent = torch.cat([ckv, pe], dim=1).contiguous()
+    bdr_records = torch.full((2, layout.packed_bytes_per_block + 17),
+                             0xA5,
+                             device=device,
+                             dtype=torch.uint8)
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.ops.trtllm.mla_bdr_write_kvarn_record(
+            latent, bdr_records, 1, layout.ckv_bits, layout.kv_lora_rank,
+            layout.qk_rope_head_dim)
+    stream.synchronize()
+
+    record_cpu = bdr_records.cpu()
+    ckv_q0, ckv_q1 = layout.field_offsets["ckv_q"]
+    sc0, sc1 = layout.field_offsets["ckv_scale_zp"]
+    pe0, pe1 = layout.field_offsets["pe_byte"]
+
+    assert bool(torch.all(record_cpu[0] == 0xA5))
+    assert bool(
+        torch.all(record_cpu[1, layout.packed_bytes_per_block:] == 0xA5))
+    assert not bool(torch.all(record_cpu[1, ckv_q0:ckv_q1] == 0xA5))
+    assert not bool(torch.all(record_cpu[1, sc0:sc1] == 0xA5))
+    assert not bool(torch.all(record_cpu[1, pe0:pe1] == 0xA5))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for the native BDR hot reader")
+def test_hisparse_read_kvarn_hot_bdr_cuda_layout_smoke():
+    """B200 smoke: production BDR hot reader decodes hot-indexed KVarN records.
+
+    This validates the producer-load primitive that sparse MLA must fuse. It is
+    deliberately not called from serving, and it does not introduce an FP16 hot
+    staging path or a Python BDR writer.
+    """
+    if not _has_mla_bdr_writer_cuda_op():
+        pytest.skip("trtllm::mla_bdr_write_kvarn_record CUDA op is not loaded")
+    if not _has_hisparse_hot_reader_cuda_op():
+        pytest.skip("trtllm::hisparse_read_kvarn_hot_bdr CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    hot_packed = torch.full((1, 2, layout.packed_bytes_per_block + 17),
+                            0xA5,
+                            dtype=torch.uint8,
+                            device=device)
+    latent = torch.zeros((64, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                         dtype=torch.float16,
+                         device=device)
+    latent[:, :cfg.kv_lora_rank] = 0.5
+
+    torch.ops.trtllm.mla_bdr_write_kvarn_record(
+        latent, hot_packed[0], 1, layout.ckv_bits, layout.kv_lora_rank,
+        layout.qk_rope_head_dim)
+    hot_indices = torch.tensor([[64 + 3, -1, -1, -1]],
+                               dtype=torch.int32,
+                               device=device)
+    topk_length = torch.tensor([1], dtype=torch.int32, device=device)
+    row_status = torch.zeros((1,), dtype=torch.uint8, device=device)
+
+    decoded, status = torch.ops.trtllm.hisparse_read_kvarn_hot_bdr(
+        hot_packed, hot_indices, topk_length, row_status, 0,
+        layout.tokens_per_block, layout.ckv_bits, layout.kv_lora_rank,
+        layout.qk_rope_head_dim)
+    torch.cuda.synchronize()
+
+    assert status.cpu().tolist() == [0]
+    valid = decoded[0, 0].float().cpu()
+    assert torch.allclose(valid[:cfg.kv_lora_rank],
+                          torch.full((cfg.kv_lora_rank,), 0.5),
+                          atol=1e-2,
+                          rtol=0)
+    assert torch.allclose(valid[cfg.kv_lora_rank:],
+                          torch.zeros((cfg.qk_rope_head_dim,)),
+                          atol=1e-2,
+                          rtol=0)
+    assert float(decoded[0, 1:].abs().max().cpu()) == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for sparse MLA KVarN-hot decode")
+def test_sparse_mla_decode_kvarn_hot_one_token_cuda_smoke():
+    """B200 smoke: sparse MLA reads packed KVarN-hot BDR records directly."""
+    if not _has_mla_bdr_writer_cuda_op():
+        pytest.skip("trtllm::mla_bdr_write_kvarn_record CUDA op is not loaded")
+    if not _has_sparse_mla_kvarn_hot_cuda_op():
+        pytest.skip("trtllm::sparse_mla_decode_kvarn_hot CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    hot_packed = torch.full((1, 2, layout.packed_bytes_per_block + 17),
+                            0xA5,
+                            dtype=torch.uint8,
+                            device=device)
+    latent = torch.zeros((64, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                         dtype=torch.float16,
+                         device=device)
+    latent[:, :cfg.kv_lora_rank] = 0.5
+    torch.ops.trtllm.mla_bdr_write_kvarn_record(
+        latent, hot_packed[0], 1, layout.ckv_bits, layout.kv_lora_rank,
+        layout.qk_rope_head_dim)
+
+    q = torch.zeros((1, 1, 128, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device)
+    indices = torch.tensor([[[64 + 3]]], dtype=torch.int32, device=device)
+    row_status = torch.zeros((1,), dtype=torch.uint8, device=device)
+
+    out, lse, metadata, splits = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
+        q,
+        hot_packed,
+        indices,
+        row_status,
+        None,
+        None,
+        0,
+        layout.tokens_per_block,
+        layout.tokens_per_block,
+        layout.ckv_bits,
+        layout.kv_lora_rank,
+        layout.qk_rope_head_dim,
+        1.0,
+    )
+    torch.cuda.synchronize()
+
+    assert tuple(out.shape) == (1, 1, 128, cfg.kv_lora_rank)
+    assert tuple(lse.shape) == (1, 128, 1)
+    assert metadata.numel() == 0
+    assert splits.numel() == 0
+    assert torch.allclose(out.float().cpu(),
+                          torch.full((1, 1, 128, cfg.kv_lora_rank), 0.5),
+                          atol=1e-2,
+                          rtol=0)
+    assert torch.allclose(lse.float().cpu(),
+                          torch.zeros((1, 128, 1)),
+                          atol=1e-5,
+                          rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="requires CUDA for sparse MLA resident decode")
+def test_sparse_mla_decode_kvarn_hot_resident_padding_cuda_smoke():
+    """B200 smoke: resident sink/tail sentinel and padded TopK compose.
+
+    This covers the production `explicit_sink_tail_v1` ABI without relying on a
+    packed hot record. A negative hot index with a nonnegative original TopK
+    token must read the resident normal-KV pool; a negative original TopK token
+    is padding and must not poison softmax/value accumulation.
+    """
+    if not _has_sparse_mla_kvarn_hot_cuda_op():
+        pytest.skip("trtllm::sparse_mla_decode_kvarn_hot CUDA op is not loaded")
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2)
+    layout = cfg.hisparse_bdr_layout(group=64)
+    device = torch.device("cuda")
+    q = torch.zeros((2, 1, 128, cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device)
+    hot_packed = torch.empty((1, 1, layout.packed_bytes_per_block),
+                             dtype=torch.uint8,
+                             device=device)
+    indices = torch.full((2, 1, 2), -1, dtype=torch.int32, device=device)
+    request_topk_indices = torch.tensor([[[3, -1]], [[-1, -1]]],
+                                        dtype=torch.int32,
+                                        device=device)
+    row_status = torch.zeros((2,), dtype=torch.uint8, device=device)
+    resident_kv_pool = torch.zeros((64, 1,
+                                    cfg.kv_lora_rank + cfg.qk_rope_head_dim),
+                                   dtype=torch.bfloat16,
+                                   device=device)
+    resident_kv_pool[3, 0, :cfg.kv_lora_rank] = 0.25
+    resident_kv_lens = torch.tensor([4, 4], dtype=torch.int64, device=device)
+    resident_req_idx = torch.tensor([0, 0], dtype=torch.int64, device=device)
+    resident_request_ids = torch.tensor([7001, 7001],
+                                        dtype=torch.int64,
+                                        device=device)
+    resident_block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
+    resident_tail_block_pos = torch.tensor([0, 0],
+                                           dtype=torch.int32,
+                                           device=device)
+    resident_tail_token_count = torch.tensor([4, 4],
+                                             dtype=torch.int32,
+                                             device=device)
+    resident_tail_valid = torch.tensor([True, True],
+                                       dtype=torch.bool,
+                                       device=device)
+
+    out, lse, metadata, splits = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
+        q,
+        hot_packed,
+        indices,
+        row_status,
+        None,
+        None,
+        0,
+        layout.tokens_per_block,
+        layout.tokens_per_block,
+        layout.ckv_bits,
+        layout.kv_lora_rank,
+        layout.qk_rope_head_dim,
+        1.0,
+        resident_kv_lens,
+        resident_req_idx,
+        resident_request_ids,
+        resident_kv_pool,
+        resident_block_table,
+        resident_tail_block_pos,
+        resident_tail_token_count,
+        resident_tail_valid,
+        0,
+        0,
+        request_topk_indices,
+    )
+    torch.cuda.synchronize()
+
+    assert tuple(out.shape) == (2, 1, 128, cfg.kv_lora_rank)
+    assert tuple(lse.shape) == (2, 128, 1)
+    assert metadata.numel() == 0
+    assert splits.numel() == 0
+    out_cpu = out.float().cpu()
+    lse_cpu = lse.float().cpu()
+    assert torch.allclose(out_cpu[0],
+                          torch.full((1, 128, cfg.kv_lora_rank), 0.25),
+                          atol=1e-4,
+                          rtol=0)
+    assert float(out_cpu[1].abs().max()) == 0.0
+    assert bool(torch.isfinite(out_cpu).all())
+    assert not bool(torch.isnan(lse_cpu).any())
+    assert torch.allclose(lse_cpu[0], torch.zeros((128, 1)), atol=1e-5, rtol=0)
+    assert bool(torch.isneginf(lse_cpu[1]).all())
+
+
 def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
     torch.manual_seed(20260606)
     group = 64
@@ -68,6 +469,7 @@ def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
         "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
     )
     pool = KVarNLatentPool(num_blocks=4, group=group, cfg=cfg, device=torch.device("cpu"))
+    assert pool.storage_layout_name == KVARN_LEGACY_SIDEPOOL_LAYOUT
 
     # Smooth-ish latent data gives a deterministic fidelity floor without making
     # this CPU test spend time on large random outliers.
@@ -90,6 +492,88 @@ def test_kvarn_latent_pool_k2v2_roundtrip_cpu():
     ckv_b, kpe_b = pool.load_blocks(torch.tensor([2], dtype=torch.long))
     assert torch.equal(ckv_b[0], ckv_rt)
     assert torch.equal(kpe_b[0], kpe_rt)
+
+    src_ptrs, src_sizes = pool.packed_source_fragments([2])
+    assert src_ptrs.tolist() == [pool.store.data_ptr() +
+                                 2 * pool.bytes_per_block]
+    assert src_sizes.tolist() == [pool.bytes_per_block]
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        pool.packed_source_fragments([1])
+
+
+def test_hisparse_direct_to_host_rejects_legacy_kvarn_source_layout():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = [object()]
+    mgr.kvarn_hisparse_source_layout = KVARN_LEGACY_SIDEPOOL_LAYOUT
+
+    with pytest.raises(NotImplementedError, match=KVARN_BDR_HISPARSE_LAYOUT):
+        DSACacheManager.kvarn_packed_source_fragments(mgr, [0], [0])
+
+
+def test_hisparse_direct_to_host_uses_bdr_source_pool():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    pool = KVarNBDRSourcePool(num_blocks=4,
+                              layout=cfg.hisparse_bdr_layout(group=64),
+                              device=torch.device("cpu"))
+    pool.commit_record_bytes(1, torch.ones(pool.bytes_per_block,
+                                           dtype=torch.uint8))
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = [object()]
+    mgr.kvarn_hisparse_bdr_pool_per_layer = [pool]
+    mgr.kvarn_hisparse_source_layout = KVARN_BDR_HISPARSE_LAYOUT
+    mgr.layer_offsets = {5: 0}
+
+    ptrs, sizes = DSACacheManager.kvarn_packed_source_fragments(
+        mgr, [5], [1])
+
+    assert ptrs.tolist() == [pool.store.data_ptr() + pool.bytes_per_block]
+    assert sizes.tolist() == [pool.bytes_per_block]
+
+
+def test_hisparse_bdr_writer_destination_and_commit_hooks():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+
+    cfg = parse_kvarn_dtype(
+        "kvarn_k2v2", kv_lora_rank=512, qk_rope_head_dim=64, iters=2
+    )
+    layout = cfg.hisparse_bdr_layout(group=64)
+    pools = [
+        KVarNBDRSourcePool(num_blocks=4, layout=layout,
+                           device=torch.device("cpu"))
+        for _ in range(2)
+    ]
+    mgr = DSACacheManager.__new__(DSACacheManager)
+    mgr.kvarn_latent_pool_per_layer = [object()]
+    mgr.kvarn_hisparse_bdr_pool_per_layer = pools
+    mgr.kvarn_hisparse_source_layout = KVARN_BDR_HISPARSE_LAYOUT
+    mgr.layer_offsets = {5: 0, 6: 1}
+
+    ptrs, sizes = DSACacheManager.kvarn_bdr_record_destination_fragments(
+        mgr, [5, 6], [1, 3])
+
+    expected_ptrs = [
+        pools[0].store.data_ptr() + pools[0].bytes_per_block,
+        pools[0].store.data_ptr() + 3 * pools[0].bytes_per_block,
+        pools[1].store.data_ptr() + pools[1].bytes_per_block,
+        pools[1].store.data_ptr() + 3 * pools[1].bytes_per_block,
+    ]
+    assert ptrs.tolist() == expected_ptrs
+    assert sizes.tolist() == [pools[0].bytes_per_block] * 4
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        DSACacheManager.kvarn_packed_source_fragments(mgr, [5], [1])
+
+    DSACacheManager.mark_kvarn_bdr_records_committed(mgr, [5, 6], [1, 3])
+
+    src_ptrs, src_sizes = DSACacheManager.kvarn_packed_source_fragments(
+        mgr, [5, 6], [1, 3])
+    assert src_ptrs.tolist() == expected_ptrs
+    assert src_sizes.tolist() == [pools[0].bytes_per_block] * 4
 
 
 class _FakeNonLocalKVarNManager:
@@ -179,6 +663,60 @@ class _FakeLocalKVarNMetadata:
         self.kv_cache_manager = mgr
 
 
+class _FakeCommitPool:
+    def __init__(self, valid=False):
+        self.valid = torch.zeros(4, dtype=torch.bool)
+        self.valid[1] = bool(valid)
+        self.store_calls = []
+
+    def store_block(self, block_id, ckv, k_pe):
+        self.store_calls.append(
+            (int(block_id), tuple(ckv.shape), tuple(k_pe.shape)))
+        self.valid[int(block_id)] = True
+
+
+class _FakeBDRCommitPool:
+    def __init__(self, valid=False):
+        self.valid_host = np.zeros(4, dtype=bool)
+        self.valid_host[1] = bool(valid)
+
+
+class _FakeDualKVarNManager:
+    kvarn_enabled = True
+    tokens_per_block = 64
+    kvarn_amortize_restore = False
+    kvarn_hisparse_source_layout = KVARN_BDR_HISPARSE_LAYOUT
+    kvarn_cfg = SimpleNamespace(sink_tokens=0, kv_lora_rank=2)
+
+    def __init__(self, *, legacy_valid=False, bdr_valid=False):
+        self.pool = _FakeCommitPool(valid=legacy_valid)
+        self.bdr_pool = _FakeBDRCommitPool(valid=bdr_valid)
+        self.buf = torch.zeros(4, 1, 64, 1, 3, dtype=torch.float16)
+        self.bdr_store_calls = []
+
+    def get_kvarn_latent_pool(self, layer_idx):
+        assert layer_idx == 2
+        return self.pool
+
+    def get_kvarn_hisparse_bdr_pool(self, layer_idx):
+        assert layer_idx == 2
+        return self.bdr_pool
+
+    def get_buffers(self, layer_idx, kv_layout="NHD"):
+        assert layer_idx == 2
+        assert kv_layout == "NHD"
+        return self.buf
+
+    def kvarn_store_block(self, layer_idx, block_id, ckv, k_pe):
+        assert layer_idx == 2
+        self.pool.store_block(block_id, ckv, k_pe)
+
+    def kvarn_store_hisparse_bdr_block(self, layer_idx, block_id, latent_block):
+        assert layer_idx == 2
+        self.bdr_store_calls.append((int(block_id), tuple(latent_block.shape)))
+        self.bdr_pool.valid_host[int(block_id)] = True
+
+
 def test_kvarn_restore_writes_local_layer_main_pool(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     mgr = _FakeLocalKVarNManager()
@@ -193,6 +731,35 @@ def test_kvarn_restore_writes_local_layer_main_pool(monkeypatch):
     assert torch.equal(mgr.buf[1, 0, :, 0, :2], mgr.pool.ckv[0])
     assert torch.equal(mgr.buf[1, 0, :, 0, 2:], mgr.pool.kpe[0])
     assert mgr.pool.restored_marked == [1]
+
+
+def test_kvarn_commit_full_blocks_populates_bdr_pool_when_legacy_already_valid():
+    metadata = _FakeLocalKVarNMetadata(
+        _FakeDualKVarNManager(legacy_valid=True, bdr_valid=False))
+    attn = DSATrtllmAttention.__new__(DSATrtllmAttention)
+    attn.layer_idx = 2
+
+    DSATrtllmAttention.kvarn_commit_full_blocks(
+        attn, metadata, is_generation=False)
+
+    mgr = metadata.kv_cache_manager
+    assert mgr.pool.store_calls == []
+    assert mgr.bdr_store_calls == [(1, (64, 3))]
+    assert bool(mgr.bdr_pool.valid_host[1])
+
+
+def test_kvarn_commit_full_blocks_writes_legacy_and_bdr_records():
+    metadata = _FakeLocalKVarNMetadata(
+        _FakeDualKVarNManager(legacy_valid=False, bdr_valid=False))
+    attn = DSATrtllmAttention.__new__(DSATrtllmAttention)
+    attn.layer_idx = 2
+
+    DSATrtllmAttention.kvarn_commit_full_blocks(
+        attn, metadata, is_generation=False)
+
+    mgr = metadata.kv_cache_manager
+    assert mgr.pool.store_calls == [(1, (64, 2), (64, 1))]
+    assert mgr.bdr_store_calls == [(1, (64, 3))]
 
 
 def _smooth_latent(group: int, cfg, seed: int):

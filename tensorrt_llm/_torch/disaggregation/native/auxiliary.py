@@ -73,6 +73,111 @@ class KVarNGQASidePoolMeta:
         )
 
 
+@dataclass
+class HiSparseHostTierMeta:
+    """NIXL registration metadata for HiSparse host-pinned packed KVarN tiers.
+
+    Entries are layer-local host memory regions. ``host_packed`` entries use
+    one item per host block slot; metadata entries use one item per host block
+    slot for validity and commit-generation state.
+    """
+
+    ptrs: np.ndarray  # dtype=np.int64, base pointer for slot 0 of each entry
+    size: np.ndarray  # dtype=np.int64, total bytes registered for each entry
+    item_sizes: np.ndarray  # dtype=np.int64, bytes for one host slot
+    names: list[str] = field(default_factory=list)
+    num_layers: int = 0
+    host_slots: int = 0
+    packed_bytes_per_block: int = 0
+    device: str = "cpu"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ptrs": self.ptrs.tolist(),
+            "size": self.size.tolist(),
+            "item_sizes": self.item_sizes.tolist(),
+            "names": list(self.names),
+            "num_layers": int(self.num_layers),
+            "host_slots": int(self.host_slots),
+            "packed_bytes_per_block": int(self.packed_bytes_per_block),
+            "device": self.device,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HiSparseHostTierMeta":
+        return cls(
+            ptrs=np.array(data["ptrs"], dtype=np.int64),
+            size=np.array(data["size"], dtype=np.int64),
+            item_sizes=np.array(data["item_sizes"], dtype=np.int64),
+            names=[str(x) for x in data.get("names", [])],
+            num_layers=int(data.get("num_layers", 0)),
+            host_slots=int(data.get("host_slots", 0)),
+            packed_bytes_per_block=int(data.get("packed_bytes_per_block", 0)),
+            device=data.get("device", "cpu"),
+        )
+
+    def entry_indices(self,
+                      entry_name: str,
+                      layer_indices: list[int] | None = None) -> list[int]:
+        """Return layer-major entry indices for a named HiSparse host tensor."""
+        layers = (list(range(int(self.num_layers))) if layer_indices is None
+                  else [int(layer) for layer in layer_indices])
+        name_to_index = {str(name): idx for idx, name in enumerate(self.names)}
+        indices = []
+        for layer in layers:
+            name = f"{entry_name}.layer{layer}"
+            if name in name_to_index:
+                indices.append(name_to_index[name])
+            elif (entry_name == "host_packed" and not self.names
+                  and 0 <= layer < int(self.num_layers)):
+                indices.append(layer)
+            else:
+                raise ValueError(
+                    f"HiSparse host meta has no entry for {name}.")
+        if len(indices) != len(layers):
+            raise ValueError(
+                f"HiSparse host meta expected {len(layers)} entries for "
+                f"{entry_name}, found {len(indices)}.")
+        return indices
+
+    def destination_fragments(
+        self,
+        entry_name: str,
+        host_slots: np.ndarray,
+        layer_indices: list[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build layer-major DRAM destination pointers for host-slot writes."""
+        slots = np.asarray(host_slots, dtype=np.int64)
+        if slots.ndim != 1:
+            raise ValueError(
+                "HiSparse host-slot fragments require a 1D host slot vector.")
+        if slots.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        if self.host_slots > 0 and (
+                int(slots.min()) < 0 or int(slots.max()) >= int(self.host_slots)):
+            raise ValueError(
+                f"HiSparse host slot out of range for host_slots={self.host_slots}: "
+                f"min={int(slots.min())}, max={int(slots.max())}.")
+        ptr_parts = []
+        size_parts = []
+        for entry_idx in self.entry_indices(entry_name, layer_indices):
+            item_size = int(self.item_sizes[entry_idx])
+            ptr_parts.append(self.ptrs[entry_idx] + slots * item_size)
+            size_parts.append(
+                np.full(slots.size, item_size, dtype=np.int64))
+        return (np.concatenate(ptr_parts).astype(np.int64, copy=False),
+                np.concatenate(size_parts).astype(np.int64, copy=False))
+
+    def packed_destination_fragments(
+        self,
+        host_slots: np.ndarray,
+        layer_indices: list[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self.destination_fragments("host_packed", host_slots,
+                                          layer_indices)
+
+
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
 

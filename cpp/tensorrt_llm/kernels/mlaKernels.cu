@@ -1459,10 +1459,10 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
     TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_input_seq_len, KT::kTokenPerBlock)), num_contexts, 1);
     // KVarN: non-null scale pool routes the ckv read through dequantCopyKVarN
-    // (INT4 unpack + per-(token,sub-block) affine -> rotated-frame fp16).
+    // (low-bit unpack + per-(token,sub-block) affine -> rotated-frame fp16).
     loadPagedKVCacheForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(
         compressed_kv_ptr, k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, max_input_seq_len, kv_scale_quant_orig_ptr,
-        reinterpret_cast<__half const*>(kvarn_scale_pool_ptr));
+        reinterpret_cast<__half const*>(kvarn_scale_pool_ptr), kvarn_bits);
 }
 
 // =============================== KVarN write ===============================
@@ -1530,6 +1530,7 @@ void invokeMLABdrQuantizeLatent(
             ckv_in, data, reinterpret_cast<__half*>(scale_pool), num_tokens);
     }
 }
+
 // ===========================================================================
 
 template <typename T, typename TCache>

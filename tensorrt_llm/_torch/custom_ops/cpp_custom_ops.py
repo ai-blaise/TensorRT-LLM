@@ -220,6 +220,154 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::hisparse_swap_in_packed_kvarn")
+    def _(host_packed, hot_packed, host_slots, hot_slots, layer_idx,
+          packed_bytes_per_block):
+        # In-place host-pinned packed KVarN -> hot device packed KVarN copy.
+        del host_packed, hot_packed, host_slots, hot_slots, layer_idx
+        del packed_bytes_per_block
+        pass
+
+    @torch.library.register_fake("trtllm::hisparse_publish_request_table_slots")
+    def _(request_ids_host, request_ids_device, request_block_host_slots_host,
+          request_block_host_slots_device, request_block_commit_gen_host,
+          request_block_commit_gen_device, request_admitted_host,
+          request_admitted_device, table_slots, sync_blocks):
+        # In-place host request-table rows -> device request-table mirror publish.
+        del request_ids_host, request_ids_device
+        del request_block_host_slots_host, request_block_host_slots_device
+        del request_block_commit_gen_host, request_block_commit_gen_device
+        del request_admitted_host, request_admitted_device
+        del table_slots, sync_blocks
+        pass
+
+    @torch.library.register_fake(
+        "trtllm::hisparse_submit_packed_kvarn_copy_schedule")
+    def _(host_packed, hot_packed, compact_host_slots, compact_hot_slots,
+          compact_row_ids, copy_count, compact_row_status, layer_idx,
+          packed_bytes_per_block, overlap_copy_stream=False,
+          copy_stream_handle=0):
+        del host_packed, hot_packed, compact_host_slots, compact_hot_slots
+        del compact_row_ids, copy_count, layer_idx, packed_bytes_per_block
+        del overlap_copy_stream, copy_stream_handle
+        return compact_row_status.new_empty(compact_row_status.shape)
+
+    @torch.library.register_fake("trtllm::hisparse_topk_to_block_positions")
+    def _(topk_indices, tokens_per_block, max_blocks_per_row):
+        del tokens_per_block
+        rows = topk_indices.shape[0]
+        return (topk_indices.new_empty((rows, max_blocks_per_row)),
+                topk_indices.new_empty((rows, )),
+                topk_indices.new_empty((rows, ), dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::hisparse_resolve_blocks_to_host_slots")
+    def _(row_request_ids, block_positions, block_counts,
+          resident_block_flags, resident_row_status, request_ids,
+          request_block_host_slots, request_block_commit_gen,
+          request_admitted):
+        del row_request_ids, block_counts, request_ids
+        del resident_block_flags, resident_row_status
+        del request_block_host_slots, request_block_commit_gen
+        del request_admitted
+        return (block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.int64),
+                block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.int64),
+                block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.uint8),
+                block_positions.new_empty((block_positions.shape[0], ),
+                                          dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::hisparse_classify_resident_blocks")
+    def _(block_positions, block_counts, row_kv_lens, tail_block_pos,
+          tail_valid, tokens_per_block, sink_blocks):
+        del block_counts, row_kv_lens, tail_block_pos, tail_valid
+        del tokens_per_block, sink_blocks
+        return (block_positions.new_empty(block_positions.shape,
+                                          dtype=torch.uint8),
+                block_positions.new_empty((block_positions.shape[0], ),
+                                          dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::hisparse_plan_hot_slots")
+    def _(host_slots, commit_gens, block_counts, resident_block_flags,
+          resolve_row_status, hot_host_slot, hot_commit_gen, hot_lru_tick,
+          layer_idx, lru_tick_base):
+        del commit_gens, resolve_row_status, resident_block_flags, hot_host_slot
+        del hot_commit_gen, hot_lru_tick, layer_idx, lru_tick_base
+        rows = host_slots.shape[0]
+        return (host_slots.new_empty(host_slots.shape),
+                host_slots.new_empty(host_slots.shape),
+                host_slots.new_empty(host_slots.shape),
+                host_slots.new_empty(host_slots.shape),
+                block_counts.new_empty((rows, )),
+                host_slots.new_empty(host_slots.shape, dtype=torch.uint8),
+                host_slots.new_empty((rows, ), dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::hisparse_compact_miss_schedule")
+    def _(miss_host_slots, miss_hot_slots, miss_counts, plan_row_status):
+        del miss_hot_slots, miss_counts, plan_row_status
+        capacity = miss_host_slots.numel()
+        rows = miss_host_slots.shape[0]
+        return (miss_host_slots.new_empty((capacity, )),
+                miss_host_slots.new_empty((capacity, )),
+                miss_host_slots.new_empty((capacity, ), dtype=torch.int32),
+                miss_host_slots.new_empty((1, ), dtype=torch.int32),
+                miss_host_slots.new_empty((rows, ), dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::hisparse_commit_hot_slots")
+    def _(host_slots, commit_gens, planned_hot_slots, planned_lru_tick,
+          block_counts, plan_row_status, hot_host_slot, hot_commit_gen,
+          hot_lru_tick, resident_block_flags, layer_idx):
+        del host_slots, commit_gens, planned_hot_slots, planned_lru_tick
+        del plan_row_status, hot_host_slot, hot_commit_gen
+        del hot_lru_tick, resident_block_flags, layer_idx
+        return block_counts.new_empty((block_counts.shape[0], ),
+                                      dtype=torch.uint8)
+
+    @torch.library.register_fake("trtllm::hisparse_build_hot_indices")
+    def _(topk_indices, block_positions, planned_hot_slots, block_counts,
+          commit_row_status, resident_block_flags, hot_capacity,
+          tokens_per_block, stride_factor, layer_idx):
+        del block_positions, planned_hot_slots, block_counts
+        del commit_row_status, resident_block_flags, hot_capacity, tokens_per_block
+        del stride_factor, layer_idx
+        return (topk_indices.new_empty(topk_indices.shape),
+                topk_indices.new_empty((topk_indices.shape[0], ),
+                                       dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::hisparse_read_kvarn_hot_bdr")
+    def _(hot_packed, hot_indices, topk_length, row_status, layer_idx,
+          tokens_per_block, kvarn_bits, kv_lora_rank, qk_rope_head_dim):
+        del hot_packed, topk_length, layer_idx, tokens_per_block
+        del kvarn_bits
+        latent_dim = kv_lora_rank + qk_rope_head_dim
+        return (hot_indices.new_empty(
+            (hot_indices.shape[0], hot_indices.shape[1], latent_dim),
+            dtype=torch.bfloat16),
+                row_status.new_empty(row_status.shape))
+
+    @torch.library.register_fake("trtllm::sparse_mla_decode_kvarn_hot")
+    def _(q, hot_packed, indices, row_status, topk_length=None, attn_sink=None,
+          layer_idx=0, tokens_per_block=64, stride_factor=64, kvarn_bits=2,
+          kv_lora_rank=512, qk_rope_head_dim=64, sm_scale=1.0,
+          resident_kv_lens=None, resident_req_idx=None,
+          resident_request_ids=None, resident_kv_pool=None,
+          resident_block_table=None,
+          resident_tail_block_pos=None, resident_tail_token_count=None,
+          resident_tail_valid=None, resident_sink_tokens=0,
+          resident_sink_blocks=0, request_topk_indices=None):
+        del hot_packed, row_status, topk_length, attn_sink, layer_idx
+        del tokens_per_block, stride_factor, kvarn_bits, kv_lora_rank
+        del qk_rope_head_dim, sm_scale, resident_kv_lens, resident_req_idx
+        del resident_request_ids, resident_kv_pool, resident_block_table
+        del resident_tail_block_pos, resident_tail_token_count
+        del resident_tail_valid, resident_sink_tokens, resident_sink_blocks
+        del request_topk_indices
+        return (q.new_empty((*q.shape[:3], 512)),
+                q.new_empty((q.shape[0], q.shape[2], q.shape[1]),
+                            dtype=torch.float32),
+                indices.new_empty((0, 0)), indices.new_empty((0, )))
+
     @torch.library.register_fake("trtllm::indexer_xstep_recency_patch")
     def _(cached_topk, refresh_end, cur_kv_lens, next_n, max_delta):
         # In-place patch; returns the same cached_topk tensor.

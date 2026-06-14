@@ -19,8 +19,12 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.sparse.layersplit import (
     LayerSplitOwnership, LayerSplitRuntimeState, ensure_cp_process_group)
+from tensorrt_llm._torch.attention_backend.sparse.hisparse import (
+    OPTRTHiSparseCoordinator)
 from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
-    KVarNLatentPool, kvarn_latent_bytes_per_token, resolve_kvarn_config)
+    KVarNBDRSourcePool, KVarNLatentPool, KVARN_BDR_HISPARSE_LAYOUT,
+    KVARN_LEGACY_SIDEPOOL_LAYOUT, kvarn_latent_bytes_per_token,
+    resolve_kvarn_config)
 
 
 def _layersplit_compute_active_block_ids(metadata):
@@ -1214,6 +1218,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Per-step memo for the LayerSplit indexer-K read set (candidate L2);
         # same lifecycle as the HISA slots above.
         self._layersplit_step_read_set = None
+        self.hisparse_coordinator = None
+        self.hisparse_request_ids = None
+        self.hisparse_sparse_mla_kvarn_hot = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
@@ -1225,6 +1232,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super().__post_init__()
         assert isinstance(self.kv_cache_manager, DSACacheManager), \
             f"DSAtrtllmAttentionMetadata requires DSACacheManager, got {type(self.kv_cache_manager)}"
+        self.hisparse_coordinator = getattr(self.kv_cache_manager,
+                                            "hisparse_coordinator", None)
 
         self.num_sparse_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
@@ -1734,6 +1743,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
+        self.hisparse_sparse_mla_kvarn_hot = None
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.reset_step()
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -2031,6 +2043,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._hisa_step_invariants = None
         self._hisa_step_rowspan = None
         self._layersplit_step_read_set = None
+        self.hisparse_sparse_mla_kvarn_hot = None
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.reset_step()
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -5009,10 +5024,26 @@ class DSATrtllmAttention(TrtllmAttention):
         # Transform the local topk indices to global topk indices in paged kv cache
         is_generation = (forward_args.attention_input_type ==
                          AttentionInputType.generation_only)
-        topk_indices_global, _ = transform_local_topk_reuse_or_compute(
-            forward_args.topk_indices, metadata,
-            self.get_local_layer_idx(metadata), self.indexer.skip_topk,
-            is_generation)
+        local_layer_idx = self.get_local_layer_idx(metadata)
+        hisparse_mapping = None
+        metadata.hisparse_sparse_mla_kvarn_hot = None
+        hisparse_coordinator = getattr(metadata, "hisparse_coordinator", None)
+        if hisparse_coordinator is not None:
+            hisparse_mapping = hisparse_coordinator.map_topk_to_hot_pool(
+                topk_indices=forward_args.topk_indices,
+                metadata=metadata,
+                layer_idx=local_layer_idx,
+                skip_topk=self.indexer.skip_topk,
+                is_generation=is_generation,
+            )
+        if hisparse_mapping is not None:
+            topk_indices_global = hisparse_mapping.topk_indices_global
+            metadata.hisparse_sparse_mla_kvarn_hot = (
+                hisparse_mapping.sparse_mla_kvarn_hot)
+        else:
+            topk_indices_global, _ = transform_local_topk_reuse_or_compute(
+                forward_args.topk_indices, metadata, local_layer_idx,
+                self.indexer.skip_topk, is_generation)
 
         # LayerSplit dense-KV + NVFP4-scale READ-SET broadcast. The indexer-K
         # broadcast (the full prefix) ran in Indexer.forward; the dense read
@@ -5038,8 +5069,17 @@ class DSATrtllmAttention(TrtllmAttention):
             pass
         elif layersplit_state is not None and layersplit_state.enabled:
             stride_factor = getattr(metadata, "_cached_stride_factor", None)
+            layersplit_topk_indices_global = topk_indices_global
+            if hisparse_mapping is not None:
+                # HiSparse remaps the attention read-set into hot-slot index
+                # space. LayerSplit still broadcasts dense normal-KV blocks,
+                # so its read-set must stay in global paged-KV index space.
+                layersplit_topk_indices_global, _ = (
+                    transform_local_topk_reuse_or_compute(
+                        forward_args.topk_indices, metadata, local_layer_idx,
+                        self.indexer.skip_topk, is_generation))
             dense_block_ids = _layersplit_topk_global_block_ids(
-                topk_indices_global, stride_factor)
+                layersplit_topk_indices_global, stride_factor)
 
             # M5f dense KV broadcast. get_buffers may raise for layers outside
             # the current manager (PP-partitioned drafts etc.) — skip the dense
@@ -5188,6 +5228,10 @@ class DSATrtllmAttention(TrtllmAttention):
         pool = mgr.get_kvarn_latent_pool(self.layer_idx)
         if pool is None:
             return
+        bdr_pool = None
+        if (getattr(mgr, "kvarn_hisparse_source_layout", None) ==
+                KVARN_BDR_HISPARSE_LAYOUT):
+            bdr_pool = mgr.get_kvarn_hisparse_bdr_pool(self.layer_idx)
         bt = self._kvarn_block_table_host(metadata)
         kv_lens = metadata.kv_lens_runtime  # host, per (all) seqs
         lo, hi = self._kvarn_seq_range(metadata, is_generation)
@@ -5196,13 +5240,22 @@ class DSATrtllmAttention(TrtllmAttention):
             n_full = klen // tpb            # number of FULL blocks for this seq
             for b in range(sink_blocks, n_full):
                 block_id = int(bt[i, b])
-                if block_id < 0 or bool(pool.valid[block_id]):
+                if block_id < 0:
                     continue
-                _, ckv, k_pe = self._kvarn_latent_block_view(mgr, metadata,
-                                                             block_id)
-                mgr.kvarn_store_block(self.layer_idx, block_id,
-                                      ckv.to(torch.float16),
-                                      k_pe.to(torch.float16))
+                legacy_committed = bool(pool.valid[block_id])
+                bdr_committed = (bdr_pool is None
+                                 or bool(bdr_pool.valid_host[block_id]))
+                if legacy_committed and bdr_committed:
+                    continue
+                blk, ckv, k_pe = self._kvarn_latent_block_view(mgr, metadata,
+                                                               block_id)
+                if not legacy_committed:
+                    mgr.kvarn_store_block(self.layer_idx, block_id,
+                                          ckv.to(torch.float16),
+                                          k_pe.to(torch.float16))
+                if bdr_pool is not None and not bdr_committed:
+                    mgr.kvarn_store_hisparse_bdr_block(
+                        self.layer_idx, block_id, blk)
 
     def kvarn_restore_for_decode(self, metadata):
         """Reconstruct committed blocks into the main-pool fp16 slot so the C++
@@ -5636,6 +5689,8 @@ class DSACacheManager(KVCacheManager):
             getattr(sparse_attn_config, "mla_latent_kv_amortize", False)
             or os.environ.get("TRTLLM_KVARN_AMORTIZE", "") in ("1", "true", "True"))
         self.kvarn_latent_pool_per_layer = []
+        self.kvarn_hisparse_bdr_pool_per_layer = []
+        self.kvarn_hisparse_source_layout = None
         if self.kvarn_cfg is not None:
             # The KVarN side-pool mirrors the dense MLA KV pool, not the
             # Indexer-K pool.  Build it on the primary KV device; the
@@ -5651,6 +5706,26 @@ class DSACacheManager(KVCacheManager):
                                 self.kvarn_cfg, dev)
                 for _ in range(self.num_local_layers)
             ]
+            self.kvarn_hisparse_source_layout = KVARN_LEGACY_SIDEPOOL_LAYOUT
+            if bool(getattr(sparse_attn_config, "hisparse_enabled", False)):
+                hisparse_layout = self.kvarn_cfg.hisparse_bdr_layout(
+                    self.tokens_per_block)
+                self.kvarn_hisparse_bdr_pool_per_layer = [
+                    KVarNBDRSourcePool(self.num_blocks, hisparse_layout, dev)
+                    for _ in range(self.num_local_layers)
+                ]
+                self.kvarn_hisparse_source_layout = (
+                    KVARN_BDR_HISPARSE_LAYOUT)
+                logger.info(
+                    "HiSparse KVarN BDR source pool allocated (%s): group=%d, "
+                    "%d B/block, %d blocks x %d layers = %.2f GiB. Native "
+                    "BDR writer and sparse MLA hot reader remain required "
+                    "before serving can be enabled.",
+                    hisparse_layout.name, self.tokens_per_block,
+                    hisparse_layout.packed_bytes_per_block, self.num_blocks,
+                    self.num_local_layers,
+                    hisparse_layout.packed_bytes_per_block * self.num_blocks
+                    * self.num_local_layers / 2**30)
             logger.info(
                 "KVarN MLA-latent backend ENABLED (%s): group=%d, "
                 "%d B/block, %.3f bits/elem, side-pool %d blocks x %d layers "
@@ -5665,6 +5740,27 @@ class DSACacheManager(KVCacheManager):
                 / self.kvarn_cfg.packed_bytes(self.tokens_per_block),
                 self.kvarn_cfg.fp8_bytes(self.tokens_per_block)
                 / self.kvarn_cfg.packed_bytes(self.tokens_per_block))
+
+        self.hisparse_coordinator = OPTRTHiSparseCoordinator(
+            sparse_attn_config, kv_cache_manager=self)
+        if self.hisparse_coordinator.enabled:
+            hisparse_device = dev if self.kvarn_cfg is not None else torch.device(
+                "cuda")
+            self.hisparse_coordinator.configure_from_kv_cache_manager()
+            self.hisparse_coordinator.allocate_packed_tensors(
+                device=hisparse_device, host_pinned=prefer_pinned())
+        self.hisparse_coordinator.assert_startup_ready()
+        if self.hisparse_coordinator.enabled:
+            logger.info(
+                "OP-TRT HiSparse enabled: mode=%s, topk=%s, hot_blocks_per_req=%s, "
+                "host_to_device_ratio=%s. Packed tiers are allocated; serving "
+                "remains fail-closed until swap-in/read kernels are ready.",
+                getattr(sparse_attn_config, "hisparse_mode", None),
+                getattr(sparse_attn_config, "hisparse_topk", None),
+                getattr(sparse_attn_config, "hisparse_hot_blocks_per_req", None),
+                getattr(sparse_attn_config, "hisparse_host_to_device_ratio",
+                        None),
+            )
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
@@ -6119,6 +6215,16 @@ class DSACacheManager(KVCacheManager):
             return None
         return self.kvarn_latent_pool_per_layer[layer_offset]
 
+    def get_kvarn_hisparse_bdr_pool(self, layer_idx: int) -> "KVarNBDRSourcePool":
+        """Production BDR source pool for a local dense-MLA HiSparse layer."""
+        pools = getattr(self, "kvarn_hisparse_bdr_pool_per_layer", None)
+        if not pools:
+            return None
+        layer_offset = self.layer_offsets.get(layer_idx)
+        if layer_offset is None:
+            return None
+        return pools[layer_offset]
+
     def kvarn_store_block(self, layer_idx: int, block_id: int,
                           ckv, k_pe) -> None:
         """Quantize+commit one full fp16 latent block into the side-pool."""
@@ -6126,12 +6232,95 @@ class DSACacheManager(KVCacheManager):
         if pool is not None:
             pool.store_block(int(block_id), ckv, k_pe)
 
+    def kvarn_store_hisparse_bdr_block(self, layer_idx: int, block_id: int,
+                                       latent_block) -> None:
+        """Native-write one full latent block into the HiSparse BDR source pool."""
+        pool = self.get_kvarn_hisparse_bdr_pool(layer_idx)
+        if pool is not None:
+            pool.store_block_from_latent(int(block_id), latent_block)
+
     def kvarn_load_block(self, layer_idx: int, block_id: int):
         """Reconstruct (ckv, k_pe) fp16 for one committed block, else None."""
         pool = self.get_kvarn_latent_pool(layer_idx)
         if pool is None or not bool(pool.valid[int(block_id)]):
             return None
         return pool.load_block(int(block_id))
+
+    def kvarn_bdr_record_destination_fragments(
+        self,
+        layer_indices,
+        block_ids,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Layer-major writable destinations for native BDR KVarN records."""
+        if getattr(self, "kvarn_hisparse_source_layout",
+                   None) != KVARN_BDR_HISPARSE_LAYOUT:
+            raise NotImplementedError(
+                "HiSparse BDR destinations require the production "
+                f"{KVARN_BDR_HISPARSE_LAYOUT} source pool.")
+        ptr_parts = []
+        size_parts = []
+        for layer_idx in layer_indices:
+            pool = self.get_kvarn_hisparse_bdr_pool(int(layer_idx))
+            if pool is None:
+                raise RuntimeError(
+                    "HiSparse native BDR writer cannot target non-local KVarN "
+                    f"layer {int(layer_idx)} from this rank.")
+            ptrs, sizes = pool.record_destination_fragments(block_ids)
+            ptr_parts.append(ptrs)
+            size_parts.append(sizes)
+        if not ptr_parts:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        return (np.concatenate(ptr_parts).astype(np.int64, copy=False),
+                np.concatenate(size_parts).astype(np.int64, copy=False))
+
+    def mark_kvarn_bdr_records_committed(self, layer_indices,
+                                         block_ids) -> None:
+        """Publish native-written BDR source records after the write succeeds."""
+        if getattr(self, "kvarn_hisparse_source_layout",
+                   None) != KVARN_BDR_HISPARSE_LAYOUT:
+            raise NotImplementedError(
+                "HiSparse BDR commit marking requires the production "
+                f"{KVARN_BDR_HISPARSE_LAYOUT} source pool.")
+        blocks = [int(block_id) for block_id in block_ids]
+        for layer_idx in layer_indices:
+            pool = self.get_kvarn_hisparse_bdr_pool(int(layer_idx))
+            if pool is None:
+                raise RuntimeError(
+                    "HiSparse native BDR writer cannot commit non-local KVarN "
+                    f"layer {int(layer_idx)} from this rank.")
+            for block_id in blocks:
+                pool.mark_record_committed(block_id)
+
+    def kvarn_packed_source_fragments(self, layer_indices,
+                                      block_ids) -> Tuple[np.ndarray, np.ndarray]:
+        """Layer-major source fragments for production BDR KVarN records."""
+        if not self.kvarn_enabled:
+            raise RuntimeError(
+                "HiSparse direct-to-host requires dense MLA KVarN source pools.")
+        source_layout = getattr(self, "kvarn_hisparse_source_layout", None)
+        if source_layout != KVARN_BDR_HISPARSE_LAYOUT:
+            raise NotImplementedError(
+                "HiSparse direct-to-host requires production BDR KVarN source "
+                f"records ({KVARN_BDR_HISPARSE_LAYOUT}); current source "
+                f"layout is {source_layout!r}. Do not transfer legacy "
+                "KVarNLatentPool records into sparse-MLA hot storage.")
+        ptr_parts = []
+        size_parts = []
+        for layer_idx in layer_indices:
+            pool = self.get_kvarn_hisparse_bdr_pool(int(layer_idx))
+            if pool is None:
+                raise RuntimeError(
+                    "HiSparse direct-to-host cannot source non-local KVarN "
+                    f"layer {int(layer_idx)} from this rank.")
+            ptrs, sizes = pool.packed_source_fragments(block_ids)
+            ptr_parts.append(ptrs)
+            size_parts.append(sizes)
+        if not ptr_parts:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        return (np.concatenate(ptr_parts).astype(np.int64, copy=False),
+                np.concatenate(size_parts).astype(np.int64, copy=False))
 
     def kvarn_bytes_per_token(self, num_attention_layers: int) -> float:
         if not self.kvarn_enabled:
@@ -6167,10 +6356,17 @@ class DSACacheManager(KVCacheManager):
         ids = [b for b in block_ids if 0 <= b < self.num_blocks]
         if not ids:
             return
-        pools = self.kvarn_latent_pool_per_layer
-        dev_ids = torch.as_tensor(ids, dtype=torch.long,
-                                  device=pools[0].device)
+        pools = list(self.kvarn_latent_pool_per_layer)
+        pools.extend(getattr(self, "kvarn_hisparse_bdr_pool_per_layer", []))
+        if not pools:
+            return
+        dev_ids_by_device = {}
         for pool in pools:
+            device = getattr(pool, "device", None)
+            if device not in dev_ids_by_device:
+                dev_ids_by_device[device] = torch.as_tensor(
+                    ids, dtype=torch.long, device=device)
+            dev_ids = dev_ids_by_device[device]
             pool.invalidate_blocks(ids, dev_ids)
 
     def free_resources(self, request, pin_on_release: bool = False):

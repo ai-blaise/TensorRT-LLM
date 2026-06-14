@@ -70,7 +70,13 @@ def _init(log_level: object = None) -> None:
     else:
         ft_decoder_lib = project_dir + "/libs/libth_common.so"
     try:
-        torch.classes.load_library(ft_decoder_lib)
+        ft_decoder_path = Path(ft_decoder_lib).resolve()
+        loaded_libraries = {
+            Path(str(path)).resolve()
+            for path in torch.classes.loaded_libraries
+        }
+        if ft_decoder_path not in loaded_libraries:
+            torch.classes.load_library(ft_decoder_lib)
         from ._torch.custom_ops import _register_fake
 
         _register_fake()

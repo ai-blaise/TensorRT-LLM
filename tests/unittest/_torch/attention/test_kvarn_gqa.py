@@ -528,9 +528,16 @@ def test_kvarn_gqa_sparse_kv_and_sparse_attn_cannot_mix():
 
 def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
     torch = _TORCH
+    import numpy as np
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
+    from tensorrt_llm._torch.disaggregation.native.auxiliary import HiSparseHostTierMeta
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        RecvReqInfo,
+        Sender,
+        _pack_hisparse_commit_payload,
+        _unpack_hisparse_commit_payload,
+    )
 
     cfg = KVarNGQAConfig(sinkhorn_iters=1)
     src_pool = _KVarNGQASidePool(
@@ -584,9 +591,55 @@ def test_kvarn_gqa_side_pool_transfer_meta_slots_and_fragments():
         block_ids_per_layer_groups=[],
         unique_rid=123,
         kvarn_gqa_side_slot=dst_slot,
+        hisparse_host_slots=np.array([4, 5, 9], dtype=np.int64),
     )
     req_info = RecvReqInfo.from_bytes(req_info.to_bytes())
     assert req_info.kvarn_gqa_side_slot == dst_slot
+    assert req_info.hisparse_host_slots is not None
+    assert req_info.hisparse_host_slots.tolist() == [4, 5, 9]
+    hisparse_meta = HiSparseHostTierMeta(
+        ptrs=np.array([1000, 2000, 3000, 4000, 5000, 6000], dtype=np.int64),
+        size=np.array([160, 160, 10, 10, 80, 80], dtype=np.int64),
+        item_sizes=np.array([16, 16, 1, 1, 8, 8], dtype=np.int64),
+        names=[
+            "host_packed.layer0",
+            "host_packed.layer1",
+            "host_valid.layer0",
+            "host_valid.layer1",
+            "host_commit_gen.layer0",
+            "host_commit_gen.layer1",
+        ],
+        num_layers=2,
+        host_slots=10,
+        packed_bytes_per_block=16,
+    )
+    dst_ptrs, host_sizes = Sender._collect_hisparse_host_dst_frags(
+        SimpleNamespace(hisparse_host_meta=hisparse_meta), req_info)
+    assert dst_ptrs.tolist() == [1064, 1080, 1144, 2064, 2080, 2144]
+    assert host_sizes.tolist() == [16, 16, 16, 16, 16, 16]
+    dst_ptrs_l1, sizes_l1 = Sender._collect_hisparse_host_dst_frags(
+        SimpleNamespace(hisparse_host_meta=hisparse_meta),
+        req_info,
+        layer_indices=[1],
+    )
+    assert dst_ptrs_l1.tolist() == [2064, 2080, 2144]
+    assert sizes_l1.tolist() == [16, 16, 16]
+    with pytest.raises(RuntimeError, match="host-tier metadata"):
+        Sender._collect_hisparse_host_dst_frags(
+            SimpleNamespace(hisparse_host_meta=None), req_info)
+
+    payload = _pack_hisparse_commit_payload(
+        np.array([0, 0, 1], dtype=np.int64),
+        np.array([0, 2, 2], dtype=np.int64),
+    )
+    layers, blocks = _unpack_hisparse_commit_payload(payload)
+    assert layers.tolist() == [0, 0, 1]
+    assert blocks.tolist() == [0, 2, 2]
+    assert _unpack_hisparse_commit_payload(None) == (None, None)
+    with pytest.raises(RuntimeError, match="count mismatch"):
+        _pack_hisparse_commit_payload(np.array([0], dtype=np.int64),
+                                      np.array([0, 1], dtype=np.int64))
+
     task = SimpleNamespace(_unique_rid=123, _slice=SimpleNamespace(is_last_slice=True))
 
     src_ptrs, dst_ptrs, sizes = Sender._collect_kvarn_gqa_side_frags(

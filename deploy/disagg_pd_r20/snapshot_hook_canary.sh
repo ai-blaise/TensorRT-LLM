@@ -91,6 +91,9 @@ if (( ${#CANARY_DGD} + 8 > 45 )); then
   exit 2
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
+
 if [[ -x /usr/local/bin/k3s ]]; then
   KUBECTL=(sudo -E /usr/local/bin/k3s kubectl)
 elif command -v kubectl >/dev/null 2>&1; then

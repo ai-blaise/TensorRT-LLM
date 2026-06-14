@@ -74,6 +74,238 @@ except ImportError:  # standalone / unit-test
 # ---------------------------------------------------------------------------
 
 _KVARN_PREFIX = "kvarn_"
+KVARN_LEGACY_SIDEPOOL_LAYOUT = "legacy_sinkhorn_v1"
+KVARN_BDR_HISPARSE_LAYOUT = "bdr_ckv_lowbit_fp8_pe_v1"
+
+
+@dataclass(frozen=True)
+class KVarNBDRLayout:
+    """Production BDR layout contract for dense-MLA HiSparse hot records.
+
+    This describes the C++ BDR helper in ``mlaKernels.cu`` rather than the
+    older Python/Sinkhorn side-pool record. C-KV is low-bit packed after the
+    block-diagonal Hadamard rotation, with per-token/sub-block fp16
+    ``{scale,zp}``; the RoPE component is carried as byte storage in the same
+    hot record until a fused low-bit PE path exists.
+    """
+
+    tokens_per_block: int
+    ckv_bits: int
+    requested_pe_bits: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    name: str = KVARN_BDR_HISPARSE_LAYOUT
+    bdr_order: int = 128
+    bytes_per_scale: int = 2
+    pe_storage_bytes_per_elem: int = 1
+
+    @property
+    def num_subblocks(self) -> int:
+        return self.kv_lora_rank // self.bdr_order
+
+    @property
+    def ckv_packed_bytes_per_token(self) -> int:
+        return self.kv_lora_rank * self.ckv_bits // 8
+
+    @property
+    def ckv_scale_zp_bytes_per_token(self) -> int:
+        return 2 * self.num_subblocks * self.bytes_per_scale
+
+    @property
+    def pe_payload_bytes_per_token(self) -> int:
+        return self.qk_rope_head_dim * self.pe_storage_bytes_per_elem
+
+    @property
+    def pe_storage_bits(self) -> int:
+        return 8 * self.pe_storage_bytes_per_elem
+
+    @property
+    def packed_bytes_per_token(self) -> int:
+        return (self.ckv_packed_bytes_per_token +
+                self.ckv_scale_zp_bytes_per_token +
+                self.pe_payload_bytes_per_token)
+
+    @property
+    def packed_bytes_per_block(self) -> int:
+        return self.tokens_per_block * self.packed_bytes_per_token
+
+    @property
+    def field_offsets(self) -> dict[str, tuple[int, int]]:
+        ckv_q = self.tokens_per_block * self.ckv_packed_bytes_per_token
+        ckv_scale_zp = (
+            self.tokens_per_block * self.ckv_scale_zp_bytes_per_token)
+        pe = self.tokens_per_block * self.pe_payload_bytes_per_token
+        return {
+            "ckv_q": (0, ckv_q),
+            "ckv_scale_zp": (ckv_q, ckv_q + ckv_scale_zp),
+            "pe_byte": (ckv_q + ckv_scale_zp, ckv_q + ckv_scale_zp + pe),
+        }
+
+
+class KVarNBDRSourcePool:
+    """Production-shaped BDR KVarN records for HiSparse direct-to-host.
+
+    The writer for this pool must be the native BDR path. This class owns the
+    storage, commit metadata, pointer fragments, and recycle invalidation; it
+    deliberately does not offer an FP16-to-BDR Python quantization serving path.
+    Tests may inject already-packed bytes through ``commit_record_bytes``.
+    """
+
+    storage_layout_name = KVARN_BDR_HISPARSE_LAYOUT
+
+    def __init__(self, num_blocks: int, layout: KVarNBDRLayout,
+                 device: torch.device):
+        self.num_blocks = int(num_blocks)
+        self.layout = layout
+        self.group = int(layout.tokens_per_block)
+        self.device = device
+        self.bytes_per_block = int(layout.packed_bytes_per_block)
+        self.store = torch.zeros((self.num_blocks, self.bytes_per_block),
+                                 dtype=torch.uint8, device=device)
+        self.valid = torch.zeros((self.num_blocks,), dtype=torch.bool,
+                                 device=device)
+        self.commit_gen = torch.zeros((self.num_blocks,), dtype=torch.int64,
+                                      device=device)
+        self.valid_host = np.zeros((self.num_blocks,), dtype=bool)
+        self.commit_gen_host = np.zeros((self.num_blocks,), dtype=np.int64)
+        self._write_events = [None for _ in range(self.num_blocks)]
+
+    def _validate_block_ids(self, block_ids) -> np.ndarray:
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.ndim != 1:
+            raise ValueError("KVarN BDR source fragments require 1D block ids.")
+        if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= self.num_blocks):
+            raise ValueError(
+                f"KVarN BDR source block id out of range: "
+                f"min={int(ids.min())}, max={int(ids.max())}, "
+                f"num_blocks={self.num_blocks}.")
+        return ids
+
+    def record_destination_fragments(self, block_ids) -> tuple[np.ndarray, np.ndarray]:
+        """Return writable BDR-record destinations for the native writer."""
+        ids = self._validate_block_ids(block_ids)
+        if ids.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        ptrs = int(self.store.data_ptr()) + ids * self.bytes_per_block
+        sizes = np.full(ids.size, self.bytes_per_block, dtype=np.int64)
+        return ptrs.astype(np.int64, copy=False), sizes
+
+    def _record_write_ready_event(self, block_id: int) -> None:
+        """Fence the current-stream BDR write before source-pointer export."""
+        bid = int(block_id)
+        if not self.store.is_cuda:
+            self._write_events[bid] = None
+            return
+        with torch.cuda.device(self.store.device):
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.store.device))
+        self._write_events[bid] = event
+
+    def _wait_for_write_events(self, block_ids: np.ndarray) -> None:
+        """Wait once for any current-stream BDR writes backing these blocks."""
+        for raw_bid in block_ids:
+            bid = int(raw_bid)
+            event = self._write_events[bid]
+            if event is None:
+                continue
+            if self.store.is_cuda and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "HiSparse direct-to-host cannot export KVarN BDR source "
+                    "pointers while the current CUDA stream is capturing.")
+            event.synchronize()
+            self._write_events[bid] = None
+
+    def mark_record_committed(self, block_id: int) -> None:
+        """Publish a native-written BDR record as committed."""
+        bid = int(block_id)
+        if bid < 0 or bid >= self.num_blocks:
+            raise ValueError(
+                f"KVarN BDR source block id out of range: {bid}; "
+                f"num_blocks={self.num_blocks}.")
+        self.valid[bid] = True
+        self.commit_gen[bid] += 1
+        self._record_write_ready_event(bid)
+        self.valid_host[bid] = True
+        self.commit_gen_host[bid] += 1
+
+    def store_block_from_latent(self, block_id: int,
+                                latent_block: torch.Tensor) -> None:
+        """Native production writer for one full dense-MLA BDR record.
+
+        ``latent_block`` is the paged-cache block view
+        ``[tokens_per_block, kv_lora_rank + qk_rope_head_dim]``. The registered
+        CUDA op writes the production BDR record directly into ``self.store``:
+        low-bit C-KV, fp16 C-KV scale/zp, and the current byte-stored RoPE
+        payload. No Python quantization path is provided here.
+        """
+        bid = int(block_id)
+        if bid < 0 or bid >= self.num_blocks:
+            raise ValueError(
+                f"KVarN BDR source block id out of range: {bid}; "
+                f"num_blocks={self.num_blocks}.")
+        if not torch.is_tensor(latent_block) or not latent_block.is_cuda:
+            raise RuntimeError(
+                "HiSparse BDR source records must be written from a CUDA "
+                "latent block by the native BDR writer.")
+        op = getattr(torch.ops.trtllm, "mla_bdr_write_kvarn_record", None)
+        if op is None:
+            raise RuntimeError(
+                "HiSparse BDR source records require "
+                "torch.ops.trtllm.mla_bdr_write_kvarn_record.")
+        op(latent_block, self.store, bid, int(self.layout.ckv_bits),
+           int(self.layout.kv_lora_rank), int(self.layout.qk_rope_head_dim))
+        self.mark_record_committed(bid)
+
+    def commit_record_bytes(self, block_id: int, record_bytes: torch.Tensor) -> None:
+        """Test helper: install one already-packed BDR record and commit it."""
+        bid = int(block_id)
+        if bid < 0 or bid >= self.num_blocks:
+            raise ValueError(
+                f"KVarN BDR source block id out of range: {bid}; "
+                f"num_blocks={self.num_blocks}.")
+        if record_bytes.dtype != torch.uint8:
+            raise TypeError("KVarN BDR record bytes must be torch.uint8.")
+        flat = record_bytes.reshape(-1)
+        if int(flat.numel()) != self.bytes_per_block:
+            raise ValueError(
+                "KVarN BDR record byte count mismatch: "
+                f"got {int(flat.numel())}, expected {self.bytes_per_block}.")
+        self.store[bid].copy_(flat.to(device=self.device, dtype=torch.uint8))
+        self.mark_record_committed(bid)
+
+    def packed_source_fragments(self, block_ids) -> tuple[np.ndarray, np.ndarray]:
+        """Return source pointers for committed production BDR records."""
+        ids = self._validate_block_ids(block_ids)
+        if ids.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        uncommitted = ids[~self.valid_host[ids]]
+        if uncommitted.size:
+            sample = ", ".join(str(int(x)) for x in uncommitted[:8])
+            raise RuntimeError(
+                "HiSparse direct-to-host requires committed production BDR "
+                f"KVarN records; uncommitted block id(s): {sample}.")
+        self._wait_for_write_events(ids)
+        ptrs = int(self.store.data_ptr()) + ids * self.bytes_per_block
+        sizes = np.full(ids.size, self.bytes_per_block, dtype=np.int64)
+        return ptrs.astype(np.int64, copy=False), sizes
+
+    def invalidate_blocks(self, block_ids, dev_ids=None) -> None:
+        ids = self._validate_block_ids(block_ids)
+        if ids.size == 0:
+            return
+        live = ids[self.valid_host[ids]]
+        if live.size:
+            self.valid_host[live] = False
+        for raw_bid in ids:
+            self._write_events[int(raw_bid)] = None
+        if dev_ids is None:
+            if live.size == 0:
+                return
+            dev_ids = torch.as_tensor(live, dtype=torch.long,
+                                      device=self.device)
+        self.valid[dev_ids] = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +352,30 @@ class KVarNConfig:
 
     def bits_per_elem(self, group: int) -> float:
         return self.packed_bytes(group) * 8 / (group * self.latent_dim)
+
+    def hisparse_bdr_layout(self, group: int) -> KVarNBDRLayout:
+        """Return the production BDR hot-record layout for HiSparse.
+
+        This is intentionally separate from :meth:`packed_bytes`, which still
+        describes the Python/Sinkhorn side-pool used by the amortized restore
+        path. HiSparse sparse-MLA hot reads must use this BDR contract or fail
+        closed before allocating host/hot tiers.
+        """
+        if self.ckv_bits not in (2, 4):
+            raise ValueError(
+                "HiSparse dense MLA BDR hot records support ckv_bits 2 or 4, "
+                f"got {self.ckv_bits}.")
+        if self.kv_lora_rank % 128 != 0:
+            raise ValueError(
+                "HiSparse dense MLA BDR hot records require kv_lora_rank to "
+                f"be divisible by 128, got {self.kv_lora_rank}.")
+        return KVarNBDRLayout(
+            tokens_per_block=int(group),
+            ckv_bits=int(self.ckv_bits),
+            requested_pe_bits=int(self.pe_bits),
+            kv_lora_rank=int(self.kv_lora_rank),
+            qk_rope_head_dim=int(self.qk_rope_head_dim),
+        )
 
 
 def is_kvarn_dtype(mla_latent_kv_dtype) -> bool:
@@ -190,6 +446,7 @@ class KVarNLatentPool:
         self.cfg = cfg
         self.device = device
         self._layout = self._compute_layout(group, cfg)
+        self.storage_layout_name = KVARN_LEGACY_SIDEPOOL_LAYOUT
         self.bytes_per_block = self._layout["total_bytes"]
         # Flat uint8 store. One alloc/layer; same shape contract as indexer-K.
         self.store = torch.zeros((num_blocks, self.bytes_per_block),
@@ -279,6 +536,37 @@ class KVarNLatentPool:
         bid = int(block_id)
         self.valid_host[bid] = True
         self.commit_gen_host[bid] += 1
+
+    def packed_source_fragments(self, block_ids) -> tuple[np.ndarray, np.ndarray]:
+        """Return VRAM source pointers for committed packed KVarN blocks.
+
+        The fragments point directly at the authoritative packed byte records.
+        This legacy side-pool layout is valid for amortized restore, but not
+        for HiSparse sparse-MLA hot reads. HiSparse direct-to-host must first
+        migrate or adapt records to ``KVARN_BDR_HISPARSE_LAYOUT``; an
+        uncommitted block is still sink/tail fp16 state and must not be
+        published as a packed host record in either layout.
+        """
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.ndim != 1:
+            raise ValueError("KVarN packed source fragments require 1D block ids.")
+        if ids.size == 0:
+            return (np.array([], dtype=np.int64),
+                    np.array([], dtype=np.int64))
+        if int(ids.min()) < 0 or int(ids.max()) >= int(self.num_blocks):
+            raise ValueError(
+                f"KVarN packed source block id out of range: "
+                f"min={int(ids.min())}, max={int(ids.max())}, "
+                f"num_blocks={self.num_blocks}.")
+        uncommitted = ids[~self.valid_host[ids]]
+        if uncommitted.size:
+            sample = ", ".join(str(int(x)) for x in uncommitted[:8])
+            raise RuntimeError(
+                "HiSparse direct-to-host requires committed dense MLA KVarN "
+                f"records; uncommitted block id(s): {sample}.")
+        ptrs = int(self.store.data_ptr()) + ids * int(self.bytes_per_block)
+        sizes = np.full(ids.size, int(self.bytes_per_block), dtype=np.int64)
+        return ptrs.astype(np.int64, copy=False), sizes
 
     def stale_committed_host(self, block_ids) -> list:
         """Filter ``block_ids`` (host ints) down to committed blocks whose

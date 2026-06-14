@@ -2666,6 +2666,190 @@ class MLA(nn.Module):
         return out.reshape(
             [num_tokens, self.num_heads_tp_cp * self.kv_lora_rank])
 
+    def _hisparse_local_layer_idx(self, attn_metadata) -> int:
+        get_local_layer_idx = getattr(self.mqa, "get_local_layer_idx", None)
+        if callable(get_local_layer_idx):
+            return int(get_local_layer_idx(attn_metadata))
+        return int(self.layer_idx)
+
+    def _sparse_mla_decode_kvarn_hot(
+        self,
+        fused_q: torch.Tensor,
+        attn_metadata: "DSAtrtllmAttentionMetadata",
+        topk_indices: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Sparse MLA decode against HiSparse packed KVarN-hot BDR records."""
+        hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
+                                       None)
+        if hisparse_coordinator is None or not hisparse_coordinator.enabled:
+            raise RuntimeError(
+                "HiSparse KVarN-hot sparse MLA requested without an enabled "
+                "coordinator.")
+        hisparse_coordinator.assert_sparse_mla_reader_ready()
+        expected_layer_idx = self._hisparse_local_layer_idx(attn_metadata)
+
+        def descriptor_is_current(descriptor) -> bool:
+            if descriptor is None:
+                return False
+            if int(descriptor.step_id) != int(hisparse_coordinator.step_id):
+                return False
+            if int(descriptor.layer_idx) != expected_layer_idx:
+                return False
+            if int(descriptor.hot_indices.shape[0]) != int(num_tokens):
+                return False
+            if int(descriptor.row_status.shape[0]) != int(num_tokens):
+                return False
+            if len(descriptor.hot_indices.shape) < 2:
+                return False
+            if len(topk_indices.shape) < 2:
+                return False
+            if int(descriptor.hot_indices.shape[1]) != int(
+                    topk_indices.shape[1]):
+                return False
+            if descriptor.request_topk_indices is None:
+                return False
+            if descriptor.resident_block_flags is None:
+                return False
+            if descriptor.resident_block_status is None:
+                return False
+            if int(descriptor.request_topk_indices.shape[0]) != int(
+                    num_tokens):
+                return False
+            if int(descriptor.request_topk_indices.shape[1]) != int(
+                    topk_indices.shape[1]):
+                return False
+            if int(descriptor.resident_block_flags.shape[0]) != int(
+                    num_tokens):
+                return False
+            if int(descriptor.resident_block_status.shape[0]) != int(
+                    num_tokens):
+                return False
+            expected_device = topk_indices.device
+            if not (descriptor.hot_indices.device == expected_device
+                    and descriptor.request_topk_indices.device == expected_device
+                    and descriptor.resident_block_flags.device == expected_device
+                    and descriptor.resident_block_status.device == expected_device
+                    and descriptor.row_status.device == expected_device
+                    and descriptor.hot_packed.device == fused_q.device):
+                return False
+            resident = getattr(descriptor, "resident_tokens", None)
+            if resident is None:
+                return False
+            if getattr(resident, "policy", None) != "explicit_sink_tail_v1":
+                return False
+            if int(resident.row_kv_lens.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.row_request_ids.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.row_req_idx.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.tail_block_pos.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.tail_token_count.shape[0]) != int(num_tokens):
+                return False
+            if int(resident.tail_valid.shape[0]) != int(num_tokens):
+                return False
+            return (resident.row_kv_lens.device == expected_device
+                    and resident.row_request_ids.device == expected_device
+                    and resident.row_req_idx.device == expected_device
+                    and resident.kv_pool.device == fused_q.device
+                    and resident.block_table.device == expected_device
+                    and resident.tail_block_pos.device == expected_device
+                    and resident.tail_token_count.device == expected_device
+                    and resident.tail_valid.device == expected_device)
+
+        descriptor = getattr(attn_metadata, "hisparse_sparse_mla_kvarn_hot",
+                             None)
+        if not descriptor_is_current(descriptor):
+            descriptor = None
+        if descriptor is None:
+            mapping = hisparse_coordinator.map_topk_to_hot_pool(
+                topk_indices=topk_indices,
+                metadata=attn_metadata,
+                layer_idx=expected_layer_idx,
+                skip_topk=False,
+                is_generation=True,
+            )
+            descriptor = None if mapping is None else mapping.sparse_mla_kvarn_hot
+        if not descriptor_is_current(descriptor):
+            raise RuntimeError(
+                "HiSparse KVarN-hot sparse MLA did not receive a native "
+                "hot-pool descriptor for the current layer, row set, TopK "
+                "width, and CUDA device; refusing to route through NVFP4 or "
+                "full-HBM sparse MLA.")
+        attn_metadata.hisparse_sparse_mla_kvarn_hot = descriptor
+
+        # Wide-window hoist deferred JOIN (lever c): when the swap-in was issued on
+        # the copy stream at the top of forward_absorption_generation (before the
+        # bmm+rope), its main-stream join was deferred to here. Take it now -- the
+        # main stream waits the copy-chain done event so the hot pool is fully
+        # resident before the read below. No-op (returns False) when no hoist ran
+        # for this (step, layer): the in-method swap-in above already joined.
+        consume_join = getattr(hisparse_coordinator, "consume_prepare_join_event",
+                               None)
+        if consume_join is not None:
+            consume_join(expected_layer_idx)
+
+        head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        q_concat = fused_q.view([num_tokens, self.num_heads_tp, head_dim])
+        padding = 128
+        assert self.num_heads_tp <= padding, (
+            f"sparse_mla_decode_kvarn_hot supports up to {padding} heads, got "
+            f"{self.num_heads_tp}")
+        if self.num_heads_tp != padding:
+            q_padded = q_concat.new_zeros((num_tokens, padding, head_dim))
+            q_padded[:, :self.num_heads_tp, :] = q_concat
+            q_concat = q_padded
+
+        num_seqs = int(
+            getattr(attn_metadata, "num_generations", 0)
+            or attn_metadata.num_seqs)
+        assert num_seqs > 0, (
+            "HiSparse sparse MLA decode requires at least one generation row.")
+        assert num_tokens % num_seqs == 0, (
+            "HiSparse sparse MLA decode requires a uniform number of query "
+            f"tokens per sequence (num_tokens={num_tokens}, "
+            f"num_seqs={num_seqs})")
+        s_q = num_tokens // num_seqs
+        q_concat = q_concat.view([num_seqs, s_q, padding, head_dim])
+        indices = descriptor.hot_indices.reshape(num_seqs, s_q,
+                                                 -1).contiguous()
+        request_topk_indices = descriptor.request_topk_indices.reshape(
+            num_seqs, s_q, -1).contiguous()
+        resident = descriptor.resident_tokens
+
+        out = torch.ops.trtllm.sparse_mla_decode_kvarn_hot(
+            q_concat,
+            descriptor.hot_packed,
+            indices,
+            descriptor.row_status,
+            descriptor.topk_length,
+            None,
+            descriptor.layer_idx,
+            descriptor.tokens_per_block,
+            descriptor.stride_factor,
+            descriptor.kvarn_bits,
+            descriptor.kv_lora_rank,
+            descriptor.qk_rope_head_dim,
+            self.softmax_scale,
+            resident.row_kv_lens,
+            resident.row_req_idx,
+            resident.row_request_ids,
+            resident.kv_pool,
+            resident.block_table,
+            resident.tail_block_pos,
+            resident.tail_token_count,
+            resident.tail_valid,
+            resident.sink_tokens,
+            resident.sink_blocks,
+            request_topk_indices,
+        )[0]
+        out = out.view([num_tokens, padding, self.kv_lora_rank])
+        out = out[:, :self.num_heads_tp_cp, :]
+        return out.reshape(
+            [num_tokens, self.num_heads_tp_cp * self.kv_lora_rank])
+
     def _run_sparse_mla_decode_nvfp4_op(
         self,
         q_concat: torch.Tensor,
@@ -2760,6 +2944,37 @@ class MLA(nn.Module):
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # HiSparse wide-window swap-in hoist (lever c): the swap-in copy + planner
+        # chain depends only on topk_indices (available now) and the coordinator
+        # tier tensors -- NOT on fused_q (the bmm+rope output below). Issue it on the
+        # coordinator copy stream HERE, before the bmm+rope, with the main-stream
+        # join DEFERRED to the hot-read, so the copy overlaps the entire bmm+rope
+        # window instead of the negligible commit/build tail. The returned descriptor
+        # is stamped on attn_metadata so _sparse_mla_decode_kvarn_hot reuses it via
+        # its descriptor_is_current fast path (no second map call) and only takes the
+        # deferred join. Byte-identical, graph-safe, fail-closed: prepare returns None
+        # (no stamp, no deferred join) whenever the hoist is not eligible, and the
+        # hot-read then runs the existing in-method swap-in exactly as before.
+        hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
+                                       None)
+        if (topk_indices is not None
+                and bool(getattr(hisparse_coordinator, "enabled", False))):
+            prepare = getattr(hisparse_coordinator,
+                              "prepare_hot_pool_overlapped", None)
+            if prepare is not None:
+                hoist_layer_idx = self._hisparse_local_layer_idx(attn_metadata)
+                hoist_mapping = prepare(
+                    topk_indices=topk_indices,
+                    metadata=attn_metadata,
+                    layer_idx=hoist_layer_idx,
+                    skip_topk=False,
+                    is_generation=True,
+                )
+                if (hoist_mapping is not None
+                        and hoist_mapping.sparse_mla_kvarn_hot is not None):
+                    attn_metadata.hisparse_sparse_mla_kvarn_hot = (
+                        hoist_mapping.sparse_mla_kvarn_hot)
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -2873,7 +3088,12 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-        if has_nvfp4_kv_cache:
+        hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
+                                       None)
+        if bool(getattr(hisparse_coordinator, "enabled", False)):
+            attn_out_latent = self._sparse_mla_decode_kvarn_hot(
+                fused_q, attn_metadata, topk_indices, num_tokens)
+        elif has_nvfp4_kv_cache:
             # The K write inside mla_rope_generation has already quantized the
             # 576-wide latent into the NVFP4 data + block-scale pools. Read it
             # back with the dedicated FlashMLA NVFP4 sparse-decode kernel.

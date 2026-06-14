@@ -11,8 +11,10 @@ REQUIRE_CACHES="${REQUIRE_CACHES:-triton,deep_gemm}"
 REGISTRY_REPO="${REGISTRY_REPO:-local/dynamo-trtllm-optrt-custom}"
 REGISTRY_TAG_TAIL="${REGISTRY_TAG_TAIL:-12}"
 OUT_DIR="${OUT_DIR:-/tmp/r20-strict-smoke-preflight-$(date -u +%Y%m%dT%H%M%SZ)}"
+SMC_GATE_MODE="${SMC_GATE_MODE:-required}"
 NAMESPACE="${NAMESPACE:-dynamo-system}"
 SKIP_CACHE_REQUIRE=0
+SKIP_NIXL_GATE_AUDIT=0
 SKIP_PREWARM_SERVER_DRY_RUN=0
 
 usage() {
@@ -39,6 +41,9 @@ Options:
                          (default: IfNotPresent)
   --require-caches LIST  Comma-separated /var/lib/optrt-cache subdirs that must
                          contain files (default: triton,deep_gemm)
+  --smc-gate-mode MODE   required or deferred for the local NIXL/custom-stack
+                         gate audit (default: required)
+  --skip-nixl-gate-audit Do not run the local NIXL/custom-stack gate audit
   --registry-repo NAME  Local registry repository for cache/image report
   --registry-tag-tail N Number of recent-looking registry tags to report
   --skip-cache-require   Do not fail closed on cache population
@@ -61,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --image-pull-policy) IMAGE_PULL_POLICY="$2"; shift 2 ;;
     --require-caches) REQUIRE_CACHES="$2"; shift 2 ;;
     --registry-repo) REGISTRY_REPO="$2"; shift 2 ;;
+    --smc-gate-mode) SMC_GATE_MODE="$2"; shift 2 ;;
+    --skip-nixl-gate-audit) SKIP_NIXL_GATE_AUDIT=1; shift ;;
     --registry-tag-tail) REGISTRY_TAG_TAIL="$2"; shift 2 ;;
     --skip-cache-require) SKIP_CACHE_REQUIRE=1; shift ;;
     --skip-prewarm-server-dry-run) SKIP_PREWARM_SERVER_DRY_RUN=1; shift ;;
@@ -75,10 +82,16 @@ case "$IMAGE_PULL_POLICY" in
   Always|IfNotPresent|Never) ;;
   *) echo "unsupported --image-pull-policy: $IMAGE_PULL_POLICY" >&2; exit 2 ;;
 esac
+case "$SMC_GATE_MODE" in
+  required|deferred) ;;
+  *) echo "unsupported --smc-gate-mode: $SMC_GATE_MODE" >&2; exit 2 ;;
+esac
 
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
 mkdir -p "$OUT_DIR"
+source "deploy/disagg_pd_r20/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
 
 run_step() {
   local name="$1"
@@ -86,6 +99,15 @@ run_step() {
   printf 'preflight_step=%s\n' "$name" | tee -a "$OUT_DIR/summary.log"
   "$@" >"$OUT_DIR/${name}.out" 2>"$OUT_DIR/${name}.err"
 }
+
+if [[ "$SKIP_NIXL_GATE_AUDIT" != 1 ]]; then
+  run_step nixl_gate_local_audit \
+    env \
+      NIXL_AUDIT_MODE=local \
+      SMC_GATE_MODE="$SMC_GATE_MODE" \
+      CHECK_RUNTIME_LIBS=0 \
+      deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
+fi
 
 if [[ -z "$IMAGE" ]]; then
   run_step image_handoff_from_dgd \
@@ -152,9 +174,21 @@ else
       --registry-tag-tail "$REGISTRY_TAG_TAIL"
 fi
 
+audit_block=""
+if [[ "$SKIP_NIXL_GATE_AUDIT" != 1 ]]; then
+  audit_block="
+# Re-run the local NIXL/custom-stack config audit before consuming rollout time.
+NIXL_AUDIT_MODE=local \\
+  SMC_GATE_MODE=$SMC_GATE_MODE \\
+  CHECK_RUNTIME_LIBS=0 \\
+  deploy/disagg_pd_r20/audit_nixl_gate_readiness.sh
+"
+fi
+
 cat >"$OUT_DIR/next_commands.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+$audit_block
 
 # Reconfirm exact image handoff before consuming rollout/prewarm time.
 deploy/disagg_pd_r20/check_image_handoff.sh \\
@@ -203,6 +237,8 @@ chmod +x "$OUT_DIR/next_commands.sh"
   printf 'dgd_name=%s\n' "$DGD_NAME"
   printf 'image_pull_policy=%s\n' "$IMAGE_PULL_POLICY"
   printf 'require_caches=%s\n' "$REQUIRE_CACHES"
+  printf 'smc_gate_mode=%s\n' "$SMC_GATE_MODE"
+  printf 'skip_nixl_gate_audit=%s\n' "$SKIP_NIXL_GATE_AUDIT"
   printf 'registry_repo=%s\n' "$REGISTRY_REPO"
   printf 'registry_tag_tail=%s\n' "$REGISTRY_TAG_TAIL"
   printf 'next_commands=%s\n' "$OUT_DIR/next_commands.sh"

@@ -28,6 +28,10 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+if(CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR)
+  include_directories(BEFORE "${CONTEXT_ATTENTION_FMHA_CUBIN_INCLUDE_DIR}")
+endif()
+
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -47,7 +51,6 @@ add_library(
   cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
-  cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
@@ -97,8 +100,14 @@ add_library(
   IndexerHisaNvfp4Op.cpp
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
+  mlaBdrKvarnOp.cpp
+  hisparseRequestTableOp.cpp
+  hisparseSwapInPackedKvarnOp.cu
+  hisparseKvarnHotReadOp.cpp
+  hisparseTopkToBlocksOp.cpp
   kvarnGqaOp.cpp
   IndexerTopKOp.cpp
+  SparseMlaDecodeKvarnHotOp.cpp
   SparseMlaDecodeNvfp4Op.cpp
   indexerXstepRecencyPatchOp.cpp
   ncclCommunicatorOp.cpp
@@ -122,10 +131,65 @@ add_library(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
   dsv3RopeOp.cpp
-  fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
   indexerAffineReuseOp.cpp
   trtllmGenQKVProcessOp.cpp)
+
+# Narrow proof target for the OP-TRT HiSparse native path. It compiles the real
+# torch registrations and production CUDA kernels used by the HiSparse smoke
+# tests without linking the full tensorrt_llm shared library and its unrelated
+# generated CUTLASS/MoE targets. Production wheels still use th_common.
+add_library(
+  th_hisparse_smoke SHARED
+  mlaBdrKvarnOp.cpp
+  hisparseRequestTableOp.cpp
+  hisparseSwapInPackedKvarnOp.cu
+  hisparseKvarnHotReadOp.cpp
+  hisparseTopkToBlocksOp.cpp
+  SparseMlaDecodeKvarnHotOp.cpp
+  ../common/assert.cpp
+  ../common/logger.cpp
+  ../common/stringUtils.cpp
+  ../common/tllmException.cpp
+  ../kernels/mlaBdrKvarnRecordKernels.cu
+  ../kernels/hisparseTopkToBlocks.cu
+  ../kernels/hisparseKvarnHotRead.cu
+  ../kernels/flashMLA/sparse_mla_decode_kvarn_hot.cu)
+set_property(TARGET th_hisparse_smoke PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET th_hisparse_smoke PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD 20)
+set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD_REQUIRED ON)
+# The HiSparse hot-read decode kernel now uses the sm100 tcgen05/UMMA + TMEM machinery
+# from nvfp4_sparse (kerutils device headers + cute/cutlass). Mirror the include paths +
+# sm_100a architecture used by the flash_mla_nvfp4_sparse_src object library so the direct
+# th_hisparse_smoke compile of sparse_mla_decode_kvarn_hot.cu resolves them and enables
+# tcgen05 codegen.
+target_include_directories(
+  th_hisparse_smoke
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse/kerutils/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse/sm100/decode/head64_nvfp4
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA
+    $<TARGET_PROPERTY:cutlass_src,INTERFACE_INCLUDE_DIRECTORIES>)
+# 100 (not "100a") so the helper emits arch=compute_100a,code=[sm_100a] with a REAL sm_100a
+# cubin (matches flash_mla_nvfp4_sparse_src); "100a" alone would emit PTX-only and the
+# driver could not load it ("no kernel image").
+set_cuda_architectures(th_hisparse_smoke 100)
+target_link_libraries(
+  th_hisparse_smoke PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                            ${CUDA_DRV_LIB} ${CUBLAS_LIB} ${CURAND_LIB})
+target_compile_options(
+  th_hisparse_smoke
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math>)
+if(NOT WIN32)
+  set_target_properties(
+    th_hisparse_smoke
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../nvidia/nccl/lib"
+               LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+endif()
+
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
@@ -145,8 +209,14 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_sources(th_common PRIVATE cublasFp4ScaledMM.cpp)
   target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  target_sources(th_common PRIVATE fusedGemmAllreduceOp.cpp)
+  target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 endif()
 
 if(ENABLE_MULTI_DEVICE)

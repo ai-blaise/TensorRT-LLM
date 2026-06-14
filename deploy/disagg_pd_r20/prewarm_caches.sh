@@ -68,6 +68,9 @@ if [[ -z "$IMAGE" ]]; then
   exit 2
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/target_node_guard.sh"
+optrt_r20_reject_disallowed_target_node "$TARGET_NODE"
+
 SSH_TARGET="${VM_USER}@${VM_HOST}"
 JOB_NAME="optrt-cache-prewarm-$(date -u +%Y%m%d%H%M%S)"
 
@@ -217,11 +220,23 @@ spec:
           os.environ.setdefault("TLLM_LLMAPI_BUILD_CACHE_ROOT", "/cache/optrt/tensorrt_llm/llmapi_build")
           for path in ["/cache/optrt/hf_modules", "/cache/optrt/transformers", "/cache/optrt/hf_datasets", "/cache/optrt/xdg", "/cache/optrt/pip", "/cache/optrt/torch_extensions", "/cache/optrt/torchinductor", "/cache/optrt/triton", "/cache/optrt/cuda", "/cache/optrt/deep_gemm", "/cache/optrt/tensorrt_llm/dg", "/cache/optrt/tensorrt_llm/llmapi_build"]:
               Path(path).mkdir(parents=True, exist_ok=True)
+          def _exception_chain_contains(exc, needle):
+              seen = set()
+              stack = [exc]
+              while stack:
+                  cur = stack.pop()
+                  if cur is None or id(cur) in seen:
+                      continue
+                  seen.add(id(cur))
+                  if needle in str(cur):
+                      return True
+                  stack.extend([getattr(cur, "__cause__", None), getattr(cur, "__context__", None)])
+              return False
           for module in ["torch", "transformers", "tensorrt_llm"]:
               try:
                   importlib.import_module(module)
               except ImportError as exc:
-                  if module == "tensorrt_llm" and "libcuda.so.1" in str(exc):
+                  if module == "tensorrt_llm" and _exception_chain_contains(exc, "libcuda.so.1"):
                       print(f"prewarm_import_warning={module}: {exc}")
                       continue
                   raise
