@@ -19,11 +19,11 @@ held: the production-ABI `sparse_mla_decode_kvarn_hot` kernel was a naive scaffo
 invest in that kernel (Gate-4) — NOT the Gate 5-7 serving integration — exactly the
 "measure before hardening" outcome Rec-4 was designed to force. That investment has
 landed: the FlashMLA-style rewrite plus the FWHT dequant and warp/vectorization
-levers took the hot-read from ~348 ms/call to **0.360 ms/call (B16), ~22 ms/step —
-A/B-viable, within ~10% of the ~20 ms c16 decode budget** (M19, Phase-4/5), at cos
-0.999999 vs the true dense reference with the production ABI frozen. Going
-comfortably under 20 ms/step would require a high-risk TMEM-UMMA tensor-core rewrite
-(Phase-5).
+levers took the hot-read from ~348 ms/call to 0.360 ms/call (M19, Phase-4/5), and the
+tcgen05/UMMA tensor-core rewrite then took it to **0.217 ms/call (B16), ~13.2 ms/step —
+comfortably under the ~20 ms c16 decode budget** (U4, Phase-6), at cos 0.999998 vs the
+true dense reference with the production ABI frozen. The ≤0.30 ms/call (≤18.3 ms/step)
+target is beaten with margin.
 
 ## 1a — Capacity (verified)
 
@@ -259,6 +259,44 @@ A follow-up round chasing "comfortably under 20 ms/step" (≤ 0.30 ms/call). Res
   risk), deferred to keep every step at cos 0.999999. The c16 A/B can proceed at M19
   (~22 ms/step): the real question is end-to-end tok/s/user, not the per-step
   microbench in isolation, and the per-step is now within ~10% of the budget.
+
+## Phase-6 — tcgen05/UMMA tensor-core rewrite to 0.217 ms/call (40% over M19, under the c16 budget)
+
+The "high-risk TMEM-UMMA rewrite" Phase-5 flagged as the only path below ~0.36 was built
+and verified. **U4 = 0.217 ms/call @ B16, cos 0.999998, ~13.2 ms/step — 40% under M19
+(0.360) and comfortably under the ~20 ms c16 budget** (orchestrator GPU-7 re-gate:
+0.216–0.217 over 3 runs; smoke PASS; hotread probe out-cos 0.999997 / lse-cos 1.000000
+VERDICT PASS). Committed `aaed1e17d`.
+
+The kernel uses sm_100 5th-gen tensor cores (tcgen05/UMMA): both the score S[64,topk] and
+value O[64,512] accumulators live in **TMEM**, M=64 heads/block (2 head-groups), bf16 WS
+SS atoms (`SM100_MMA_F16BF16_WS_SS_NOELECT`, operands in SMEM), flash-decoding online
+softmax reading S from TMEM. The frozen KVarN-BDR 2-bit dequant fills the bf16 operand
+tiles. It auto-enables on sm_100 (`HISPARSE_UMMA_ENABLED` when `__CUDA_ARCH__ >= 1000`)
+with a host-stub fallback; only the kernel `.cu` and the th_hisparse_smoke `CMakeLists.txt`
+change.
+
+The win was an **occupancy insight, not the GEMMs** — and it came from a falsified thesis:
+- **The binding resource is TMEM, not SMEM.** The kernel allocates all 512 TMEM cols/block
+  and a B200 SM has exactly 512, so two CTAs serialize on the single TMEM pool — proven by
+  a spin-probe (two 512-col CTAs on one SM double walltime, ratio 2.00). The kernel is
+  hard-capped at **1 effective block/SM regardless of SMEM**.
+- **fp8 was built, validated, and rejected.** The fp8 WS atom (`SM100_MMA_F8F6F4_WS_SS_NOELECT`;
+  the cutlass non-WS fp8 atom *hangs* the GPU on nested elect+barrier) computed correct GEMMs
+  and held end-to-end cos 0.99939, and fp8 *did* halve SMEM to 2 blocks/SM-by-SMEM — but it
+  can't win because the kernel is TMEM-capped to 1 block/SM and overhead/dequant-bound, so the
+  fp8 GEMM 2× is swamped (decomposed: SW64 swizzle +0.011, fp8 itself +0.032). Shipped clean bf16.
+- **The actual lever: stop over-splitting.** Because the kernel is TMEM-capped to 1 block/SM,
+  the prior split factor (numSplits=10 → 320 CTAs ≈ 2.2 waves, sized for 2 blocks/SM) was
+  2.5× over-split; each extra CTA pays redundant TMEM alloc/free + barrier init + Q-reload.
+  Retargeting to a **single wave** (numSplits = SMs/baseBlocks; nS=4 → 128 CTAs at B16) removed
+  that overhead: nS=10 0.347, nS=5 0.235, **nS=4 0.217**, nS=1 0.589. The split logic now
+  auto-targets one wave from the queried SM count (`HISPARSE_TARGET_BLOCKS` override).
+
+**Honest floor:** below ~0.217 needs ≤256 TMEM cols/block for true 2-way concurrency, but
+O[64,512]=256 cols + S=32 > 256 — impossible without 2× dequant passes or a 2-CTA-cluster
+restructure (under investigation). The kernel is otherwise overhead-bound; the precision and
+GEMM levers are exhausted.
 
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
