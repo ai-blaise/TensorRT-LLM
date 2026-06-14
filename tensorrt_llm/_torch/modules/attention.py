@@ -2780,6 +2780,17 @@ class MLA(nn.Module):
                 "full-HBM sparse MLA.")
         attn_metadata.hisparse_sparse_mla_kvarn_hot = descriptor
 
+        # Wide-window hoist deferred JOIN (lever c): when the swap-in was issued on
+        # the copy stream at the top of forward_absorption_generation (before the
+        # bmm+rope), its main-stream join was deferred to here. Take it now -- the
+        # main stream waits the copy-chain done event so the hot pool is fully
+        # resident before the read below. No-op (returns False) when no hoist ran
+        # for this (step, layer): the in-method swap-in above already joined.
+        consume_join = getattr(hisparse_coordinator, "consume_prepare_join_event",
+                               None)
+        if consume_join is not None:
+            consume_join(expected_layer_idx)
+
         head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         q_concat = fused_q.view([num_tokens, self.num_heads_tp, head_dim])
         padding = 128
@@ -2933,6 +2944,37 @@ class MLA(nn.Module):
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # HiSparse wide-window swap-in hoist (lever c): the swap-in copy + planner
+        # chain depends only on topk_indices (available now) and the coordinator
+        # tier tensors -- NOT on fused_q (the bmm+rope output below). Issue it on the
+        # coordinator copy stream HERE, before the bmm+rope, with the main-stream
+        # join DEFERRED to the hot-read, so the copy overlaps the entire bmm+rope
+        # window instead of the negligible commit/build tail. The returned descriptor
+        # is stamped on attn_metadata so _sparse_mla_decode_kvarn_hot reuses it via
+        # its descriptor_is_current fast path (no second map call) and only takes the
+        # deferred join. Byte-identical, graph-safe, fail-closed: prepare returns None
+        # (no stamp, no deferred join) whenever the hoist is not eligible, and the
+        # hot-read then runs the existing in-method swap-in exactly as before.
+        hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
+                                       None)
+        if (topk_indices is not None
+                and bool(getattr(hisparse_coordinator, "enabled", False))):
+            prepare = getattr(hisparse_coordinator,
+                              "prepare_hot_pool_overlapped", None)
+            if prepare is not None:
+                hoist_layer_idx = self._hisparse_local_layer_idx(attn_metadata)
+                hoist_mapping = prepare(
+                    topk_indices=topk_indices,
+                    metadata=attn_metadata,
+                    layer_idx=hoist_layer_idx,
+                    skip_topk=False,
+                    is_generation=True,
+                )
+                if (hoist_mapping is not None
+                        and hoist_mapping.sparse_mla_kvarn_hot is not None):
+                    attn_metadata.hisparse_sparse_mla_kvarn_hot = (
+                        hoist_mapping.sparse_mla_kvarn_hot)
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp

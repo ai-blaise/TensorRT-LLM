@@ -245,6 +245,19 @@ class OPTRTHiSparseCoordinator:
         self._swap_in_fork_event = None
         self._swap_in_done_event = None
         self._swap_in_overlap_supported = None
+        # Wide-window hoist (lever c): the swap-in copy + the whole planner chain is
+        # issued on the copy stream BEFORE the decode bmm+rope (which does not depend
+        # on it) and the main-stream JOIN is deferred to just before the hot-read, so
+        # the copy overlaps the full bmm+rope window instead of the ~0 commit/build
+        # tail G1 left. A dedicated fork/done pair (distinct from the in-method G1
+        # pair above) drives this single wide fork/join; created lazily on first use.
+        self._prepare_fork_event = None
+        self._prepare_done_event = None
+        # Pending deferred-join event for the wide-window hoist, keyed by
+        # (step_id, layer_idx). The hot-read site waits + clears it on the main
+        # stream just before consuming the hot pool, so the bmm+rope overlaps the
+        # copy. Empty unless a prepare ran for the current layer this step.
+        self._pending_prepare_join: Dict[Tuple[int, int], "object"] = {}
         self.overlap_swap_in = bool(
             getattr(sparse_attention_config, "hisparse_overlap_swap_in", True))
         self.coalesce_swap_in = bool(
@@ -440,6 +453,53 @@ class OPTRTHiSparseCoordinator:
             return False
         return (len(self._free_request_slots) >= 1
                 and len(self._free_host_slots) >= n)
+
+    def filter_admissible_requests(self, requests, *, num_prompt_blocks_of):
+        """P4 freed-HBM admission gate (pure accounting, no CUDA, no model).
+
+        Given an ordered iterable of scheduler requests and a callable
+        ``num_prompt_blocks_of(request) -> int`` returning each request's prompt
+        footprint in 64-token host blocks, greedily admit requests in priority order
+        while the coordinator's free host-block + request-slot budget holds, and
+        DEFER the rest. The running budget is decremented per admitted request so a
+        whole admission batch is mutually consistent (admitting K requests at once
+        must fit the SUM of their footprints, not each in isolation). Requests whose
+        footprint exceeds ``max_blocks_per_request`` are deferred (never admitted) --
+        the live stack rejects/chunks them elsewhere; here they simply do not fit.
+
+        This is the HiSparse analogue of a host-backed capacity gate: after a finished
+        request is released (``release_request`` returns its host slots to the free
+        pool), the freed headroom re-opens admission for queued requests. Returns
+        ``(admitted, deferred)`` preserving input order. When HiSparse is unconfigured
+        the gate is a no-op (admits everything) so it is safe to consult
+        unconditionally.
+
+        Side-effect-free: it does NOT reserve slots (that is ``reserve_request`` on
+        the live admit path). It only decides who fits the current free budget, which
+        is exactly what a scheduler needs to choose the admission set; the live path
+        then reserves the admitted ones. This keeps the gate unit-testable in
+        isolation against the real ``_free_host_slots`` / ``_free_request_slots``
+        accounting without any CUDA or forward.
+        """
+        requests = list(requests)
+        tier = self._tier
+        if tier is None:
+            # Unconfigured HiSparse: no host-backed gate -> admit all (no-op).
+            return requests, []
+        free_host = len(self._free_host_slots)
+        free_req = len(self._free_request_slots)
+        max_blocks = int(tier.max_blocks_per_request)
+        admitted = []
+        deferred = []
+        for request in requests:
+            n = int(num_prompt_blocks_of(request))
+            if (0 <= n <= max_blocks and free_req >= 1 and free_host >= n):
+                admitted.append(request)
+                free_req -= 1
+                free_host -= n
+            else:
+                deferred.append(request)
+        return admitted, deferred
 
     # P2: measured hot-buffer right-sizing. The knee for a single decode step's
     # hot residency is the smallest H that holds the full per-step working set
@@ -1204,6 +1264,36 @@ class OPTRTHiSparseCoordinator:
             self._swap_in_done_event = torch.cuda.Event()
         return (self._copy_stream, self._swap_in_fork_event,
                 self._swap_in_done_event)
+
+    def _ensure_prepare_events(self):
+        """Lazily create the wide-window hoist fork/done events (lever c).
+
+        Reuses the coordinator copy stream with its OWN fork/done pair (distinct from
+        the in-method G1 pair). The events are FIXED coordinator-owned objects created
+        once: this is required for CUDA graph capture (events must pre-exist capture;
+        the captured graph references fixed event objects -- allocating a fresh event
+        mid-capture is illegal). Timing is disabled (the default) so the cross-stream
+        ordering stays capture-legal, exactly like the G1 pair.
+
+        Reusing one done event across layers is safe because at most ONE wide-window
+        prepare is pending at a time: each layer's forward issues its prepare, runs
+        bmm+rope, then its hot-read consumes (and clears) the deferred join BEFORE the
+        next layer's forward issues its prepare. So the (record -> wait) cycle for a
+        layer completes in program order before the event is re-recorded for the next
+        layer; the per-(step,layer) pending map (popped on consume) enforces the same
+        single-in-flight invariant and is defensively pruned in
+        consume_prepare_join_event.
+        """
+        import torch
+
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream()
+        if self._prepare_fork_event is None:
+            self._prepare_fork_event = torch.cuda.Event()
+        if self._prepare_done_event is None:
+            self._prepare_done_event = torch.cuda.Event()
+        return (self._copy_stream, self._prepare_fork_event,
+                self._prepare_done_event)
 
     @property
     def copy_stream(self):
@@ -2075,6 +2165,7 @@ class OPTRTHiSparseCoordinator:
         compact_status,
         layer_idx: int,
         packed_bytes_per_block: int,
+        on_copy_stream: bool = False,
     ):
         """Submit the native packed-KVarN miss copy, overlapped on the copy stream.
 
@@ -2095,6 +2186,19 @@ class OPTRTHiSparseCoordinator:
         import torch
 
         op = torch.ops.trtllm.hisparse_submit_packed_kvarn_copy_schedule
+        if on_copy_stream:
+            # Wide-window hoist: the enclosing prepare_hot_pool_overlapped already
+            # forked the main stream onto the coordinator copy stream and set it
+            # current, and owns the single done event the hot-read waits. So the
+            # copy launches IN-STREAM on the current (copy) stream with no nested
+            # fork/join -- byte-for-byte identical bytes/slots/rowStatus to the
+            # serial path, just on the side stream so it runs concurrently with the
+            # main-stream bmm+rope. The whole planner chain that produced these
+            # compact slots also ran on this stream, so they are correctly ordered
+            # before the copy without any extra event.
+            return op(host_packed, hot_packed, compact_host_slots,
+                      compact_hot_slots, compact_row_ids, copy_count,
+                      compact_status, int(layer_idx), int(packed_bytes_per_block))
         serial = (not self.overlap_swap_in or not torch.cuda.is_available()
                   or not compact_host_slots.is_cuda
                   or not self._swap_in_overlap_args_supported(op))
@@ -2144,7 +2248,30 @@ class OPTRTHiSparseCoordinator:
         self._swap_in_overlap_supported = supported
         return supported
 
-    def map_topk_to_hot_pool(
+    def _prepare_overlap_eligible(self, topk_indices) -> bool:
+        """Whether the wide-window hoist can run for this call (else fall back).
+
+        The hoist requires: overlap enabled, CUDA available, CUDA int32 2-D TopK,
+        and the built op advertising the overlap args. When any is false the caller
+        skips the prepare and the hot-read takes the existing in-method serial/G1
+        path, preserving the fail-closed, byte-identical contract.
+        """
+        import torch
+
+        if not self.enabled or not self.overlap_swap_in:
+            return False
+        if not torch.cuda.is_available():
+            return False
+        if not getattr(topk_indices, "is_cuda", False):
+            return False
+        if getattr(topk_indices, "dim", lambda: 0)() != 2:
+            return False
+        if getattr(topk_indices, "dtype", None) != torch.int32:
+            return False
+        op = torch.ops.trtllm.hisparse_submit_packed_kvarn_copy_schedule
+        return self._swap_in_overlap_args_supported(op)
+
+    def prepare_hot_pool_overlapped(
         self,
         *,
         topk_indices,
@@ -2153,6 +2280,115 @@ class OPTRTHiSparseCoordinator:
         skip_topk: bool,
         is_generation: bool,
     ) -> Optional[HiSparseTopKMapping]:
+        """Wide-window swap-in (lever c): issue the copy + planner chain on the copy
+        stream BEFORE the decode bmm+rope and DEFER the main-stream join.
+
+        The decode bmm(q_nope.k_b)+mla_rope_generation that produces ``fused_q`` does
+        NOT depend on the swap-in result, yet today it runs entirely before the
+        swap-in is even issued (the swap-in fires inside ``_sparse_mla_decode_kvarn_
+        hot`` after the bmm). Calling this at the TOP of ``forward_absorption_
+        generation`` forks the main stream onto the coordinator copy stream and runs
+        the WHOLE map_topk_to_hot_pool chain there (planners + the in-stream copy +
+        commit + build), records a done event, and returns WITHOUT joining the main
+        stream. The bmm+rope then runs on the main stream CONCURRENTLY with that
+        chain. The hot-read site later waits the done event (``consume_prepare_join_
+        event``) just before reading the hot pool.
+
+        EXACT: byte-for-byte identical to the serial path -- same device ops, same
+        data order, same descriptor; only the launch stream changes and the
+        fork/done events impose the identical copy-before-read happens-before.
+        GRAPH-SAFE: the fork/wait_event/record_event are the same capture-legal
+        high-level Stream/Event calls G1 already captures; no host sync / d2h / CPU
+        gather is added. FAIL-CLOSED: returns ``None`` (caller falls back to the
+        in-method path) whenever the hoist is not eligible; ``resident_v1_ready`` and
+        every per-op guard inside map_topk_to_hot_pool are untouched.
+
+        Returns the mapping (descriptor) so the caller can stamp
+        ``metadata.hisparse_sparse_mla_kvarn_hot``; returns ``None`` to fall back.
+        """
+        if not self._prepare_overlap_eligible(topk_indices):
+            return None
+        import torch
+
+        try:
+            copy_stream, fork_event, done_event = self._ensure_prepare_events()
+        except Exception:
+            return None
+
+        device = topk_indices.device
+        main_stream = torch.cuda.current_stream(device=device)
+        # Single wide fork: the copy chain may begin where the main stream is now
+        # (after the indexer that produced topk_indices). The copy stream waits the
+        # fork so the chain never races a prior reader/writer of the hot tier.
+        fork_event.record(main_stream)
+        copy_stream.wait_event(fork_event)
+        with torch.cuda.stream(copy_stream):
+            mapping = self.map_topk_to_hot_pool(
+                topk_indices=topk_indices,
+                metadata=metadata,
+                layer_idx=layer_idx,
+                skip_topk=skip_topk,
+                is_generation=is_generation,
+                on_copy_stream=True,
+            )
+        # Record copy-chain completion on the copy stream; the main stream join is
+        # DEFERRED to the hot-read (consume_prepare_join_event) so bmm+rope overlaps.
+        done_event.record(copy_stream)
+        if mapping is None or mapping.sparse_mla_kvarn_hot is None:
+            # Nothing to defer-join against; drain the event now so a later layer
+            # never inherits a stale pending join, then signal fall back.
+            main_stream.wait_event(done_event)
+            return None
+        self._pending_prepare_join[(int(self.step_id),
+                                    int(layer_idx))] = done_event
+        return mapping
+
+    def consume_prepare_join_event(self, layer_idx: int) -> bool:
+        """Main-stream join for the wide-window hoist, taken just before the hot-read.
+
+        If a prepare ran for (current step, ``layer_idx``), make the main stream wait
+        the recorded done event (so the hot pool is fully resident before the read)
+        and clear the pending entry. Returns True iff a join was consumed. No-op
+        (returns False) when no prepare ran -- the in-method path handled it.
+        """
+        step = int(self.step_id)
+        key = (step, int(layer_idx))
+        done_event = self._pending_prepare_join.pop(key, None)
+        # Defensive prune: drop any entries from PRIOR steps. A prepared layer always
+        # consumes within the same step's hot-read, so a leftover prior-step entry can
+        # only arise if a layer prepared but never reached its hot-read (it must not be
+        # waited now -- it belongs to a stale step). This keeps the map bounded.
+        if len(self._pending_prepare_join) > 0:
+            stale = [k for k in self._pending_prepare_join if k[0] != step]
+            for k in stale:
+                self._pending_prepare_join.pop(k, None)
+        if done_event is None:
+            return False
+        import torch
+
+        main_stream = torch.cuda.current_stream()
+        main_stream.wait_event(done_event)
+        return True
+
+    def map_topk_to_hot_pool(
+        self,
+        *,
+        topk_indices,
+        metadata,
+        layer_idx: int,
+        skip_topk: bool,
+        is_generation: bool,
+        on_copy_stream: bool = False,
+    ) -> Optional[HiSparseTopKMapping]:
+        """Plan + swap-in the hot pool for ``topk_indices`` and return the mapping.
+
+        ``on_copy_stream`` is an INTERNAL flag set by ``prepare_hot_pool_overlapped``
+        when the whole chain is already being issued on the coordinator copy stream
+        (the wide-window hoist). In that mode the inner copy submit runs IN-STREAM
+        (no nested fork/join) because the enclosing prepare owns the single
+        fork/done pair; the device ops, bytes, and descriptor are otherwise
+        IDENTICAL to the serial/G1 in-method path (``on_copy_stream=False``).
+        """
         if not self.enabled:
             return None
         self._require_configured()
@@ -2369,6 +2605,7 @@ class OPTRTHiSparseCoordinator:
             compact_status=compact_status,
             layer_idx=int(layer_idx),
             packed_bytes_per_block=int(tier.packed_bytes_per_block),
+            on_copy_stream=on_copy_stream,
         )
         commit_status = torch.ops.trtllm.hisparse_commit_hot_slots(
             host_slots,
