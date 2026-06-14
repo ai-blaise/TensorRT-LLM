@@ -76,7 +76,11 @@ constexpr int32_t kResidentKvPoolFp16 = 1;
 constexpr int32_t kHeadsPerBlock = 64;
 constexpr int32_t kHeadGroups = kHeadQ / kHeadsPerBlock; // 2
 constexpr int32_t kTileTokens = 64;
-constexpr int32_t kThreads = 128;
+constexpr int32_t kThreads = 128;            // threads driving softmax/UMMA/epilogue (64 heads x 2 halves)
+constexpr int32_t kDequantThreads = 384;     // C-WIDE-DEQUANT: extra warps hide load/barrier latency in
+                                             // the warp-per-token dequant (8 warps -> 8 tok/warp vs 16).
+                                             // The latency-bound dequant phase is the kernel's wall (C0).
+constexpr int32_t kDequantWarps = kDequantThreads / 32; // 8
 constexpr int32_t kMaxSplits = 16;
 constexpr int32_t kValueNTile = 256; // value-GEMM N per atom (kDv/kValueNTile = 2 atoms)
 
@@ -127,6 +131,33 @@ __device__ __forceinline__ void fwhtSubblockWarp(float (&reg)[ELTS], int laneInB
     }
 #pragma unroll
     for (int i = 0; i < ELTS; ++i)
+        reg[i] *= kInvSqrtHadamard128;
+}
+
+// C4 HADAMARD-HOIST: full 128-point orthonormal Walsh-Hadamard entirely in registers (one
+// thread owns all 128 dims of a subblock -- no cross-lane shuffle). Used in the epilogue to
+// fold Hhat onto O_raw. Sylvester order (matches the popcount-parity BDR reader). 7 butterfly
+// stages + 1/sqrt128.
+__device__ __forceinline__ void fwht128InReg(float (&reg)[128])
+{
+    constexpr float kInvSqrtHadamard128 = 0.088388347648318f;
+#pragma unroll
+    for (int len = 1; len < 128; len <<= 1)
+    {
+#pragma unroll
+        for (int i = 0; i < 128; ++i)
+        {
+            int partner = i ^ len;
+            if (i < partner)
+            {
+                float u = reg[i], v = reg[partner];
+                reg[i] = u + v;
+                reg[partner] = u - v;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 128; ++i)
         reg[i] *= kInvSqrtHadamard128;
 }
 
@@ -312,7 +343,7 @@ using ScoreMMA = decltype(cg::make_tiled_mma(
 using ValueMMA = decltype(cg::make_tiled_mma(
     cg::SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, kHeadsPerBlock, kValueNTile, cg::UMMA::Major::K, cg::UMMA::Major::MN>{}));
 
-__global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams params)
+__global__ __launch_bounds__(kDequantThreads) void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams params)
 {
 #if !defined(HISPARSE_UMMA_ENABLED)
     return;
@@ -444,11 +475,38 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
         // Load Q[64,576] into sQ (SW128) once. Each thread streams a strided slice.
         int64_t const qHeadBase = qRowBase + static_cast<int64_t>(headBase) * params.strideQHQ;
         __nv_bfloat16 const* qbase = reinterpret_cast<__nv_bfloat16 const*>(params.q);
-        for (int32_t i = tid; i < kHeadsPerBlock * kDqk; i += kThreads)
+        for (int32_t i = tid; i < kHeadsPerBlock * kDqk; i += kDequantThreads)
         {
             int32_t const hh = i / kDqk;
             int32_t const dd = i - hh * kDqk;
             sQ(hh, dd) = bf16(__bfloat162float(qbase[qHeadBase + static_cast<int64_t>(hh) * params.strideQHQ + dd]));
+        }
+        __syncthreads();
+
+        // --- C4 HADAMARD-HOIST: pre-transform Q's 512 ckv dims by the orthonormal Hadamard
+        // (Hhat) ONCE/row so the per-token dequant can skip the FWHT entirely. Exact because
+        // S = Q.K^T = Q.(Hhat@K_raw)^T = (Hhat@Q).K_raw^T (Hhat symmetric). One warp FWHTs one
+        // head's 4 subblocks (lanes 0..7->sb0 .. 24..31->sb3, 16 contig dims/lane) -- mirrors
+        // the dequant lane map. Rope dims [512,576) are NOT Hadamard'd (left as-is). ~256
+        // subblock-FWHTs total, ONCE per row (amortized over topk tokens -> negligible).
+        {
+            int32_t const lane = tid & 31;
+            int32_t const laneInBlk = lane & 7;
+            int32_t const subblock = lane >> 3;
+            int32_t const subBase = subblock * 128;
+            unsigned const subMask = 0xFFu << (subblock * 8);
+            int32_t const dim0 = subBase + laneInBlk * 16;
+            for (int32_t hh = warp; hh < kHeadsPerBlock; hh += kDequantWarps)
+            {
+                float reg[16];
+#pragma unroll
+                for (int32_t i = 0; i < 16; ++i)
+                    reg[i] = static_cast<float>(sQ(hh, dim0 + i));
+                fwhtSubblockWarp<16>(reg, laneInBlk, subMask);
+#pragma unroll
+                for (int32_t i = 0; i < 16; ++i)
+                    sQ(hh, dim0 + i) = bf16(reg[i]);
+            }
         }
         __syncthreads();
 
@@ -469,7 +527,7 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                 int32_t const subblock = lane >> 3;
                 int32_t const subBase = subblock * 128;
                 unsigned const subMask = 0xFFu << (subblock * 8);
-                for (int32_t tt = warpId; tt < kTileTokens; tt += (kThreads / 32))
+                for (int32_t tt = warpId; tt < kTileTokens; tt += kDequantWarps)
                 {
                     bool const inRange = tt < tileLen;
                     int32_t const k = tileStart + tt;
@@ -513,11 +571,13 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                                     reg[b * 4 + j] = static_cast<float>(q) * scale + zp;
                                 }
                             }
-                            fwhtSubblockWarp<16>(reg, laneInBlk, subMask);
+                            // C4 HADAMARD-HOIST: NO per-token FWHT here. K_raw = q*scale+zp goes
+                            // straight to SMEM; the orthonormal Hadamard (incl 1/sqrt128) is folded
+                            // into Q (pre-loop) and O (epilogue). subMask/laneInBlk now unused here.
 #pragma unroll
                             for (int32_t i = 0; i < 16; ++i)
                             {
-                                sK(tt, dim0 + i) = bf16(reg[i]); // C-KV (dim<512); V reads it transposed
+                                sK(tt, dim0 + i) = bf16(reg[i]); // raw C-KV (dim<512); V reads it transposed
                             }
                         }
 #pragma unroll
@@ -534,7 +594,27 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                     }
                     else if (inRange && st.status == kHotReadOk && st.active && !st.isHot)
                     {
-                        for (int32_t d = lane; d < kDqk; d += 32)
+                        // C4 HADAMARD-HOIST: the resident pool stores the FULLY-dequantized K
+                        // (Hadamard'd). To match the hoisted hot path (which feeds K_raw to the
+                        // UMMA + folds Hhat into Q/O), convert resident K back to K_raw by applying
+                        // Hhat (= its own inverse) per 128-dim subblock. Rope dims [512,576) carry
+                        // no Hadamard -> written straight through. Resident is the cold path
+                        // (resident_v1_ready()==false); this keeps it numerically consistent.
+                        int32_t const rLaneInBlk = lane & 7;
+                        int32_t const rSubblock = lane >> 3;
+                        int32_t const rSubBase = rSubblock * 128;
+                        unsigned const rSubMask = 0xFFu << (rSubblock * 8);
+                        int32_t const rDim0 = rSubBase + rLaneInBlk * 16;
+                        float rreg[16];
+#pragma unroll
+                        for (int32_t i = 0; i < 16; ++i)
+                            rreg[i] = readResidentLatentValue(params, st.residentGlobalToken, rDim0 + i);
+                        fwhtSubblockWarp<16>(rreg, rLaneInBlk, rSubMask);
+#pragma unroll
+                        for (int32_t i = 0; i < 16; ++i)
+                            sK(tt, rDim0 + i) = bf16(rreg[i]);
+                        // rope tail (dims [512,576)): no Hadamard.
+                        for (int32_t d = layout.kvLoraRank + lane; d < kDqk; d += 32)
                             sK(tt, d) = bf16(readResidentLatentValue(params, st.residentGlobalToken, d));
                     }
                     else
@@ -555,75 +635,83 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                 ku::utcmma_ss(scoreMma, sQ, sK, tS, /*clear_accum=*/true);
                 ku::umma_arrive_noelect(sm.barScore);
             }
-            sm.barScore.wait(scorePhase);
-            scorePhase = !scorePhase;
-            ku::tcgen05_after_thread_sync();
+            // C-WIDE-DEQUANT: only the kThreads "compute" warps (0..3) drive score/softmax/value.
+            // The extra dequant warps (4..7) skip this WORK but MUST hit every __syncthreads() below
+            // (kept unconditional) to stay lock-step + not overwrite sK before the GEMMs consume it.
+            bool const computeWarp = (warp < (kThreads / 32));
+            float correction = 1.0F;
+            float newMax = kNegInf;
+            float tileDenom = 0.0F;
+            float prevDenom = 0.0F;
+            float scKeep[kHalfCols]; // masked+scaled scores, kept in regs across the max barrier
+            if (computeWarp)
+            {
+                sm.barScore.wait(scorePhase);
+                scorePhase = !scorePhase;
+                ku::tcgen05_after_thread_sync();
 
-            // --- (3) softmax: read S, row-max/exp/sum over the head's N_tile cols ---
-            float sc[kHalfCols];
-            ku::tmem_ld_32dp32bNx<kHalfCols>(tmemBase + kTmemS, sc);
-            cutlass::arch::fence_view_async_tmem_load();
-            // mask inactive tokens, scale by smScale, partial max over my 32 cols.
-            float partMax = kNegInf;
-#pragma unroll
-            for (int32_t j = 0; j < kHalfCols; ++j)
-            {
-                int32_t const tok = colHalf * kHalfCols + j;
-                float v = (tok < tileLen && sm.tileActive[tok]) ? (sc[j] * params.smScale) : kNegInf;
-                sc[j] = v;
-                partMax = fmaxf(partMax, v);
-            }
-            // exchange partial max with peer-half -> full tile max for this head.
-            sm.rowExch[tid] = partMax;
-            __syncthreads();
-            float const tileMax = fmaxf(partMax, sm.rowExch[peer]);
-            float const prevMax = sm.runMax[myHead];
-            float const prevDenom = sm.runDenom[myHead];
-            float const newMax = fmaxf(prevMax, tileMax);
-            float const correction = (prevMax == kNegInf) ? 0.0F : __expf(prevMax - newMax);
-            // weights for my 32 cols -> sP; partial denom.
-            float partDenom = 0.0F;
-#pragma unroll
-            for (int32_t j = 0; j < kHalfCols; ++j)
-            {
-                int32_t const tok = colHalf * kHalfCols + j;
-                float const w = (sc[j] == kNegInf) ? 0.0F : __expf(sc[j] - newMax);
-                partDenom += w;
-                sP(myHead, tok) = bf16(w);
-            }
-            sm.rowExch[tid] = partDenom;
-            __syncthreads();
-            float const tileDenom = partDenom + sm.rowExch[peer];
-
-            // --- rescale O accumulator in TMEM by the per-row correction (max growth) ---
-            // Every thread rescales ITS OWN 128 cols of each O tile (WS-M64 readout map:
-            // thread t -> row t%64, cols (t/64)*128 + [0,128) of each tile). The branch is
-            // gated ONLY on !firstTile (UNIFORM across the block) -- never on the per-thread
-            // `correction`, because tmem_ld/tmem_st are warp-collective and would hang on
-            // partial-warp participation when correction differs per head within a warp.
-            // Multiplying by correction==1.0F (no growth for that row) is a harmless no-op.
-            if (!firstTile)
-            {
-                constexpr int32_t kOHalf = kValueNTile / 2; // 128
-                float o0[kOHalf], o1[kOHalf];
-                ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
-                ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+                // --- (3) softmax: read S, row-max/exp/sum over the head's N_tile cols ---
+                ku::tmem_ld_32dp32bNx<kHalfCols>(tmemBase + kTmemS, scKeep);
                 cutlass::arch::fence_view_async_tmem_load();
+                float partMax = kNegInf;
 #pragma unroll
-                for (int32_t j = 0; j < kOHalf; ++j)
+                for (int32_t j = 0; j < kHalfCols; ++j)
                 {
-                    o0[j] *= correction;
-                    o1[j] *= correction;
+                    int32_t const tok = colHalf * kHalfCols + j;
+                    float v = (tok < tileLen && sm.tileActive[tok]) ? (scKeep[j] * params.smScale) : kNegInf;
+                    scKeep[j] = v;
+                    partMax = fmaxf(partMax, v);
                 }
-                ku::tcgen05_before_thread_sync();
-                ku::tmem_st_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
-                ku::tmem_st_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
-                cutlass::arch::fence_view_async_tmem_store();
+                sm.rowExch[tid] = partMax;
             }
-            if (colHalf == 0)
+            __syncthreads();
+            if (computeWarp)
             {
-                sm.runMax[myHead] = newMax;
-                sm.runDenom[myHead] = prevDenom * correction + tileDenom;
+                float partMax = sm.rowExch[tid];
+                float const tileMax = fmaxf(partMax, sm.rowExch[peer]);
+                float const prevMax = sm.runMax[myHead];
+                prevDenom = sm.runDenom[myHead];
+                newMax = fmaxf(prevMax, tileMax);
+                correction = (prevMax == kNegInf) ? 0.0F : __expf(prevMax - newMax);
+                float partDenom = 0.0F;
+#pragma unroll
+                for (int32_t j = 0; j < kHalfCols; ++j)
+                {
+                    int32_t const tok = colHalf * kHalfCols + j;
+                    float const w = (scKeep[j] == kNegInf) ? 0.0F : __expf(scKeep[j] - newMax);
+                    partDenom += w;
+                    sP(myHead, tok) = bf16(w);
+                }
+                sm.rowExch[tid] = partDenom;
+            }
+            __syncthreads();
+            if (computeWarp)
+            {
+                tileDenom = sm.rowExch[tid] + sm.rowExch[peer];
+                // --- rescale O accumulator in TMEM by the per-row correction (max growth) ---
+                if (!firstTile)
+                {
+                    constexpr int32_t kOHalf = kValueNTile / 2; // 128
+                    float o0[kOHalf], o1[kOHalf];
+                    ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+                    ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+                    cutlass::arch::fence_view_async_tmem_load();
+#pragma unroll
+                    for (int32_t j = 0; j < kOHalf; ++j)
+                    {
+                        o0[j] *= correction;
+                        o1[j] *= correction;
+                    }
+                    ku::tcgen05_before_thread_sync();
+                    ku::tmem_st_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+                    ku::tmem_st_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+                    cutlass::arch::fence_view_async_tmem_store();
+                }
+                if (colHalf == 0)
+                {
+                    sm.runMax[myHead] = newMax;
+                    sm.runDenom[myHead] = prevDenom * correction + tileDenom;
+                }
             }
             __syncthreads();
 
@@ -637,9 +725,12 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                 ku::utcmma_ss(valueMma, sP, sVbHi, tO1, firstTile);
                 ku::umma_arrive_noelect(sm.barValue);
             }
-            sm.barValue.wait(valuePhase);
-            valuePhase = !valuePhase;
-            ku::tcgen05_after_thread_sync();
+            if (computeWarp)
+            {
+                sm.barValue.wait(valuePhase);
+                valuePhase = !valuePhase;
+                ku::tcgen05_after_thread_sync();
+            }
             __syncthreads();
             firstTile = false;
         }
@@ -661,31 +752,42 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
 
     if (splitMode)
     {
-        int64_t const partBase = ((static_cast<int64_t>(row) * params.hQ + headF) * numSplits + splitIdx);
-        bool const failed = (finalRowCode != kHotReadOk);
-        float const m = failed ? kNegInf : sm.runMax[eHead];
-        float const d = failed ? 0.0F : sm.runDenom[eHead];
-        float* pacc = params.partialAcc + partBase * kDv;
-        constexpr int32_t kOHalf = kValueNTile / 2; // 128
-        float o0[kOHalf], o1[kOHalf];
-        if (!failed)
+        // C-WIDE-DEQUANT: only the kThreads compute-warps own valid (eHead,eHalf) TMEM readout
+        // mapping; the extra dequant warps (tid>=kThreads) skip the epilogue WORK but still hit
+        // the __syncthreads + TMEM free below.
+        if (tid < kThreads)
         {
-            ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
-            ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
-            cutlass::arch::fence_view_async_tmem_load();
-        }
+            int64_t const partBase = ((static_cast<int64_t>(row) * params.hQ + headF) * numSplits + splitIdx);
+            bool const failed = (finalRowCode != kHotReadOk);
+            float const m = failed ? kNegInf : sm.runMax[eHead];
+            float const d = failed ? 0.0F : sm.runDenom[eHead];
+            float* pacc = params.partialAcc + partBase * kDv;
+            constexpr int32_t kOHalf = kValueNTile / 2; // 128
+            float o0[kOHalf], o1[kOHalf];
+            if (!failed)
+            {
+                ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+                ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+                cutlass::arch::fence_view_async_tmem_load();
+                // C4 HADAMARD-HOIST: fold Hhat onto each partial O_raw (2 complete 128-dim subblocks
+                // per thread). The combine kernel is LINEAR in the partials (per-(row,head) scalar
+                // weights), so Hhat@partial then combine == combine then Hhat.
+                fwht128InReg(o0);
+                fwht128InReg(o1);
+            }
 #pragma unroll
-        for (int32_t j = 0; j < kOHalf; ++j)
-        {
-            int32_t const c0 = eHalf * kOHalf + j;        // 0..255  (tile0 -> O cols 0..255)
-            int32_t const c1 = 256 + eHalf * kOHalf + j;  // 256..511 (tile1)
-            pacc[c0] = failed ? 0.0F : o0[j];
-            pacc[c1] = failed ? 0.0F : o1[j];
-        }
-        if (tid < kHeadsPerBlock)
-        {
-            params.partialMax[partBase] = m;
-            params.partialDenom[partBase] = d;
+            for (int32_t j = 0; j < kOHalf; ++j)
+            {
+                int32_t const c0 = eHalf * kOHalf + j;        // 0..255  (tile0 -> O cols 0..255)
+                int32_t const c1 = 256 + eHalf * kOHalf + j;  // 256..511 (tile1)
+                pacc[c0] = failed ? 0.0F : o0[j];
+                pacc[c1] = failed ? 0.0F : o1[j];
+            }
+            if (tid < kHeadsPerBlock)
+            {
+                params.partialMax[partBase] = m;
+                params.partialDenom[partBase] = d;
+            }
         }
         __syncthreads();
         if (warp == 0)
@@ -697,7 +799,7 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
     {
         // failed-row path: no TMEM was read (mainloop skipped), but warp 0 still frees the
         // allocation; sync so all warps reach here together.
-        for (int32_t d = tid; d < kHeadsPerBlock * kDv; d += kThreads)
+        for (int32_t d = tid; d < kHeadsPerBlock * kDv; d += kDequantThreads)
         {
             int32_t const hh = d / kDv;
             int32_t const dd = d - hh * kDv;
@@ -711,36 +813,45 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
         return;
     }
 
-    float const sinkVal = params.attnSink == nullptr ? kNegInf : params.attnSink[headF];
-    float const mF = sm.runMax[eHead];
-    float finalMax = (sinkVal != kNegInf) ? fmaxf(mF, sinkVal) : mF;
-    float denom = sm.runDenom[eHead];
-    if (finalMax != mF)
+    // C-WIDE-DEQUANT: only kThreads compute-warps drive the (eHead,eHalf) TMEM epilogue readout;
+    // extra dequant warps skip the WORK, still hit the __syncthreads + TMEM free below.
+    if (tid < kThreads)
     {
-        float const corr = (mF == kNegInf) ? 0.0F : __expf(mF - finalMax);
-        denom = denom * corr;
-    }
-    if (sinkVal != kNegInf)
-        denom += __expf(sinkVal - finalMax);
-    float const accScale = (finalMax == mF) ? 1.0F : ((mF == kNegInf) ? 0.0F : __expf(mF - finalMax));
-    float const invDenom = denom > 0.0F ? 1.0F / denom : 0.0F;
-    float const oScale = accScale * invDenom;
+        float const sinkVal = params.attnSink == nullptr ? kNegInf : params.attnSink[headF];
+        float const mF = sm.runMax[eHead];
+        float finalMax = (sinkVal != kNegInf) ? fmaxf(mF, sinkVal) : mF;
+        float denom = sm.runDenom[eHead];
+        if (finalMax != mF)
+        {
+            float const corr = (mF == kNegInf) ? 0.0F : __expf(mF - finalMax);
+            denom = denom * corr;
+        }
+        if (sinkVal != kNegInf)
+            denom += __expf(sinkVal - finalMax);
+        float const accScale = (finalMax == mF) ? 1.0F : ((mF == kNegInf) ? 0.0F : __expf(mF - finalMax));
+        float const invDenom = denom > 0.0F ? 1.0F / denom : 0.0F;
+        float const oScale = accScale * invDenom;
 
-    constexpr int32_t kOHalf = kValueNTile / 2; // 128
-    float o0[kOHalf], o1[kOHalf];
-    ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
-    ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
-    cutlass::arch::fence_view_async_tmem_load();
+        constexpr int32_t kOHalf = kValueNTile / 2; // 128
+        float o0[kOHalf], o1[kOHalf];
+        ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+        ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+        cutlass::arch::fence_view_async_tmem_load();
+        // C4 HADAMARD-HOIST: O_raw -> O = Hhat@O_raw per 128-dim subblock (each thread owns 2 full
+        // 128-dim subblocks via the WS-M64 readout). Exact: O = P.(Hhat@K_raw[:512]) = Hhat@(P.K_raw).
+        fwht128InReg(o0);
+        fwht128InReg(o1);
 #pragma unroll
-    for (int32_t j = 0; j < kOHalf; ++j)
-    {
-        int32_t const c0 = eHalf * kOHalf + j;
-        int32_t const c1 = 256 + eHalf * kOHalf + j;
-        writeBf16(params.out, outBase + c0, o0[j] * oScale);
-        writeBf16(params.out, outBase + c1, o1[j] * oScale);
+        for (int32_t j = 0; j < kOHalf; ++j)
+        {
+            int32_t const c0 = eHalf * kOHalf + j;
+            int32_t const c1 = 256 + eHalf * kOHalf + j;
+            writeBf16(params.out, outBase + c0, o0[j] * oScale);
+            writeBf16(params.out, outBase + c1, o1[j] * oScale);
+        }
+        if (tid < kHeadsPerBlock)
+            params.lse[lseRowBase + headF] = (denom > 0.0F) ? (logf(denom) + finalMax) : kNegInf;
     }
-    if (tid < kHeadsPerBlock)
-        params.lse[lseRowBase + headF] = (denom > 0.0F) ? (logf(denom) + finalMax) : kNegInf;
 
     // All warps must finish their TMEM reads before warp 0 deallocates TMEM.
     __syncthreads();
@@ -897,7 +1008,7 @@ void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& paramsIn
     }
 
     dim3 const grid(totalRows, kHeadGroups, numSplits);
-    sparseMlaDecodeKvarnHotKernel<<<grid, kThreads, sharedBytes, stream>>>(params);
+    sparseMlaDecodeKvarnHotKernel<<<grid, kDequantThreads, sharedBytes, stream>>>(params);
     auto err = cudaGetLastError();
     if (err != cudaSuccess)
     {
