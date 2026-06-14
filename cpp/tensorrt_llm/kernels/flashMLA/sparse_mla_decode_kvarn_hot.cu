@@ -313,6 +313,11 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
     float* tileScore = runDenom + kHeadsPerBlock;
     __shared__ int32_t tileStatusAgg;
     __shared__ int32_t rowCode;
+    // Per-token activity, written ONCE during the dequant resolve and read by the score
+    // loop -- removes the redundant per-token params.indices[]/readRequestTopkToken GMEM
+    // re-read that the score loop did just to recompute `active` (the dequant already
+    // resolves every token). Bit-identical: same `active` value, sourced from SMEM.
+    __shared__ uint8_t tileActive[kTileTokens];
 
     if (tid == 0)
     {
@@ -387,9 +392,15 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
             // the whole token loop publishes kTile to the score/PV consumers.
             int32_t const warpId = tid >> 5;
             int32_t const lane = tid & 31;
-            int32_t const laneInBlk = lane & 15;     // 0..15 within a 128-sub-block
-            int32_t const subInRound = lane >> 4;    // 0 or 1 (which sub-block of the round)
-            unsigned const halfMask = (subInRound == 0) ? 0x0000FFFFu : 0xFFFF0000u;
+            // ELTS=16 layout: a 128-channel C-KV sub-block is covered by 8 lanes (each
+            // owning 16 contiguous channels), so the 32 lanes of a warp cover ALL 4 C-KV
+            // sub-blocks in ONE pass (no 2-round loop). laneInBlk in [0,8); subblock in
+            // [0,4). Cross-lane FWHT now spans kLanes=8 (3 stages, 16 shuffles each = 48
+            // shuffles/token) vs the prior ELTS=8 path (2 rounds x 4 spans x 8 = 64).
+            int32_t const laneInBlk = lane & 7;      // 0..7 within a 128-sub-block (8 lanes)
+            int32_t const subblock = lane >> 3;      // 0..3 which C-KV sub-block
+            int32_t const subBase = subblock * 128;
+            unsigned const subMask = 0xFFu << (subblock * 8); // the 8 lanes of this sub-block
             for (int32_t tt = warpId; tt < tileLen; tt += (kThreads / 32))
             {
                 int32_t const k = tileStart + tt;
@@ -397,6 +408,10 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                 if (st.status != kHotReadOk && lane == 0)
                 {
                     atomicCAS(&tileStatusAgg, kHotReadOk, static_cast<int32_t>(st.status));
+                }
+                if (lane == 0)
+                {
+                    tileActive[tt] = (st.status == kHotReadOk && st.active) ? 1 : 0;
                 }
                 bool const buildHot = (st.status == kHotReadOk) && st.active && st.isHot;
                 __nv_bfloat16* ktRow = kTile + static_cast<int64_t>(tt) * kDqk;
@@ -407,34 +422,40 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                     uint8_t const* tokenScaleZpBytes = st.record + layout.ckvBytesPerBlock
                         + static_cast<int64_t>(st.tokenOffset) * layout.scaleZpBytesPerToken;
                     uint8_t const* peBytes = st.record + layout.ckvBytesPerBlock + layout.scaleZpBytesPerBlock;
-                    // 4 C-KV sub-blocks over 2 rounds (2 sub-blocks/round via the lane halves).
-#pragma unroll
-                    for (int32_t round = 0; round < 2; ++round)
+                    // All 4 C-KV sub-blocks in one pass: this lane owns the 16 contiguous
+                    // channels [laneInBlk*16, +16) of sub-block `subblock`.
                     {
-                        int32_t const subblock = round * 2 + subInRound; // 0..3
-                        int32_t const subBase = subblock * 128;
                         // Per-sub-block (scale, zp) for this token.
                         float const scale = __half2float(
                             readHisparseHalfUnaligned(tokenScaleZpBytes + static_cast<int64_t>(subblock) * sizeof(__half)));
                         float const zp = __half2float(readHisparseHalfUnaligned(
                             tokenScaleZpBytes + static_cast<int64_t>(4 + subblock) * sizeof(__half)));
-                        // This lane owns the 8 contiguous channels [laneInBlk*8, +8) of the
-                        // sub-block. Unpack their 2-bit codes -> reg[].
-                        float reg[8];
+                        // Unpack 16 channels' 2-bit codes -> reg[]. The 16 channels span 4
+                        // contiguous packed bytes (laneInBlk*16 is 4-aligned), so read them
+                        // as one 32-bit word and shift out the 16 2-bit codes.
+                        float reg[16];
+                        int32_t const dim0 = subBase + laneInBlk * 16;
+                        // The 16 channels span exactly 4 contiguous packed bytes (dim0 is
+                        // 4-aligned in channel index => byte index dim0>>2). The record base
+                        // is not guaranteed 4-byte aligned, so read the 4 bytes individually
+                        // (unaligned-safe) and unpack 4 codes each.
+                        uint8_t const* pk = tokenPacked + (dim0 >> 2);
 #pragma unroll
-                        for (int32_t i = 0; i < 8; ++i)
+                        for (int32_t b = 0; b < 4; ++b)
                         {
-                            int32_t const dim = subBase + laneInBlk * 8 + i;
-                            int32_t const byteIdx = dim >> 2;       // 4 vals/byte (2-bit)
-                            int32_t const shift = (dim & 3) * 2;
-                            int32_t const q = (tokenPacked[byteIdx] >> shift) & 0x3;
-                            reg[i] = static_cast<float>(q) * scale + zp;
+                            uint32_t const byte = pk[b];
+#pragma unroll
+                            for (int32_t j = 0; j < 4; ++j)
+                            {
+                                int32_t const q = (byte >> (j * 2)) & 0x3;
+                                reg[b * 4 + j] = static_cast<float>(q) * scale + zp;
+                            }
                         }
-                        fwhtSubblockWarp<8>(reg, laneInBlk, halfMask);
+                        fwhtSubblockWarp<16>(reg, laneInBlk, subMask);
 #pragma unroll
-                        for (int32_t i = 0; i < 8; ++i)
+                        for (int32_t i = 0; i < 16; ++i)
                         {
-                            ktRow[subBase + laneInBlk * 8 + i] = __float2bfloat16_rn(reg[i]);
+                            ktRow[dim0 + i] = __float2bfloat16_rn(reg[i]);
                         }
                     }
                     // 64 PE dims (fp8 E4M3), warp-distributed (32 lanes x 2).
@@ -472,21 +493,12 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
             int32_t const headLocal = headLocalTop;
             int32_t const laneH = laneHTop;
 
+#pragma unroll 4
             for (int32_t tt = 0; tt < tileLen; ++tt)
             {
-                int32_t const k = tileStart + tt;
-                int32_t const hotIndex = params.indices[indexBase + k];
-                bool active;
-                if (hotIndex < 0)
-                {
-                    int32_t requestToken = -1;
-                    uint8_t const ts = readRequestTopkToken(params, batch, s, k, requestToken);
-                    active = (ts == kHotReadOk) && (requestToken >= 0);
-                }
-                else
-                {
-                    active = true;
-                }
+                // `active` was resolved once in the dequant pass and cached in SMEM; no
+                // need to re-read params.indices[]/readRequestTopkToken from GMEM here.
+                bool const active = tileActive[tt] != 0;
                 float part = 0.0F;
                 int4 const* kt8 = reinterpret_cast<int4 const*>(kTile) + static_cast<int64_t>(tt) * (kDqk / 8);
 #pragma unroll
@@ -554,6 +566,7 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
                 {
                     a[e] = accH[accIdx + e] * correction;
                 }
+#pragma unroll 4
                 for (int32_t tt = 0; tt < tileLen; ++tt)
                 {
                     float const w = tileScore[headLocal * kTileTokens + tt];
