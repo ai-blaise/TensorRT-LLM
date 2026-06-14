@@ -19,9 +19,11 @@ held: the production-ABI `sparse_mla_decode_kvarn_hot` kernel was a naive scaffo
 invest in that kernel (Gate-4) — NOT the Gate 5-7 serving integration — exactly the
 "measure before hardening" outcome Rec-4 was designed to force. That investment has
 landed: the FlashMLA-style rewrite plus the FWHT dequant and warp/vectorization
-levers took the hot-read from ~348 ms/call to **0.377 ms/call (B16), ~23 ms/step —
-within the ~20 ms c16 decode budget, A/B-viable** (Phase-4), at cos 0.999999 vs the
-true dense reference with the production ABI frozen.
+levers took the hot-read from ~348 ms/call to **0.360 ms/call (B16), ~22 ms/step —
+A/B-viable, within ~10% of the ~20 ms c16 decode budget** (M19, Phase-4/5), at cos
+0.999999 vs the true dense reference with the production ABI frozen. Going
+comfortably under 20 ms/step would require a high-risk TMEM-UMMA tensor-core rewrite
+(Phase-5).
 
 ## 1a — Capacity (verified)
 
@@ -232,6 +234,31 @@ reference at every step, smoke PASS throughout (orchestrator re-gate on GPU 7:
   348 ms/call). Only the kernel `.cu` differs (+173/−70 vs the M4 commit);
   `SparseMlaDecodeKvarnHotOp.cpp` and `hisparseKvarnBdrRead.cuh` are git-diff-empty
   and `..._resident_v1_ready()` stays `false`.
+
+## Phase-5 — further tuning + the measured non-tensor-core ceiling (M15 → M19, bit-identical)
+
+A follow-up round chasing "comfortably under 20 ms/step" (≤ 0.30 ms/call). Result:
+**M19 = 0.360 ms/call @ B16, bit-identical to M15** (SIG −3.2716296266e+02, cos
+0.999999, smoke PASS, orchestrator-regated GPU 7), per-step ~23 → ~22 ms. The
+≤ 0.30 target was NOT reached; the round's value is the measured evidence for why
+~0.36 is the ceiling of a math-faithful scalar kernel. Committed `be2e620a5`.
+
+- **What landed (bit-identical):** M16 single-pass ELTS=16 FWHT (cleaner, neutral);
+  **M18** cache per-token `active` in a 32-byte SMEM array to kill a redundant
+  per-token `params.indices[]` GMEM re-read in the score loop (+2.4%, the real win);
+  M19 score/PV unroll-4 (+1.4%).
+- **cp.async software-pipelined dequant — REJECTED, −23%:** the framework issue cost
+  (2nd resolve + `__pipeline_commit`/`wait`, ~0.08 ms) dwarfs the ~0.04 ms / 11%
+  hideable GMEM load latency at 25% occupancy. Same root cause that sank score-MMA.
+- **Occupancy is dual-locked at 2 blocks/SM:** REG=128 *and* dynamic SMEM=104 KB
+  (the 64 KB `acc[32][512]` fp32 V-accumulator is intrinsic). 3 blocks needs reg < 85
+  AND smem < 77 KB; hpb16 fits 3 but is slower (2× dequant redundancy). The grid is
+  already 2.16× over the 148 SMs, so split-K is saturated.
+- **The only path to ≤ 0.30** is a TMEM-accumulator UMMA mainloop (sm_100 5th-gen
+  tensor cores) — a high-risk rewrite vs the fp32 dense reference (cos-divergence
+  risk), deferred to keep every step at cos 0.999999. The c16 A/B can proceed at M19
+  (~22 ms/step): the real question is end-to-end tok/s/user, not the per-step
+  microbench in isolation, and the per-step is now within ~10% of the budget.
 
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
