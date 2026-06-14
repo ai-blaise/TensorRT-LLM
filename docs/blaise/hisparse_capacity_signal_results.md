@@ -357,7 +357,10 @@ SGLang's non-kernel design is algorithmically ahead of ours — its only edge is
 live while ours is fail-closed**, plus two axes where we can *beat* it (overlap, prefetch —
 SGLang does neither). Implemented in the coordinator (`hisparse.py`, +471/−3, purely additive;
 ABI + `resident_v1_ready()=false` preserved; every path bit-identical on the real coordinator;
-gate probes pass). Committed `5e2d281ac`.
+gate probes pass). Committed `5e2d281ac`. **A later wiring + composability sweep (below) found P1/P3
+as built were on a *dormant* Python-records path the captured forward never called; G1 ported the
+overlap into the live native op graph-safely and removed the dormant code. Read the P1/P3 entries
+below as the isolation findings, and the G1 block for what is live.**
 
 - **P1 — miss-DMA overlap + bulk coalescing (the must-win).** The decisive finding: the swap-in
   path's per-block `cudaMemcpyAsync` is **100% launch-bound** for scattered misses — 8864 copies
@@ -388,10 +391,44 @@ gate probes pass). Committed `5e2d281ac`.
   `resident_v1_ready()` is a hardcoded `return false` by design pending a live multi-rank DSA/NIXL
   forward (Gate-5-7); the mechanism exists, the promotion is documented as needing the model stack.
 
-**Net:** the per-step miss-DMA (~52 ms, which would have made HiSparse unviable as wired) is
-coalesced 16× and overlapped to ~0 exposed; the working-set knee and the freed-HBM admission loop
-are in place; the only residual is the live multi-rank serving proof (Gate-5-7), which needs a
-model forward, not a microbench.
+### Wiring + composability sweep → G1 (the live graph-safe overlap)
+
+A full wiring sweep (does each optimization reach the live captured forward, and compose with the
+custom + production pieces?) found: **U7 hot-read kernel WIRED** (op → `invokeSparseMlaDecodeKvarnHot`
+→ forward, gated on `coordinator.enabled`); **P2 sizing WIRED** (`recommend_hot_blocks` →
+`configure_from_kv_cache_manager`); **P4 capacity AVAILABLE-ONLY** (complete accounting, no scheduler
+hookup); and critically **P1/P3 DORMANT** — the live swap-in is a *device-native* CUDA-op chain
+(`map_topk_to_hot_pool` → `… compact_miss_schedule → submit_packed_kvarn_copy_schedule`) whose copy is
+a single mapped-host **kernel on the compute stream** (no copy stream, no overlap), while the P1/P3
+Python `execute_swap_in_plan_overlapped` / `prefetch` were a *separate Python-records model the
+forward never invoked* — and not graph-safe (CPU `index_select` gather + Python stream mgmt).
+Composability otherwise clean: U7 ⊗ swap-in byte-identical (the Hadamard-hoist is algebraic, BDR
+storage invariant), no op-registry collision with WarpDecode/NVFP4/Indexer-HISA/GQA/LayerSplit,
+fail-closed intact, A+B compile + link together.
+
+**G1 (committed `5124f823`)** closed the dormancy by porting the overlap **into the native op**,
+graph-safe. The binding constraint: `compact_miss_schedule` emits `copy_count` + slot lists as
+**device-resident** tensors and the forward runs **inside the DSA CUDA-graph-captured region**, so a
+host-enumerated copy-engine `cudaMemcpyAsync`-per-run loop (the P1 staging-gather recipe) is **not
+expressible graph-safely** — it needs a capture-illegal d2h readback, and no CUDA API issues a
+copy-engine memcpy from device-resident pointers/sizes. So the copy stays a **byte-identical kernel**
+moved onto a coordinator copy stream behind **capture-safe fork/join events** — the win is *overlap*,
+not SM-elimination. `hisparse_submit_packed_kvarn_copy_schedule` gained 2 defaulted args
+(`overlap_copy_stream`, `copy_stream_handle`); `hisparse.py` does Python-side fork/join via the torch
+Stream/Event API and **removed the 214 dormant non-graph-safe lines**; `register_fake` extended 1:1.
+Verified (re-gated independently on GPU7): native planner/copy byte-equal at rb=512 **and rb=13312
+(production)** + row2 fail-closed + warm `copy_count==0`; hotread cos **0.999999** (kernel untouched);
+**graph-capture probe — 16 replays, captured-graph bytes + copy_status byte-identical to serial
+(graph-safety proven)**; overlap **0.10 → 0.005 ms exposed, step-segment 0.41 → 0.31 ms (~1.30-1.33×)**
+in the realistic decode regime, ~1.0× under a fully SM-saturating kernel.
+
+**Net:** the live per-step swap-in is now a graph-safe, byte-identical kernel **overlapped** on a copy
+stream (the dormant Python staging-gather path is removed); the working-set knee (P2) is wired, and
+the freed-HBM admission loop (P4) is built but needs the scheduler hookup. Honest residual: true
+zero-SM copy-engine swap-in is unreachable graph-safely with a device-resident schedule (would need
+re-architecting `compact_miss_schedule` to emit a host-side run table pre-capture); the cross-layer
+prefetch hoist is seam-ready but deferred; and live promotion still needs the multi-rank serving
+proof (Gate-5-7), a model forward not a microbench.
 
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
