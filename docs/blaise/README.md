@@ -26,6 +26,14 @@ per the 2026-06-11 a2a-graphed sizing — expert GEMMs 23.3 %), dense-proj
 HISA 0.7 %. The per-stage deltas map to commits — see the methodology
 section of [optimization_candidates.md](optimization_candidates.md).
 
+**Current r20 production default (commit-derived, 2026-06-12):** disaggregated
+1P x 4GPU + 1D x 4GPU serving uses NIXL with the Python/native
+generation-first handoff, dense MLA 2-bit KVarN (`kvarn_k2v2`), LayerSplit
+TP2xCP2 prefill, TP4/EP4 decode with WarpDecode forced, DeepEP low-latency MoE
+communication on decode, and SMC-SD with the GLM-4-9B-FP8 draft model using
+bf16 draft KV. Generic/GQA KVarN remains fail-closed and is not a production
+default.
+
 Every piece here is **production code**. Each was validated by *kernel-level*
 correctness (top-k set match / partial-O + LSE / numerical cosine vs a torch
 reference) and *kernel microsecond / decode-tps* measurement, because the
@@ -49,15 +57,15 @@ a correctness signal — see "Validation philosophy" below).
 | 10 | KVarN: k2v2/k4v4 dense latent KV quant | [kvarn.md](kvarn.md) | ~2.3 bits @ FP16 accuracy, 3–5× capacity | default k2v2 for production dense MLA |
 | 11 | KVarN: BDR fold (in-kernel dequant-on-read) | [kvarn.md](kvarn.md#bdr-fold-in-kernel-dequant-on-read) | amortized restore under budget | default with KVarN |
 | 11b | KVarN GQA: SMC-SD generic KV path | [kvarn_gqa.md](kvarn_gqa.md) | safe scaffolding + fused-op-gated reference code | fail-closed by default |
-| 12 | WarpDecode: retuned NVFP4 tactics + bridge | [warpdecode.md](warpdecode.md) | 1.20–1.36× vs native MoE | opt-in (env/config) |
+| 12 | WarpDecode: retuned NVFP4 tactics + bridge | [warpdecode.md](warpdecode.md) | 1.20–1.36× vs native MoE | default in r20 decode |
 | 13 | NVFP4 fusion: add + RMSNorm + quant | [nvfp4_fusions.md](nvfp4_fusions.md#add--rmsnorm--quant-fusion) | −48…−54 % norm→quant sub-path | on (torch.compile) |
 | 13b | NVFP4 fusion: shared-expert SwiGLU+FP4-out @ decode M | [nvfp4_fusions.md](nvfp4_fusions.md#shared-expert-swiglu--fp4-output-at-decode-m-guard-lift) | ~100 µs/step + 58 launches | on (guard lifted) |
 | 13c | NVFP4 fusion: lowrank-gate+quant epilogue (MoE input) | [nvfp4_fusions.md](nvfp4_fusions.md#lowrank-gate--nvfp4-quant-single-launch-epilogue-moe-input) | chain 7.04 → 4.19 µs/layer ⇒ −165 µs/tok | on (`68866e061`) |
 | 13d | NVFP4 fusion: dense-MLP gate+quant handoff (swizzled-SF) | [nvfp4_fusions.md](nvfp4_fusions.md#dense-mlp-gated-norm--nvfp4-quant-handoff-swizzled-sf) | 4 → 3 kernels on the dense-layer input; ~6–8 µs/tok | on (`TRTLLM_OPTRT_GATED_PREMLP_QUANT`) |
 | 14 | NVFP4 fusion: fused RoPE-cat-FP4 | [nvfp4_fusions.md](nvfp4_fusions.md#fused-rope-cat-fp4) | removes a cat + a quant launch | on when shape matches |
-| 15 | NVFP4 fusion: KVarN-BDR fold into add+RMSNorm | [nvfp4_fusions.md](nvfp4_fusions.md#kvarn-bdr-fold) | see KVarN | opt-in |
-| 16 | SMC-SD: static-particle speculative decode | [smc_sd.md](smc_sd.md) | draft validated; e2e in progress | opt-in (draft model) |
-| 17 | LayerSplit: per-layer CP KV/indexer-K split | [../source/features/layersplit.md](../source/features/layersplit.md) | 21× broadcast latency @ scale | opt-in (`layersplit_enabled`) |
+| 15 | NVFP4 fusion: KVarN-BDR fold into add+RMSNorm | [nvfp4_fusions.md](nvfp4_fusions.md#kvarn-bdr-fold) | see KVarN | default with dense MLA KVarN |
+| 16 | SMC-SD: static-particle speculative decode | [smc_sd.md](smc_sd.md) | r20 GLM draft path wired; bf16 draft KV while GQA KVarN is fail-closed | default in r20 decode |
+| 17 | LayerSplit: per-layer CP KV/indexer-K split | [../source/features/layersplit.md](../source/features/layersplit.md) | 21× broadcast latency @ scale | default in r20 prefill |
 | 18 | Topology + deploy: DP2/TP4 disaggregated decode | [topology_deploy.md](topology_deploy.md) | DP2/TP4 best (64/49/41/40) | deployment choice |
 | 19 | tok/s/user optimization candidates (open levers) | [optimization_candidates.md](optimization_candidates.md) | re-profile 30.8 ms/step (−26.1 %); ranked plan: MoE a2a (M3 flip GO, graphed sizing −1.48–1.57 ms/step), expert-GEMM megakernel (P1 phases 1–2 validated, phase 3 in flight), MLA gate overlap (B2 SHIPPED `833ecf794`, −0.55/−0.50 ms/step) | living hill-climb plan |
 

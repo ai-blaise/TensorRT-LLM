@@ -111,10 +111,12 @@ The custom pieces that are topology-aware:
 - Engine: op-trt + Dynamo single-node decode deploy on 8×B200.
 - Production concurrency target: **c16**.
 - Topology: **DP2 / TP4**, disaggregated decode.
-- Recommended decode config: the Indexer stack (`indexer.md`) with
-  `index_topk_freq` set, the sparse-MLA defaults on, the NVFP4 fusions on
-  (automatic), WarpDecode opt-in per the deployment guide, LayerSplit opt-in for
-  CP deployments, KVarN opt-in once the dense-MLA read path lands.
+- Recommended r20 config: the Indexer stack (`indexer.md`) with
+  `index_topk_freq` set, sparse-MLA defaults on, NVFP4 fusions on, dense MLA
+  KVarN defaulted to `kvarn_k2v2`, WarpDecode forced on decode, DeepEP
+  low-latency MoE comms on decode, LayerSplit owner-local TP2xCP2 prefill, and
+  SMC-SD enabled with the GLM draft using bf16 draft KV. Generic/GQA KVarN stays
+  fail-closed until its backend readiness guard is promoted.
 
 ## Composition
 

@@ -11,7 +11,7 @@ KC="${KC:-sudo -E /usr/local/bin/k3s kubectl -n dynamo-system}"
 REQUIRE_DYNAMO_PIN_MARKERS="${REQUIRE_DYNAMO_PIN_MARKERS:-1}"
 REQUIRE_POSITIVE_TRANSFER_METRICS="${REQUIRE_POSITIVE_TRANSFER_METRICS:-1}"
 REQUIRE_ABORT_CLEANUP_MARKER="${REQUIRE_ABORT_CLEANUP_MARKER:-1}"
-SMC_GATE_MODE="${SMC_GATE_MODE:-deferred}"
+SMC_GATE_MODE="${SMC_GATE_MODE:-required}"
 SMOKE_TMPDIR=""
 
 cleanup() {
@@ -56,6 +56,14 @@ require_runtime_nixl_gate() {
     env_dump="$($KC get "$pod" -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"="}{.value}{"\n"}{end}' 2>/dev/null || true)"
     ! grep -Eq '^TRTLLM_USE_(UCX|MOONCAKE|MPI)_KVCACHE=1$' <<<"$env_dump" \
       || die "$pod has a legacy env backend override that conflicts with the NIXL gate"
+    grep -q '^TRTLLM_NIXL_KVCACHE_BACKEND=UCX$' <<<"$env_dump" \
+      || die "$pod is missing the NIXL UCX plugin env"
+    grep -q '^TRTLLM_NIXL_ENABLE_COALESCE=1$' <<<"$env_dump" \
+      || die "$pod is missing NIXL descriptor coalescing"
+    grep -q '^TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0$' <<<"$env_dump" \
+      || die "$pod disabled NIXL transfer overlap"
+    grep -q '^TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL=1$' <<<"$env_dump" \
+      || die "$pod is missing parallel KV receive"
 
     log_dump="$($KC logs "$pod" 2>/dev/null || true)"
     grep -q 'Initializing NIXL Connect' <<<"$log_dump" || die "$pod did not initialize NIXL Connect"
@@ -71,6 +79,20 @@ require_runtime_nixl_gate() {
 
   grep -q 'transfer_attr=True' <<<"$($KC logs "$pre" 2>/dev/null || true)" \
     || die "prefill did not expose DSACacheManager transfer_attr=True global metadata"
+
+  env_dump="$($KC get "$pre" -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"="}{.value}{"\n"}{end}' 2>/dev/null || true)"
+  grep -q '^TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED$' <<<"$env_dump" \
+    || die "prefill must keep NVLINK_TWO_SIDED for the LayerSplit TP/CP path"
+
+  env_dump="$($KC get "$dec" -o jsonpath='{range .spec.containers[*].env[*]}{.name}{"="}{.value}{"\n"}{end}' 2>/dev/null || true)"
+  grep -q '^TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY$' <<<"$env_dump" \
+    || die "decode must use DeepEP low-latency MoE comms"
+  grep -q '^TRTLLM_DEEP_EP_TOKEN_LIMIT=64$' <<<"$env_dump" \
+    || die "decode must pin DeepEP token limit to 64"
+  grep -q '^TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE=0$' <<<"$env_dump" \
+    || die "decode must leave DeepEP low-latency P2P enabled"
+  grep -q '^TRTLLM_MOE_POST_QUANT_ALLTOALLV=1$' <<<"$env_dump" \
+    || die "decode must enable post-quant alltoallv"
 }
 
 require_config_gate() {
@@ -98,12 +120,18 @@ require_config_gate() {
 
   case "$SMC_GATE_MODE" in
     deferred)
-      ! grep -q 'decoding_type: SMC' <<<"$cfg" || die "SMC-SD must remain deferred for the current NIXL/LayerSplit gate"
-      ! grep -q 'speculative_model:' <<<"$cfg" || die "speculative draft model must remain absent while SMC is deferred"
-      ! grep -q 'draft_attention_backend:' <<<"$cfg" || die "draft attention backend must remain absent while SMC is deferred"
+      ! grep -q 'decoding_type: SMC' <<<"$cfg" || die "SMC-SD must be absent when explicitly running SMC_GATE_MODE=deferred"
+      ! grep -q 'speculative_model:' <<<"$cfg" || die "speculative draft model must be absent when explicitly running SMC_GATE_MODE=deferred"
+      ! grep -q 'draft_attention_backend:' <<<"$cfg" || die "draft attention backend must be absent when explicitly running SMC_GATE_MODE=deferred"
       ;;
     required)
       grep -q 'decoding_type: SMC' <<<"$cfg" || die "SMC-SD is required for this smoke but not configured"
+      grep -q 'speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP' <<<"$cfg" \
+        || die "SMC-SD GLM draft model is not configured"
+      grep -q 'draft_attention_backend: triton' <<<"$cfg" || die "SMC-SD draft attention backend is not triton"
+      grep -q 'draft_kv_cache_dtype: bfloat16' <<<"$cfg" || die "SMC-SD draft KV must be bf16 while GQA KVarN is fail-closed"
+      ! grep -q 'draft_kv_cache_dtype: kvarn' <<<"$cfg" || die "GQA KVarN draft KV was selected before readiness promotion"
+      grep -q 'use_low_precision_moe_combine: false' <<<"$cfg" || die "DeepEP low-latency decode must keep low-precision MoE combine disabled"
       ;;
     *) die "SMC_GATE_MODE must be deferred or required, got $SMC_GATE_MODE" ;;
   esac

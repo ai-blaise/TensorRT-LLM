@@ -8,11 +8,12 @@
 > (figures + file map + composition) so the decode picture is complete in one
 > place even before that merge.
 
-WarpDecode is an **opt-in decode-only MoE fast path** for the Blaise
+WarpDecode is a config-gated decode-only MoE fast path for the Blaise
 DeepSeek-V3.2 NVFP4 target shape (`hidden=7168`, `intermediate=2048`,
-`experts=128`, `topk=8`). It is selected after routing has materialized
-`topk_ids` / `topk_weights` (post-EPLB, post-dispatch) and falls back to the
-native MoE backend when its runtime guards do not match.
+`experts=128`, `topk=8`). It is default-on in the r20 production decode
+manifest with `policy: force` and no kernel-backend fallback; outside that
+manifest it is selected after routing has materialized `topk_ids` /
+`topk_weights` (post-EPLB, post-dispatch).
 
 ## What landed this campaign
 

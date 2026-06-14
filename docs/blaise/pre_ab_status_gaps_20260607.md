@@ -1,11 +1,59 @@
-# Pre-A/B status and remaining gaps - 2026-06-07
+# Pre-A/B status and remaining gaps - current through 2026-06-12
 
-This note records the current state of the `op-trt` custom-stack gate after the
-r20 disaggregated prefill/decode rollout on the B200 canary. It is intentionally
-explicit about incomplete work so later commits do not accidentally treat a
-smoke-response, readiness result, or partial marker as production completion.
+This note records the current commit-derived state of the `op-trt`
+custom-stack gate after the r20 disaggregated prefill/decode rollout on the
+B200 canary. It is intentionally explicit about incomplete work so later commits
+do not accidentally treat a smoke-response, readiness result, or partial marker
+as production completion. Older live rollout sections below are retained as
+historical snapshots, not as the current source of truth.
 
-## Current update - 2026-06-07 17:55 UTC
+## Current update - 2026-06-12
+
+- Current checked `op-trt` head is `797f61f47`
+  (`perf(decode): round-2 residual squeeze -- LL adapter cache + graphed KVarN
+  T1 fire`). The commit train since June 7 is ahead of this file's previous
+  live-state language.
+- The r20 production manifest now treats the optimized default as:
+  NIXL transceiver with the V2 Python/native runtime, generation-first/write-mode
+  request handoff, dense MLA latent KV as 2-bit KVarN (`kvarn_k2v2`), LayerSplit
+  TP2xCP2 prefill with owner-local allocation, TP4/EP4 decode with WarpDecode
+  forced, SMC-SD enabled with the GLM-4-9B-FP8 draft model, and bf16 draft KV.
+- The Dynamo production mirror must match the TensorRT r20 manifest exactly for
+  the default gate: `cache_transceiver_config.backend: NIXL`,
+  `cache_transceiver_config.transceiver_runtime: PYTHON`,
+  `TRTLLM_NIXL_KVCACHE_BACKEND=UCX`, coalesced NIXL descriptors, transfer
+  overlap enabled, and parallel KV receive enabled on both workers.
+- The immediate NIXL plugin remains `UCX` inside the NIXL runtime. This is not
+  the old direct UCX cache transceiver. LIBFABRIC was not promoted because the
+  fleet evidence still shows real VRAM registration failures; Mooncake,
+  direct UCX, and MORI-IO remain A/B candidates.
+- Decode MoE comms should use the measured DeepEP low-latency path:
+  `TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY`,
+  `TRTLLM_DEEP_EP_TOKEN_LIMIT=64`,
+  `TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE=0`, and
+  `TRTLLM_MOE_POST_QUANT_ALLTOALLV=1`. Keep low-precision MoE combine disabled
+  on that path until the combine correctness gate is cleared.
+- Generic/GQA KVarN remains fail-closed. Dense MLA KVarN is production default;
+  GQA KVarN is still guarded by `kvarnGqaBackendReady()==false` and should not
+  be selected by default for SMC-SD. The r20 SMC-SD default therefore uses bf16
+  draft KV.
+- Remaining proof before A/B: deploy the synchronized TensorRT+Dynamo manifests,
+  run NIXL audit, run strict request-pinning smoke with SMC enabled, prove zero
+  fallback/broadcast handoff, then run c16 throughput and length sweep.
+
+Current acceptance smoke:
+
+```bash
+REQUIRE_DYNAMO_PIN_MARKERS=1 \
+REQUIRE_POSITIVE_TRANSFER_METRICS=1 \
+REQUIRE_ABORT_CLEANUP_MARKER=1 \
+./deploy/disagg_pd_r20/smoke_request_pinning.sh
+```
+
+`SMC_GATE_MODE=deferred` is only a regression-bisect aid and does not clear the
+production r20 gate.
+
+## Historical update - 2026-06-07 17:55 UTC
 
 - Pushed head after this integration pass is `cd1712c75`
   (`bench(kvarn): align GQA side-state NIXL probe registration`). It includes
@@ -70,7 +118,7 @@ smoke-response, readiness result, or partial marker as production completion.
 - Rollout note: chained thin overlays previously hit containerd rootfs
   `mount options is too long`. Do not deploy chained overlays for ABI-affecting
   C++/CUDA fixes. Use a full source build for the next endpoint/NIXL proof.
-- Active custom stack in live config:
+- Active custom stack in this historical live config:
   - NIXL cache transceiver on prefill and decode.
   - LayerSplit prefill with `TP2 x CP2`, `cp_type: LAYERSPLIT`, owner-local
     allocation, all-CP-rank transfer, and NIXL transfer backend.
@@ -78,14 +126,14 @@ smoke-response, readiness result, or partial marker as production completion.
     kernel-backend fallback.
   - Dense MLA latent KV uses 2-bit KVarN (`mla_latent_kv_dtype: kvarn_k2v2`)
     with amortized restore; Indexer K remains FP4/HISA, not KVarN.
-  - Moondream-style overlap is enabled while SMC-SD remains deferred in the
-    live manifest.
+  - Moondream-style overlap was enabled while SMC-SD was deferred in that
+    historical live manifest.
 
-## Latest strict smoke result and current gate state
+## Historical strict smoke result and previous gate state
 
 NIXL is the pre-A/B KV-transfer gate. UCX, Mooncake, and MORI-IO are A/B-only
-until NIXL proves end-to-end correctness under the custom r20 stack. The strict
-smoke command remains:
+until NIXL proves end-to-end correctness under the custom r20 stack. The
+historical deferred-SMC smoke command was:
 
 ```bash
 REQUIRE_DYNAMO_PIN_MARKERS=1 \
@@ -216,11 +264,12 @@ accepted.
 Reference: https://github.com/huawei-csl/KVarN
 Reference doc: `docs/blaise/kvarn.md`
 
-### Moondream pipelining without SMC-SD
+### Moondream pipelining with SMC-SD
 
 Moondream-style overlap is enabled in r20 prefill and decode via
-`disable_overlap_scheduler: false`. The current non-SMC gate keeps the
-pipelining path active while SMC-SD is deferred.
+`disable_overlap_scheduler: false`. The current r20 gate requires SMC-SD decode
+to preserve the same overlap contract rather than falling back to a blocking or
+unpinned draft-token path.
 
 SMC-SD decode now has a fail-closed Moondream handoff guard in
 `tensorrt_llm/_torch/speculative/smc.py`: generation-only decode requests must
@@ -234,13 +283,12 @@ ctx_dp_rank=... ctx_info_endpoint=...` for live proof. If that evented pinned
 back to a blocking `.cpu()` draft-token copy; the unpinned path requires the
 explicit diagnostic override `TRTLLM_SMC_ALLOW_UNPINNED_DRAFT_COMMIT=1`.
 
-Remaining Moondream gap: live SMC-SD E2E is still required. Run the strict smoke
-with `SMC_GATE_MODE=required` only after the NIXL/LayerSplit gate is green and
-SMC-SD is explicitly enabled; that mode now fails if the decode handoff marker,
-pinned host-token proof, ctx DP rank, or ctx endpoint is missing. The required
-SMC marker must also correlate to the same request id and completed-prefill
-`ctx_info_endpoint`/`ctx_dp_rank` that Dynamo pinned and sent outbound to decode,
-so a generic SMC log line cannot satisfy the gate.
+Remaining Moondream gap: live SMC-SD E2E proof is still required on the current
+manifest. The strict smoke defaults to `SMC_GATE_MODE=required` and fails if the
+decode handoff marker, pinned host-token proof, ctx DP rank, or ctx endpoint is
+missing. The required SMC marker must also correlate to the same request id and
+generation-first `ctx_info_endpoint`/`ctx_dp_rank` that Dynamo pinned and sent
+outbound to decode, so a generic SMC log line cannot satisfy the gate.
 
 Reference: https://moondream.ai/blog/popping-the-gpu-bubble
 Reference doc: `docs/blaise/moondream_pipelining.md`
@@ -311,27 +359,25 @@ Mooncake or MORI win from config importability alone.
 
 ## Major remaining gaps requested by the user
 
-### Complete SMC-SD
+### SMC-SD production default and remaining proof
 
-SMC-SD remains deferred from the live r20 gate. The GLM/SGLang kernel work has
-several June 6 commits in `op-trt`, and the service can boot without SMC-SD, but
-full SMC-SD production integration is not done.
+SMC-SD is now wired into the r20 DGD and standalone decode config as the
+production default with the GLM-4-9B-FP8 draft model and bf16 draft KV. Generic
+GQA KVarN stays fail-closed, so the SMC-SD default must not request
+`kvarn_k2v2_g128` until the GQA backend readiness guard is promoted.
 
 Required completion:
 
-- Finish SMC-SD against https://github.com/abdelfattah-lab/smcsd and
-  https://arxiv.org/pdf/2604.15672.
-- Import/port any remaining SGLang kernels needed by
-  `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`.
-- Treat the SGLang GLM path as the practical source implementation where it
-  already has optimized kernels. Port/copy the required kernels directly, then
-  adapt the TensorRT-LLM runner/resource-manager APIs rather than re-deriving
-  the kernel family from scratch.
-- Review the June 6 `op-trt` commits before further kernel work so the port does
-  not duplicate or regress already-imported SGLang pieces.
+- Run strict request-pinning smoke with SMC enabled. `SMC_GATE_MODE=deferred` is
+  only a regression-bisect aid and does not clear the gate.
 - Validate the GLM draft model path with the target `DeepSeekV32` main model,
-  dense MLA KVarN, NIXL, request pinning, WarpDecode, and LayerSplit.
-- Re-enable `SMC_GATE_MODE=required` only after live E2E is stable.
+  dense MLA KVarN, NIXL generation-first handoff, request pinning, WarpDecode,
+  DeepEP low-latency decode comms, Moondream overlap, and LayerSplit prefill.
+- Keep the SGLang GLM path as the practical reference implementation if further
+  draft kernels regress. Port/copy only kernels still missing after the June
+  commit train and adapt the TensorRT-LLM runner/resource-manager APIs.
+- Compare SMC-on/off during the c16 A/B sweep; SMC being configured is not by
+  itself a throughput-win claim.
 
 References:
 
@@ -391,10 +437,11 @@ References:
 
 ### Request pinning and MORI/Mooncake/NIXL transport composition
 
-Request pinning is live for the current non-SMC r20 gate. Route selection,
-pin-establish, outbound-to-decode, cleanup, early stream close, positive NIXL
-transfer, and completion markers are all proven in the generation-99 strict
-smoke. Dynamo still fails closed if completed prefill lacks endpoint metadata.
+Request pinning is live for the r20 gate. Route selection, pin-establish,
+outbound-to-decode, cleanup, early stream close, positive NIXL transfer, and
+completion markers were proven in the earlier generation-99 strict smoke; the
+current gate must repeat that proof with SMC enabled. Dynamo fails closed if
+generation-first endpoint metadata is absent.
 
 Required completion:
 
@@ -402,21 +449,25 @@ Required completion:
   production manifest and benchmark run.
 - Ensure the same request id and non-null `ctx_dp_rank` continue to reach
   prefill and decode across all A/B variants.
-- Ensure completed-prefill metadata continues to include non-empty
-  `ctx_info_endpoint`; the router must continue to reject unpinned decode if
-  this field is missing.
+- Ensure generation-first metadata continues to include non-empty
+  `ctx_info_endpoint`; the router must continue to reject unpinned decode if this
+  field is missing. Completed-prefill metadata remains a serial/read-style A/B
+  proof path, not the current write-mode gate.
 - Keep pinning transport-independent so NIXL, Mooncake, UCX, and MORI-IO can be
   compared later without changing correctness semantics.
 - Keep MORI-IO out of the pre-A/B gate for now; use it in A/B only after NIXL is
   proven.
 - NIXL replaces UCX as the pre-A/B KV-pool gate. UCX, Mooncake, and MORI-IO are
-  comparison candidates only after this now-green NIXL correctness gate.
+  comparison candidates only after the strict NIXL correctness gate passes on
+  the synchronized current manifests.
 
 ### Optimized disaggregated deployment
 
 The current r20 topology is the intended initial deployment shape: one prefill
-worker on four GPUs and one decode worker on four GPUs. It is live and ready,
-but not yet accepted as the final optimized production config.
+worker on four GPUs and one decode worker on four GPUs. The checked manifests
+now select the optimized production-default stack, but live acceptance still
+requires rerunning audit, strict smoke, and c16 throughput proof on the
+synchronized TensorRT+Dynamo heads.
 
 Required completion:
 
@@ -426,10 +477,11 @@ Required completion:
   being used.
 - Confirm the exact r20 custom stack in the accepted manifest: prefill TP2xCP2
   LayerSplit with owner-local allocation, all-CP transfer, and NIXL transfer;
-  decode TP4/CP1 with WarpDecode forced on and no kernel-backend fallback;
+  decode TP4/CP1 with WarpDecode forced on, DeepEP low-latency MoE comms, and
+  no kernel-backend fallback;
   dense MLA `kvarn_k2v2` with BDR/amortized restore; HISA/Indexer K remaining
-  fp4; Moondream overlap enabled; SMC-SD deferred until its GLM/GQA pieces are
-  proven.
+  fp4; Moondream overlap enabled; SMC-SD enabled with GLM bf16 draft KV while
+  generic/GQA KVarN stays fail-closed.
 - Warm/cache all recurring autotune shapes so cache-miss fallback tactics do not
   dominate perf runs.
 - Keep TP vs EP, memory fraction, kernel backend, and transport variants as A/B
@@ -455,39 +507,27 @@ Required A/B axes include at minimum:
 
 ## Current gate checklist
 
-- [x] r20 DGD boots on 1 prefill x 4 GPUs + 1 decode x 4 GPUs.
-- [x] NIXL is selected in live config.
+- [x] r20 manifests select 1 prefill x 4 GPUs + 1 decode x 4 GPUs.
+- [x] NIXL is selected with `transceiver_runtime: PYTHON` and generation-first
+  write-mode metadata.
+- [x] NIXL plugin is explicit as `TRTLLM_NIXL_KVCACHE_BACKEND=UCX` with
+  coalescing, transfer overlap, and parallel receive enabled.
 - [x] LayerSplit owner-local prefill config is selected.
-- [x] Dense MLA KVarN 2-bit is selected.
+- [x] Dense MLA KVarN 2-bit is selected and BDR/amortized restore is default
+  with dense MLA KVarN.
 - [x] WarpDecode is forced on decode with kernel-backend fallback disabled.
-- [x] Moondream-style overlap is enabled while SMC-SD is deferred.
-- [x] Routerpin image reaches route-selected and cleanup markers.
-- [x] Current pushed `op-trt` head includes the C++ completed-prefill endpoint
-  source fix, NIXL plugin fail-closed behavior, SMC/Moondream pinned-handoff
-  guard, image reuse helper, prewarm dry-run path, and snapshot-composition
-  hardening.
-- [x] Static C++ endpoint audit passes from a clean VM checkout.
-- [x] Offline request-pinning smoke, including negative endpoint and SMC
-  handoff cases, passes.
-- [x] Cached DGD render/server-dry-run validation passes with the active image.
-- [ ] Live NIXL gate readiness audit passes on the current generation. The
-  generation-104 audit fails only on the missing generation-first request-pin
-  marker in the live 3457 overlay.
-- [x] Endpoint-fixed full-source base plus latest Python/shell overlay is built,
-  pushed to the local registry, imported/resident, and deployed.
-- [x] Routerpin emits full pin-established/outbound decode lifecycle markers
-  with non-empty completed-prefill `ctx_info_endpoint`.
-- [x] Strict request-pinning smoke passes.
-- [x] Positive nonzero NIXL KV transfer proof passes.
-- [x] Prior KV transfer timeout warning stays absent after the endpoint-fixed
-  rollout and idle-transfer-poll overlay.
-- [ ] SMC-SD live E2E with GLM draft model passes.
-- [ ] Remaining SGLang GLM kernels are ported/adapted for
-  `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`.
+- [x] Decode MoE comms use DeepEP low-latency with token limit 64 and
+  post-quant alltoallv; low-precision combine remains disabled on that path.
+- [x] SMC-SD is selected by default with GLM draft model and bf16 draft KV.
+- [x] Moondream-style overlap is enabled and the strict smoke defaults to
+  SMC-required mode.
+- [ ] Deploy synchronized TensorRT+Dynamo current manifests.
+- [ ] Live NIXL gate readiness audit passes on the current generation.
+- [ ] Strict request-pinning smoke passes with SMC enabled.
+- [ ] Positive nonzero NIXL KV transfer proof passes on the current generation.
+- [ ] SMC-SD live E2E with GLM draft model passes under the r20 custom stack.
 - [ ] GQA KVarN 2-bit path is production-complete and optimized.
-- [ ] GQA KVarN BDR fold is implemented and benchmarked against the dense
-  restore path.
-- [ ] Moondream pipelining is proven with SMC-SD decode enabled, not only in the
-  current SMC-deferred gate.
+- [ ] GQA KVarN BDR fold is benchmarked and promoted by the readiness guard.
+- [ ] Moondream pipelining is proven with SMC-SD decode enabled in live smoke.
 - [ ] Setup scripts are committed to infra repo and snapshot artifact is taken.
 - [ ] 16-user A/B matrix is run and tokens/second/user target is met.
