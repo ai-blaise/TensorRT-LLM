@@ -430,6 +430,48 @@ re-architecting `compact_miss_schedule` to emit a host-side run table pre-captur
 prefetch hoist is seam-ready but deferred; and live promotion still needs the multi-rank serving
 proof (Gate-5-7), a model forward not a microbench.
 
+### G2 — wide-window overlap (hoist before bmm+rope) + P4 scheduler seam
+
+The G1 mechanism was correct but its overlap window was ~nil in the *real* decode flow: the swap-in
+issued **inside** `map_topk_to_hot_pool`, after the decode `bmm(q_nope·k_b)+mla_rope_generation`, and
+joined almost immediately. A follow-up determination settled the achievable win from code + numbers:
+the **clean cross-layer hoist is dependency-BLOCKED** (the DSA `Indexer` is a per-layer `nn.Module`
+with per-layer trained weights — L's top-k is unknowable until L−1 completes); **cross-step
+speculative prefetch is locality-blocked** (measured step-to-step block reuse only 19–59%, and the
+reused blocks are already LRU-resident, so the ~63% churn is unpredictable); **miss-reduction is
+churn-bounded**. The one real lever is **widening the in-method window** — and the `bmm+rope` that
+produces `fused_q` depends only on q/q_pe/latent_cache, **not** on the swap-in.
+
+**G2 (committed `012c096b4`)** issues the WHOLE swap-in chain (planners + in-stream copy + commit +
+build) on the coordinator copy stream at the **top of `forward_absorption_generation`, before the
+bmm+rope**, and **defers** the main-stream join to just before the hot-read (`prepare_hot_pool_
+overlapped` + `consume_prepare_join_event`: a dedicated fork/done pair keyed `(step_id, layer_idx)`;
+`map_topk_to_hot_pool` gained an `on_copy_stream` kwarg so the submit launches in-stream with no
+nested fork/join; the descriptor is stamped so `_sparse_mla_decode_kvarn_hot` reuses it via its
+`descriptor_is_current` fast path and only takes the join). Issue + join derive the layer index from
+the same `_hisparse_local_layer_idx`, so the key always matches and the join fires. **EXACT** (serial
+== wide == captured-wide, byte-identical on hot pool + hot_indices + build/commit status, all regimes,
+index_topk 256 and 1024, worst-case 5900+ miss blocks, cos 1.0); **graph-capture PASS** (re-gated
+independently on GPU7); **off-switchable** (falls back to the G1 in-method path). No .cu/ABI change.
+Overlap collapse **1.4–1.7×** when the bmm-shaped window is comparable to the exposed chain, toward
+fully-hidden for larger windows; the precise live magnitude (real bmm duration vs real per-layer miss
+volume) is a Gate-5-7 measurement. Since the mechanism is exact + graph-safe + off-switchable, it can
+only help or no-op.
+
+**P4 scheduler-admission seam (also G2):** `filter_admissible_requests` (a pure, side-effect-free
+freed-HBM budget gate over the existing `can_admit_request`/`admittable_token_capacity` accounting) +
+a `SimpleScheduler` optional `hisparse_coordinator` hook (`_apply_hisparse_gate` filters the capacity
+scheduler's fitting set; **strict no-op when no coordinator is attached**, so non-HiSparse serving is
+byte-for-byte unchanged) + `hisparse_num_prompt_blocks` (returns 0 when unsizable, never spuriously
+rejects). 14 admission unit tests + 6 lever-c control-flow tests pass; the live wiring (plumb the
+coordinator into the PyExecutor scheduler construction + the C++ `BindCapacityScheduler` path +
+multi-rank release/readmit validation) is the remaining Gate-5-7 integration.
+
+**Updated residual:** the live overlap magnitude and the P4 live wiring both need the multi-rank DSA
+decode forward (Gate-5-7); live promotion (`resident_v1_ready()`, left false) likewise. The swap-in
+overlap mechanism, the working-set knee (P2), and the freed-HBM admission accounting + seam are all in
+place and verified in isolation.
+
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
 Run in parallel (separate worktree/GPU): the SMC-SD GQA-KVarN packed-decode kernel
