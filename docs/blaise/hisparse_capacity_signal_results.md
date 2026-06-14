@@ -20,10 +20,11 @@ invest in that kernel (Gate-4) — NOT the Gate 5-7 serving integration — exac
 "measure before hardening" outcome Rec-4 was designed to force. That investment has
 landed: the FlashMLA-style rewrite plus the FWHT dequant and warp/vectorization
 levers took the hot-read from ~348 ms/call to 0.360 ms/call (M19, Phase-4/5), and the
-tcgen05/UMMA tensor-core rewrite then took it to **0.217 ms/call (B16), ~13.2 ms/step —
-comfortably under the ~20 ms c16 decode budget** (U4, Phase-6), at cos 0.999998 vs the
-true dense reference with the production ABI frozen. The ≤0.30 ms/call (≤18.3 ms/step)
-target is beaten with margin.
+tcgen05/UMMA tensor-core rewrite then took it to 0.217 ms/call (U4, Phase-6), and a
+profile-driven wide-dequant + Hadamard-hoist round then to **0.147 ms/call (B16),
+~9.0 ms/step** (U7, Phase-7) — comfortably under the ~20 ms c16 decode budget, at cos
+0.999995 vs the true dense reference with the production ABI frozen. The ≤0.30 ms/call
+(≤18.3 ms/step) target is beaten ~2×.
 
 ## 1a — Capacity (verified)
 
@@ -305,6 +306,46 @@ the 512-col TMEM cap was *masking* a compute bound, not creating one, so breakin
 headroom; (3) the O-split forces a V GMEM round-trip + a serial pass-2 (+66 µs by nsys) U4 never
 pays. The 2-CTA-cluster variant would also lose (it duplicates the compute-bound dequant). The
 precision (fp8), GEMM, and occupancy levers are all exhausted — **U4 (0.217) stands.**
+(Superseded by Phase-7: those *were* exhausted, but a different axis — thread-level
+latency hiding — was not yet explored.)
+
+## Phase-7 — profile-driven wide-dequant + Hadamard-hoist to 0.147 ms/call (−32% over U4)
+
+A research-grounded round (CuTe DSL docs + the CuTe-layout paper + Colfax FA-4/Blackwell
+tutorials + Veitner, with cutest/CZS/IKP as tooling). The dequant-*arithmetic* levers the
+plan centered on proved a ~2-10% ceiling — because **C0 profiling falsified the
+dequant-bound premise** and found a new axis Phases 5-6 missed. Result: **U7 = 0.147 ms/call
+@ B16, cos 0.999995, ~9.0 ms/step — a further 32% under U4 (0.217)** (orchestrator GPU-7
+re-gate: 0.147-0.148 ×5; smoke PASS; dense-ref cos 0.999995; ABI diff-empty). Committed
+`ff3b4f086`. The win **grows with topk**: at topk=2048, U4 0.342 → U7 0.218 (−36%).
+
+**C0 — the measurement that redirected the round.** Ablation (resolution-immune compute
+attribution) + IKP region trace (per-region ns; NVBit silently can't instrument Blackwell
+tcgen05 SASS — a documented tooling negative; `ncu` unavailable). Dequant *compute* is only
+~16% (FWHT 8.7%, score/value UMMA 5.5%, unpack/PE/exp ~2%); **~80% is memory-latency
+stalls** — the gather *pattern* (random == sequential) and the load *count* (vectorized ==
+scalar) were both proven *irrelevant* by ablation. Root cause: **latency-bound at 6% thread
+occupancy** (128 threads, 1 block/SM, TMEM-capped) — *not* compute- or TMEM-occupancy-bound
+as Phase-5/6 concluded.
+
+- **Hadamard-hoist (C4), kept, −2.8%:** the inverse-Hadamard is orthogonal + symmetric +
+  self-inverse, so it folds out of the per-token dequant into a one-time per-row transform —
+  S = (Ĥ Q)·K_raw^T and O = Ĥ·(P·K_raw). The per-token hot path drops the FWHT and its
+  cross-lane shuffles entirely. Proven exact in isolation (S cos 1.0, O cos 0.99999988); the
+  resident cold path applies Ĥ⁻¹ on pool reads to keep the smoke consistent.
+- **Wide-dequant (the dominant lever), −32%:** since the dequant is latency-bound at 6%
+  occupancy, run it on **384 threads / 12 warps** (`kDequantThreads`; 8 tokens/warp vs 16) to
+  hide load + barrier latency, while score/softmax/value/epilogue stay gated to the first 128
+  threads (the UMMA/TMEM layout) with all `__syncthreads` block-wide (no hang). Sweep:
+  128=0.211, 256=0.158, 320=0.153, **384=0.148**, 512=0.148 (plateau).
+- **Rejected (all measured):** packed-cvt conversions (~2% ceiling), softmax O-rescale-skip
+  (inert on near-uniform random scores), vectorized byte loads (not load-instr-bound),
+  register-frugal epilogue (<2%; the 384-thread spill is intrinsic to the hot loop). Only the
+  kernel `.cu` changes (+231/-120); ABI frozen.
+
+**Lesson:** this kernel's true ceiling is **warp-level parallelism / latency hiding**, not
+compute or TMEM occupancy — which only the IKP + ablation profiling surfaced, after
+fp8/GEMM/occupancy/TMEM-split were all measured-dead in Phases 4-6.
 
 ## Companion track — KVarN-GQA packed decode (24.7× dense + FWHT/sparse/split-K, bit-identical/graph-safe)
 
