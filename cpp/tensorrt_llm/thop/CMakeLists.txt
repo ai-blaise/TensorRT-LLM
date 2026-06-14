@@ -159,6 +159,23 @@ set_property(TARGET th_hisparse_smoke PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_hisparse_smoke PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD 20)
 set_property(TARGET th_hisparse_smoke PROPERTY CUDA_STANDARD_REQUIRED ON)
+# The HiSparse hot-read decode kernel now uses the sm100 tcgen05/UMMA + TMEM machinery
+# from nvfp4_sparse (kerutils device headers + cute/cutlass). Mirror the include paths +
+# sm_100a architecture used by the flash_mla_nvfp4_sparse_src object library so the direct
+# th_hisparse_smoke compile of sparse_mla_decode_kvarn_hot.cu resolves them and enables
+# tcgen05 codegen.
+target_include_directories(
+  th_hisparse_smoke
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse/kerutils/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA/nvfp4_sparse/sm100/decode/head64_nvfp4
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/flashMLA
+    $<TARGET_PROPERTY:cutlass_src,INTERFACE_INCLUDE_DIRECTORIES>)
+# 100 (not "100a") so the helper emits arch=compute_100a,code=[sm_100a] with a REAL sm_100a
+# cubin (matches flash_mla_nvfp4_sparse_src); "100a" alone would emit PTX-only and the
+# driver could not load it ("no kernel image").
+set_cuda_architectures(th_hisparse_smoke 100)
 target_link_libraries(
   th_hisparse_smoke PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                             ${CUDA_DRV_LIB} ${CUBLAS_LIB} ${CURAND_LIB})

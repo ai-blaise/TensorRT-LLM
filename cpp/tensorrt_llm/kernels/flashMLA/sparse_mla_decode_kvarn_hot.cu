@@ -3,6 +3,25 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
+// HiSparse hot-read sparse-MLA decode (opt5): tcgen05/UMMA + TMEM rewrite.
+//
+// The two GEMMs (score Q.K^T and value P.V) run on 5th-gen tensor cores
+// (SM100 tcgen05/UMMA, WS 1-CTA bf16->f32 atoms) with BOTH accumulators in TMEM:
+//   - O[64,512] accumulator at TMEM cols [0,256)  (two N=256 tiles, 128 phys cols each)
+//   - S[64,N_tile] accumulator at TMEM cols [256, 256+N_tile/2)
+// Moving the 64KB acc[heads][512] fp32 V-accumulator out of SMEM into TMEM frees the
+// dual-lock that pinned M19 to 2 blocks/SM, and UMMA does the GEMMs at TC throughput.
+//
+// The KVarN-BDR 2-bit dequant (FWHT + 2-bit unpack + fp8 PE) is reused verbatim from
+// the scalar M19 kernel; only its write target changes to fill the canonical SW128
+// bf16 SMEM operand tiles (sK[N_tile,576] for score, sV[N_tile,512] for value).
+//
+// Block = 64 heads of one row (grid (rows, 2 headGroups, splits)), 128 threads.
+// Online (flash-decoding) softmax between the GEMMs reads S from TMEM, does
+// row-max/exp/sum (the 64 columns of a head split across thread t and t^64), writes
+// the bf16 weights P to SMEM, rescales the O TMEM accumulator on max growth, and feeds
+// P back as the value-GEMM A operand. Verified vs the TRUE dense BDR-dequant reference.
+
 #include "tensorrt_llm/kernels/flashMLA/sparse_mla_decode_kvarn_hot.h"
 
 #include "tensorrt_llm/kernels/hisparseKvarnBdrRead.cuh"
@@ -11,8 +30,28 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+
+// The cute/cutlass/kerutils TYPES (SMEM layouts, TMEM/UMMA wrappers, barriers) must be
+// visible in BOTH the host and device compilation passes -- the host pass emits the
+// kernel-registration stub that references them. Only the inline-asm tcgen05 INSTRUCTIONS
+// inside the kernel body are device-only (and the kerutils headers self-guard those).
+// Include unconditionally; gate only the kernel body on __CUDA_ARCH__.
+#include <cute/tensor.hpp>
+#include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/arch/barrier.h>
+
+#include "kerutils/common/common.h"
+#include "kerutils/device/common.h"
+#include "kerutils/device/sm100/gemm.cuh"
+#include "kerutils/device/sm100/helpers.cuh"
+#include "kerutils/device/sm100/intrinsics.cuh"
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#define HISPARSE_UMMA_ENABLED 1
+#endif
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -26,24 +65,25 @@ constexpr int32_t kDv = 512;
 constexpr int32_t kTokensPerBlock = 64;
 constexpr int32_t kKvLoraRank = 512;
 constexpr int32_t kQkRopeHeadDim = 64;
-constexpr int32_t kThreads = 256;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr int32_t kResidentKvPoolBf16 = 0;
 constexpr int32_t kResidentKvPoolFp16 = 1;
 
-// Head-grouped flash decode: grid is (rows, headGroups, splits). Each block owns
-// kHeadsPerBlock query heads of one row and a contiguous slice of that row's selected
-// tokens (split-K). It streams its token slice in tiles of kTileTokens, dequantizes
-// each tile's K/V latent ONCE into a shared bf16 tile (shared across all heads in the
-// block, removing the per-head redundant inverse-Hadamard dequant), and runs
-// online-softmax flash attention per head. With numSplits==1 it finalizes directly to
-// out/lse; with numSplits>1 it writes per-split partial flash state to scratch and the
-// combine kernel reduces.
-constexpr int32_t kHeadsPerBlock = 32;
-constexpr int32_t kHeadGroups = kHeadQ / kHeadsPerBlock;
-constexpr int32_t kTileTokens = 32;
-constexpr int32_t kThreadsPerHead = kThreads / kHeadsPerBlock;
+// UMMA flash-decode tiling: 64 heads/block (M=64 = the WS-M64 UMMA M-mode), 128 threads
+// (4 warps), token tile N_tile=64 (the score N-mode and the value K-mode). The SMEM
+// operand tiles + Q at N_tile=64 sum to ~221KB (< 228KB B200 opt-in SMEM); larger tiles
+// overflow. The dequant is warp-per-token (4 warps -> tokens tt = warpId, +4, ...).
+constexpr int32_t kHeadsPerBlock = 64;
+constexpr int32_t kHeadGroups = kHeadQ / kHeadsPerBlock; // 2
+constexpr int32_t kTileTokens = 64;
+constexpr int32_t kThreads = 128;
 constexpr int32_t kMaxSplits = 16;
+constexpr int32_t kValueNTile = 256; // value-GEMM N per atom (kDv/kValueNTile = 2 atoms)
+
+// TMEM column layout (512 cols total). A WS-M64 [64,N] accumulator occupies N/2 phys cols.
+constexpr int32_t kTmemO0 = 0;                    // O tile0 [64,256] -> cols [0,128)
+constexpr int32_t kTmemO1 = 128;                  // O tile1 [64,256] -> cols [128,256)
+constexpr int32_t kTmemS = 256;                   // S [64,N_tile] -> cols [256, 256+N_tile/2)
 
 __device__ __forceinline__ void writeBf16(void* ptr, int64_t offset, float value)
 {
@@ -53,11 +93,7 @@ __device__ __forceinline__ void writeBf16(void* ptr, int64_t offset, float value
 
 // Warp-shuffle Fast Walsh-Hadamard Transform over a 16-lane group (one 128-channel
 // sub-block) where lane l holds the ELTS contiguous channels [l*ELTS, l*ELTS+ELTS).
-// Intra-lane butterfly for the low stages, __shfl_xor for the high (cross-lane)
-// stages; output channel d = laneInBlk*ELTS + i. Verified bit-exact vs the natural
-// (-1)^popcount(d&j) Hadamard reference (warpfwht_probe, max_abs_err 0). 1/sqrt(128)
-// normalized. Identical primitive to mlaKernels.cu::bdrFwhtSubblockWarp; replicated
-// here because that one lives in another translation unit.
+// Identical primitive to the M19 scalar kernel; bit-exact vs the natural Hadamard.
 template <int ELTS>
 __device__ __forceinline__ void fwhtSubblockWarp(float (&reg)[ELTS], int laneInBlk, unsigned mask)
 {
@@ -258,8 +294,29 @@ __device__ __forceinline__ HiSparseSelectedToken resolveSelectedToken(
     return r;
 }
 
+using kerutils::bf16;
+namespace cg = cute;
+
+// Canonical SW128 K-major SMEM operand layouts.
+using SmemLayoutQ = decltype(ku::make_umma_canonical_k_major_layout<kHeadsPerBlock, kDqk, 128, bf16>());
+using SmemLayoutK = decltype(ku::make_umma_canonical_k_major_layout<kTileTokens, kDqk, 128, bf16>());
+using SmemLayoutP = decltype(ku::make_umma_canonical_k_major_layout<kHeadsPerBlock, kTileTokens, 128, bf16>());
+// V (value-GEMM B operand, MN-major [dim, token]) is derived from the FIRST 512 dims of
+// the SAME 576-wide SW128 K store via transposed composition -- NO separate sV tile
+// (saves kTileTokens*512 bf16 of SMEM; verified cos=1.0 vs a standalone V store).
+using SmemLayoutVb = decltype(cg::composition(
+    SmemLayoutK{}, cg::make_layout(cg::Shape<cg::Int<kDv>, cg::Int<kTileTokens>>{}, cg::Stride<cg::Int<kTileTokens>, cg::_1>{})));
+
+using ScoreMMA = decltype(cg::make_tiled_mma(
+    cg::SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, kHeadsPerBlock, kTileTokens, cg::UMMA::Major::K, cg::UMMA::Major::K>{}));
+using ValueMMA = decltype(cg::make_tiled_mma(
+    cg::SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, kHeadsPerBlock, kValueNTile, cg::UMMA::Major::K, cg::UMMA::Major::MN>{}));
+
 __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(SparseMlaDecodeKvarnHotParams params)
 {
+#if !defined(HISPARSE_UMMA_ENABLED)
+    return;
+#else
     int32_t const row = static_cast<int32_t>(blockIdx.x);
     int32_t const headGroup = static_cast<int32_t>(blockIdx.y);
     int32_t const splitIdx = static_cast<int32_t>(blockIdx.z);
@@ -271,6 +328,7 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
     }
     int32_t const headBase = headGroup * kHeadsPerBlock;
     int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    int32_t const warp = tid >> 5;
 
     int32_t const batch = row / params.sQ;
     int32_t const s = row - batch * params.sQ;
@@ -289,7 +347,6 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
 
     bool const splitMode = numSplits > 1;
 
-    // Token range for this split: contiguous tile-aligned slices of [0, rowTopK).
     int32_t kStart = 0;
     int32_t kEnd = rowTopK;
     if (splitMode)
@@ -301,380 +358,398 @@ __global__ __launch_bounds__(kThreads) void sparseMlaDecodeKvarnHotKernel(Sparse
         if (kStart >= kEnd)
         {
             kStart = 0;
-            kEnd = 0; // empty split: contributes -inf max / 0 denom
+            kEnd = 0;
         }
     }
 
-    extern __shared__ float smem[];
-    __nv_bfloat16* kTile = reinterpret_cast<__nv_bfloat16*>(smem);
-    float* acc = reinterpret_cast<float*>(kTile + static_cast<int64_t>(kTileTokens) * kDqk);
-    float* runMax = acc + static_cast<int64_t>(kHeadsPerBlock) * kDv;
-    float* runDenom = runMax + kHeadsPerBlock;
-    float* tileScore = runDenom + kHeadsPerBlock;
-    __shared__ int32_t tileStatusAgg;
-    __shared__ int32_t rowCode;
-    // Per-token activity, written ONCE during the dequant resolve and read by the score
-    // loop -- removes the redundant per-token params.indices[]/readRequestTopkToken GMEM
-    // re-read that the score loop did just to recompute `active` (the dequant already
-    // resolves every token). Bit-identical: same `active` value, sourced from SMEM.
-    __shared__ uint8_t tileActive[kTileTokens];
+    // SMEM plan: SW128 operand tiles + per-head flash scalars + scratch + barriers.
+    extern __shared__ char smemRaw[];
+    struct SmemPlan
+    {
+        cg::array_aligned<bf16, cg::cosize_v<SmemLayoutQ>> q;
+        cg::array_aligned<bf16, cg::cosize_v<SmemLayoutK>> k;
+        cg::array_aligned<bf16, cg::cosize_v<SmemLayoutP>> p;
+        float runMax[kHeadsPerBlock];
+        float runDenom[kHeadsPerBlock];
+        float rowExch[kThreads]; // peer-half exchange for max/denom (thread t <-> t^64)
+        uint8_t tileActive[kTileTokens];
+        cg::array_aligned<uint32_t, 1> tmemBase;
+        cutlass::arch::ClusterTransactionBarrier barScore;
+        cutlass::arch::ClusterTransactionBarrier barValue;
+        int32_t rowCode;
+        int32_t tileStatusAgg;
+    };
+    SmemPlan& sm = *reinterpret_cast<SmemPlan*>(smemRaw);
+
+    cg::Tensor sQ = cg::make_tensor(cg::make_smem_ptr(sm.q.data()), SmemLayoutQ{});
+    cg::Tensor sK = cg::make_tensor(cg::make_smem_ptr(sm.k.data()), SmemLayoutK{});
+    cg::Tensor sP = cg::make_tensor(cg::make_smem_ptr(sm.p.data()), SmemLayoutP{});
+    // V operand is a transposed view of the first 512 dims of sK (no separate sV tile).
+    cg::Tensor sVb = cg::make_tensor(cg::make_smem_ptr(sm.k.data()), SmemLayoutVb{});
 
     if (tid == 0)
     {
-        rowCode = params.rowStatus[row] == 0 ? kHotReadOk : kHotReadUpstreamInvalid;
-        if (rowCode == kHotReadOk && (rowTopK < 0 || rowTopK > params.topK))
+        sm.rowCode = params.rowStatus[row] == 0 ? kHotReadOk : kHotReadUpstreamInvalid;
+        if (sm.rowCode == kHotReadOk && (rowTopK < 0 || rowTopK > params.topK))
         {
-            rowCode = kHotReadBadTopKLength;
+            sm.rowCode = kHotReadBadTopKLength;
         }
-        tileStatusAgg = kHotReadOk;
-    }
-    for (int32_t i = tid; i < kHeadsPerBlock * kDv; i += kThreads)
-    {
-        acc[i] = 0.0F;
+        sm.tileStatusAgg = kHotReadOk;
     }
     for (int32_t h = tid; h < kHeadsPerBlock; h += kThreads)
     {
-        runMax[h] = kNegInf;
-        runDenom[h] = 0.0F;
+        sm.runMax[h] = kNegInf;
+        sm.runDenom[h] = 0.0F;
+    }
+
+    // TMEM allocation (one elected warp) + barrier init.
+    if (warp == 0)
+    {
+        if (cg::elect_one_sync())
+        {
+            sm.barScore.init(1);
+            sm.barValue.init(1);
+            cutlass::arch::fence_barrier_init();
+        }
+        cg::TMEM::Allocator1Sm().allocate(512, sm.tmemBase.data());
+        cg::TMEM::Allocator1Sm().release_allocation_lock();
     }
     __syncthreads();
+    uint32_t const tmemBase = sm.tmemBase.data()[0];
+    int32_t const rowCode = sm.rowCode;
+#ifdef HISPARSE_DBG
+    bool const dbg = (blockIdx.x == 0 && blockIdx.y == 0 && tid == 0);
+    if (dbg) printf("[K] alloc done tmemBase=%u rowCode=%d kStart=%d kEnd=%d numSplits=%d\n", tmemBase, rowCode, kStart, kEnd, numSplits);
+#endif
 
-    // Per-thread Q register cache: each thread serves one head (headLocal, fixed by
-    // tid) and owns Q dims {laneH, laneH+kThreadsPerHead, ...}. Loading Q once here
-    // (vs re-reading from GMEM for every token of every tile) removes the dominant
-    // redundant Q traffic; values are byte-identical.
-    // Per-thread Q register cache in 128-bit (8-dim) chunks: lane laneHTop owns the
-    // 8 contiguous Q dims [base_g, base_g+8) for chunk g, base_g = (laneHTop +
-    // g*kThreadsPerHead)*8. Loaded once via 16-byte reads. The score dot reads kTile
-    // as int4 (8 bf16) at the matching offset, so both operands use one 128-bit SMEM/
-    // GMEM transaction per 8 dims (vs scalar per-dim). Q is float in registers.
-    int32_t const headLocalTop = tid / kThreadsPerHead;
-    int32_t const laneHTop = tid % kThreadsPerHead;
-    int32_t const headTop = headBase + headLocalTop;
-    constexpr int32_t kQ8PerThread = (kDqk + 8 * kThreadsPerHead - 1) / (8 * kThreadsPerHead);
-    constexpr int32_t kQRegPerThread = kQ8PerThread * 8;
-    float qReg[kQRegPerThread];
+    // TMEM accumulator fragments.
+    ScoreMMA scoreMma;
+    ValueMMA valueMma;
+    cg::Tensor tS = cg::partition_fragment_C(scoreMma, cg::Shape<cg::Int<kHeadsPerBlock>, cg::Int<kTileTokens>>{});
+    tS.data().get() = tmemBase + kTmemS;
+    cg::Tensor tO0 = cg::partition_fragment_C(valueMma, cg::Shape<cg::Int<kHeadsPerBlock>, cg::Int<kValueNTile>>{});
+    tO0.data().get() = tmemBase + kTmemO0;
+    cg::Tensor tO1 = cg::partition_fragment_C(valueMma, cg::Shape<cg::Int<kHeadsPerBlock>, cg::Int<kValueNTile>>{});
+    tO1.data().get() = tmemBase + kTmemO1;
+
+    // Per-thread softmax ownership: thread t owns head h = tid % 64 and the column half
+    // colHalf = tid / 64 (0 -> S cols [0,32), 1 -> [32,64)) of that head's score row.
+    int32_t const myHead = tid % kHeadsPerBlock;       // 0..63
+    int32_t const colHalf = tid / kHeadsPerBlock;       // 0 or 1
+    constexpr int32_t kHalfCols = kTileTokens / 2;       // 32 (== N_tile/2)
+    int32_t const peer = tid ^ kHeadsPerBlock;           // thread holding the other half of myHead
+
     if (rowCode == kHotReadOk)
     {
-        int64_t const qBaseTop = qRowBase + static_cast<int64_t>(headTop) * params.strideQHQ;
-        int4 const* qg8 = reinterpret_cast<int4 const*>(params.q);
-#pragma unroll
-        for (int32_t g = 0; g < kQ8PerThread; ++g)
+        // Load Q[64,576] into sQ (SW128) once. Each thread streams a strided slice.
+        int64_t const qHeadBase = qRowBase + static_cast<int64_t>(headBase) * params.strideQHQ;
+        __nv_bfloat16 const* qbase = reinterpret_cast<__nv_bfloat16 const*>(params.q);
+        for (int32_t i = tid; i < kHeadsPerBlock * kDqk; i += kThreads)
         {
-            int32_t const chunk = laneHTop + g * kThreadsPerHead; // int4 index within the head
-            int4 raw = make_int4(0, 0, 0, 0);
-            if (chunk * 8 < kDqk)
-            {
-                raw = qg8[qBaseTop / 8 + chunk];
-            }
-            __nv_bfloat162 const* qb = reinterpret_cast<__nv_bfloat162 const*>(&raw);
-#pragma unroll
-            for (int32_t p = 0; p < 4; ++p)
-            {
-                float2 const qv = __bfloat1622float2(qb[p]);
-                qReg[g * 8 + 2 * p] = qv.x;
-                qReg[g * 8 + 2 * p + 1] = qv.y;
-            }
+            int32_t const hh = i / kDqk;
+            int32_t const dd = i - hh * kDqk;
+            sQ(hh, dd) = bf16(__bfloat162float(qbase[qHeadBase + static_cast<int64_t>(hh) * params.strideQHQ + dd]));
         }
+        __syncthreads();
+
+        bool firstTile = true;
+        bool scorePhase = false; // ClusterTransactionBarrier wait-phase parity (flips per reuse)
+        bool valuePhase = false;
         for (int32_t tileStart = kStart; tileStart < kEnd; tileStart += kTileTokens)
         {
             int32_t const tileLen = min(kTileTokens, kEnd - tileStart);
 
-            // --- (1) dequant this tile's K/V latent ONCE into kTile ---
-            // Warp-per-token: each of the 8 warps owns whole tokens (tt = warpId, +8, ...)
-            // and dequantizes them entirely warp-locally -- NO block syncs and NO per-token
-            // serialization (the prior block-cooperative path did 3 __syncthreads() per
-            // token). The 32 lanes cover two 128-sub-blocks at once (lanes 0..15 -> low
-            // sub-block of the round, 16..31 -> high), and run the verified warp-shuffle
-            // FWHT (bdrFwhtSubblockWarp<8>, output channel d = laneInBlk*8 + i) directly on
-            // the 2-bit-unpacked registers -- no baseCache SMEM round-trip. The hot 512-d
-            // C-KV is 4 sub-blocks => 2 rounds of 2 sub-blocks. A single block sync after
-            // the whole token loop publishes kTile to the score/PV consumers.
-            int32_t const warpId = tid >> 5;
-            int32_t const lane = tid & 31;
-            // ELTS=16 layout: a 128-channel C-KV sub-block is covered by 8 lanes (each
-            // owning 16 contiguous channels), so the 32 lanes of a warp cover ALL 4 C-KV
-            // sub-blocks in ONE pass (no 2-round loop). laneInBlk in [0,8); subblock in
-            // [0,4). Cross-lane FWHT now spans kLanes=8 (3 stages, 16 shuffles each = 48
-            // shuffles/token) vs the prior ELTS=8 path (2 rounds x 4 spans x 8 = 64).
-            int32_t const laneInBlk = lane & 7;      // 0..7 within a 128-sub-block (8 lanes)
-            int32_t const subblock = lane >> 3;      // 0..3 which C-KV sub-block
-            int32_t const subBase = subblock * 128;
-            unsigned const subMask = 0xFFu << (subblock * 8); // the 8 lanes of this sub-block
-            for (int32_t tt = warpId; tt < tileLen; tt += (kThreads / 32))
+            // --- (1) dequant N_tile tokens -> sK (576, SW128) + sV (512, SW128) ---
+            // Warp-per-token (4 warps): tokens tt = warpId, +4, ... Reused FWHT/unpack/PE
+            // from M19; only the store target changed to the cute SW128 operand tiles.
             {
-                int32_t const k = tileStart + tt;
-                HiSparseSelectedToken st = resolveSelectedToken(params, row, batch, s, k, indexBase);
-                if (st.status != kHotReadOk && lane == 0)
+                int32_t const lane = tid & 31;
+                int32_t const warpId = warp;
+                int32_t const laneInBlk = lane & 7;
+                int32_t const subblock = lane >> 3;
+                int32_t const subBase = subblock * 128;
+                unsigned const subMask = 0xFFu << (subblock * 8);
+                for (int32_t tt = warpId; tt < kTileTokens; tt += (kThreads / 32))
                 {
-                    atomicCAS(&tileStatusAgg, kHotReadOk, static_cast<int32_t>(st.status));
-                }
-                if (lane == 0)
-                {
-                    tileActive[tt] = (st.status == kHotReadOk && st.active) ? 1 : 0;
-                }
-                bool const buildHot = (st.status == kHotReadOk) && st.active && st.isHot;
-                __nv_bfloat16* ktRow = kTile + static_cast<int64_t>(tt) * kDqk;
-                if (buildHot)
-                {
-                    uint8_t const* tokenPacked
-                        = st.record + static_cast<int64_t>(st.tokenOffset) * layout.ckvBytesPerToken;
-                    uint8_t const* tokenScaleZpBytes = st.record + layout.ckvBytesPerBlock
-                        + static_cast<int64_t>(st.tokenOffset) * layout.scaleZpBytesPerToken;
-                    uint8_t const* peBytes = st.record + layout.ckvBytesPerBlock + layout.scaleZpBytesPerBlock;
-                    // All 4 C-KV sub-blocks in one pass: this lane owns the 16 contiguous
-                    // channels [laneInBlk*16, +16) of sub-block `subblock`.
+                    bool const inRange = tt < tileLen;
+                    int32_t const k = tileStart + tt;
+                    HiSparseSelectedToken st{kHotReadInvalidIndex, false, false, nullptr, 0, -1};
+                    if (inRange)
                     {
-                        // Per-sub-block (scale, zp) for this token.
-                        float const scale = __half2float(
-                            readHisparseHalfUnaligned(tokenScaleZpBytes + static_cast<int64_t>(subblock) * sizeof(__half)));
-                        float const zp = __half2float(readHisparseHalfUnaligned(
-                            tokenScaleZpBytes + static_cast<int64_t>(4 + subblock) * sizeof(__half)));
-                        // Unpack 16 channels' 2-bit codes -> reg[]. The 16 channels span 4
-                        // contiguous packed bytes (laneInBlk*16 is 4-aligned), so read them
-                        // as one 32-bit word and shift out the 16 2-bit codes.
-                        float reg[16];
-                        int32_t const dim0 = subBase + laneInBlk * 16;
-                        // The 16 channels span exactly 4 contiguous packed bytes (dim0 is
-                        // 4-aligned in channel index => byte index dim0>>2). The record base
-                        // is not guaranteed 4-byte aligned, so read the 4 bytes individually
-                        // (unaligned-safe) and unpack 4 codes each.
-                        uint8_t const* pk = tokenPacked + (dim0 >> 2);
-#pragma unroll
-                        for (int32_t b = 0; b < 4; ++b)
+                        st = resolveSelectedToken(params, row, batch, s, k, indexBase);
+                        if (st.status != kHotReadOk && lane == 0)
                         {
-                            uint32_t const byte = pk[b];
+                            atomicCAS(&sm.tileStatusAgg, kHotReadOk, static_cast<int32_t>(st.status));
+                        }
+                        if (lane == 0)
+                        {
+                            sm.tileActive[tt] = (st.status == kHotReadOk && st.active) ? 1 : 0;
+                        }
+                    }
+                    bool const buildHot = inRange && (st.status == kHotReadOk) && st.active && st.isHot;
+                    if (buildHot)
+                    {
+                        uint8_t const* tokenPacked
+                            = st.record + static_cast<int64_t>(st.tokenOffset) * layout.ckvBytesPerToken;
+                        uint8_t const* tokenScaleZpBytes = st.record + layout.ckvBytesPerBlock
+                            + static_cast<int64_t>(st.tokenOffset) * layout.scaleZpBytesPerToken;
+                        uint8_t const* peBytes = st.record + layout.ckvBytesPerBlock + layout.scaleZpBytesPerBlock;
+                        {
+                            float const scale = __half2float(readHisparseHalfUnaligned(
+                                tokenScaleZpBytes + static_cast<int64_t>(subblock) * sizeof(__half)));
+                            float const zp = __half2float(readHisparseHalfUnaligned(
+                                tokenScaleZpBytes + static_cast<int64_t>(4 + subblock) * sizeof(__half)));
+                            float reg[16];
+                            int32_t const dim0 = subBase + laneInBlk * 16;
+                            uint8_t const* pk = tokenPacked + (dim0 >> 2);
 #pragma unroll
-                            for (int32_t j = 0; j < 4; ++j)
+                            for (int32_t b = 0; b < 4; ++b)
                             {
-                                int32_t const q = (byte >> (j * 2)) & 0x3;
-                                reg[b * 4 + j] = static_cast<float>(q) * scale + zp;
+                                uint32_t const byte = pk[b];
+#pragma unroll
+                                for (int32_t j = 0; j < 4; ++j)
+                                {
+                                    int32_t const q = (byte >> (j * 2)) & 0x3;
+                                    reg[b * 4 + j] = static_cast<float>(q) * scale + zp;
+                                }
+                            }
+                            fwhtSubblockWarp<16>(reg, laneInBlk, subMask);
+#pragma unroll
+                            for (int32_t i = 0; i < 16; ++i)
+                            {
+                                sK(tt, dim0 + i) = bf16(reg[i]); // C-KV (dim<512); V reads it transposed
                             }
                         }
-                        fwhtSubblockWarp<16>(reg, laneInBlk, subMask);
 #pragma unroll
-                        for (int32_t i = 0; i < 16; ++i)
+                        for (int32_t r = 0; r < (kQkRopeHeadDim + 31) / 32; ++r)
                         {
-                            ktRow[dim0 + i] = __float2bfloat16_rn(reg[i]);
+                            int32_t const peDim = lane + r * 32;
+                            if (peDim < layout.qkRopeHeadDim)
+                            {
+                                uint8_t const byte
+                                    = peBytes[static_cast<int64_t>(st.tokenOffset) * layout.qkRopeHeadDim + peDim];
+                                sK(tt, layout.kvLoraRank + peDim) = bf16(readHisparseFp8E4m3Byte(byte));
+                            }
                         }
                     }
-                    // 64 PE dims (fp8 E4M3), warp-distributed (32 lanes x 2).
-#pragma unroll
-                    for (int32_t r = 0; r < (kQkRopeHeadDim + 31) / 32; ++r)
+                    else if (inRange && st.status == kHotReadOk && st.active && !st.isHot)
                     {
-                        int32_t const peDim = lane + r * 32;
-                        if (peDim < layout.qkRopeHeadDim)
-                        {
-                            uint8_t const byte
-                                = peBytes[static_cast<int64_t>(st.tokenOffset) * layout.qkRopeHeadDim + peDim];
-                            ktRow[layout.kvLoraRank + peDim] = __float2bfloat16_rn(readHisparseFp8E4m3Byte(byte));
-                        }
+                        for (int32_t d = lane; d < kDqk; d += 32)
+                            sK(tt, d) = bf16(readResidentLatentValue(params, st.residentGlobalToken, d));
                     }
-                }
-                else if (st.status == kHotReadOk && st.active && !st.isHot)
-                {
-                    for (int32_t d = lane; d < kDqk; d += 32)
+                    else
                     {
-                        float const val = readResidentLatentValue(params, st.residentGlobalToken, d);
-                        ktRow[d] = __float2bfloat16_rn(val);
-                    }
-                }
-                else
-                {
-                    for (int32_t d = lane; d < kDqk; d += 32)
-                    {
-                        ktRow[d] = __float2bfloat16_rn(0.0F);
+                        // masked or out-of-range token: zero K (score uses it, masked later by
+                        // tileActive; V reads the same zeros transposed -> 0 contribution).
+                        for (int32_t d = lane; d < kDqk; d += 32)
+                            sK(tt, d) = bf16(0.0F);
                     }
                 }
             }
             __syncthreads();
 
-            // --- (2) per-head scores + online-softmax update ---
-            int32_t const headLocal = headLocalTop;
-            int32_t const laneH = laneHTop;
-
-#pragma unroll 4
-            for (int32_t tt = 0; tt < tileLen; ++tt)
+            // --- (2) SCORE UMMA: S[64,N_tile] = Q . K^T ---
+            if (warp == 0 && cg::elect_one_sync())
             {
-                // `active` was resolved once in the dequant pass and cached in SMEM; no
-                // need to re-read params.indices[]/readRequestTopkToken from GMEM here.
-                bool const active = tileActive[tt] != 0;
-                float part = 0.0F;
-                int4 const* kt8 = reinterpret_cast<int4 const*>(kTile) + static_cast<int64_t>(tt) * (kDqk / 8);
-#pragma unroll
-                for (int32_t g = 0; g < kQ8PerThread; ++g)
-                {
-                    int32_t const chunk = laneH + g * kThreadsPerHead;
-                    if (chunk * 8 < kDqk)
-                    {
-                        int4 const raw = kt8[chunk];
-                        __nv_bfloat162 const* kb = reinterpret_cast<__nv_bfloat162 const*>(&raw);
-#pragma unroll
-                        for (int32_t p = 0; p < 4; ++p)
-                        {
-                            float2 const kv = __bfloat1622float2(kb[p]);
-                            part += qReg[g * 8 + 2 * p] * kv.x + qReg[g * 8 + 2 * p + 1] * kv.y;
-                        }
-                    }
-                }
-#pragma unroll
-                for (int32_t off = kThreadsPerHead / 2; off > 0; off >>= 1)
-                {
-                    part += __shfl_down_sync(0xffffffffu, part, off, kThreadsPerHead);
-                }
-                if (laneH == 0)
-                {
-                    tileScore[headLocal * kTileTokens + tt] = active ? (part * params.smScale) : kNegInf;
-                }
+                ku::tcgen05_after_thread_sync();
+                ku::utcmma_ss(scoreMma, sQ, sK, tS, /*clear_accum=*/true);
+                ku::umma_arrive_noelect(sm.barScore);
             }
+            sm.barScore.wait(scorePhase);
+            scorePhase = !scorePhase;
+            ku::tcgen05_after_thread_sync();
+
+            // --- (3) softmax: read S, row-max/exp/sum over the head's N_tile cols ---
+            float sc[kHalfCols];
+            ku::tmem_ld_32dp32bNx<kHalfCols>(tmemBase + kTmemS, sc);
+            cutlass::arch::fence_view_async_tmem_load();
+            // mask inactive tokens, scale by smScale, partial max over my 32 cols.
+            float partMax = kNegInf;
+#pragma unroll
+            for (int32_t j = 0; j < kHalfCols; ++j)
+            {
+                int32_t const tok = colHalf * kHalfCols + j;
+                float v = (tok < tileLen && sm.tileActive[tok]) ? (sc[j] * params.smScale) : kNegInf;
+                sc[j] = v;
+                partMax = fmaxf(partMax, v);
+            }
+            // exchange partial max with peer-half -> full tile max for this head.
+            sm.rowExch[tid] = partMax;
             __syncthreads();
-
-            float tileMax = kNegInf;
-            for (int32_t tt = 0; tt < tileLen; ++tt)
-            {
-                tileMax = fmaxf(tileMax, tileScore[headLocal * kTileTokens + tt]);
-            }
-            float const prevMax = runMax[headLocal];
-            float const prevDenom = runDenom[headLocal];
+            float const tileMax = fmaxf(partMax, sm.rowExch[peer]);
+            float const prevMax = sm.runMax[myHead];
+            float const prevDenom = sm.runDenom[myHead];
             float const newMax = fmaxf(prevMax, tileMax);
-            float const correction = (prevMax == kNegInf) ? 0.0F : expf(prevMax - newMax);
-            // Precompute the softmax weight w[tt] = exp(score - newMax) ONCE per token
-            // into tileScore in place (it depends only on tt, not the value dim d). The
-            // PV inner loop was recomputing this expf for every (d, tt) pair -> ~kDv/
-            // kThreadsPerHead redundant transcendentals per token. The 16 lanes of a head
-            // cooperatively fill its tileLen weights; a block sync publishes them before
-            // the PV reads. Byte-identical (adding 0 for masked tokens == skipping them).
-            for (int32_t tt = laneH; tt < tileLen; tt += kThreadsPerHead)
+            float const correction = (prevMax == kNegInf) ? 0.0F : __expf(prevMax - newMax);
+            // weights for my 32 cols -> sP; partial denom.
+            float partDenom = 0.0F;
+#pragma unroll
+            for (int32_t j = 0; j < kHalfCols; ++j)
             {
-                float const sc = tileScore[headLocal * kTileTokens + tt];
-                tileScore[headLocal * kTileTokens + tt] = (sc == kNegInf) ? 0.0F : expf(sc - newMax);
+                int32_t const tok = colHalf * kHalfCols + j;
+                float const w = (sc[j] == kNegInf) ? 0.0F : __expf(sc[j] - newMax);
+                partDenom += w;
+                sP(myHead, tok) = bf16(w);
+            }
+            sm.rowExch[tid] = partDenom;
+            __syncthreads();
+            float const tileDenom = partDenom + sm.rowExch[peer];
+
+            // --- rescale O accumulator in TMEM by the per-row correction (max growth) ---
+            // Every thread rescales ITS OWN 128 cols of each O tile (WS-M64 readout map:
+            // thread t -> row t%64, cols (t/64)*128 + [0,128) of each tile). The branch is
+            // gated ONLY on !firstTile (UNIFORM across the block) -- never on the per-thread
+            // `correction`, because tmem_ld/tmem_st are warp-collective and would hang on
+            // partial-warp participation when correction differs per head within a warp.
+            // Multiplying by correction==1.0F (no growth for that row) is a harmless no-op.
+            if (!firstTile)
+            {
+                constexpr int32_t kOHalf = kValueNTile / 2; // 128
+                float o0[kOHalf], o1[kOHalf];
+                ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+                ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+                cutlass::arch::fence_view_async_tmem_load();
+#pragma unroll
+                for (int32_t j = 0; j < kOHalf; ++j)
+                {
+                    o0[j] *= correction;
+                    o1[j] *= correction;
+                }
+                ku::tcgen05_before_thread_sync();
+                ku::tmem_st_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+                ku::tmem_st_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+                cutlass::arch::fence_view_async_tmem_store();
+            }
+            if (colHalf == 0)
+            {
+                sm.runMax[myHead] = newMax;
+                sm.runDenom[myHead] = prevDenom * correction + tileDenom;
             }
             __syncthreads();
-            // PV accumulation, 128-bit vectorized: each lane owns 8 contiguous value dims
-            // and reads kTile via a single 16-byte (int4 = 4x bf16x2) SMEM transaction,
-            // cutting the kTile read count 8x vs scalar. 8 fp32 accumulators. Per-acc-element
-            // sum order unchanged => byte-identical.
-            constexpr int32_t kDqkOct = kDqk / 8;
-            int4 const* kTile8 = reinterpret_cast<int4 const*>(kTile);
-            float* accH = acc + headLocal * kDv;
-            for (int32_t d8 = laneH; d8 < kDv / 8; d8 += kThreadsPerHead)
+
+            // --- (4) VALUE UMMA: O += P . V  (accumulate; clear on first tile) ---
+            if (warp == 0 && cg::elect_one_sync())
             {
-                int32_t const accIdx = d8 * 8;
-                float a[8];
-#pragma unroll
-                for (int32_t e = 0; e < 8; ++e)
-                {
-                    a[e] = accH[accIdx + e] * correction;
-                }
-#pragma unroll 4
-                for (int32_t tt = 0; tt < tileLen; ++tt)
-                {
-                    float const w = tileScore[headLocal * kTileTokens + tt];
-                    int4 const raw = kTile8[static_cast<int64_t>(tt) * kDqkOct + d8];
-                    __nv_bfloat162 const* vb = reinterpret_cast<__nv_bfloat162 const*>(&raw);
-#pragma unroll
-                    for (int32_t p = 0; p < 4; ++p)
-                    {
-                        float2 const v = __bfloat1622float2(vb[p]);
-                        a[2 * p] += w * v.x;
-                        a[2 * p + 1] += w * v.y;
-                    }
-                }
-#pragma unroll
-                for (int32_t e = 0; e < 8; ++e)
-                {
-                    accH[accIdx + e] = a[e];
-                }
+                ku::tcgen05_after_thread_sync();
+                cg::Tensor sVbLo = cg::local_tile(sVb, cg::Shape<cg::Int<kValueNTile>, cg::Int<kTileTokens>>{}, cg::make_coord(cg::_0{}, cg::_0{}));
+                cg::Tensor sVbHi = cg::local_tile(sVb, cg::Shape<cg::Int<kValueNTile>, cg::Int<kTileTokens>>{}, cg::make_coord(cg::_1{}, cg::_0{}));
+                ku::utcmma_ss(valueMma, sP, sVbLo, tO0, firstTile);
+                ku::utcmma_ss(valueMma, sP, sVbHi, tO1, firstTile);
+                ku::umma_arrive_noelect(sm.barValue);
             }
-            if (laneH == 0)
-            {
-                float tileDenom = 0.0F;
-                for (int32_t tt = 0; tt < tileLen; ++tt)
-                {
-                    tileDenom += tileScore[headLocal * kTileTokens + tt];
-                }
-                runDenom[headLocal] = prevDenom * correction + tileDenom;
-                runMax[headLocal] = newMax;
-            }
+            sm.barValue.wait(valuePhase);
+            valuePhase = !valuePhase;
+            ku::tcgen05_after_thread_sync();
             __syncthreads();
+            firstTile = false;
         }
     }
 
-    if (tid == 0 && rowCode == kHotReadOk && tileStatusAgg != kHotReadOk)
+    if (tid == 0 && rowCode == kHotReadOk && sm.tileStatusAgg != kHotReadOk)
     {
-        rowCode = tileStatusAgg;
+        sm.rowCode = sm.tileStatusAgg;
     }
     __syncthreads();
+    int32_t const finalRowCode = sm.rowCode;
 
-    int32_t const headLocalF = tid / kThreadsPerHead;
-    int32_t const laneF = tid % kThreadsPerHead;
-    int32_t const headF = headBase + headLocalF;
+    // Epilogue: read O[64,512] from TMEM, scale, write out + lse.
+    // Each thread: row = tid%64, half = tid/64 (which 256 cols of the 512 output).
+    int32_t const eHead = tid % kHeadsPerBlock;
+    int32_t const eHalf = tid / kHeadsPerBlock; // 0 -> out cols via O0/O1 col [0,128); 1 -> [128,256)
+    int32_t const headF = headBase + eHead;
+    int64_t const outBase = outRowBase + static_cast<int64_t>(headF) * params.strideOHQ;
 
-    // --- split-mode: write partial flash state to scratch; combine kernel finalizes ---
     if (splitMode)
     {
-        int64_t const partBase
-            = ((static_cast<int64_t>(row) * params.hQ + headF) * numSplits + splitIdx);
-        // a failed row marks all its partials as empty (-inf/0) so combine yields zero.
-        bool const failed = (rowCode != kHotReadOk);
-        float const m = failed ? kNegInf : runMax[headLocalF];
-        float const d = failed ? 0.0F : runDenom[headLocalF];
+        int64_t const partBase = ((static_cast<int64_t>(row) * params.hQ + headF) * numSplits + splitIdx);
+        bool const failed = (finalRowCode != kHotReadOk);
+        float const m = failed ? kNegInf : sm.runMax[eHead];
+        float const d = failed ? 0.0F : sm.runDenom[eHead];
         float* pacc = params.partialAcc + partBase * kDv;
-        for (int32_t dd = laneF; dd < kDv; dd += kThreadsPerHead)
+        constexpr int32_t kOHalf = kValueNTile / 2; // 128
+        float o0[kOHalf], o1[kOHalf];
+        if (!failed)
         {
-            pacc[dd] = failed ? 0.0F : acc[headLocalF * kDv + dd];
+            ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+            ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+            cutlass::arch::fence_view_async_tmem_load();
         }
-        if (laneF == 0)
+#pragma unroll
+        for (int32_t j = 0; j < kOHalf; ++j)
+        {
+            int32_t const c0 = eHalf * kOHalf + j;        // 0..255  (tile0 -> O cols 0..255)
+            int32_t const c1 = 256 + eHalf * kOHalf + j;  // 256..511 (tile1)
+            pacc[c0] = failed ? 0.0F : o0[j];
+            pacc[c1] = failed ? 0.0F : o1[j];
+        }
+        if (tid < kHeadsPerBlock)
         {
             params.partialMax[partBase] = m;
             params.partialDenom[partBase] = d;
         }
+        __syncthreads();
+        if (warp == 0)
+            cg::TMEM::Allocator1Sm().free(0, 512);
         return;
     }
 
-    // --- single-split: finalize directly ---
-    int64_t const outBase = outRowBase + static_cast<int64_t>(headF) * params.strideOHQ;
-    if (rowCode != kHotReadOk)
+    if (finalRowCode != kHotReadOk)
     {
-        for (int32_t d = laneF; d < kDv; d += kThreadsPerHead)
+        // failed-row path: no TMEM was read (mainloop skipped), but warp 0 still frees the
+        // allocation; sync so all warps reach here together.
+        for (int32_t d = tid; d < kHeadsPerBlock * kDv; d += kThreads)
         {
-            writeBf16(params.out, outBase + d, 0.0F);
+            int32_t const hh = d / kDv;
+            int32_t const dd = d - hh * kDv;
+            writeBf16(params.out, outRowBase + static_cast<int64_t>(headBase + hh) * params.strideOHQ + dd, 0.0F);
         }
-        if (laneF == 0)
-        {
-            params.lse[lseRowBase + headF] = kNegInf;
-        }
+        for (int32_t h = tid; h < kHeadsPerBlock; h += kThreads)
+            params.lse[lseRowBase + headBase + h] = kNegInf;
+        __syncthreads();
+        if (warp == 0)
+            cg::TMEM::Allocator1Sm().free(0, 512);
         return;
     }
 
     float const sinkVal = params.attnSink == nullptr ? kNegInf : params.attnSink[headF];
-    float const mF = runMax[headLocalF];
+    float const mF = sm.runMax[eHead];
     float finalMax = (sinkVal != kNegInf) ? fmaxf(mF, sinkVal) : mF;
-    float denom = runDenom[headLocalF];
+    float denom = sm.runDenom[eHead];
     if (finalMax != mF)
     {
-        float const corr = (mF == kNegInf) ? 0.0F : expf(mF - finalMax);
+        float const corr = (mF == kNegInf) ? 0.0F : __expf(mF - finalMax);
         denom = denom * corr;
     }
     if (sinkVal != kNegInf)
-    {
-        denom += expf(sinkVal - finalMax);
-    }
-    float const accScale = (finalMax == mF) ? 1.0F : ((mF == kNegInf) ? 0.0F : expf(mF - finalMax));
+        denom += __expf(sinkVal - finalMax);
+    float const accScale = (finalMax == mF) ? 1.0F : ((mF == kNegInf) ? 0.0F : __expf(mF - finalMax));
     float const invDenom = denom > 0.0F ? 1.0F / denom : 0.0F;
-    for (int32_t d = laneF; d < kDv; d += kThreadsPerHead)
+    float const oScale = accScale * invDenom;
+
+    constexpr int32_t kOHalf = kValueNTile / 2; // 128
+    float o0[kOHalf], o1[kOHalf];
+    ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO0, o0);
+    ku::tmem_ld_32dp32bNx<kOHalf>(tmemBase + kTmemO1, o1);
+    cutlass::arch::fence_view_async_tmem_load();
+#pragma unroll
+    for (int32_t j = 0; j < kOHalf; ++j)
     {
-        float const a = acc[headLocalF * kDv + d] * accScale;
-        writeBf16(params.out, outBase + d, a * invDenom);
+        int32_t const c0 = eHalf * kOHalf + j;
+        int32_t const c1 = 256 + eHalf * kOHalf + j;
+        writeBf16(params.out, outBase + c0, o0[j] * oScale);
+        writeBf16(params.out, outBase + c1, o1[j] * oScale);
     }
-    if (laneF == 0)
-    {
+    if (tid < kHeadsPerBlock)
         params.lse[lseRowBase + headF] = (denom > 0.0F) ? (logf(denom) + finalMax) : kNegInf;
-    }
+
+    // All warps must finish their TMEM reads before warp 0 deallocates TMEM.
+    __syncthreads();
+    if (warp == 0)
+        cg::TMEM::Allocator1Sm().free(0, 512);
+#endif
 }
 
 // Combine partial flash states across splits into final out/lse, per (row, head).
-// One block per (row, head); 128 threads cooperate over kDv dims.
 __global__ __launch_bounds__(128) void sparseMlaDecodeKvarnHotCombineKernel(SparseMlaDecodeKvarnHotParams params)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x);
@@ -696,7 +771,6 @@ __global__ __launch_bounds__(128) void sparseMlaDecodeKvarnHotCombineKernel(Spar
 
     int64_t const partRowHead = (static_cast<int64_t>(row) * params.hQ + head) * numSplits;
 
-    // global max over splits + optional sink
     __shared__ float sMax;
     __shared__ float sDenom;
     float const sinkVal = params.attnSink == nullptr ? kNegInf : params.attnSink[head];
@@ -704,17 +778,13 @@ __global__ __launch_bounds__(128) void sparseMlaDecodeKvarnHotCombineKernel(Spar
     {
         float gmax = sinkVal;
         for (int32_t sp = 0; sp < numSplits; ++sp)
-        {
             gmax = fmaxf(gmax, params.partialMax[partRowHead + sp]);
-        }
         float gden = (sinkVal != kNegInf && gmax != kNegInf) ? expf(sinkVal - gmax) : 0.0F;
         for (int32_t sp = 0; sp < numSplits; ++sp)
         {
             float const m = params.partialMax[partRowHead + sp];
             if (m == kNegInf)
-            {
                 continue;
-            }
             gden += params.partialDenom[partRowHead + sp] * expf(m - gmax);
         }
         sMax = gmax;
@@ -733,18 +803,14 @@ __global__ __launch_bounds__(128) void sparseMlaDecodeKvarnHotCombineKernel(Spar
         {
             float const m = params.partialMax[partRowHead + sp];
             if (m == kNegInf)
-            {
                 continue;
-            }
             float const scale = expf(m - gmax);
             o += params.partialAcc[(partRowHead + sp) * kDv + d] * scale;
         }
         writeBf16(params.out, outBase + d, o * invDenom);
     }
     if (tid == 0)
-    {
         params.lse[lseOff] = (gden > 0.0F) ? (logf(gden) + gmax) : kNegInf;
-    }
 }
 
 } // namespace
@@ -773,23 +839,40 @@ void invokeSparseMlaDecodeKvarnHot(SparseMlaDecodeKvarnHotParams const& paramsIn
     }
 
     int32_t const totalRows = params.b * params.sQ;
-    // adaptive split-K: add token-range splits when (rows * headGroups) under-fills the
-    // GPU, so few-row decode batches keep all SMs busy without redundant dequant.
     int32_t const baseBlocks = totalRows * kHeadGroups;
     int32_t const tilesTotal = (params.topK + kTileTokens - 1) / kTileTokens;
-    constexpr int32_t kTargetBlocks = 304; // ~2x SM count on B200
-    int32_t numSplits = (baseBlocks >= kTargetBlocks) ? 1 : ((kTargetBlocks + baseBlocks - 1) / baseBlocks);
+    // Split-K factor. This kernel is TMEM-bound to 1 EFFECTIVE block/SM: it allocates all
+    // 512 TMEM columns and a B200 SM has exactly 512, so a second SMEM-resident CTA cannot
+    // run concurrently (verified: a single SM with two 512-col-TMEM CTAs doubles kernel
+    // walltime). Therefore the optimum is to fill the SMs to ~ONE wave (baseBlocks*numSplits
+    // <= #SMs) and no more -- extra splits beyond one wave only multiply per-CTA overhead
+    // (TMEM alloc/free, barrier init, Q-reload) under serialized execution. Measured B16:
+    // numSplits 10 (320 CTAs) = 0.347ms vs numSplits 4 (128 CTAs, 1 wave) = 0.217ms.
+    // HISPARSE_TARGET_BLOCKS overrides the SM target for tuning.
+    static int32_t const smCount = []() {
+        char const* e = std::getenv("HISPARSE_TARGET_BLOCKS");
+        if (e != nullptr) { int32_t v = atoi(e); if (v > 0) return v; }
+        int dev = 0; cudaGetDevice(&dev);
+        int sm = 148; cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+        return static_cast<int32_t>(sm);
+    }();
+    // numSplits = #SMs / baseBlocks, floored to stay within a single wave (>=1).
+    int32_t numSplits = max(1, smCount / max(1, baseBlocks));
     numSplits = min(numSplits, min(kMaxSplits, max(1, tilesTotal)));
     if (numSplits < 1)
-    {
         numSplits = 1;
-    }
     params.numSplits = numSplits;
 
-    size_t const sharedBytes = static_cast<size_t>(kTileTokens) * kDqk * sizeof(__nv_bfloat16)
-        + static_cast<size_t>(kHeadsPerBlock) * kDv * sizeof(float)
-        + static_cast<size_t>(2 * kHeadsPerBlock) * sizeof(float)
-        + static_cast<size_t>(kHeadsPerBlock) * kTileTokens * sizeof(float);
+    // Dynamic SMEM for the kernel's SmemPlan. Computed from the same constants the device
+    // SmemPlan uses (SW128 operand tiles are exact multiples of their elem counts) plus a
+    // generous slack for the scalars/barriers/alignment. Over-provisioning is safe.
+    size_t const sharedBytes = (static_cast<size_t>(kHeadsPerBlock) * kDqk      // q
+                                   + static_cast<size_t>(kTileTokens) * kDqk    // k (V shares it)
+                                   + static_cast<size_t>(kHeadsPerBlock) * kTileTokens) // p
+            * sizeof(__nv_bfloat16)
+        + (static_cast<size_t>(2 * kHeadsPerBlock) + kThreads) * sizeof(float)
+        + static_cast<size_t>(kTileTokens) * sizeof(uint8_t)
+        + 4096; // tmemBase + 2 barriers + rowCode/tileStatusAgg + alignment slack
 
     static bool attrSet = false;
     if (!attrSet)
