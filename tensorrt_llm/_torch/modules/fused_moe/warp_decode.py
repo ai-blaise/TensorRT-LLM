@@ -415,6 +415,7 @@ def _run_nvfp4_explicit_tactic(
     local_expert_offset: int,
     local_num_experts: int,
     scaling_vector_size: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     w13 = _nvfp4_weight_bytes(w13)
     w2 = _nvfp4_weight_bytes(w2)
@@ -429,7 +430,16 @@ def _run_nvfp4_explicit_tactic(
     expected_scale_cols = padded_hidden_size // scaling_vector_size
     if x_sf.shape[-1] < expected_scale_cols:
         x_sf = _pad_nvfp4_last_dim(x_sf, expected_scale_cols)
-    output = torch.empty((x.shape[0], hidden_size), dtype=torch.bfloat16, device=x.device)
+    if out is not None:
+        # M1 one-sided a2a (NVLinkOneSided combine-into-workspace): write the MoE
+        # result straight into the comm workspace payload tensor instead of a fresh
+        # buffer, so the downstream payload_in_workspace=True combine is zero-copy.
+        # `out` is the 2D workspace view [ep_size*max_tokens, hidden] from
+        # get_combine_payload_tensor_in_workspace(); it is contiguous with
+        # numel == x.shape[0]*hidden, so this is a no-copy reshape.
+        output = out.view(x.shape[0], hidden_size)
+    else:
+        output = torch.empty((x.shape[0], hidden_size), dtype=torch.bfloat16, device=x.device)
     # Enable PDL for the decode bucket. The direct C++ runner call avoids the
     # registered custom-op dispatcher and Python TunableRunner wrapper while
     # preserving the same trtllm_gen kernels. Tactic selection defaults to auto
@@ -437,7 +447,7 @@ def _run_nvfp4_explicit_tactic(
     # WARPDECODE backend's autotune-default policy.
     os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
     runner = _nvfp4_torch_runner()
-    return runner.run_moe(
+    result = runner.run_moe(
         None,
         None,
         x,
@@ -468,7 +478,11 @@ def _run_nvfp4_explicit_tactic(
         topk_weights.to(torch.bfloat16),
         topk_ids,
         output,
-    )[0]
+    )
+    # The kernel writes in-place into `output`. When that is the M1 comm
+    # workspace view, return the exact workspace buffer so the downstream
+    # payload_in_workspace=True combine sees the matching data_ptr.
+    return output if out is not None else result[0]
 
 
 @lru_cache(maxsize=None)
@@ -955,6 +969,7 @@ def _run_nvfp4_warp_decode(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     x_sf: torch.Tensor,
+    moe_output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, str]:
     output1_scale = _get_backend_tensor(moe, "fc31_scale_c")
     output1_gate_scale = _get_backend_tensor(moe, "fc31_alpha")
@@ -969,7 +984,7 @@ def _run_nvfp4_warp_decode(
     op = cursor_op if use_cursor else _get_nvfp4_op()
     if op is None:
         raise RuntimeError("NVFP4 WarpDecode op disappeared after guard check.")
-    return op(
+    op_args = (
         x,
         x_sf,
         _get_backend_tensor(moe, "w3_w1_weight"),
@@ -987,7 +1002,19 @@ def _run_nvfp4_warp_decode(
         _backend_int(moe.backend, "slot_start", 0),
         local_num_experts,
         _NVFP4_TARGET_SCALING_VECTOR_SIZE,
-    ), "nvfp4_cursor_op" if use_cursor else "nvfp4_explicit_tactic_op"
+    )
+    if use_cursor:
+        # Cursor megakernel op has a fixed torch-op schema (no out buffer). If M1
+        # one-sided a2a supplied a workspace payload tensor, land the result into
+        # it so the downstream payload_in_workspace=True combine stays valid.
+        output = op(*op_args)
+        if moe_output is not None:
+            moe_output.view(output.shape).copy_(output)
+            output = moe_output.view(output.shape)
+        return output, "nvfp4_cursor_op"
+    # Explicit-tactic path writes directly into the workspace payload (zero-copy)
+    # when moe_output is provided (M1 NVLinkOneSided); else allocates its own.
+    return op(*op_args, out=moe_output), "nvfp4_explicit_tactic_op"
 
 
 def try_run_warp_decode(
@@ -999,6 +1026,7 @@ def try_run_warp_decode(
     x_sf: Optional[torch.Tensor],
     do_finalize: bool,
     all_rank_num_tokens: Optional[List[int]],
+    moe_output: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     config = _config(moe)
     if config is None or not getattr(config, "enabled", False):
@@ -1031,6 +1059,7 @@ def try_run_warp_decode(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             x_sf=x_sf,
+            moe_output=moe_output,
         )
         if selected_reason == "nvfp4_cursor_op":
             _record(moe, WarpDecodeStatus.SELECTED, selected_reason)
@@ -1051,6 +1080,10 @@ def try_run_warp_decode(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
         )
+        if moe_output is not None:
+            # BF16 op allocates its own buffer; land it in the M1 comm workspace.
+            moe_output.view(output.shape).copy_(output)
+            output = moe_output.view(output.shape)
         _record(moe, WarpDecodeStatus.SELECTED, "bf16_op")
         logger.info_once("WarpDecode SELECTED (overlay): BF16 OP-compatible path.",
                          key="warp_decode_selected_bf16")

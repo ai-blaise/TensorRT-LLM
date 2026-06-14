@@ -480,6 +480,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             x_sf=x_sf,
             do_finalize=do_finalize,
             all_rank_num_tokens=all_rank_num_tokens,
+            # M1 one-sided a2a: when NVLinkOneSided supplies a combine-into-workspace
+            # payload tensor (_get_backend_kwargs also sets payload_in_workspace=True),
+            # the WARPDECODE overlay must write its output INTO that workspace so the
+            # downstream combine(payload_in_workspace=True) is valid. None for all
+            # other comm strategies -> overlay allocates its own buffer (unchanged).
+            moe_output=backend_kwargs.get("moe_output"),
         )
         if final_hidden_states is None:
             final_hidden_states = moe.backend.run_moe(
