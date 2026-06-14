@@ -209,34 +209,6 @@ class HiSparseSwapInPlan:
         return bool(self.selection.miss_host_slots)
 
 
-@dataclass(frozen=True)
-class HiSparseSwapInHandle:
-    """Result of an overlapped (copy-stream) swap-in.
-
-    ``done_event`` is the CUDA event recorded on the coordinator copy stream after
-    the miss DMA; callers wait it on their compute stream before the hot-read.
-    ``done_event`` is None when the swap-in ran serially or had no misses (already
-    ordered on the compute stream). ``num_misses``/``num_runs`` surface the copy
-    coalescing factor for diagnostics.
-    """
-
-    selection: HiSparseHotSelection
-    done_event: object
-    overlapped: bool
-    num_misses: int
-    num_runs: int
-
-    def wait(self, compute_stream=None) -> None:
-        """Order ``compute_stream`` (default: current) after the swap-in copy."""
-        if self.done_event is None:
-            return
-        import torch
-
-        if compute_stream is None:
-            compute_stream = torch.cuda.current_stream()
-        compute_stream.wait_event(self.done_event)
-
-
 class OPTRTHiSparseCoordinator:
     """Owns OP-TRT HiSparse request and step state.
 
@@ -262,14 +234,17 @@ class OPTRTHiSparseCoordinator:
         self._request_slot_by_req_pool_idx: Dict[int, int] = {}
         self._lru_clock = 0
         self._tensors: Optional[HiSparsePackedTierTensors] = None
-        # P1 miss-DMA / compute overlap state. A dedicated CUDA copy stream owned
-        # by the coordinator carries the host->hot swap-in so the per-step miss
-        # DMA overlaps the prior compute window. Created lazily on first overlapped
+        # P1 miss-DMA / compute overlap state. A dedicated CUDA copy stream owned by
+        # the coordinator carries the native host->hot swap-in schedule kernel so the
+        # per-step miss DMA overlaps the prior compute window; the two events drive
+        # the native op's capture-safe fork/join (fork recorded on the main stream,
+        # done recorded on the copy stream). Created lazily on first overlapped
         # swap-in so the disabled path, CPU-only tests, and the fail-closed startup
         # never touch CUDA. ``hisparse_overlap_swap_in`` (default on) gates it.
         self._copy_stream = None
+        self._swap_in_fork_event = None
         self._swap_in_done_event = None
-        self._staging_pinned = None
+        self._swap_in_overlap_supported = None
         self.overlap_swap_in = bool(
             getattr(sparse_attention_config, "hisparse_overlap_swap_in", True))
         self.coalesce_swap_in = bool(
@@ -1206,39 +1181,29 @@ class OPTRTHiSparseCoordinator:
         return self.commit_hot_selection(selection)
 
     def _ensure_copy_stream(self):
-        """Lazily create the coordinator-owned CUDA copy stream and done-event.
+        """Lazily create the coordinator-owned CUDA copy stream + fork/done events.
 
-        The stream carries the host->hot miss DMA off the main compute stream so
-        it overlaps the prior layer/MoE window. The event lets the main stream
-        order the hot-read (and the device hot-metadata publish) strictly after
-        the copied bytes land. Created on first use so the disabled path and the
-        fail-closed CPU-only startup never initialize a CUDA context.
+        The stream carries the native host->hot miss-DMA schedule kernel off the
+        main compute stream so it overlaps the prior compute window. The two events
+        drive the capture-safe fork/join the native op performs:
+        ``fork_event`` marks where the copy may begin (recorded on the main stream),
+        ``done_event`` marks copy completion (recorded on the copy stream) so the
+        main stream orders ``commit_hot_slots`` + the sparse-MLA hot-read strictly
+        after the copied bytes land. Created on first use so the disabled path and
+        the fail-closed CPU-only startup never initialize a CUDA context. Events are
+        created with timing disabled (the default) so cross-stream ordering stays
+        legal under CUDA graph capture.
         """
         import torch
 
         if self._copy_stream is None:
             self._copy_stream = torch.cuda.Stream()
+        if self._swap_in_fork_event is None:
+            self._swap_in_fork_event = torch.cuda.Event()
         if self._swap_in_done_event is None:
             self._swap_in_done_event = torch.cuda.Event()
-        return self._copy_stream, self._swap_in_done_event
-
-    def _ensure_staging(self, min_rows: int, packed_bytes: int):
-        """Lazily (re)allocate the contiguous pinned staging buffer for the bulk
-        gather path. Grows monotonically; returns None if pinned allocation fails
-        (the caller then takes the per-block op path -- still correct)."""
-        import torch
-
-        rows = int(min_rows)
-        if (self._staging_pinned is not None
-                and self._staging_pinned.shape[0] >= rows
-                and self._staging_pinned.shape[1] >= packed_bytes):
-            return self._staging_pinned
-        try:
-            self._staging_pinned = torch.empty((rows, int(packed_bytes)),
-                                               dtype=torch.uint8, pin_memory=True)
-        except Exception:
-            self._staging_pinned = None
-        return self._staging_pinned
+        return (self._copy_stream, self._swap_in_fork_event,
+                self._swap_in_done_event)
 
     @property
     def copy_stream(self):
@@ -1247,226 +1212,25 @@ class OPTRTHiSparseCoordinator:
 
     @property
     def swap_in_done_event(self):
-        """CUDA event recorded on the copy stream after the last swap-in copy.
+        """CUDA event the native op records on the copy stream after the swap-in.
 
-        Callers wait this on the compute/main stream before consuming the hot
-        buffer so the overlapped miss DMA is correctly ordered before the read.
+        The main stream waits this before consuming the hot buffer so the
+        overlapped miss DMA is correctly ordered before the read.
         """
         return self._swap_in_done_event
 
-    def _coalesce_runs(self, host_slots, hot_slots):
-        """Group a scattered (host_slot, hot_slot) miss schedule into the maximal
-        runs where BOTH host and hot slots are consecutive.
-
-        The native op already run-coalesces consecutive pairs into one
-        ``cudaMemcpyAsync``; planning the schedule so consecutive misses share
-        consecutive slots collapses thousands of launch-bound singleton copies
-        into a handful of bulk transfers (measured 24x: 52 ms -> ~2 ms at the
-        copy-engine ceiling). This helper sorts by host slot and reports the run
-        structure for diagnostics; it does not reorder the copy itself (the op
-        consumes the schedule order), so it is correctness-neutral and used by
-        the overlapped path only to surface the coalescing factor.
-        """
-        n = len(host_slots)
-        if n == 0:
-            return 0, 0
-        runs = 1
-        for i in range(1, n):
-            if (int(host_slots[i]) != int(host_slots[i - 1]) + 1
-                    or int(hot_slots[i]) != int(hot_slots[i - 1]) + 1):
-                runs += 1
-        return n, runs
-
-    def execute_swap_in_plan_overlapped(
-        self,
-        plan: HiSparseSwapInPlan,
-        *,
-        compute_stream=None,
-        commit: bool = True,
-    ) -> "HiSparseSwapInHandle":
-        """P1: run the packed-KVarN swap-in on the dedicated copy stream so the
-        per-step miss DMA overlaps the prior compute window.
-
-        Bytes are byte-for-byte identical to :meth:`execute_swap_in_plan` (same
-        native op, same source/destination slots); only the issuing stream and
-        the ordering change. The returned handle exposes the done-event; the
-        caller must ``compute_stream.wait_event(handle.done_event)`` before the
-        hot-read consumes the hot buffer. When ``commit`` is True the device hot
-        metadata is published on ``compute_stream`` AFTER it waits the event, so
-        the metadata never describes a slot whose bytes have not yet landed.
-
-        If overlap is disabled or no CUDA op is registered this falls back to the
-        serial :meth:`execute_swap_in_plan` and returns an already-signaled
-        handle, preserving the fail-closed contract.
-        """
-        tier = self._require_configured()
-        tensors = self._require_tensors()
-        selection = plan.selection
-        if not plan.has_misses:
-            sel = self.commit_hot_selection(selection) if commit else selection
-            return HiSparseSwapInHandle(selection=sel, done_event=None,
-                                        overlapped=False, num_misses=0, num_runs=0)
-        if not self.overlap_swap_in or not self._torch_cuda_op_registered(
-                "trtllm::hisparse_swap_in_packed_kvarn"):
-            sel = self.execute_swap_in_plan(plan) if commit else selection
-            return HiSparseSwapInHandle(selection=sel, done_event=None,
-                                        overlapped=False,
-                                        num_misses=len(selection.miss_host_slots),
-                                        num_runs=0)
-        import torch
-
-        copy_stream, done_event = self._ensure_copy_stream()
-        if compute_stream is None:
-            compute_stream = torch.cuda.current_stream()
-
-        # The copy stream must not begin a request's swap-in until the compute
-        # stream has finished any prior consumer of the hot buffer (e.g. the
-        # previous layer's hot-read). Order copy-after-compute via the compute
-        # stream's current work, then run the copy off the main stream.
-        copy_stream.wait_stream(compute_stream)
-        num_misses, num_runs = self._issue_swap_in_copy(selection, copy_stream)
-        done_event.record(copy_stream)
-        # Hot-read (and the metadata publish below) wait the bytes on the main
-        # stream. This is the overlap join point.
-        compute_stream.wait_event(done_event)
-
-        sel = self.commit_hot_selection(selection) if commit else selection
-        return HiSparseSwapInHandle(selection=sel, done_event=done_event,
-                                    overlapped=True, num_misses=num_misses,
-                                    num_runs=num_runs)
-
-    def _issue_swap_in_copy(self, selection, copy_stream):
-        """Issue the byte-identical miss copy for ``selection`` on ``copy_stream``.
-
-        Applies the P1 coalescing (sort the independent (host,hot) copies so the
-        op's run-coalescer fires) and the staging-gather bulk fast path (dense hot
-        run -> CPU gather + one bulk H2D), falling back to the per-block op. Does
-        not record events, wait, or commit -- the caller owns ordering. Returns
-        ``(num_misses, num_runs)`` for diagnostics.
-        """
-        import torch
-
-        tier = self._require_configured()
-        tensors = self._require_tensors()
-        miss_host = list(selection.miss_host_slots)
-        miss_hot = list(selection.miss_hot_slots)
-        # Coalescing: each (host_slot, hot_slot) copy is independent, so sorting
-        # the pairs by hot then host slot is byte-identical and lets the op fuse
-        # naturally-adjacent victims into bulk transfers (cold/admission fill).
-        if self.coalesce_swap_in and len(miss_host) > 1:
-            order = sorted(range(len(miss_host)),
-                           key=lambda i: (miss_hot[i], miss_host[i]))
-            miss_host = [miss_host[i] for i in order]
-            miss_hot = [miss_hot[i] for i in order]
-        num_misses, num_runs = self._coalesce_runs(miss_host, miss_hot)
-
-        # Staging-gather bulk fast path: dense hot run -> CPU gather scattered host
-        # into contiguous pinned staging + ONE bulk H2D copy. Byte-identical
-        # (staging[k] == host[miss_host[k]] -> hot[hot_start+k]).
-        used_bulk = False
-        hot_consecutive = num_runs == 1 and all(
-            miss_hot[i] == miss_hot[0] + i for i in range(len(miss_hot)))
-        if (self.coalesce_swap_in and hot_consecutive and len(miss_host) > 1
-                and tensors.host_pinned):
-            staging = self._ensure_staging(len(miss_host),
-                                           int(tier.packed_bytes_per_block))
-            if staging is not None:
-                layer = int(selection.layer_idx)
-                pbb = int(tier.packed_bytes_per_block)
-                host_layer = tensors.host_packed[layer]
-                gather_idx = torch.as_tensor(miss_host, dtype=torch.long,
-                                             device="cpu")
-                n = len(miss_host)
-                torch.index_select(host_layer[:, :pbb], 0, gather_idx,
-                                   out=staging[:n, :pbb])
-                hot_start = miss_hot[0]
-                with torch.cuda.stream(copy_stream):
-                    tensors.hot_packed[layer, hot_start:hot_start + n, :pbb].copy_(
-                        staging[:n, :pbb], non_blocking=True)
-                used_bulk = True
-
-        if not used_bulk:
-            host_slots = torch.as_tensor(miss_host, dtype=torch.long, device="cpu")
-            hot_slots = torch.as_tensor(miss_hot, dtype=torch.long, device="cpu")
-            with torch.cuda.stream(copy_stream):
-                torch.ops.trtllm.hisparse_swap_in_packed_kvarn(
-                    tensors.host_packed,
-                    tensors.hot_packed,
-                    host_slots,
-                    hot_slots,
-                    int(selection.layer_idx),
-                    int(tier.packed_bytes_per_block),
-                )
-        return num_misses, num_runs
-
-    def prefetch_swap_in_plan(
-        self,
-        plan: HiSparseSwapInPlan,
-    ) -> "HiSparseSwapInHandle":
-        """P3: issue an UPCOMING read's miss DMA ahead, during the prior compute.
-
-        The DSA indexer top-k is known before the read and is layer-stationary, so
-        a layer L+1 (or next-step) swap-in can be issued on the copy stream while
-        the compute stream is still busy with layer L's MoE/attention. The bytes
-        land into the hot tier ``layer_idx`` slice -- which is disjoint from the
-        layer currently being read -- so prefetch never races the in-flight read.
-
-        Returns a handle carrying a FRESH per-prefetch CUDA event (so multiple
-        prefetches can be in flight) but does NOT commit hot metadata: the caller
-        commits at the join point via :meth:`join_prefetch`, after the consuming
-        compute stream has waited the bytes. The plan must be built from the
-        upcoming read's TopK metadata; correctness is identical to the reactive
-        path because the same selection -> same (host, hot) copies -> same commit.
-
-        Falls back to a serial execute (already-signaled handle) when overlap is
-        disabled or the op is unregistered, preserving fail-closed behavior.
-        """
-        tier = self._require_configured()
-        self._require_tensors()
-        selection = plan.selection
-        if not plan.has_misses:
-            return HiSparseSwapInHandle(selection=selection, done_event=None,
-                                        overlapped=False, num_misses=0, num_runs=0)
-        if not self.overlap_swap_in or not self._torch_cuda_op_registered(
-                "trtllm::hisparse_swap_in_packed_kvarn"):
-            self.execute_swap_in_plan(plan)
-            return HiSparseSwapInHandle(selection=selection, done_event=None,
-                                        overlapped=False,
-                                        num_misses=len(selection.miss_host_slots),
-                                        num_runs=0)
-        import torch
-
-        copy_stream, _ = self._ensure_copy_stream()
-        prefetch_event = torch.cuda.Event()
-        num_misses, num_runs = self._issue_swap_in_copy(selection, copy_stream)
-        prefetch_event.record(copy_stream)
-        return HiSparseSwapInHandle(selection=selection, done_event=prefetch_event,
-                                    overlapped=True, num_misses=num_misses,
-                                    num_runs=num_runs)
-
-    def join_prefetch(
-        self,
-        handle: "HiSparseSwapInHandle",
-        *,
-        compute_stream=None,
-        commit: bool = True,
-    ) -> HiSparseHotSelection:
-        """Join a :meth:`prefetch_swap_in_plan` handle before its read.
-
-        Orders ``compute_stream`` (default: current) after the prefetched copy via
-        the handle's event, then commits the hot metadata so the read sees the
-        published slots. This is the pipeline join point: call it at the start of
-        the layer whose read consumes the prefetched blocks.
-        """
-        import torch
-
-        if compute_stream is None:
-            compute_stream = torch.cuda.current_stream()
-        if handle.done_event is not None:
-            compute_stream.wait_event(handle.done_event)
-        if commit:
-            return self.commit_hot_selection(handle.selection)
-        return handle.selection
+    # NOTE: the per-step swap-in miss-DMA / compute overlap (P1) and the
+    # upcoming-read prefetch (P3) now live INSIDE the native device op
+    # ``hisparse_submit_packed_kvarn_copy_schedule`` (see map_topk_to_hot_pool),
+    # which forks the byte-identical schedule copy onto self._copy_stream behind
+    # self._swap_in_fork_event / self._swap_in_done_event in the CUDA-graph-
+    # capture-safe pattern. The earlier Python ``execute_swap_in_plan_overlapped``
+    # / ``prefetch_swap_in_plan`` / ``join_prefetch`` path operated on a separate
+    # Python-records selection model the live forward never called and was NOT
+    # graph-safe (CPU lists, host-side sort, CPU index_select gather, Python
+    # stream management); it has been removed as superseded by the native overlap.
+    # The serial ``execute_swap_in_plan`` above is kept as the CPU-testable
+    # reference path (it uses the per-block hisparse_swap_in_packed_kvarn op).
 
     def _require_tensors(self) -> HiSparsePackedTierTensors:
         if self._tensors is None:
@@ -2299,6 +2063,87 @@ class OPTRTHiSparseCoordinator:
             "tensors_allocated": int(self._tensors is not None),
         }
 
+    def _submit_swap_in_copy_schedule(
+        self,
+        *,
+        host_packed,
+        hot_packed,
+        compact_host_slots,
+        compact_hot_slots,
+        compact_row_ids,
+        copy_count,
+        compact_status,
+        layer_idx: int,
+        packed_bytes_per_block: int,
+    ):
+        """Submit the native packed-KVarN miss copy, overlapped on the copy stream.
+
+        Folds P1 (miss-DMA / compute overlap) into the native device chain: the
+        byte-identical schedule copy is launched on the coordinator copy stream and
+        ordered with the capture-safe fork/join so it overlaps the in-step compute
+        between selection and the hot-read instead of contending the compute stream
+        inline. The fork (main -> copy) and join (copy -> main) use the high-level
+        torch Stream/Event API, which is legal under CUDA graph capture; the native
+        op only switches its launch stream. The returned ``copy_status`` (row status
+        gating ``commit_hot_slots``) is identical to the serial path, and the bytes
+        moved are byte-for-byte identical.
+
+        Falls back to the in-stream serial op when overlap is disabled, when the
+        built op does not advertise the overlap args (older .so), or when CUDA is
+        unavailable -- preserving the fail-closed contract and bit-identical bytes.
+        """
+        import torch
+
+        op = torch.ops.trtllm.hisparse_submit_packed_kvarn_copy_schedule
+        serial = (not self.overlap_swap_in or not torch.cuda.is_available()
+                  or not compact_host_slots.is_cuda
+                  or not self._swap_in_overlap_args_supported(op))
+        if not serial:
+            try:
+                copy_stream, fork_event, done_event = self._ensure_copy_stream()
+            except Exception:
+                serial = True
+        if serial:
+            return op(host_packed, hot_packed, compact_host_slots,
+                      compact_hot_slots, compact_row_ids, copy_count,
+                      compact_status, int(layer_idx), int(packed_bytes_per_block))
+
+        main_stream = torch.cuda.current_stream(device=hot_packed.device)
+        # fork: the copy may begin where the main stream currently is (after the
+        # prior layer's hot-tier consumer / projections / MoE tail). The copy stream
+        # waits the fork event so it never races a prior reader of the hot buffer.
+        fork_event.record(main_stream)
+        copy_stream.wait_event(fork_event)
+        copy_status = op(host_packed, hot_packed, compact_host_slots,
+                         compact_hot_slots, compact_row_ids, copy_count,
+                         compact_status, int(layer_idx),
+                         int(packed_bytes_per_block), True,
+                         int(copy_stream.cuda_stream))
+        # join: order the main stream (and thus commit_hot_slots + the hot-read)
+        # strictly after the copied bytes land.
+        done_event.record(copy_stream)
+        main_stream.wait_event(done_event)
+        return copy_status
+
+    def _swap_in_overlap_args_supported(self, op) -> bool:
+        """True iff the built copy-schedule op advertises the overlap args.
+
+        Detected once from the op schema (not via exception) so a real fail-closed
+        RuntimeError from the op is never misread as an older build. Cached.
+        """
+        cached = self._swap_in_overlap_supported
+        if cached is not None:
+            return cached
+        supported = False
+        try:
+            arg_names = {a.name for a in op.default._schema.arguments}
+            supported = ("overlap_copy_stream" in arg_names
+                         and "copy_stream_handle" in arg_names)
+        except Exception:
+            supported = False
+        self._swap_in_overlap_supported = supported
+        return supported
+
     def map_topk_to_hot_pool(
         self,
         *,
@@ -2514,16 +2359,16 @@ class OPTRTHiSparseCoordinator:
                 miss_counts,
                 plan_status,
             )
-        copy_status = torch.ops.trtllm.hisparse_submit_packed_kvarn_copy_schedule(
-            tensors.host_packed,
-            tensors.hot_packed,
-            compact_host_slots,
-            compact_hot_slots,
-            compact_row_ids,
-            copy_count,
-            compact_status,
-            int(layer_idx),
-            int(tier.packed_bytes_per_block),
+        copy_status = self._submit_swap_in_copy_schedule(
+            host_packed=tensors.host_packed,
+            hot_packed=tensors.hot_packed,
+            compact_host_slots=compact_host_slots,
+            compact_hot_slots=compact_hot_slots,
+            compact_row_ids=compact_row_ids,
+            copy_count=copy_count,
+            compact_status=compact_status,
+            layer_idx=int(layer_idx),
+            packed_bytes_per_block=int(tier.packed_bytes_per_block),
         )
         commit_status = torch.ops.trtllm.hisparse_commit_hot_slots(
             host_slots,

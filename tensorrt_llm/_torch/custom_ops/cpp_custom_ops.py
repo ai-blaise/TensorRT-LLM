@@ -245,9 +245,11 @@ def _register_fake():
         "trtllm::hisparse_submit_packed_kvarn_copy_schedule")
     def _(host_packed, hot_packed, compact_host_slots, compact_hot_slots,
           compact_row_ids, copy_count, compact_row_status, layer_idx,
-          packed_bytes_per_block):
+          packed_bytes_per_block, overlap_copy_stream=False,
+          copy_stream_handle=0):
         del host_packed, hot_packed, compact_host_slots, compact_hot_slots
         del compact_row_ids, copy_count, layer_idx, packed_bytes_per_block
+        del overlap_copy_stream, copy_stream_handle
         return compact_row_status.new_empty(compact_row_status.shape)
 
     @torch.library.register_fake("trtllm::hisparse_topk_to_block_positions")

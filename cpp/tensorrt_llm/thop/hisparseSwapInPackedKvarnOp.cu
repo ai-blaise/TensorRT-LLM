@@ -226,7 +226,8 @@ void hisparseSwapInPackedKvarn(th::Tensor const& hostPacked, th::Tensor const& h
 
 th::Tensor hisparseSubmitPackedKvarnCopySchedule(th::Tensor const& hostPacked, th::Tensor const& hotPacked,
     th::Tensor const& compactHostSlots, th::Tensor const& compactHotSlots, th::Tensor const& compactRowIds,
-    th::Tensor const& copyCount, th::Tensor const& compactRowStatus, int64_t layerIdx, int64_t packedBytesPerBlock)
+    th::Tensor const& copyCount, th::Tensor const& compactRowStatus, int64_t layerIdx, int64_t packedBytesPerBlock,
+    bool overlapCopyStream, int64_t copyStreamHandle)
 {
     TORCH_CHECK(packedBytesPerBlock > 0
             && packedBytesPerBlock <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
@@ -311,8 +312,25 @@ th::Tensor hisparseSubmitPackedKvarnCopySchedule(th::Tensor const& hostPacked, t
 
     constexpr int32_t kThreads = 256;
     int32_t const grid = static_cast<int32_t>(capacity > 0 ? capacity : 1);
-    auto stream = at::cuda::getCurrentCUDAStream(device).stream();
-    hisparseSubmitPackedKvarnCopyScheduleKernel<<<grid, kThreads, 0, stream>>>(
+    auto const mainStream = at::cuda::getCurrentCUDAStream(device).stream();
+
+    // P1 overlap: when the coordinator supplies its copy stream the byte-identical
+    // schedule copy is launched on that side stream so it overlaps the prior compute
+    // window. The coordinator owns the fork/join: it records a fork event on the main
+    // stream and makes the copy stream wait it BEFORE calling this op, and after this
+    // op returns it records a done event on the copy stream and makes the main stream
+    // wait it (so commit_hot_slots + the sparse-MLA hot-read are ordered strictly
+    // after the copied bytes land). All of that uses the high-level torch
+    // Stream/Event API and is CUDA-graph-capture legal. This op only switches the
+    // launch stream; the bytes moved, the kernel, the source/destination slots, and
+    // the returned rowStatus are IDENTICAL to the in-stream serial path. When the
+    // copy stream is absent / equals the main stream / overlap is disabled, the
+    // kernel launches on the main stream exactly as before (in-stream fallback).
+    auto const copyStream = reinterpret_cast<cudaStream_t>(copyStreamHandle);
+    bool const useOverlap = overlapCopyStream && copyStream != nullptr && copyStream != mainStream;
+    auto const launchStream = useOverlap ? copyStream : mainStream;
+
+    hisparseSubmitPackedKvarnCopyScheduleKernel<<<grid, kThreads, 0, launchStream>>>(
         static_cast<uint8_t const*>(mappedHostPtr), hotPacked.data_ptr<uint8_t>(), hostSlots.data_ptr<int64_t>(),
         hotSlots.data_ptr<int64_t>(), rowIds.data_ptr<int32_t>(), count.data_ptr<int32_t>(),
         rowStatus.data_ptr<uint8_t>(), static_cast<int32_t>(capacity), static_cast<int32_t>(rows),
@@ -336,7 +354,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "hisparse_submit_packed_kvarn_copy_schedule(Tensor host_packed, Tensor hot_packed, "
         "Tensor compact_host_slots, Tensor compact_hot_slots, Tensor compact_row_ids, Tensor copy_count, "
-        "Tensor compact_row_status, int layer_idx, int packed_bytes_per_block) -> Tensor");
+        "Tensor compact_row_status, int layer_idx, int packed_bytes_per_block, "
+        "bool overlap_copy_stream=False, int copy_stream_handle=0) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
