@@ -44,7 +44,21 @@ filter_source_cuda_architectures(
   ARCHS 80 86 89 90 100 120
   IMPLICIT_FAMILY)
 
-if(NOT _FMHA_V2_ENABLED_CUBIN_ARCHIVES)
+# The real FMHA v2 cubin metadata translation unit (cubin/fmha_cubin.cpp) is
+# produced by scripts/build_wheel.py::generate_fmha_cu (via fmha_v2/setup.py)
+# and is gitignored. When it is present it already *defines*
+# `sMhaKernelMetaInfosV2[]` / `sMhaKernelMetaInfosV2Size` (with real entries,
+# including SM100 from the .cu path) and ships the matching cubin/fmha_cubin.h;
+# the recursive `*.cpp` glob above also compiles it into context_attention_src.
+# The empty-stub branch below must therefore only fire when that generated
+# source is ABSENT (the exact-clean th_common proof build). Emitting the stub
+# alongside the real source produces two definitions of the same symbols and
+# breaks the libtensorrt_llm.so link, regardless of whether any arch-matched
+# *.cubin.tar.zst archives survived filtering.
+set(_FMHA_V2_REAL_CUBIN_SOURCE "${_FMHA_V2_CUBIN_DIR}/fmha_cubin.cpp")
+
+if(NOT _FMHA_V2_ENABLED_CUBIN_ARCHIVES AND NOT EXISTS
+                                          "${_FMHA_V2_REAL_CUBIN_SOURCE}")
   set(_EMPTY_FMHA_CUBIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/cubin")
   set(_EMPTY_FMHA_CUBIN_HEADER "${_EMPTY_FMHA_CUBIN_DIR}/fmha_cubin.h")
   set(_EMPTY_FMHA_CUBIN_SOURCE

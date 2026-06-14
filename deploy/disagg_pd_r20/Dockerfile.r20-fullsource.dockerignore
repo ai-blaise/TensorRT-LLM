@@ -1,0 +1,32 @@
+# Per-Dockerfile ignore for the full-source build. BuildKit consults
+# "<dockerfile-name>.dockerignore" in preference to the repo-root .dockerignore,
+# and the chosen file fully REPLACES the root one (no merge). So this file must
+# restate the root .dockerignore rules and then add build-context hygiene
+# entries that keep the context limited to committed source.
+
+# --- mirror of repo-root .dockerignore ---
+build
+cpp/*build*
+cpp/cmake-*
+cpp/.ccache
+cpp/tests/resources/models
+tensorrt_llm/libs
+**/__pycache__
+examples/**/.git
+examples/**/*.bin
+examples/**/*.engine
+examples/**/*.onnx
+examples/**/*.safetensors
+examples/**/c-model
+examples/models/core/gpt/gpt*
+
+# --- full-source build context hygiene ---
+# The build compiles from the committed checkout; git metadata and local scratch
+# directories are not needed and only bloat the BuildKit context / build stage.
+.git
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.ruff_cache/
+.bench_runs_claude/
+*.png
