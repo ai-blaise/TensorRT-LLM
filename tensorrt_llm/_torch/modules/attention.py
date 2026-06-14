@@ -229,6 +229,21 @@ def _helix_cp_allgather_input(hidden_states: torch.Tensor,
     """
     if (mapping.has_cp_helix() and mapping.enable_attention_dp
             and layer_idx > 0):
+        # Helix-CP allgather is a collective on the captured layer-forward
+        # path. Collectives are NOT legal inside a piecewise CUDA graph
+        # capture (SGLang #23351: CP is unsupported under PCG). The DSA
+        # piecewise-prefill enable (see deploy/disagg_pd_r20/
+        # prefill_piecewise.yaml) is scoped to NON-CP prefill; fail closed
+        # here so a helix-CP config can never silently run this collective
+        # under capture and corrupt the graph. is_torch_compiling() is True
+        # during the piecewise trace/capture and False in normal eager
+        # execution, so this guard never fires on the supported (non-PCG or
+        # non-CP) paths.
+        assert not is_torch_compiling(), (
+            "Helix context-parallel allgather reached under piecewise CUDA "
+            "graph capture. CP is not supported under piecewise CUDA graph "
+            "(SGLang #23351); enable piecewise only on a non-CP prefill "
+            "config (context_parallel_size=1, LayerSplit/Helix off).")
         hidden_states = cp_allgather(hidden_states, mapping, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
     return hidden_states

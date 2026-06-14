@@ -1,0 +1,116 @@
+# =============================================================================
+# Disagg P/D r20 -- PREFILL worker engine config WITH Piecewise CUDA Graph ON.
+#
+# This is the opt-in variant of deploy/disagg_pd_r20/prefill.yaml that enables
+# the DSA-prefill piecewise CUDA graph win. The baseline prefill.yaml is left
+# BYTE-IDENTICAL (piecewise OFF) -- selecting this file is the off-switch.
+#
+# WHY THIS EXISTS (P0 finding):
+#   op-trt already implements the SGLang #23351 fix-set for DSA -- the DSA
+#   forward is split into the CUDA-graph-capturable trtllm::mla_dsa_proj
+#   (projections) and the eager trtllm::mla_dsa_attn_inplace (indexer top-k +
+#   index-K-cache + sparse attention), and the latter is already registered as
+#   a piecewise split point (compilation/piecewise_optimizer.py). There is NO
+#   DSA piecewise-exclusion list to remove. DSA prefill runs eager in
+#   production solely because enable_piecewise_cuda_graph defaults to False and
+#   the baseline prefill.yaml sets no torch_compile_config. This file turns it
+#   on, which captures the graph-safe prefill spans (per-layer projections,
+#   MoE, norms) and runs only mla_dsa_attn_inplace eager -> cuts the eager
+#   prefill's per-op launch overhead -> faster TTFT + prefill/mixed throughput.
+#
+# CONSTRAINTS HONORED (docs/source/features/torch_compile_and_piecewise_cuda_graph.md):
+#   * Piecewise (fullgraph torch.compile) cannot work with a multi-ModelEngine
+#     config -> NO two-model MTP/Eagle here. (The NextN/MTP head must be
+#     one-model or disabled for this worker.)
+#   * CP is NOT supported under piecewise CUDA graph (SGLang #23351). The
+#     baseline r20 prefill is TP2xCP2 LayerSplit; piecewise capture of a CP
+#     prefill is unsupported. This variant is therefore NON-CP
+#     (context_parallel_size=1, LayerSplit OFF) so the captured spans contain
+#     no CP collectives. A fail-closed guard in
+#     tensorrt_llm/_torch/modules/attention.py::_helix_cp_allgather_input
+#     additionally asserts no Helix-CP collective runs under capture.
+#
+# Custom piece status vs baseline prefill.yaml:
+#   * LayerSplit: OFF (it is a CP feature; out of scope under PCG).
+#   * WarpDecode: OFF (decode-only, as in baseline).
+#   * Everything else (DSA indexer, KVarN dense latent KV, NVFP4 HISA, chunked
+#     prefill) unchanged -- those live inside the eager mla_dsa_attn_inplace op
+#     and are untouched by the capture.
+# =============================================================================
+backend: pytorch
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+context_parallel_size: 1            # NON-CP: required for piecewise (CP unsupported under PCG)
+enable_attention_dp: false
+trust_remote_code: true
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+allreduce_strategy: AUTO
+use_cute_dsl_blockscaling_bmm: true
+use_cute_dsl_bf16_bmm: true
+max_batch_size: 32
+max_input_len: 131072
+max_seq_len: 132096
+max_num_tokens: 8192
+print_iter_log: false
+stream_interval: 50
+num_postprocess_workers: 8
+# ---- Piecewise CUDA Graph ON (the prefill win) ----
+# fullgraph torch.compile + per-num-tokens piecewise capture of the graph-safe
+# prefill spans. enable_userbuffers off (it is a separate optimization; keep
+# the enable minimal and isolated). max_num_streams=1 to start (the multi-stream
+# schedule is applied inside piecewise_optimizer when >1; leave conservative).
+# inductor off (op-trt uses torch.compile only for the FX split capture, not
+# inductor codegen, matching the production decode full-graph philosophy).
+torch_compile_config:
+  enable_fullgraph: true
+  enable_inductor: false
+  enable_piecewise_cuda_graph: true
+  enable_userbuffers: false
+  max_num_streams: 1
+  # Prefill-biased capture buckets: dense small (KV-reuse short contexts) +
+  # fixed 256-step up to max_num_tokens. Tune per workload (see the feature doc
+  # Performance Tuning section). Capped at max_num_tokens=8192 by
+  # _filter_piecewise_capture_num_tokens at engine build.
+  capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  max_tokens_in_buffer: 131072
+moe_config:
+  backend: WARPDECODE
+  use_low_precision_moe_combine: true
+  warp_decode:
+    enabled: false                 # WarpDecode is a DECODE-only fast path; off on prefill
+    tile_mode: autotune
+nvfp4_gemm_config:
+  allowed_backends: [cutlass, cublaslt, cuda_core]
+sparse_attention_config:
+  algorithm: dsa
+  indexer_mode: indexcache-hisa
+  index_n_heads: 64
+  index_head_dim: 128
+  index_topk: 1024
+  index_topk_pattern: FSSS
+  index_topk_freq: 4
+  indexer_k_dtype: fp4
+  mla_latent_kv_dtype: kvarn_k2v2
+  mla_latent_kv_amortize: true
+  enable_nvfp4_hisa: true
+  hisa_block_size: 128
+  hisa_block_topk: 64
+  hisa_compression_ratio: 4.0
+  hisa_min_seq_len: 65536
+  hisa_execution_mode: optimized
+  use_cute_dsl_topk: true
+  use_cute_dsl_paged_mqa_logits: true
+  # ---- LayerSplit OFF (it is a CP feature; unsupported under piecewise) ----
+  layersplit_enabled: false
