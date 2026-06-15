@@ -108,3 +108,20 @@ found NO further kernel-level win — and rigorously bounded why:
 via `run_all_passes`: **6 Proved / 0 Disproved / 0 Unknown** (clean — removes R1's hand-encoded bank-conflict
 artifact). cos=1.0 throughout. NET: the cutedsl squeeze is exhausted at the kernel level; R1's o_proj win
 (1.14-1.24x) stands and is now real-kernel-CZS-verified; q_a/moe_up/moe_down are provably at the hardware floor.
+
+## AutoTuner config-change prototype (2026-06-15): adding 'cutedsl' to allowed_backends auto-realizes the o_proj win
+
+Measured the WARMED nvfp4_gemm dispatcher (autotune() context, captured, cos=1.0), prodset vs prodset+cutedsl:
+| shape | M | prodset (cutlass,cublaslt,cuda_core) | +cutedsl | lift |
+|---|---|---|---|---|
+| o_proj | 1/16 | 16.39/16.40us | **14.32/14.35us** | **1.14x** |
+| q_a / moe_up / moe_down | * | 8.21 / 8.21 / 6.16 | same | tie |
+
+**The warmed AutoTuner auto-selects cutedsl on o_proj (16.4->14.3) and keeps cublaslt elsewhere — strictly
+non-regressive.** So the fix is a CONFIG change, NOT a get_valid_tactics code edit: add 'cutedsl' to the three
+`TRTLLM_DSV3_MLP_NVFP4_BACKENDS` / `_MLA_PROJ_` / `_INDEXER_NVFP4_BACKENDS` env vars (or the _dsv3_mlp/_mla_proj/
+_indexer defaults in modeling_deepseekv3.py / attention.py / dsa.py). The earlier 26.6us "stock" was the
+UN-warmed default tactic, not the AutoTuner's warmed pick (the winner IS in get_valid_tactics already).
+Prereq (same as the headline GEMM lever): the serving image must have cutedsl available (CuTe DSL JIT, present)
+AND the AutoTuner warmed at model load (prod model-load does this). **Decode-level impact: o_proj ~= 5% of the
+~20.8ms step -> ~0.6% tok/s/user. Real + clean + deployable (config-only) but modest.** Harness: blaise_perf/pde_directtest/autotune_proto/proto.py.
