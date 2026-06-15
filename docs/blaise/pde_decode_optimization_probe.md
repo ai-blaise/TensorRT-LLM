@@ -87,3 +87,24 @@ hand-encoded Module (14 Proved / 1 Disproved-artifact, legality-only); cos=1.0 i
 prefetch at small-M tall-N shapes (else the stock mis-pick makes cutedsl WORSE, which is why prod excludes it
 today). The AutoTuner small-M-tall-N fix also lifts the stock op 26.6->14.2us (o_proj) / 10.27->8.23 (q_a/moe_up).
 This does NOT change the headline GEMM lever (ensure warmed cublaslt in serving) — it's an additional o_proj-only edge.
+
+## Round 2 (deeper squeeze, 2026-06-15): R1 tactic is the kernel optimum + CZS real-pybind upgrade
+
+A round-2 agent (fresh direct read of the 4 sources for techniques BEYOND tactic-selection; CZS-gated)
+found NO further kernel-level win — and rigorously bounded why:
+- **q_a / moe_up / moe_down: BEATING cublaslt is config-impossible.** FLAT ~8.24us (q_a/moe_up) / ~6.17us
+  (moe_down) across all occupancy(4-22%)/tile/cluster; cublaslt hits the SAME fixed NVFP4-blockscaled
+  per-launch floor (TMEM-lifecycle + pipeline prologue/epilogue at K=7168). R1's "tie" IS the ceiling.
+- **o_proj 14.3us is a structural plateau** = 1.95x the 7.34us pure-W-read floor; the gap is the
+  HARDWARE-IMPLICIT per-k_block `tcgen05.cp(SF)->tcgen05.mma` serialization (Colfax block-scaling tutorial:
+  no overlap) + the checkpoint-fixed nvf4 vec=16 SF (4x heavier TMEM than mxf4). Occupancy is NOT the
+  bottleneck (sweep flat; 76% occ is WORSE); intra-kernel split-K is dead (re-serializes SF per partial).
+  A from-scratch 2-deep SF-TMEM-ring is the only lever but the implicit pipeline likely prevents the overlap
+  -> high-risk/multi-day/low-yield for o_proj's ~0.65%/tok share. NOT worth it.
+- Best config UNCHANGED from R1: `((256,64),cluster(4,1),swap_ab=True,prefetch=False)`.
+
+**Verification upgrade:** built the `czs_py` pybind (pybind11 3.0.4) -> `/home/spencer/work/CZS/python/czs/_native.cpython-311-*.so`
+(REAL_PYBIND confirmed). The R1 winning config is now structurally verified against the REAL compiled kernel
+via `run_all_passes`: **6 Proved / 0 Disproved / 0 Unknown** (clean — removes R1's hand-encoded bank-conflict
+artifact). cos=1.0 throughout. NET: the cutedsl squeeze is exhausted at the kernel level; R1's o_proj win
+(1.14-1.24x) stands and is now real-kernel-CZS-verified; q_a/moe_up/moe_down are provably at the hardware floor.
