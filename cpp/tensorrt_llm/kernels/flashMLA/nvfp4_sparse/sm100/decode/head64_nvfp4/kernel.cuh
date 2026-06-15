@@ -340,7 +340,9 @@ KernelTemplate<MODEL_TYPE>
                 cudaTriggerProgrammaticLaunchCompletion();
             }
 
-            if (args.is_no_split) {
+            if (args.is_no_split && params.v_b_proj == nullptr) {
+                // ---- No-split, NO v_b fusion: stage normalized latent into sO and
+                // TMA-store the 512-wide latent (unchanged original path). ----
                 Tensor tma_gO = flat_divide(
                     tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx, args.batch_idx),
                     Shape<Int<B_H>, Int<64>>{}
@@ -391,6 +393,94 @@ KernelTemplate<MODEL_TYPE>
                     }
                 }
                 cute::tma_store_arrive();
+            } else if (args.is_no_split) {
+                // ---- No-split WITH v_b (W_UV) fusion ----
+                // The B_H=64 rows of O are 64 DISTINCT heads of one query token, so the
+                // projection is applied to the FULLY-REDUCED latent (this is the no-split
+                // path: o_accum cross-split reduction does not happen here). We:
+                //   1. Stage the 1/li-normalized latent (d_v=512) into sO (swizzled SMEM).
+                //   2. __syncthreads (wg0_sync) so all 512 cols are visible to every thread.
+                //   3. Each thread projects its head's row: out[h, j] = sum_k latent[h,k] * W_UV[h,j,k],
+                //      reading latent from sO (swizzled accessor) and W_UV streamed from gmem in fp32.
+                //   4. Write the D_VHD-wide bf16 result into o_proj_buf (aliases o_buf -- safe,
+                //      written only after the projection has consumed all of sO), then bulk-store.
+                float o_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li + exp2f(attn_sink - mi));
+                float2 o_scale_float2 = {o_scale, o_scale};
+                float2 o[B_EPI/2];
+                __nv_bfloat162 o_bf16[B_EPI/2];
+                // (1) Stage the full normalized latent into sO (no per-tile TMA store).
+                CUTE_UNROLL
+                for (int i = 0; i < (D_V/2) / B_EPI; ++i) {
+                    ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + i*B_EPI, o);
+                    cutlass::arch::fence_view_async_tmem_load();
+                    CUTE_UNROLL
+                    for (int j = 0; j < B_EPI/2; ++j) {
+                        o[j] = ku::float2_mul(o[j], o_scale_float2);
+                        o_bf16[j] = __float22bfloat162_rn(o[j]);
+                    }
+                    int col_base = (i*B_EPI>=D_V/4 ? D_V/2 : 0) + (i*B_EPI%(D_V/4));
+                    CUTE_UNROLL
+                    for (int j = 0; j < B_EPI / 8; ++j)
+                        *(__int128_t*)(sO_bases[j] + col_base*B_H) = *(__int128_t*)(&o_bf16[j*4]);
+                }
+                // (2) Make the fully-staged latent visible to all WG0 threads.
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+
+                // (3) Project. 128 WG0 threads -> 2 threads/head, 64 output cols each.
+                static_assert(D_VHD == 128 && B_H == 64, "v_b fusion epilogue assumes D_VHD=128, B_H=64");
+                const int proj_row = idx_in_warpgroup % B_H;       // head local to this launch
+                const int proj_col_half = idx_in_warpgroup / B_H;  // 0 -> cols 0..63; 1 -> cols 64..127
+                const int proj_col_base = proj_col_half * (D_VHD / 2);
+                // W_UV row base for this head: v_b_proj is already offset to this launch's
+                // first head by the host head-split lambda; add proj_row * stride_vb_h.
+                const bf16* wuv_row = params.v_b_proj + proj_row * params.stride_vb_h;
+                // Cache this head's normalized latent row in registers as fp32, read once
+                // from the (swizzled) sO accessor. 512 fp32 spills to local memory, so we
+                // instead read sO directly inside the k-loop below (SMEM, no spill); the
+                // 8-wide gmem read of W_UV (the dominant, L2-resident cost) stays vectorized.
+                bf16 out_proj[D_VHD / 2];
+                // stride_vb_d == 1 (contiguous nn.Parameter), so the k-dim of each W_UV
+                // row is contiguous: read 8 bf16 at a time via __int128. sO(row,k) is read
+                // per element (swizzled SMEM): high-bandwidth, re-read across the 64 cols.
+                // NOTE: the jj (64) and k (64) loops are intentionally NOT fully unrolled
+                // (only the inner 8-wide read is) to keep code size / I-cache sane.
+                for (int jj = 0; jj < D_VHD / 2; ++jj) {
+                    int j = proj_col_base + jj;
+                    const bf16* wuv_jk = wuv_row + j * params.stride_vb_vhd;
+                    float acc = 0.0f;
+                    for (int k = 0; k < D_V; k += 8) {
+                        __int128_t w8 = *(const __int128_t*)(wuv_jk + k);
+                        const bf16* wptr = reinterpret_cast<const bf16*>(&w8);
+                        CUTE_UNROLL
+                        for (int kk = 0; kk < 8; ++kk) {
+                            acc += float(sO(proj_row, k + kk)) * float(wptr[kk]);
+                        }
+                    }
+                    out_proj[jj] = bf16(acc);
+                }
+                // (4) Write into o_proj_buf (aliases o_buf -- safe now that sO reads are
+                // done above) and bulk-store the D_VHD-wide row.
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);  // all sO reads complete
+                bf16* sO_proj = plan.u.qo.o.o_proj_buf.data();
+                CUTE_UNROLL
+                for (int jj = 0; jj < D_VHD / 2; ++jj) {
+                    sO_proj[proj_row * D_VHD + proj_col_base + jj] = out_proj[jj];
+                }
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+                if (elect_one_sync()) {
+                    CUTE_UNROLL
+                    for (int local_row = 0; local_row < B_H/4; ++local_row) {
+                        int smem_row = local_row*4 + warp_idx;
+                        SM90_BULK_COPY_S2G::copy(
+                            sO_proj + smem_row * D_VHD,
+                            (bf16*)params.out + args.batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + smem_row*params.stride_o_h_q,
+                            D_VHD*sizeof(bf16)
+                        );
+                    }
+                    cute::tma_store_arrive();
+                }
             } else {
                 float o_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li);   // Here we leave attn_sink to the combine kernel, otherwise attn_sink will take effect for multiple times
                 float2 o_scale_float2 = {o_scale, o_scale};
@@ -962,7 +1052,14 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
         SmemLayoutQ_SW128{}
     );
 
-    auto shape_O = make_shape(B_H, D_V, params.s_q, params.b);
+    // Output width is D_V (latent) normally, or D_VHD when the v_b (W_UV) epilogue
+    // fusion is active (params.out is then [b, s_q, h_q, v_head_dim]). The fused
+    // no-split epilogue bulk-stores and does NOT use tma_O, but the descriptor is
+    // still constructed here, so it must describe the real (narrower) output tensor
+    // to stay valid. D_VHD=128 is a multiple of the [B_H,64] TMA tile so the
+    // descriptor encodes cleanly either way.
+    const int out_width = params.v_b_proj != nullptr ? D_VHD : D_V;
+    auto shape_O = make_shape(B_H, out_width, params.s_q, params.b);
     auto tma_O = cute::make_tma_copy(
         SM90_TMA_STORE{},
         make_tensor(

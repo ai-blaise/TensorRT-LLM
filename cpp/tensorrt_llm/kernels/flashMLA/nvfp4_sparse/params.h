@@ -75,8 +75,17 @@ struct SparseAttnDecodeParams {
     float* __restrict__ attn_sink;  // [h_q], may be nullptr
 
     float* __restrict__ lse;    // [b, s_q, h_q]
-    cutlass::bfloat16_t* __restrict__ out;   // [b, s_q, h_q, d_v]
-    
+    cutlass::bfloat16_t* __restrict__ out;   // [b, s_q, h_q, d_v] (latent) or [b, s_q, h_q, v_head_dim] (v_b fused)
+
+    // Optional v_b (W_UV) epilogue fusion: when v_b_proj != nullptr the kernel
+    // contracts the fully-reduced latent O (d_v=512) against W_UV[h_q, v_head_dim, d_v]
+    // (bf16, streamed from global memory) and writes the projected v_head_dim-wide
+    // output instead of the latent. NO-SPLIT path only -- the split path still writes
+    // the latent o_accum and the projection happens in the combine kernel.
+    cutlass::bfloat16_t* __restrict__ v_b_proj;  // [h_q, v_head_dim, d_v], may be nullptr
+    int v_head_dim;
+    int stride_vb_h, stride_vb_vhd, stride_vb_d;  // element strides into v_b_proj
+
     int extra_num_blocks, extra_page_block_size, extra_topk;
     cutlass::bfloat16_t* __restrict__ extra_kv;  // [extra_num_blocks, extra_page_block_size, d_qk]
     int* __restrict__ extra_indices;   // [b, s_q, extra_topk]
@@ -112,9 +121,16 @@ struct CombineParams {
     int b, s_q, h_q, d_v;
 
     float* __restrict__ lse;    // [b, s_q, h_q]
-    void* __restrict__ out;   // [b, s_q, h_q, d_v]
+    void* __restrict__ out;   // [b, s_q, h_q, d_v] (latent) or [b, s_q, h_q, v_head_dim] (v_b fused)
     int stride_lse_b, stride_lse_s_q;
     int stride_o_b, stride_o_s_q, stride_o_h_q;
+
+    // Optional v_b (W_UV) epilogue fusion. When v_b_proj != nullptr the combine
+    // kernel projects the cross-split-reduced latent (d_v=512) against
+    // W_UV[h_q, v_head_dim, d_v] (bf16) and writes v_head_dim-wide output.
+    cutlass::bfloat16_t* __restrict__ v_b_proj;  // [h_q, v_head_dim, d_v], may be nullptr
+    int v_head_dim;
+    int stride_vb_h, stride_vb_vhd, stride_vb_d;  // element strides into v_b_proj
 
     float* __restrict__ lse_accum;  // [num_splits, s_q, h_q]
     float* __restrict__ o_accum;    // [num_splits, s_q, h_q, d_v]

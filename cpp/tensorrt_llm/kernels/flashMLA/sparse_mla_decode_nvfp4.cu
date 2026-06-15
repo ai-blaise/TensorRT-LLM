@@ -164,6 +164,13 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
         params.lse,
         reinterpret_cast<cutlass::bfloat16_t*>(params.out),
 
+        // v_b (W_UV) epilogue fusion (nullptr -> latent output, original behavior)
+        params.vBProj,
+        params.vHeadDim,
+        params.strideVbH,
+        params.strideVbVhd,
+        params.strideVbD,
+
         0,
         0,
         0,
@@ -244,6 +251,12 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
         curParams.out += startHeadIdx * params.strideOHQ;
         curParams.lse_accum += startHeadIdx;
         curParams.o_accum += startHeadIdx * params.strideOAccumHQ;
+        // v_b (W_UV) fusion: per-head W_UV rows. Offset to this launch's first head
+        // so the kernel reads v_b_proj + (head_local)*stride_vb_h. Mirrors out/lse.
+        if (curParams.v_b_proj != nullptr)
+        {
+            curParams.v_b_proj += startHeadIdx * params.strideVbH;
+        }
         curParams.h_q = kHeadSplit;
         sm100::decode::head64_nvfp4::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>(curParams);
     };
@@ -316,6 +329,13 @@ void invokeSparseMlaDecodeNvfp4(SparseMlaDecodeNvfp4Params const& params, cudaSt
         params.strideOB,
         params.strideOSQ,
         params.strideOHQ,
+        // v_b (W_UV) epilogue fusion: combine projects the cross-split-reduced
+        // latent when vBProj != nullptr (the split path's o_accum stays latent).
+        params.vBProj,
+        params.vHeadDim,
+        params.strideVbH,
+        params.strideVbVhd,
+        params.strideVbD,
         params.lseAccum,
         params.outAccum,
         params.strideLseAccumSplit,

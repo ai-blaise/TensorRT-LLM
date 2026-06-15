@@ -1,5 +1,6 @@
 #include "combine.h"
 
+#include <type_traits>
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -15,7 +16,7 @@ using namespace cute;
 
 namespace smxx::decode {
 
-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
+template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS, bool VB_FUSE = false>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
@@ -145,18 +146,65 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         }
         
         const int h_q_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
-        ElementT* o_ptr = (ElementT*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + h_q_idx*params.stride_o_h_q;
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-            float4 data = result[i];
-            ElementT data_converted[4];
-            data_converted[0] = (ElementT)(data.x);
-            data_converted[1] = (ElementT)(data.y);
-            data_converted[2] = (ElementT)(data.z);
-            data_converted[3] = (ElementT)(data.w);
-            static_assert(sizeof(ElementT) == 2);
-            *(uint64_t*)(o_ptr + lane_idx*4 + i*128) = *(uint64_t*)data_converted;
+        if constexpr (!VB_FUSE) {
+            // ---- Original latent output (no v_b fusion) -- byte-identical to the
+            // pre-fusion combine kernel; the projection code below is not even
+            // instantiated for this template specialization. ----
+            ElementT* o_ptr = (ElementT*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + h_q_idx*params.stride_o_h_q;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                float4 data = result[i];
+                ElementT data_converted[4];
+                data_converted[0] = (ElementT)(data.x);
+                data_converted[1] = (ElementT)(data.y);
+                data_converted[2] = (ElementT)(data.z);
+                data_converted[3] = (ElementT)(data.w);
+                static_assert(sizeof(ElementT) == 2);
+                *(uint64_t*)(o_ptr + lane_idx*4 + i*128) = *(uint64_t*)data_converted;
+            }
+        } else {
+            // ---- v_b (W_UV) epilogue fusion on the FULLY-REDUCED latent ----
+            // `result` holds this head's cross-split-reduced latent (HEAD_DIM_V=512)
+            // distributed across the 32 lanes (lane l holds cols {l*4 + i*128 + 0..3}).
+            // Stage the warp's 512 latent into shared memory, then each lane projects
+            // a 4-column slice of the v_head_dim output via a full 512 dot product,
+            // streaming W_UV[h, j, :] (bf16) from global memory in fp32.
+            __shared__ float lat_smem[BLOCK_SIZE_M][HEAD_DIM_V];
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                float4 data = result[i];
+                int base = lane_idx*4 + i*128;
+                lat_smem[warp_idx][base + 0] = data.x;
+                lat_smem[warp_idx][base + 1] = data.y;
+                lat_smem[warp_idx][base + 2] = data.z;
+                lat_smem[warp_idx][base + 3] = data.w;
+            }
+            __syncwarp();
+
+            const int v_head_dim = params.v_head_dim;
+            ElementT* o_ptr = (ElementT*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + h_q_idx*params.stride_o_h_q;
+            const cutlass::bfloat16_t* wuv_h = params.v_b_proj + (int64_t)h_q_idx*params.stride_vb_h;
+            // 32 lanes cover v_head_dim columns, COLS_PER_LANE each (v_head_dim must
+            // be a multiple of 32; 128/32 = 4 for the V3.2 shape).
+            const int cols_per_lane = v_head_dim / 32;
+            const float* lat = lat_smem[warp_idx];
+            for (int c = 0; c < cols_per_lane; ++c) {
+                int j = lane_idx + c*32;
+                const cutlass::bfloat16_t* wuv_jk = wuv_h + (int64_t)j*params.stride_vb_vhd;
+                float acc = 0.0f;
+                // stride_vb_d == 1 (contiguous): read 8 bf16 / __int128 along k. The
+                // k-loop is left rolled (only the inner 8-wide read unrolls) for code size.
+                for (int k = 0; k < HEAD_DIM_V; k += 8) {
+                    __int128_t w8 = *(const __int128_t*)(wuv_jk + k);
+                    const cutlass::bfloat16_t* wptr = reinterpret_cast<const cutlass::bfloat16_t*>(&w8);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int kk = 0; kk < 8; ++kk) {
+                        acc += lat[k + kk] * float(wptr[kk]);
+                    }
+                }
+                o_ptr[j] = (ElementT)acc;
+            }
         }
     }
 }
@@ -198,12 +246,14 @@ template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
+    // The v_b (W_UV) projection epilogue is compiled into a separate template
+    // specialization (VB_FUSE=true) so the original latent-combine path is left
+    // byte-identical and pays no extra static SMEM / register cost.
+    const bool vbFuse = params.v_b_proj != nullptr;
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
         constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
         constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         cudaLaunchAttribute attribute[1];
         attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attribute[0].val.programmaticStreamSerializationAllowed = 1;
@@ -215,7 +265,17 @@ void run_flash_mla_combine_kernel(CombineParams &params) {
             attribute,
             1
         };
-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        auto launch = [&](auto vb_fuse_t) {
+            constexpr bool VB_FUSE = decltype(vb_fuse_t)::value;
+            auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, VB_FUSE>;
+            CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        };
+        if (vbFuse) {
+            launch(std::true_type{});
+        } else {
+            launch(std::false_type{});
+        }
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }

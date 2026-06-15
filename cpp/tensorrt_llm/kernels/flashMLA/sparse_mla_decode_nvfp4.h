@@ -8,6 +8,7 @@
 #include <cuda_runtime_api.h>
 #include <cstdint>
 
+#include "cutlass/bfloat16.h"
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -28,6 +29,16 @@ struct SparseMlaDecodeNvfp4Params
     int32_t* numSplits;
     float* lseAccum;
     float* outAccum;
+
+    // Optional v_b (W_UV) epilogue fusion. When vBProj != nullptr the decode +
+    // combine kernels project the fully-reduced latent (dV=512) against
+    // W_UV[hQ, vHeadDim, dV] (bf16) and write a vHeadDim-wide output (out is then
+    // [b, sQ, hQ, vHeadDim]). nullptr keeps the original latent-output behavior.
+    cutlass::bfloat16_t* vBProj;
+    int32_t vHeadDim;
+    int32_t strideVbH;
+    int32_t strideVbVhd;
+    int32_t strideVbD;
 
     int32_t b;
     int32_t sQ;

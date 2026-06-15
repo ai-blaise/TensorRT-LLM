@@ -36,6 +36,10 @@ struct KernelTemplate {
 static constexpr int D_Q = MODEL_TYPE == ModelType::V32 ? 576 : 512;
 static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
+// Projected value head dim for the optional v_b (W_UV) epilogue fusion. When
+// params.v_b_proj != nullptr the no-split epilogue contracts the d_v=512 latent
+// down to D_VHD and stores D_VHD-wide instead of the 512-wide latent.
+static constexpr int D_VHD = 128;
 static constexpr int D_NOPE = MODEL_TYPE == ModelType::V32 ? 512 : 448;
 static constexpr int D_ROPE = 64;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
@@ -228,6 +232,12 @@ struct SharedMemoryPlan {
                     array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> q;
                     CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
                 } native_qk;
+                // v_b (W_UV) fusion scratch: the projected D_VHD-wide bf16 output,
+                // row-major [B_H, D_VHD]. Aliases o_buf -- it is only written AFTER
+                // a __syncthreads() that guarantees every thread has finished reading
+                // the normalized latent staged in o_buf, then bulk-copied to gmem.
+                // 64*128 bf16 = 16KB << o_buf 64*512 bf16, so the union does not grow.
+                array_aligned<bf16, B_H*D_VHD> o_proj_buf;
             } o;
         } qo;
         struct {

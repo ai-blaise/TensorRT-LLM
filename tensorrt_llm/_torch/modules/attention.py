@@ -1465,6 +1465,11 @@ class MLA(nn.Module):
             ),
             requires_grad=False,
         )
+        # Set True per-call by _sparse_mla_decode_nvfp4 when the W_UV projection is
+        # fused into the NVFP4 sparse-decode kernel (bf16 W_UV path). When True,
+        # forward_absorption_generation writes the kernel output directly and skips
+        # the external v_b bmm tail. Defaults False (external bmm, original path).
+        self._vb_fused = False
 
         mapping_o = Mapping(
             world_size=pp_size * dp_size * tp_size * cp_size,
@@ -2610,6 +2615,14 @@ class MLA(nn.Module):
         ``sparse_mla_decode_nvfp4`` (h_q hard-padded to 128, d_v=512), and
         returns ``[num_tokens, num_heads_tp_cp * kv_lora_rank]`` to feed the
         existing v_b_proj BMM tail.
+
+        When the v_b (W_UV) epilogue fusion is eligible (bf16 W_UV, no
+        CP-layersplit), this instead calls ``sparse_mla_decode_nvfp4_vfuse``,
+        which fuses the per-head projection into the kernel and returns the
+        already-projected ``[num_tokens, num_heads_tp_cp * v_head_dim]``. In that
+        case ``self._vb_fused`` is set to ``True`` so the caller skips the
+        external bmm. Otherwise ``self._vb_fused`` is ``False`` and the latent is
+        returned for the existing bmm tail.
         """
         kv_cache_manager = attn_metadata.kv_cache_manager
         tokens_per_block = kv_cache_manager.tokens_per_block
@@ -2658,6 +2671,44 @@ class MLA(nn.Module):
         # [num_tokens, topk] -> [batch, s_q, topk]
         indices = topk_indices_pool.view(num_seqs, s_q, -1).contiguous()
 
+        # v_b (W_UV) epilogue fusion: when W_UV is bf16 and CP-layersplit is NOT
+        # active (so v_b_proj rows map 1:1 onto the leading q head rows), call the
+        # fused op which projects latent[512] @ W_UV -> v_head_dim inside the
+        # decode/combine epilogue and returns the projected output directly. The
+        # external bmm in forward_absorption_generation is then skipped. For fp8
+        # W_UV or under CP-layersplit, fall back to the latent path + external bmm.
+        use_vb_fusion = (self.v_b_proj.dtype == torch.bfloat16
+                         and self.num_heads_tp == self.num_heads_tp_cp)
+        if use_vb_fusion:
+            # Pad v_b_proj to the kernel-required 128 heads (padded head rows
+            # produce don't-care output rows that are sliced off below). v_b_proj
+            # is [num_heads_tp_cp, v_head_dim, kv_lora_rank].
+            if self.num_heads_tp_cp != padding:
+                v_b_proj_padded = self.v_b_proj.new_zeros(
+                    (padding, self.v_head_dim, self.kv_lora_rank))
+                v_b_proj_padded[:self.num_heads_tp_cp] = self.v_b_proj
+            else:
+                v_b_proj_padded = self.v_b_proj
+            v_b_proj_padded = v_b_proj_padded.contiguous()
+
+            out = torch.ops.trtllm.sparse_mla_decode_nvfp4_vfuse(
+                q_concat,
+                kv,
+                kv_scales,
+                indices,
+                v_b_proj_padded,
+                d_v=self.kv_lora_rank,
+                v_head_dim=self.v_head_dim,
+                sm_scale=self.softmax_scale,
+            )[0]
+            self._vb_fused = True
+            # out: [batch, s_q, 128, v_head_dim] -> drop head padding.
+            out = out.view([num_tokens, padding, self.v_head_dim])
+            out = out[:, :self.num_heads_tp_cp, :]
+            return out.reshape(
+                [num_tokens, self.num_heads_tp_cp * self.v_head_dim])
+
+        self._vb_fused = False
         out = self._run_sparse_mla_decode_nvfp4_op(
             q_concat, kv, kv_scales, indices, attn_metadata, num_seqs, s_q)
         # out: [batch, s_q, 128, kv_lora_rank] -> drop head padding.
@@ -3088,6 +3139,11 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
+        # Reset the v_b-fusion flag for this step; only the NVFP4 sparse-decode
+        # path below re-sets it True (per-call) when it fuses the W_UV projection.
+        # This keeps non-NVFP4 dispatch branches on the external bmm tail.
+        self._vb_fused = False
+
         hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
                                        None)
         if bool(getattr(hisparse_coordinator, "enabled", False)):
@@ -3136,6 +3192,23 @@ class MLA(nn.Module):
             )
         fused_q = None
         attn_out_latent = self._select_layersplit_local_heads(attn_out_latent)
+
+        if self._vb_fused:
+            # The NVFP4 sparse-decode kernel already applied the per-head W_UV
+            # projection; `attn_out_latent` is the projected output
+            # [num_tokens, num_heads_tp_cp * v_head_dim]. Write `output` directly
+            # and skip the external v_b bmm. (Only reached for bf16 W_UV without
+            # CP-layersplit -- see _sparse_mla_decode_nvfp4's eligibility gate.)
+            assert (attn_out_latent.shape[0] == q.shape[0]
+                    and attn_out_latent.shape[1]
+                    == self.num_heads_tp_cp * self.v_head_dim)
+            output.view([num_tokens, self.num_heads_tp_cp,
+                         self.v_head_dim]).copy_(
+                             attn_out_latent.view([
+                                 num_tokens, self.num_heads_tp_cp,
+                                 self.v_head_dim
+                             ]))
+            return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (attn_out_latent.shape[0] == q.shape[0]
