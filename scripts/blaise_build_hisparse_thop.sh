@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+# NOTE: ENABLE_CUBLASLT_FP4_GEMM defaults OFF here for fast-iteration build speed.
+# cuBLASLt FP4 GEMM is ~2x over cutlass and is the production NVFP4 default backend;
+# SERVING builds MUST run with ENABLE_CUBLASLT_FP4_GEMM=ON (else dense NVFP4 GEMMs fall
+# back to cutlass at ~2x cost). See docs/blaise/pde_decode_optimization_probe.md.
+
 REPO_DIR="${REPO_DIR:-/home/spencer/work/TensorRT-LLM-hisparse-smoke}"
 CACHE_DIR="${CACHE_DIR:-/home/spencer/work/build-cache/hisparse-thop}"
 IMAGE="${IMAGE:-local/dynamo-trtllm-optrt-custom:hisa-buildtools-20260531}"
@@ -61,7 +66,7 @@ cmake \
   -DUSING_OSS_CUTLASS_FP4_GEMM=OFF \
   -DUSING_OSS_CUTLASS_MOE_GEMM=ON \
   -DUSING_OSS_CUTLASS_ALLREDUCE_GEMM=OFF \
-  -DENABLE_CUBLASLT_FP4_GEMM=OFF \
+  -DENABLE_CUBLASLT_FP4_GEMM=${ENABLE_CUBLASLT_FP4_GEMM:-OFF} \
   -DTRTLLM_FETCHCONTENT_CACHE=/work/3rdparty/.cache_3rdparty \
   -DNCCL_INCLUDE_DIR=${NCCL_INCLUDE_DIR} \
   -DNCCL_LIBRARY=${NCCL_LIBRARY} \
