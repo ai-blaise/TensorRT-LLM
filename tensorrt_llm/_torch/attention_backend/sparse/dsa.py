@@ -411,6 +411,40 @@ def _hisa_perrow_cand() -> bool:
     return os.environ.get("TRTLLM_OPTRT_HISA_PERROW_CAND", "0") == "1"
 
 
+def _indexer_topk_decode(logits: torch.Tensor, seq_lens: torch.Tensor,
+                         indices: torch.Tensor, next_n: int, index_topk: int,
+                         **kwargs) -> None:
+    """Decode index top-k seam — the PDE G3 device-control-flow hook.
+
+    Default routes to ``torch.ops.trtllm.indexer_topk_decode`` (the existing,
+    bit-exact behavior; ``kwargs`` such as ``pre_idx`` / ``heuristic_scratch``
+    are forwarded untouched). When the static gate ``TRTLLM_OPTRT_PDE_G3_TOPK``
+    is ON (see ``pde_g3_topk.pde_g3_topk_enabled``), routes the selection through
+    the PDE G3 device-resident radix-select (``pde_g3_topk_decode``) instead,
+    keeping the indexer -> top-k -> gather chain device-resident. The G3 selected
+    set is index-identical to FP32 ``torch.topk`` (recall 1.0 at the prod decode
+    shapes); it is a correctness-equivalent fallback, validated default-OFF (it is
+    NOT a speedup over the capture-safe CuTe-DSL top-k in the current build — its
+    win is build/serve-gated; see ``pde_g3_topk`` module docstring). G3 does not
+    consume the heuristic ``pre_idx`` hint, so the ``kwargs`` are dropped on the
+    G3 branch (the hint only shrinks the C++ walk; correctness is unaffected)."""
+    from tensorrt_llm._torch.attention_backend.sparse import pde_g3_topk
+    if pde_g3_topk.pde_g3_topk_enabled():
+        pde_g3_topk.pde_g3_topk_decode(logits, seq_lens, indices, next_n,
+                                       index_topk)
+        return
+    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n,
+                                         index_topk, **kwargs)
+
+
+def _pde_g3_topk_active() -> bool:
+    """True iff the PDE G3 device-resident top-k gate is ON
+    (``TRTLLM_OPTRT_PDE_G3_TOPK``). Thin accessor so the decode dispatch can
+    branch without importing the JIT module when the gate is OFF."""
+    from tensorrt_llm._torch.attention_backend.sparse import pde_g3_topk
+    return pde_g3_topk.pde_g3_topk_enabled()
+
+
 def _hisa_step_memo_enabled() -> bool:
     """Gate for the per-step memo of layer-invariant HISA decode index math
     (row_to_batch / prefix_lens / block_counts / row spans). Default on; set
@@ -2403,7 +2437,7 @@ class Indexer(nn.Module):
         self.rope_dim = mla_params.qk_rope_head_dim
         self.n_heads = sparse_attention_config.index_n_heads  # 64
         self.head_dim = sparse_attention_config.index_head_dim  # 128
-        self.index_topk = sparse_attention_config.index_topk  # 2048
+        self.index_topk = sparse_attention_config.index_topk  # 1024
         self.layer_idx = layer_idx
         # Per-block (device int64) epoch last reconstructed into this layer's
         # fp16 main pool; lazily sized to the pool on first amortized restore.
@@ -3048,8 +3082,8 @@ class Indexer(nn.Module):
         top_blocks = torch.empty((q_flat.shape[0], block_topk),
                                  dtype=torch.int32,
                                  device=q_flat.device)
-        torch.ops.trtllm.indexer_topk_decode(block_scores, block_counts,
-                                             top_blocks, 1, block_topk)
+        _indexer_topk_decode(block_scores, block_counts, top_blocks, 1,
+                             block_topk)
         return top_blocks
 
     def _hisa_select_blocks_deepgemm_fp4(
@@ -3118,8 +3152,8 @@ class Indexer(nn.Module):
         top_blocks = torch.empty((q_flat.shape[0], block_topk),
                                  dtype=torch.int32,
                                  device=q_flat.device)
-        torch.ops.trtllm.indexer_topk_decode(block_scores, block_counts,
-                                             top_blocks, 1, block_topk)
+        _indexer_topk_decode(block_scores, block_counts, top_blocks, 1,
+                             block_topk)
         return top_blocks
 
     def _hisa_select_blocks(
@@ -3168,8 +3202,8 @@ class Indexer(nn.Module):
             top_blocks = torch.empty((q_flat.shape[0], block_topk),
                                      dtype=torch.int32,
                                      device=q_flat.device)
-            torch.ops.trtllm.indexer_topk_decode(block_scores, block_counts,
-                                                 top_blocks, 1, block_topk)
+            _indexer_topk_decode(block_scores, block_counts, top_blocks, 1,
+                                 block_topk)
             return top_blocks
 
         return self._hisa_select_blocks_tensor_ops(q_flat,
@@ -3438,8 +3472,8 @@ class Indexer(nn.Module):
         else:
             selected_lengths = self._hisa_full_int32(num_rows, candidate_len,
                                                      q_values.device)
-        torch.ops.trtllm.indexer_topk_decode(candidate_scores, selected_lengths,
-                                             selected, 1, topk)
+        _indexer_topk_decode(candidate_scores, selected_lengths, selected, 1,
+                             topk)
         if (self.hisa_execution_mode in ("auto", "optimized")
                 and hasattr(torch.ops.trtllm, "indexer_hisa_remap_selected")):
             return torch.ops.trtllm.indexer_hisa_remap_selected(
@@ -3524,8 +3558,8 @@ class Indexer(nn.Module):
                                             device=logits.device)
             selected_lengths = self._hisa_full_int32(
                 num_rows, selected_scores.shape[1], logits.device)
-            torch.ops.trtllm.indexer_topk_decode(
-                selected_scores, selected_lengths, selected_relative, 1, topk)
+            _indexer_topk_decode(selected_scores, selected_lengths,
+                                 selected_relative, 1, topk)
         else:
             selected_relative = selected_scores.topk(
                 topk, dim=-1, sorted=False)[1]
@@ -4515,6 +4549,18 @@ class Indexer(nn.Module):
                 if hisa_topk is not None:
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :] = hisa_topk
+                elif _pde_g3_topk_active():
+                    # PDE G3 device-resident radix-select for the single-level
+                    # full-width decode top-k (gate TRTLLM_OPTRT_PDE_G3_TOPK,
+                    # default OFF). Keeps the selection device-resident; selected
+                    # set is index-identical to the C++/DSL ops at fp32 logits
+                    # (recall 1.0). Bit-exact fallback = the cute_dsl / C++
+                    # branches below when the gate is OFF.
+                    _indexer_topk_decode(
+                        logits_decode, gen_kv_lens_cuda,
+                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                            num_gen_tokens, :], next_n,
+                        self.index_topk)
                 elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
                       and metadata.max_gen_kv_len >= _DSL_TOPK_MIN_KV_LEN):
                     # DSL allocates O(num_gen_tokens * live_kv_len) scratch, so

@@ -20,6 +20,13 @@ context_parallel_size: 1
 enable_attention_dp: true
 trust_remote_code: true
 enable_chunked_prefill: true
+# NOTE: overlap is requested here, but the SMC GLM draft runs its DECODE on
+# FlashInfer (draft_attention_backend: triton forces only draft PREFILL onto the
+# Triton shim; GLM dense GQA has no SM100 fused TRTLLM decode kernel). The runtime
+# then force-disables the overlap scheduler in py_executor_creator.py because the
+# draft engine's attn backend is not TrtllmAttention. Overlap is NOT active on this
+# decode worker; value kept false-as-written for honesty. (trtllm_mha draft attn
+# would re-enable overlap but OOMs the GQA O(num_q*max_kv) MHA scratch at max_seq_len.)
 disable_overlap_scheduler: false
 # DeepSeek decode should run attention-DP/local dense MLP ownership rather than
 # exercising the dense MLP TP allreduce path during warmup.

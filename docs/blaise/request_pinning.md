@@ -54,9 +54,15 @@ back to an unknown-DP broadcast path before A/B testing.
 
 ## Moondream-style overlap invariants
 
-- Prefill uses the same overlap scheduler pipeline as decode:
-  `disable_overlap_scheduler: false`.
-- SMC-SD decode is allowed to use overlap; it must preserve
+- Both engines set `disable_overlap_scheduler: false`. On the SMC-SD decode
+  worker, however, the runtime force-disables the overlap scheduler in
+  `py_executor_creator.py`: the GLM draft runs its decode on FlashInfer
+  (`draft_attention_backend: triton` forces only draft PREFILL onto the Triton
+  shim; GLM dense GQA has no SM100 fused TRTLLM decode kernel), and a non-
+  TrtllmAttention draft engine is not overlap-eligible. The expected
+  `Disable overlap scheduler ...` log line is therefore a normal SMC signal
+  (see the log-grep gate below), not a misconfiguration.
+- SMC-SD decode does not get scheduler-level overlap, but it must still preserve
   `draft_token_log_probs` and event-gated pinned host draft tokens. It must not
   fall back to greedy draft verification.
 - The delayed commit waits on `SampleState.sampler_event` before reading pinned

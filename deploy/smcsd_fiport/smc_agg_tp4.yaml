@@ -7,6 +7,13 @@ moe_expert_parallel_size: 4
 enable_attention_dp: false
 trust_remote_code: true
 enable_chunked_prefill: true
+# NOTE: this requests overlap, but with the SMC GLM draft running its decode on
+# FlashInfer (draft_attention_backend: triton forces only draft PREFILL onto the
+# Triton shim; GLM dense GQA has no SM100 fused TRTLLM decode kernel), the runtime
+# force-disables the overlap scheduler in py_executor_creator.py (the draft engine
+# attn backend is not TrtllmAttention). Overlap is therefore NOT active on this
+# decode; the value is kept false-as-written for honesty. trtllm_mha draft attn
+# would re-enable it but OOMs the GQA O(num_q*max_kv) MHA scratch at max_seq_len.
 disable_overlap_scheduler: false
 allreduce_strategy: AUTO
 use_cute_dsl_blockscaling_bmm: true
