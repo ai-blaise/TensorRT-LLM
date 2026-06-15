@@ -125,3 +125,29 @@ UN-warmed default tactic, not the AutoTuner's warmed pick (the winner IS in get_
 Prereq (same as the headline GEMM lever): the serving image must have cutedsl available (CuTe DSL JIT, present)
 AND the AutoTuner warmed at model load (prod model-load does this). **Decode-level impact: o_proj ~= 5% of the
 ~20.8ms step -> ~0.6% tok/s/user. Real + clean + deployable (config-only) but modest.** Harness: blaise_perf/pde_directtest/autotune_proto/proto.py.
+
+## Broader TileRT/PDE system probe (2026-06-15): production decode is comprehensively optimized; the lever is the ~65% inter-kernel overhead
+
+System map (per-layer, M=1, measured under capture on B200): dense GEMMs ~50us + attention (flash_mla sparse
+decode) ~18us FLAT + indexer ~6us + MoE (WARPDECODE cute_dsl grouped-GEMM) ~45us = **~120us measured compute
+vs ~340us/layer budget (20.8ms/61L) -> ~65% is inter-kernel launch/overhead/sync + bmm/rope/quant glue.** This
+confirms the "decode is overhead-bound, 20-40x over BW floor" thesis with measured numbers.
+
+- **MoE: WARPDECODE beats CUTLASS 1.77x(M1)/1.38x(M8)/1.30x(M32), cos=1.0 — but NOT a new win:** ALL production
+  decode configs (decode.yaml, smc_agg_tp4.yaml, topo-c1-dp2tp4-r20) ALREADY use WARPDECODE; the only CUTLASS
+  user is sdt_gen_decode.yaml, a DENSE-GEMM MICROBENCH (CUTLASS pinned to isolate the GEMM variable; README +
+  header confirm). Corrects the earlier read of sdt_gen_decode as the live serve config — it's a microbench.
+  MoE tactic is NOT AutoTuner-mis-picked (trtllm_gen AutoTuner == no-autotune 1.00-1.02x, unlike the dense GEMM).
+- **Attention** (standard FMHA MLA-gen on fp8 KV): ~18us, small + flat in batch — not a lever.
+- **SMC spec-decode (serve-gated, biggest potential):** draft = 6 GLM-9B-FP8 forwards per verify (gamma=6);
+  forwards 1-5 each process batch x 25 tokens (n_particles=4 x gamma + root tree) = the dominant added cost.
+  tok/s/user = accepted_len / (6x draft + 345B verify); acceptance is data-dependent -> serve-gated. Cheap
+  config lever: smc_vectorize_logprob_record (off; saves ~15 launches/step, bit-exact within 1 ULP) + gamma/
+  n_particles tradeoff.
+- Topology already DP2/TP4-tuned; overlap scheduler on.
+
+**BIGGEST REMAINING tok/s/user LEVER (honest): NOT any single compute kernel** (MoE/attn/GEMM/indexer all
+optimal). It's the **~65% inter-kernel overhead** — exactly what the validated PDE primitives (G3 device-control-
+flow, G9 cross-step persistence) target, but those are NOT yet wired into the live serving runtime. The other
+lever is SMC acceptance x draft-cost. **Both require the model/serve** (wire PDE control-flow into the live
+runtime + measure, or tune SMC vs live acceptance). No new op/backend-level no-serve serving win remains.
