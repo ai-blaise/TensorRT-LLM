@@ -1,10 +1,12 @@
-// PDE G3 gate microbench (standalone, sm_100). REAL numbers on GPU0.
+// PDE G3-OPT gate microbench (standalone, sm_100). REAL numbers on GPU0.
 //
 // G3 = device-resident DATA-DEPENDENT CONTROL FLOW (Indexer -> top-k -> attention
-// gather). Compares:
+// gather). G3-OPT swaps the device top-k from O(K*C) blockwide argmax-evict to an
+// EXACT O(C) 64-bit composite-key MSD radix-select, and adds MULTI-CTA-PER-QUERY
+// parallelism so M=1 is not 1-CTA-bound. Compares:
 //
 //   (A) DEVICE-RESIDENT : ONE persistent cooperative kernel doing
-//        score -> grid barrier -> device top-k select -> grid barrier ->
+//        score -> grid barrier -> device RADIX top-k select -> grid barrier ->
 //        data-dependent gather+reduce. The selection NEVER leaves the device.
 //   (B) HOST-ORCHESTRATED (today's pattern): score kernel -> cudaMemcpy scores
 //        d2h -> HOST top-k -> cudaMemcpy indices h2d -> gather kernel. The real
@@ -12,14 +14,16 @@
 //
 // Both are checked against an INDEPENDENT CPU reference (CPU computes scores,
 // exact top-k with the same deterministic tiebreak, and the weighted gather).
-// We also isolate the raw d2h+h2d+sync cost that (A) eliminates, and report the
-// persistent control-flow kernel's occupancy.
+// We also isolate the raw d2h+h2d+sync cost that (A) eliminates, isolate the new
+// device radix top-k kernel time (vs the old O(K*C) argmax), and report the
+// persistent control-flow kernel's occupancy + the ctas-per-query used.
 //
 // Gate:
 //   Correctness: A == B == CPU (out cos >= 0.999999) AND the device top-k INDEX
-//                SET == CPU top-k index set, at M in {1,8,32}.
-//   Perf: latency(A) vs latency(B) at M in {1,8,32}; speedup; plus the measured
-//         d2h+h2d+sync cost removed.
+//                SET == CPU top-k index set, at M in {1,8,32}, max_set_diff=0.
+//   Perf: latency(A) vs latency(B) at M in {1,8,32}; speedup >= 1.0x at EVERY
+//         point (incl. M=1 large-k, where the old G3 lost at 0.27x); plus the
+//         measured d2h+h2d+sync removed and the isolated device radix top-k cost.
 //
 // Build: nvcc -std=c++17 -arch=sm_100 -O3 -o pde_g3_bench pde_g3_bench.cu
 #include "pde_g3_dev_ctrl.cuh"
@@ -209,6 +213,8 @@ int main() {
   double sj_removed_us[2][3] = {{0}};
   double sj_A_us[2][3] = {{0}};
   double sj_B_us[2][3] = {{0}};
+  double sj_sel_us[2][3] = {{0}};   // G3-OPT: isolated device radix-topk time
+  int sj_cpq[2][3] = {{0}};         // G3-OPT: ctas_per_query used at this M
   int sj_idx_match[2][3] = {{0}};
   int occ_dev = 0, occ_sel = 0, regs_dev = 0;
 
@@ -278,12 +284,42 @@ int main() {
       CK(cudaMemcpy(dQ, hQ.data(), hQ.size() * sizeof(float),
                     cudaMemcpyHostToDevice));
 
-      g3::Problem p{dQ, dBlocks, dScores, dSelIdx, dSelScore, dOut, Q, C, K};
+      // ---- G3-OPT global scratch for the multi-CTA radix-select ----
+      unsigned int* dHist;        // [Q, 256]  per-query digit histogram
+      unsigned long long* dThr;   // [Q]       per-query threshold composite key
+      unsigned int* dOutCnt;      // [Q]       per-query atomic fill counter
+      CK(cudaMalloc(&dHist, (size_t)Q * g3::kRadixBins * sizeof(unsigned int)));
+      CK(cudaMalloc(&dThr, (size_t)Q * sizeof(unsigned long long)));
+      CK(cudaMalloc(&dOutCnt, (size_t)Q * sizeof(unsigned int)));
+      // Histogram MUST start all-zero for the first pass's atomics (the kernel
+      // self-resets it to zero on exit thereafter, so no per-rep memset needed).
+      CK(cudaMemset(dHist, 0, (size_t)Q * g3::kRadixBins * sizeof(unsigned int)));
+      CK(cudaMemset(dOutCnt, 0, (size_t)Q * sizeof(unsigned int)));
 
-      // Cooperative grid is capped at Q CTAs (one CTA owns a query; extra CTAs
-      // would just idle, and cg grid sync requires every launched CTA resident).
-      int gridA = std::min(planA.grid_blocks, Q);
-      if (gridA < 1) gridA = 1;
+      // G3-OPT: choose CTAs-per-query so SMALL M is not 1-CTA-bound. A query
+      // group of `cpq` CTAs cooperates on one query; we want n_groups >= Q (one
+      // wave) AND to fill the device when Q is small. Measured sweep (cap in
+      // {16,32,64,128}): M=1 is insensitive to cap above ~16 (its floor is the
+      // cooperative-launch + grid-barrier fixed overhead, NOT candidate-parallel
+      // work), while LARGER caps HURT M=8/M=32 (too many CTAs/query => more
+      // barrier + 256-bin global-histogram atomic contention once the queries
+      // already fill the device). cap=16 is the best all-rounder: it ties the
+      // higher caps at M=1 and is fastest at M=8/M=32. Override via PDE_MAX_CPQ.
+      const char* cpq_env = getenv("PDE_MAX_CPQ");
+      const int kMaxCtasPerQuery = cpq_env ? atoi(cpq_env) : 16;
+      int cpq = planA.grid_blocks / Q;            // how many CTAs each query can get
+      if (cpq < 1) cpq = 1;
+      if (cpq > kMaxCtasPerQuery) cpq = kMaxCtasPerQuery;
+      // ensure the launched grid keeps n_groups >= Q (one wave): grid = cpq*Q,
+      // clamped to the resident cap.
+      int gridA = cpq * Q;
+      if (gridA > planA.grid_blocks) gridA = (planA.grid_blocks / cpq) * cpq;
+      if (gridA < cpq) gridA = cpq;
+      // n_groups actually resident = gridA / cpq; guarantee >= 1.
+      sj_cpq[si][mi] = cpq;
+
+      g3::Problem p{dQ,   dBlocks, dScores, dSelIdx, dSelScore, dOut,
+                    dHist, dThr,   dOutCnt, Q,       C,         K,    cpq};
 
       // =================== (A) DEVICE-RESIDENT ===================
       auto launchA = [&]() {
@@ -408,6 +444,31 @@ int main() {
         cudaEventDestroy(e0); cudaEventDestroy(e1);
       }
 
+      // ====== isolate the DEVICE RADIX TOP-K cost (the optimized kernel) ======
+      // Cooperative select-only kernel: score is assumed already in dScores from
+      // the (A) functional run above; this isolates the radix-select+emit time so
+      // we can report new-vs-old top-k cost (old G3 = the O(K*C) argmax flat time).
+      double sel_us;
+      {
+        auto launchSel = [&]() {
+          void* args[] = {&p};
+          CK(cudaLaunchCooperativeKernel((void*)g3::kSelectOnlyPersistent, gridA,
+                                         g3::kBlockThreads, args, sel_smem,
+                                         stream));
+        };
+        const int REPS = 100, WARM = 20;
+        for (int w = 0; w < WARM; ++w) launchSel();
+        CK(cudaStreamSynchronize(stream));
+        cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        CK(cudaEventRecord(e0, stream));
+        for (int r = 0; r < REPS; ++r) launchSel();
+        CK(cudaEventRecord(e1, stream)); CK(cudaEventSynchronize(e1));
+        float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+        sel_us = ms * 1000.0 / REPS;
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+      }
+      sj_sel_us[si][mi] = sel_us;
+
       // =================== CORRECTNESS ===================
       CmpStat cA = compare(A_out, ref.out);
       CmpStat cB = compare(B_out, ref.out);
@@ -436,13 +497,16 @@ int main() {
       printf("  (A) device-resident   : %.3f us\n", A_us);
       printf("  (B) host-orchestrated : %.3f us   -> A is %.3fx %s\n", B_us,
              speedup, (A_us < B_us) ? "FASTER" : "slower");
+      printf("  device radix top-k    : %.3f us  (isolated; old G3 O(K*C) argmax "
+             "was the bulk of A's flat cost)\n", sel_us);
       printf("  d2h+h2d+sync removed  : %.3f us  (the capture-illegal round-trip "
              "(A) dissolves)\n", copy_us);
-      printf("  grids: (A) coop=%d CTAs | (B) score=%d gather=%d CTAs\n", gridA,
-             score_grid, gather_grid);
+      printf("  grids: (A) coop=%d CTAs (cpq=%d, n_groups=%d) | (B) score=%d "
+             "gather=%d CTAs\n", gridA, cpq, gridA / cpq, score_grid, gather_grid);
 
       cudaFree(dQ); cudaFree(dScores); cudaFree(dSelIdx); cudaFree(dSelScore);
       cudaFree(dOut);
+      cudaFree(dHist); cudaFree(dThr); cudaFree(dOutCnt);
     }
     cudaFree(dBlocks);
   }
@@ -454,9 +518,11 @@ int main() {
          "\"s0_name\":\"%s\",\"s1_name\":\"%s\","
          "\"s0_A_us\":[%.3f,%.3f,%.3f],\"s0_B_us\":[%.3f,%.3f,%.3f],"
          "\"s0_speedup\":[%.3f,%.3f,%.3f],\"s0_removed_us\":[%.3f,%.3f,%.3f],"
+         "\"s0_sel_us\":[%.3f,%.3f,%.3f],\"s0_cpq\":[%d,%d,%d],"
          "\"s0_idxmatch_per_M\":[%d,%d,%d],"
          "\"s1_A_us\":[%.3f,%.3f,%.3f],\"s1_B_us\":[%.3f,%.3f,%.3f],"
          "\"s1_speedup\":[%.3f,%.3f,%.3f],\"s1_removed_us\":[%.3f,%.3f,%.3f],"
+         "\"s1_sel_us\":[%.3f,%.3f,%.3f],\"s1_cpq\":[%d,%d,%d],"
          "\"s1_idxmatch_per_M\":[%d,%d,%d],"
          "\"M\":[1,8,32],\"corr_gate\":\"%s\"}\n",
          prop.multiProcessorCount, occ_dev, occ_sel, regs_dev,
@@ -465,11 +531,15 @@ int main() {
          sj_B_us[0][0], sj_B_us[0][1], sj_B_us[0][2],
          sj_speedup[0][0], sj_speedup[0][1], sj_speedup[0][2],
          sj_removed_us[0][0], sj_removed_us[0][1], sj_removed_us[0][2],
+         sj_sel_us[0][0], sj_sel_us[0][1], sj_sel_us[0][2],
+         sj_cpq[0][0], sj_cpq[0][1], sj_cpq[0][2],
          sj_idx_match[0][0], sj_idx_match[0][1], sj_idx_match[0][2],
          sj_A_us[1][0], sj_A_us[1][1], sj_A_us[1][2],
          sj_B_us[1][0], sj_B_us[1][1], sj_B_us[1][2],
          sj_speedup[1][0], sj_speedup[1][1], sj_speedup[1][2],
          sj_removed_us[1][0], sj_removed_us[1][1], sj_removed_us[1][2],
+         sj_sel_us[1][0], sj_sel_us[1][1], sj_sel_us[1][2],
+         sj_cpq[1][0], sj_cpq[1][1], sj_cpq[1][2],
          sj_idx_match[1][0], sj_idx_match[1][1], sj_idx_match[1][2],
          all_corr ? "PASS" : "FAIL");
 
