@@ -1,0 +1,61 @@
+{
+  "name": "cutedsl_nvf4_winner_v2_mma256x64_clu4x1_swapab_block16_faithful",
+  "layouts": [
+    { "label": "sA_smem_Kcontig_128x64_fp4byte",
+      "shape":  [{"is_static":true,"value":64},{"is_static":true,"value":128},{"is_static":true,"value":4}],
+      "stride": [{"is_static":true,"value":1},{"is_static":true,"value":64},{"is_static":true,"value":8192}] },
+    { "label": "sB_smem_Kcontig_64x64_fp4byte",
+      "shape":  [{"is_static":true,"value":64},{"is_static":true,"value":64},{"is_static":true,"value":4}],
+      "stride": [{"is_static":true,"value":1},{"is_static":true,"value":64},{"is_static":true,"value":4096}] },
+    { "label": "sfa_storage_block16_injective",
+      "shape":  [{"is_static":true,"value":32},{"is_static":true,"value":4},{"is_static":true,"value":4}],
+      "stride": [{"is_static":true,"value":16},{"is_static":true,"value":4},{"is_static":true,"value":1}] },
+    { "label": "gC_out_7168x64_mmajor_swapab_bf16",
+      "shape":  [{"is_static":true,"value":64},{"is_static":true,"value":7168}],
+      "stride": [{"is_static":true,"value":1},{"is_static":true,"value":64}] },
+    { "label": "lane_bank_map_swz128_16Bseg_fp4",
+      "shape":  [{"is_static":true,"value":32},{"is_static":true,"value":4}],
+      "stride": [{"is_static":true,"value":4},{"is_static":true,"value":1}] }
+  ],
+  "swizzles": [
+    { "label": "swz128B", "b": 3, "m": 4, "s": 3, "addr_bits": 64 }
+  ],
+  "swizzled_layouts": [
+    { "layout_idx": 4, "swizzle_idx": 0, "element_bytes": 4 }
+  ],
+  "tma_descriptors": [
+    { "label": "tma_A_W_128x64_fp4_16U4_swz128",
+      "base_address": {"is_static":true,"value":0},
+      "box_shape":   [{"is_static":true,"value":128},{"is_static":true,"value":64}],
+      "stride_bytes":[{"is_static":true,"value":2},{"is_static":true,"value":8192}],
+      "element_bytes": 2, "swizzle": 128, "bytes_per_tma": 8192 },
+    { "label": "tma_B_x_64x64_fp4_16U4_swz128",
+      "base_address": {"is_static":true,"value":0},
+      "box_shape":   [{"is_static":true,"value":64},{"is_static":true,"value":64}],
+      "stride_bytes":[{"is_static":true,"value":2},{"is_static":true,"value":4096}],
+      "element_bytes": 2, "swizzle": 128, "bytes_per_tma": 4096 }
+  ],
+  "mma_atoms": [
+    { "label": "sm100_umma_mxf4nvf4_perCTA_M128N64K64_block16",
+      "kind": 4, "m": 128, "n": 64, "k": 64,
+      "a_k_major": true, "b_k_major": true,
+      "a_swizzle": 128, "b_swizzle": 128,
+      "element_bytes_a": 1, "element_bytes_b": 1 }
+  ],
+  "vectorization_ops": [
+    { "label": "ldg128_fp4_A_Kcontig_16packed", "layout_idx": 0, "element_bytes": 1, "vector_width": 16,
+      "base_address": {"is_static":true,"value":0} },
+    { "label": "ldg128_fp4_B_Kcontig_16packed", "layout_idx": 1, "element_bytes": 1, "vector_width": 16,
+      "base_address": {"is_static":true,"value":0} },
+    { "label": "stg128_C_bf16_swapab_mmajor", "layout_idx": 3, "element_bytes": 2, "vector_width": 8,
+      "base_address": {"is_static":true,"value":0} }
+  ],
+  "mbarrier_sites": [
+    { "label": "ab_full_tx_2cta_block16", "expect_tx_bytes": 24576, "tma_byte_counts": [8192, 4096, 8192, 4096] }
+  ],
+  "dsmem_sites": [
+    { "label": "cluster4x1_smem", "cluster_size": 4, "smem_size_bytes": 233472,
+      "accesses": [ {"rank":{"is_static":true,"value":0},"byte_offset":{"is_static":true,"value":0}},
+                    {"rank":{"is_static":true,"value":3},"byte_offset":{"is_static":true,"value":1024}} ] }
+  ]
+}

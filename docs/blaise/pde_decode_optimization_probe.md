@@ -60,3 +60,30 @@ Dense GEMMs use scaling_vector_size=16 (NOT the ue8m0/vec=32 of the indexer path
 One real high-impact actionable win (restore cublaslt FP4 in serving builds, ~2x dense GEMMs, pending
 deploy-provenance), one real-but-build-gated lever (nvfp4/higgs KV bytes), and a thorough confirmation
 that the rest of the decode is already well-optimized. Harnesses: blaise_perf/pde_directtest/.
+
+## CORRECTION — cutedsl CAN beat cublaslt on o_proj (tactic-selection fix; 2026-06-15)
+
+A follow-up agent (deep-read CuTe DSL docs + arXiv 2603.02298 + Veitner + Colfax; CZS-gated) overturned the
+"cutedsl never beats cublaslt" claim above. Independently re-verified on GPU6 (image -fixed-20260611, cos=1.0):
+
+| shape (K->N) | M | cublaslt | cutedsl WIN_TACTIC | result |
+|---|---|---|---|---|
+| o_proj 16384->7168 | 1/4/16/64 | 16.4-16.5 | **14.25 / 13.28 / 14.36 / 14.36** | **BEATS 1.14-1.24x** |
+| q_a 7168->1536 | * | 8.24 | 8.23 | ties |
+| moe_up 7168->2048 | * | 8.24 | 8.23 | ties |
+| moe_down 2048->7168 | * | 6.17 | 6.17 | ties |
+
+WIN_TACTIC = `((256,64), cluster(4,1), swap_ab=True, prefetch=False)` on the EXISTING
+`Sm100BlockScaledPersistentDenseGemmKernel` (tactic-tuning, not a new kernel). Lever: swap_ab=True puts
+N=7168 on the kernel-M axis -> 28-56 M-tiles fill the 148 SMs (wave-quantization, the #1 Colfax-CLC technique
+for small M). **The gap was AutoTuner MIS-SELECTION**: stock `cute_dsl_nvfp4_gemm_blackwell` picks
+swap_ab=False/big-tile = 26.6us on o_proj; `prefetch=True` is catastrophic at small M (246-343us).
+Negatives: dispatch-split-K is S-x slower (serializes under capture); 7.34us pure-BW floor unreachable
+(~14.3us = 1.95x = real block-scaled-GEMM plateau). CZS: czs_py pybind not built on 001 -> CLI on a
+hand-encoded Module (14 Proved / 1 Disproved-artifact, legality-only); cos=1.0 is the correctness gate.
+
+**Scope (honest):** o_proj only (1x/layer x 61 ~= 130us/tok ~= 0.65% of decode = modest). Deploy needs BOTH
+(a) 'cutedsl' added to the NVFP4 allowed_backends AND (b) the AutoTuner fixed to prefer swap_ab=True + disable
+prefetch at small-M tall-N shapes (else the stock mis-pick makes cutedsl WORSE, which is why prod excludes it
+today). The AutoTuner small-M-tall-N fix also lifts the stock op 26.6->14.2us (o_proj) / 10.27->8.23 (q_a/moe_up).
+This does NOT change the headline GEMM lever (ensure warmed cublaslt in serving) — it's an additional o_proj-only edge.
