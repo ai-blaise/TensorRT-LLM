@@ -136,9 +136,37 @@ def _pde_g3_module():
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _pde_g3_smem_optin_bytes(device_index: int) -> int:
+    """The device's max opt-in dynamic shared memory per block (bytes), cached.
+
+    The G3 one-CTA-per-row radix-select stages every score column in dynamic
+    SMEM (``cols*4 + 256*4`` bytes for the histogram). A column count whose SMEM
+    request exceeds this cap makes ``cudaFuncSetAttribute(MaxDynamicSharedMemory
+    Size)`` reject the launch (``cudaErrorInvalidValue``). On B200 the cap is
+    ~227KB, so the kernel fits up to ~56K columns -- enough for the HISA block
+    top-k (cols~=1032) and the decode final top-k at short live KV, but NOT the
+    prod padded final-logits width (132096 -> ~517KB). Queried once per device."""
+    props = torch.cuda.get_device_properties(device_index)
+    optin = getattr(props, "shared_memory_per_block_optin", 0) or 0
+    if optin <= 0:
+        optin = props.shared_memory_per_block
+    return int(optin)
+
+
+def _pde_g3_smem_fits(cols: int, device_index: int) -> bool:
+    """Whether the G3 kernel's dynamic SMEM for ``cols`` columns fits the device.
+
+    Mirrors the launcher's ``smem = cols*4 + 256*4``. When False the caller MUST
+    route the selection to the existing bit-exact op instead (the G3 kernel would
+    otherwise fail the launch)."""
+    smem = cols * 4 + 256 * 4
+    return smem <= _pde_g3_smem_optin_bytes(device_index)
+
+
 def pde_g3_topk_decode(logits: torch.Tensor, seq_lens: torch.Tensor,
                        out_indices: torch.Tensor, next_n: int,
-                       index_topk: int) -> None:
+                       index_topk: int) -> bool:
     """Device-resident radix-select drop-in for ``indexer_topk_decode``.
 
     Same in/out contract: ``logits[num_rows, cols]`` (fp32/bf16/fp16) + per-row
@@ -147,11 +175,21 @@ def pde_g3_topk_decode(logits: torch.Tensor, seq_lens: torch.Tensor,
     padded). ``next_n`` must be 1 (decode); selection is per row independently, so
     next_n>1 rows are already flattened into the row dimension by the caller, as
     with the existing op.
-    """
+
+    Returns ``True`` when the G3 kernel handled the selection, ``False`` when the
+    logits column count exceeds the device SMEM cap (see ``_pde_g3_smem_fits``).
+    On ``False`` NOTHING is written and the caller must fall back to the existing
+    op -- this keeps the gate-ON path correctness-safe (recall 1.0 where it fits,
+    bit-exact prod-op fallback where it does not) at every decode shape instead
+    of failing the launch at the prod final-logits width."""
     assert next_n == 1, "pde_g3_topk_decode supports next_n==1 (decode)"
     assert out_indices.dtype == torch.int32
+    cols = int(logits.shape[1])
+    if not _pde_g3_smem_fits(cols, logits.device.index or 0):
+        return False
     seq_lens_i32 = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(
         torch.int32)
     _pde_g3_module().pde_g3_launch_topk(logits.contiguous(),
                                         seq_lens_i32.contiguous(), out_indices,
                                         int(index_topk))
+    return True

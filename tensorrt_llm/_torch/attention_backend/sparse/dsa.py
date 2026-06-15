@@ -375,7 +375,9 @@ _DG_SCHEDULE_BLOCK_KV = 64
 # the metadata and we cache its returned tensors into the pre-allocated
 # graph-stable buffers below; layers 1..15 pass those buffers back in so the op
 # skips the serial metadata kernel (`computeSchedulerMetadata=false`).
-# Gated OFF by default → byte-identical to the per-layer recompute.
+# Default ON (commit e5952886 ships SM1 default-on) → byte-identical to the
+# per-layer recompute: a per-step batch signature revalidates the cached
+# metadata before reuse, so the result is identical whether on or off.
 # `DecodingSchedMeta` is 8 int32s (params.h); `kMaxNvfp4NumSmParts` (= 4096,
 # sparse_mla_decode_nvfp4.cu) caps `num_sm_parts`, so the worst-case metadata
 # buffer is [4096, 8] int32 — the analogue of the bf16 FlashMLA `sm_count * 8`.
@@ -386,11 +388,11 @@ _SPARSE_MLA_MAX_NUM_SM_PARTS = 4096
 def _hoist_sparse_mla_meta_enabled() -> bool:
     """Whether to hoist the NVFP4 sparse-MLA tile-scheduler metadata.
 
-    Gated by ``TRTLLM_OPTRT_HOIST_SPARSE_MLA_META`` (default ``"0"`` = OFF). OFF
-    keeps the current per-F-layer recompute (each call passes
-    ``tile_scheduler_metadata=None``), which is byte-identical to the historical
-    behavior. ON computes the metadata once per step and reuses it across the 16
-    F-layers.
+    Gated by ``TRTLLM_OPTRT_HOIST_SPARSE_MLA_META`` (default ``"1"`` = ON; set
+    to ``"0"`` to disable). ON computes the metadata once per step and reuses it
+    across the 16 F-layers (the populated buffers are revalidated against a
+    per-step batch signature before reuse). OFF restores the per-F-layer recompute
+    (each call passes ``tile_scheduler_metadata=None``); byte-identical either way.
     """
     return os.environ.get("TRTLLM_OPTRT_HOIST_SPARSE_MLA_META", "1") == "1"
 
@@ -430,9 +432,14 @@ def _indexer_topk_decode(logits: torch.Tensor, seq_lens: torch.Tensor,
     G3 branch (the hint only shrinks the C++ walk; correctness is unaffected)."""
     from tensorrt_llm._torch.attention_backend.sparse import pde_g3_topk
     if pde_g3_topk.pde_g3_topk_enabled():
-        pde_g3_topk.pde_g3_topk_decode(logits, seq_lens, indices, next_n,
-                                       index_topk)
-        return
+        # G3 returns False when the logits column count exceeds the device SMEM
+        # cap (e.g. the prod padded final-logits width 132096); in that case it
+        # wrote nothing, so fall through to the existing op below. Where it fits
+        # (HISA block top-k cols~=1032; decode final top-k at short live KV) it
+        # handled the selection (recall 1.0) and we return.
+        if pde_g3_topk.pde_g3_topk_decode(logits, seq_lens, indices, next_n,
+                                          index_topk):
+            return
     torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n,
                                          index_topk, **kwargs)
 
@@ -465,8 +472,9 @@ def _hoist_hisa_sched() -> bool:
     (1x vs 16x), not what it computes. The per-layer consumer revalidates a small
     `(num_rows, next_n, candidate_len)` provenance signature before substituting
     the prebuilt buffer and otherwise falls back to the in-line rebuild, so the
-    result is bit-identical whether on or off. Default off (0) = the in-line
-    per-layer rebuild, byte-identical."""
+    result is bit-identical whether on or off. Default ON; set
+    ``TRTLLM_OPTRT_HOIST_HISA_SCHED=0`` for the in-line per-layer rebuild
+    (byte-identical either way)."""
     return os.environ.get("TRTLLM_OPTRT_HOIST_HISA_SCHED", "1") == "1"
 
 

@@ -464,14 +464,22 @@ class SMCModelDrafter(ModelDrafter):
                 continue
             disagg_request_id, ctx_dp_rank, ctx_info_endpoint = (
                 validate_smc_decode_request_pin(target_model_req))
-            logger.info(
-                "SMC Moondream decode handoff preserved "
-                "draft_token_log_probs sample_state.sampler_event "
-                f"pinned_host_tokens={used_pinned_host_tokens} "
-                f"request_id={target_model_req.py_request_id} "
-                f"disagg_request_id={disagg_request_id} "
-                f"ctx_dp_rank={ctx_dp_rank} "
-                f"ctx_info_endpoint={ctx_info_endpoint}")
+            # This handoff trace runs per request per draft-commit on the SMC
+            # decode hot path. At INFO level (usually enabled in prod) it built
+            # and emitted a 5-field f-string every step -- pure host overhead
+            # under the overlap scheduler. Gate behind TRTLLM_OPTRT_SMC_DEBUG so
+            # the disagg pin trace stays available when debugging but costs
+            # nothing in steady-state decode. The pin VALIDATION above is
+            # unchanged (still fail-closed every step); only the log is gated.
+            if os.environ.get("TRTLLM_OPTRT_SMC_DEBUG", "0") == "1":
+                logger.info(
+                    "SMC Moondream decode handoff preserved "
+                    "draft_token_log_probs sample_state.sampler_event "
+                    f"pinned_host_tokens={used_pinned_host_tokens} "
+                    f"request_id={target_model_req.py_request_id} "
+                    f"disagg_request_id={disagg_request_id} "
+                    f"ctx_dp_rank={ctx_dp_rank} "
+                    f"ctx_info_endpoint={ctx_info_endpoint}")
             _smc_debug(
                 "drafter_process_static_commit_start",
                 target_model_req,

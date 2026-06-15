@@ -1548,6 +1548,28 @@ class MLA(nn.Module):
                              torch.cuda.Event()]
                             if self.gate_proj is not None else None)
 
+        # Dedicated stream for the q_b_proj || pre_indexer_proj overlap in
+        # forward_dsa_proj (DSA F-layers). q_b_proj (dense Q up-proj, ~12us
+        # cublaslt) and the indexer projections (wq_b + fused wk/wp GEMMs +
+        # fused_rope_cat quant) both read qr/hidden_states read-only and are
+        # mutually independent, but run SERIALLY on the default stream today.
+        # This MUST be a stream DISTINCT from self.aux_stream: the indexer's
+        # pre_indexer_proj already uses self.aux_stream for its internal q/k
+        # quant overlap, so reusing aux here serializes the two overlaps and
+        # the GEMM-level win collapses (direct-test: shared aux 0.97-1.00x vs
+        # dedicated stream 1.14-1.25x, cos=1.0). Allocated only when the DSA
+        # indexer path exists (mqa present) and the env switch is on. Kill
+        # switch TRTLLM_OPTRT_DSA_QB_OVERLAP=0 restores the serial path.
+        self._dsa_qb_overlap_enabled = (
+            os.environ.get("TRTLLM_OPTRT_DSA_QB_OVERLAP", "1") == "1"
+            and self.mqa is not None)
+        if self._dsa_qb_overlap_enabled:
+            self.dsa_qb_stream = torch.cuda.Stream()
+            self.dsa_qb_events = [torch.cuda.Event(), torch.cuda.Event()]
+        else:
+            self.dsa_qb_stream = None
+            self.dsa_qb_events = None
+
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.rope_fusion
@@ -1973,23 +1995,49 @@ class MLA(nn.Module):
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
-        q = self.q_b_proj(q)
-
         use_short_mha_for_ctx = self._should_use_short_mha(
             attn_metadata, position_ids)
 
         # Skip the indexer when the short MHA path handles all context
-        # tokens and there are no generation tokens.
+        # tokens and there are no generation tokens. q_b_proj runs alone here
+        # (nothing to overlap), so keep it serial -- byte-identical fallback.
         if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
+            q = self.q_b_proj(qr)
             return [q, compressed_kv, k_pe, latent_cache]
 
+        # Indexer-running path: q_b_proj (dense Q up-proj) and the indexer
+        # projections (pre_indexer_proj: wq_b + fused wk/wp GEMMs +
+        # fused_rope_cat quant) are mutually independent -- both read qr /
+        # hidden_states read-only and neither writes the other's inputs. Run
+        # q_b_proj on a DEDICATED stream concurrently with pre_indexer_proj on
+        # the default stream. The dedicated stream is required: pre_indexer_proj
+        # already uses self.aux_stream for its internal q/k quant overlap, so
+        # reusing aux collapses the GEMM-level win (direct-test on B200:
+        # dedicated 1.14-1.25x vs shared aux ~1.0x; cos=1.0, no capture
+        # deadlock). The maybe_execute_in_parallel join re-synchronizes the
+        # default stream onto q_b before forward_dsa_attn consumes q.
+        #
         # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
         # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
         # access to batch-specific metadata or the k cache. Returns q_scale
         # as a 5th element so the FP4 dispatch can forward it to the kernel;
         # the FP8 path ignores it in forward_dsa_attn.
-        q_fp8, k_fp8, k_scale, weights, q_scale = (
-            self.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
+        if (self._dsa_qb_overlap_enabled
+                and self.dsa_qb_stream is not None):
+            indexer_out, q = maybe_execute_in_parallel(
+                lambda: self.mqa.indexer.pre_indexer_proj(
+                    qr, hidden_states, position_ids),
+                lambda: self.q_b_proj(qr),
+                self.dsa_qb_events[0],
+                self.dsa_qb_events[1],
+                self.dsa_qb_stream,
+            )
+            q_fp8, k_fp8, k_scale, weights, q_scale = indexer_out
+        else:
+            q = self.q_b_proj(qr)
+            q_fp8, k_fp8, k_scale, weights, q_scale = (
+                self.mqa.indexer.pre_indexer_proj(qr, hidden_states,
+                                                  position_ids))
 
         return [
             q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,

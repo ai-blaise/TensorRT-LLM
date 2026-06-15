@@ -151,3 +151,158 @@ optimal). It's the **~65% inter-kernel overhead** — exactly what the validated
 flow, G9 cross-step persistence) target, but those are NOT yet wired into the live serving runtime. The other
 lever is SMC acceptance x draft-cost. **Both require the model/serve** (wire PDE control-flow into the live
 runtime + measure, or tune SMC vs live acceptance). No new op/backend-level no-serve serving win remains.
+
+## PDE-stack wiring audit ROUND 2 (2026-06-15): seam-level, what is JIT-tractable vs build/serve-gated
+
+Deeper pass than R1 (which wired only the G3 top-k hook). Located the REAL runtime seam for every
+PDE primitive and proved the gating empirically (proof image op-schema probe, GPU3 B200).
+
+### Empirical op inventory (proof image optrt-aaa7e2b542b2-...-20260613, blaise_perf/pde_directtest/pde2_opcheck.py)
+- topk ops present: indexer_topk_decode + cute_dsl_indexer_topk_decode -> G3 substitutes at BOTH the HISA
+  block top-k AND the final top-k (all 5 _indexer_topk_decode call-sites share the wrapper).
+- G4 hisparse hot chain: ALL 8 ops PRESENT (hisparse_topk_to_block_positions ... sparse_mla_decode_kvarn_hot).
+- G4 copy-overlap: hisparse_submit_packed_kvarn_copy_schedule PRESENT but does NOT advertise the overlap args
+  (overlap_copy_stream / copy_stream_handle ABSENT from the schema) -> _swap_in_overlap_args_supported()==False.
+- G9 cross-step: indexer_xstep_recency_patch PRESENT. G8: extract_real_draft_tokens_op PRESENT.
+
+### Per-primitive verdict
+- G3 device-control-flow top-k = JIT-tractable, WIRED (default-OFF, now prod-safe). Seam: dsa.py
+  _indexer_topk_decode (the chokepoint for all 5 top-k sites: block-topk 3085/3155, two-level 3475, from-logits
+  3561, final 4559) + the explicit _pde_g3_topk_active() branch at dsa.py:4552. R2 FIX: the G3 kernel stages
+  every score column in dynamic SMEM (cols*4 + 1KB); B200 optin cap ~227KB, so it FAILS the launch
+  (cudaErrorInvalidValue) above ~57.8K cols. R1 routed the FINAL top-k (prod padded width 132096) through G3 when
+  gated ON -> would hard-crash the live decode on enable. pde_g3_topk_decode now returns bool (False = SMEM over
+  cap, writes nothing) and the wrapper falls back to indexer_topk_decode. Gate-ON now recall=1.0 where G3 fits +
+  bit-exact prod-op fallback where it does not, at EVERY shape. Verified GPU3: C in {1032,8192,32768} -> G3
+  set==gold; C in {65536,132096} -> decline+fallback set==gold, no crash; gate-OFF==prodop unchanged. Real-import
+  test confirms the genuine site. (Still not a perf win in this capture-safe-cute image; win is C++-Scheme-X /
+  full indexer->topk->gather fusion = serve-gated.)
+- G4 het copy/compute overlap = ALREADY FULLY WIRED natively; BUILD-gated on ONE op signature. Seam:
+  hisparse.py submit_packed_kvarn_copy_schedule (2168, P1 per-step miss-DMA overlap) + prepare_hot_pool_overlapped
+  (2291, wide-window hoist) forked at attention.py:2956 forward_absorption_generation, deferred join consumed at
+  attention.py:2789. Gated by hisparse_overlap_swap_in (default ON) AND the C++ .so advertising
+  overlap_copy_stream/copy_stream_handle. The proof image op LACKS those args -> _swap_in_overlap_args_supported
+  ==False -> both P1 and the wide-window hoist fail-CLOSE to byte-identical serial. NOT JIT-wirable: the overlap
+  needs the copy-schedule op recompiled with the overlap-arg launch-stream signature (cpp/.../hisparse). All other
+  G4 chain ops are present, so the ONLY missing piece is that op variant. (Even wired, the overlap is only live
+  when HiSparse hot-pool serves -- not on the dense 345B decode path without the serve.)
+- G8 MTP device variable-accept-len loop = SERVE/BUILD-gated. Two host loops: drafting_loops.py:758
+  (SMCStaticParticleDraftingLoopWrapper.forward "for layer_idx in range(1, max_draft_len)" = gamma=6 FULL GLM-9B
+  forwards, each internally CUDA-graph captured) + smc.py:855 (SMCSampler._accept_selected_particle
+  "for depth in token_indices" = the accept walk). The accept side is intrinsically HOST/scheduler-resident (it
+  mutates LlmRequest python objects: add_new_token, _handle_stop_criteria, py_num_accepted...). The draft side is
+  already device-resident + graph-captured per forward with sync-free inter-forward glue (_host_draft_layout memo;
+  extract_real_draft_tokens_op CUDA-graph path; .item() only behind SMC_CUDA_SYNC_PROBE). A device-side
+  variable-accept-len LOOP = fusing the gamma graph replays into one persistent kernel that early-exits on a
+  device-resident accept decision -> needs the C++ engine (model forwards in-kernel) + the live model. No bit-exact
+  JIT hook exists.
+- G9 cross-step persistence = ALREADY has a runtime-level analog WIRED (config-gated, APPROXIMATE). Seam:
+  dsa.py cross-step Top-K reuse (_xstep_reuse_active 2644 / _xstep_reuse_decode 2662 / _xstep_store_decode 2714;
+  short-circuit at 4154; counter advance 4661). Persists the decode Top-K selection across index_topk_step_freq
+  steps and SKIPS the ~24us logits-MQA + Top-K recompute on reuse steps -- the application-level form of G9. Runs in
+  the non-graph-captured mla_dsa_attn_inplace eager region (why it is JIT-safe). Gated by index_topk_step_freq
+  (llm_args.py:329, default None=OFF) + index_topk_step_recency_patch (default OFF). It is NOT a bit-exact hook:
+  frozen reuse drops the newest up to (freq-1)*next_n positions (approximation budget); the recency patch op
+  restores them (indexer_xstep_recency_patch, present, jaccard=1.0 vs the old block) at a launch cost. So
+  G9-as-shipped is an accuracy/throughput LEVER, not a correctness-gated substitution; tuning it vs live
+  acceptance is serve-gated.
+
+### Net R2
+Only G3 is JIT-tractable as a default-OFF correctness-gated hook, and R2 made it prod-safe (SMEM guard;
+was a latent gate-ON crash at the prod final width). G4 is wired but build-gated on the single copy-schedule
+overlap-arg op variant (every other hot-pool op is present). G8 is serve/build-gated (draft = full-model
+graph replays; accept = host/scheduler-resident). G9 already has a config-gated approximate cross-step-reuse
+analog in the eager indexer region; the bit-exact device-resident form needs the engine. Harness:
+blaise_perf/pde_directtest/pde2_*.py. tip op-trt-pde-pdewire2.
+---
+
+## MISSED-OPTIMIZATIONS round (2026-06-15, op-trt-pde-missed2): two new wins + one rigorous serve-gated lever
+
+Directive: find decode optimizations the prior rounds MISSED — orthogonal/creative angles not on the
+"confirmed-optimal" map. Direct op/kernel tests at real prod shapes under CUDA-graph capture, B200 GPU4.
+Harnesses: blaise_perf/pde_directtest/missed2/.
+
+### WIN 1 (IMPLEMENTED, verified cos=1.0): q_b_proj || pre_indexer_proj on a DEDICATED stream
+
+The prior probe noted "the codebase already uses multi-stream" but did NOT find that the
+`forward_dsa_proj` (captured Op-1) seam runs `q_b_proj` (dense Q up-proj 1536->24576) and the indexer's
+`pre_indexer_proj` (wq_b 1536->8192 + fused wk/wp 7168->192 + fused_rope_cat quant) **serially on the
+default stream**, although they are mutually independent (both read qr/hidden_states read-only; neither
+writes the other's inputs).
+
+KEY FINDING — the dedicated stream is load-bearing: `pre_indexer_proj` ALREADY uses `self.aux_stream`
+(== the shared Attention aux stream, same object as the indexer's) for its internal q/k quant overlap.
+Reusing that aux stream for the q_b overlap makes the two overlaps contend and the GEMM-level win
+COLLAPSES. Measured under capture (cublaslt image, real shapes, full faithful Op-1 incl indexer inner
+overlap):
+
+| arrangement | M=1 | M=8 | M=32 | M=64 |
+|---|---|---|---|---|
+| q_b on SHARED aux (contends) | 0.980x | 0.971x | 0.997x | 1.000x |
+| **q_b on DEDICATED stream** | **1.160x** | **1.144x** | **1.153x** | **1.176x** |
+
+Pure proj-GEMM region (cublaslt, q_b||indexer GEMMs, no inner quant): serial 32.8us -> parallel 24.6us =
+**1.33x**, cos=1.00000. Full Op-1 (incl indexer inner overlap): serial 59.4us -> 51.2us = 1.16x @M=1.
+q_b (~12us cublaslt) is fully hidden behind the indexer-proj region (~47us) -> near-optimal; the result
+lands at ~indexer-alone time. cos=1.00000 serial-vs-parallel at every M=1..64; no CUDA-graph capture
+deadlock under the nested-stream pattern.
+
+Scope: DSA F-layers only (where the indexer runs). On S-layers (skip_topk) pre_indexer_proj returns dead
+buffers -> no GEMMs -> nothing to overlap (q_b kept serial, byte-identical). Short-MHA path also serial.
+With index_topk_freq=4 (~15 F-layers of 61): ~8us/F-layer x ~15 ~= 120us/step ~= 0.6% tok/s/user. Real,
+clean, deployable.
+
+Impl: `tensorrt_llm/_torch/modules/attention.py` — MLA.__init__ allocates `self.dsa_qb_stream` +
+`self.dsa_qb_events` (gated by `mqa is not None` and env); `forward_dsa_proj` overlaps via
+`maybe_execute_in_parallel(pre_indexer_proj [default], q_b_proj [dsa_qb_stream])`. Kill switch
+`TRTLLM_OPTRT_DSA_QB_OVERLAP=0`. Commit b4acac8e on op-trt-pde-missed2.
+Harness: missed2/qb_indexer_overlap.py, missed2/nested_overlap.py.
+
+### WIN 2 (IMPLEMENTED, log-only, zero numerical change): gate per-step SMC handoff logger.info
+
+`smc.py` `process_static_draft_outputs` emitted an unconditional 5-field f-string `logger.info` per
+request per draft-commit on the SMC decode hot path (fires even single-node where the pin fields are
+None). At INFO level (usually on in prod) that is host string-build + emit every step under the overlap
+scheduler. Gated behind `TRTLLM_OPTRT_SMC_DEBUG` (default off); the fail-closed pin VALIDATION is
+unchanged. Commit fe650edc. (Small host-overhead trim on the serve-gated SMC path; not a measured
+tok/s number — no draft model on node for direct timing.)
+
+### SERVE-GATED LEVER (rigorous, NOT shipped unverified): fuse the attn-INPUT gated-norm with NVFP4 quant
+
+The prior probe flagged "the attn-input seam is unfused (~1.1x, gate-compute-bound)" but did not pursue
+or quantify it. Decomposed here:
+
+- `modeling_deepseekv3.py` layer forward: the PRE-attention `input_gated_norm` (`_maybe_apply_gated_norm`)
+  outputs **bf16**; `self_attn -> forward_dsa_proj -> kv_a_proj_with_mqa(hidden_states)` then RE-quantizes
+  to swizzled NVFP4 inside its GEMM. The POST-attention path ALREADY fuses gate+quant
+  (`_apply_post_attention_gated_norm_quant_dense` -> `cute_lowrank_gate_quant_nvfp4_swizzled`, returns
+  (bf16, fp4)) — the INPUT path does not.
+- Refuting "gate-compute-bound": standalone fp4_quantize of [M,7168] is ~4.1us (measured), and the
+  existing post-attn fused kernel's own benchmark is 4.2us fused vs 7.0us unfused (gate+quant) = **~2.8us
+  saved/layer**. This applies to ALL 61 layers (input gate runs every layer) -> ~170us/step ~= **0.8%
+  tok/s/user** — LARGER than WIN 1 because it is not F-layer-gated.
+- Feasibility PROVEN: `Linear.forward` accepts `Fp4QuantizedTensor` input (linear.py:1391), so
+  `kv_a_proj_with_mqa(fp4)` works; the swizzled fused op exists in serving builds and is the same kernel
+  the dense-MLP post-attn handoff already uses.
+- Complication (why it's a real change, not a one-liner): `forward_dsa_proj` consumes `hidden_states`
+  TWICE — `kv_a_proj_with_mqa` (wants fp4) AND `indexer.pre_indexer_proj` (needs bf16 + dynamic amax).
+  The fused op returns BOTH (bf16, fp4); the plumbing must thread the fp4 through
+  `self_attn.forward -> forward_impl_with_dsa -> forward_dsa_proj` while keeping bf16 for the indexer.
+
+NOT shipped here: the cute lowrank gate kernels (`cute_lowrank_gate_quant_nvfp4*`) are ABSENT from both
+direct-test images, so the fused kernel's correctness (cos=1.0) CANNOT be verified on this node, and the
+signature change is invasive. Per "a plausible-but-unverified win is not valuable," this is documented as
+a high-confidence serve-gated lever (seam + feasibility + win estimate all proven) for implementation +
+validation in a real serving build, NOT committed as unverified plumbing.
+SEAM: `modeling_deepseekv3.py` DeepseekV3DecoderLayer.forward (input gated norm) + attention.py
+forward_dsa_proj kv_a_proj input. NEED: serving build with the cute swizzled gate kernel + a real-model
+forward to confirm bit-exactness and the per-layer delta.
+
+### Rigorously-confirmed NEGATIVES this round
+- q_b overlap on the SHARED Attention aux stream: 0.97-1.00x (NO win) — contends with the indexer's
+  existing internal q/k quant overlap. The dedicated stream is mandatory.
+- Extending the overlap to also cover kv_a_proj: no headroom — kv_a_proj is the dependency ROOT that
+  feeds BOTH the dense and indexer paths; q_b is already fully hidden behind the indexer region, so the
+  Op-1 floor is ~max(kv_a + q_b, kv_a + indexer) which the current overlap already reaches.
+- proof image (no-cublaslt) dense NVFP4 GEMM is ~2x the cublaslt-image cost (35-47us vs 15-31us),
+  re-confirming the headline "restore cublaslt in serving builds" lever from the other direction.
