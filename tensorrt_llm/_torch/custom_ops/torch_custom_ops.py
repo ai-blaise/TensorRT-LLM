@@ -939,12 +939,25 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Prefer cutlass as fallback if available, otherwise use first valid backend
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
-            tactic = ("cutlass",
-                      -1) if "cutlass" in self.allowed_backends else (
-                          self.allowed_backends[0], -1)
+            # The autotuner only tunes the max-token (prefill) shape during
+            # warmup (_run_autotuner_warmup runs a single forward at
+            # curr_max_num_tokens); decode shapes (small M) are never profiled,
+            # so they hit this fallback every step. The historical fallback was
+            # always CUTLASS's generic kernel, which is ~1.5x slower than
+            # cuBLASLt for un-tuned small-M NVFP4 GEMMs — notably the fused
+            # qkv_a projection (M=1, N=2112, N%128=64) that CUTLASS tiles
+            # poorly. Prefer cuBLASLt's heuristic in the decode regime; keep
+            # CUTLASS for larger M (its historical, prefill-tuned default).
+            m = inputs[0].shape[0]
+            if m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION and \
+                    "cublaslt" in self.allowed_backends:
+                tactic = ("cublaslt", -1)
+            elif "cutlass" in self.allowed_backends:
+                tactic = ("cutlass", -1)
+            else:
+                tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
         if backend == "cuda_core":
