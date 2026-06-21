@@ -209,6 +209,12 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_gate_gemm_op")
+    def _(mat_a, weight):
+        shape = list(mat_a.shape)
+        shape[-1] = weight.shape[0]
+        return mat_a.new_empty(shape, dtype=mat_a.dtype)
+
     @torch.library.register_fake("trtllm::fp4_gemm")
     def _(
         mat1: torch.Tensor,
@@ -623,7 +629,10 @@ def _register_fake():
         output_allocation_count: int,
         ep_rank: int,
         ep_size: int,
-        need_zero_output: Optional[List[bool]],
+        need_zero_output: Optional[List[bool]] = None,
+        use_low_precision: Optional[bool] = None,
+        token_selected_slots_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
     ):
         outputs = []
         for input_tensor in inputs:
@@ -1388,6 +1397,21 @@ def _register_fake():
         # input: 2D tensor [M, N] (bf16 or fp16)
         # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
         # output_sf: swizzled scale factors
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf
+
+    @torch.library.register_fake(
+        "trtllm::fused_sigmoid_mul_quant_nvfp4_swizzled")
+    def _(
+        input: torch.Tensor,
+        gate: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del gate, sf_scale
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, is_swizzled_layout=True)
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)

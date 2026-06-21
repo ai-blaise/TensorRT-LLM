@@ -7,6 +7,8 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -356,6 +358,162 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
+
+    @triton.jit
+    def _splitk_reduce_bf16_kernel(
+        partial,
+        output,
+        total: tl.constexpr,
+        split_k: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        mask = offsets < total
+        acc = tl.zeros((block, ), dtype=tl.float32)
+        for split_idx in tl.static_range(0, split_k):
+            values = tl.load(partial + split_idx * total + offsets,
+                             mask=mask,
+                             other=0.0)
+            acc += values.to(tl.float32)
+        tl.store(output + offsets, acc, mask=mask)
+
+    def _splitk_reduce_bf16(partial: torch.Tensor,
+                            output: torch.Tensor) -> None:
+        if partial.dim() != 3 or output.dim() != 2:
+            raise ValueError("split-K reduction expects partial [S,M,N] and output [M,N].")
+        if partial.shape[1:] != output.shape:
+            raise ValueError("split-K partial/output shape mismatch.")
+        if partial.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+            raise ValueError("split-K reduction currently supports BF16 only.")
+        if not partial.is_contiguous() or not output.is_contiguous():
+            raise ValueError("split-K reduction expects contiguous tensors.")
+
+        total = output.numel()
+        split_k = partial.shape[0]
+        block = 256
+        grid = (triton.cdiv(total, block), )
+        _splitk_reduce_bf16_kernel[grid](partial,
+                                         output,
+                                         total,
+                                         split_k,
+                                         block,
+                                         num_warps=8)
+
+    def _nvfp4_splitk_parse_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        normalized = raw.strip().lower()
+        if normalized in ("1", "true", "yes", "y", "on"):
+            return True
+        if normalized in ("0", "false", "no", "n", "off"):
+            return False
+        raise ValueError(f"Invalid boolean env value {name}={raw!r}")
+
+    def _nvfp4_splitk_tactic_from_env(
+    ) -> Tuple[Tuple[int, int], Tuple[int, int], bool]:
+        try:
+            tile_m = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_TILE_M",
+                                        "128"))
+            tile_n = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_TILE_N",
+                                        "128"))
+            cluster_m = int(
+                os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_CLUSTER_M", "1"))
+            cluster_n = int(
+                os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_CLUSTER_N", "1"))
+            use_prefetch = os.environ.get(
+                "TRTLLM_NVFP4_GEMM_SPLITK_PREFETCH", "0").strip().lower()
+            if use_prefetch not in ("0", "1", "false", "true", "off",
+                                    "on", "no", "yes"):
+                raise ValueError("invalid prefetch flag")
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid TRTLLM_NVFP4_GEMM_SPLITK tactic env value") from exc
+
+        if min(tile_m, tile_n, cluster_m, cluster_n) <= 0:
+            raise ValueError(
+                "Invalid non-positive TRTLLM_NVFP4_GEMM_SPLITK tactic env value"
+            )
+        return ((tile_m, tile_n), (cluster_m, cluster_n),
+                use_prefetch in ("1", "true", "on", "yes"))
+
+    def _nvfp4_splitk_temp_buffer(shape: List[int], dtype: torch.dtype,
+                                  buffer_name: str,
+                                  device: torch.device) -> torch.Tensor:
+        try:
+            return get_memory_buffers().get_buffer(shape, dtype, buffer_name,
+                                                   False)
+        except Exception as exc:
+            logger.debug(
+                f"Falling back to direct allocation for {buffer_name}: {exc}")
+            return torch.empty(shape, dtype=dtype, device=device)
+
+    def _copy_nvfp4_fp4_splitk_l(
+        tensor: torch.Tensor,
+        split_k: int,
+        buffer_name: Optional[str] = None,
+    ) -> torch.Tensor:
+        if tensor.dim() != 2:
+            raise ValueError(
+                f"split-K FP4 pack expects a 2D tensor, got dim={tensor.dim()}"
+            )
+        rows, packed_k = tensor.shape
+        if packed_k % split_k != 0:
+            raise ValueError(
+                f"split-K FP4 pack requires divisible packed K, got packed_k={packed_k}, split={split_k}"
+            )
+        chunk_packed_k = packed_k // split_k
+        out_shape = [split_k, rows, chunk_packed_k]
+        if buffer_name is None:
+            out = tensor.new_empty(out_shape)
+        else:
+            out = _nvfp4_splitk_temp_buffer(out_shape, tensor.dtype,
+                                            buffer_name, tensor.device)
+        source = tensor.reshape(rows, split_k,
+                                chunk_packed_k).permute(1, 0, 2)
+        out.copy_(source)
+        return out
+
+    def _copy_nvfp4_swizzled_sf_splitk_l(
+        sf_tensor: torch.Tensor,
+        rows: int,
+        real_k: int,
+        split_k: int,
+        buffer_name: Optional[str] = None,
+    ) -> torch.Tensor:
+        sf_vec_size = 16
+        if real_k % split_k != 0:
+            raise ValueError(
+                f"split-K SF pack requires divisible K, got K={real_k}, split={split_k}"
+            )
+        sf_rows = pad_up(rows, 128)
+        full_sf_k = pad_up(real_k // sf_vec_size, 4)
+        chunk_real_k = real_k // split_k
+        chunk_sf_k = pad_up(chunk_real_k // sf_vec_size, 4)
+        if full_sf_k != chunk_sf_k * split_k:
+            raise ValueError(
+                f"split-K SF pack requires equal padded chunks, got full_sf_k={full_sf_k}, chunk_sf_k={chunk_sf_k}, split={split_k}"
+            )
+        expected_size = sf_rows * full_sf_k
+        if sf_tensor.numel() != expected_size:
+            raise ValueError(
+                f"split-K SF pack size mismatch. Expected {expected_size}, got {sf_tensor.numel()}"
+            )
+
+        row_groups = sf_rows // 128
+        chunk_sf_groups = chunk_sf_k // 4
+        out_shape = [split_k, sf_rows * chunk_sf_k]
+        if buffer_name is None:
+            out = sf_tensor.new_empty(out_shape)
+        else:
+            out = _nvfp4_splitk_temp_buffer(out_shape, sf_tensor.dtype,
+                                            buffer_name, sf_tensor.device)
+
+        source = sf_tensor.reshape(
+            row_groups, split_k, chunk_sf_groups,
+            512).permute(1, 0, 2, 3)
+        out.reshape(split_k, row_groups, chunk_sf_groups, 512).copy_(source)
+        return out
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
@@ -848,6 +1006,711 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # output is fixed as bf16
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
+
+    class CuteDSLNVFP4SplitKBlackwellRunner(TunableRunner):
+        """Narrow split-K runner for small-M/large-K NVFP4 projections."""
+
+        kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
+        kernel_cache = dict()
+        packed_weight_cache = dict()
+
+        def __init__(
+            self,
+            output_dtype: torch.dtype,
+            output_buffer_kind: int = int(BufferKind.DEFAULT),
+            group: Optional[List[int]] = None,
+            split_k: int = 2,
+            atomic_reduce: bool = False,
+            mma_tiler_mn: Tuple[int, int] = (128, 128),
+            cluster_shape_mn: Tuple[int, int] = (1, 1),
+            use_prefetch: bool = False,
+            packed_l: bool = False,
+        ):
+            super().__init__()
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL split-K NVFP4 only supports bfloat16 output, got {output_dtype}"
+                )
+            self.output_dtype = output_dtype
+            self.output_buffer_kind = int(output_buffer_kind)
+            self.group = group
+            self.split_k = int(split_k)
+            self.atomic_reduce = bool(atomic_reduce)
+            self.mma_tiler_mn = mma_tiler_mn
+            self.cluster_shape_mn = cluster_shape_mn
+            self.use_prefetch = use_prefetch
+            self.packed_l = bool(packed_l)
+
+        def unique_id(self):
+            return (
+                self.output_dtype,
+                self.output_buffer_kind,
+                tuple(self.group) if self.group is not None else None,
+                self.split_k,
+                self.atomic_reduce,
+                self.mma_tiler_mn,
+                self.cluster_shape_mn,
+                self.use_prefetch,
+                self.packed_l,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            return [0]
+
+        @classmethod
+        def _get_packed_weight(
+            cls,
+            b_tensor: torch.Tensor,
+            b_sf_tensor: torch.Tensor,
+            n: int,
+            real_k: int,
+            split_k: int,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            cache_key = (
+                b_tensor.data_ptr(),
+                b_sf_tensor.data_ptr(),
+                b_tensor.device.index,
+                b_tensor.dtype,
+                b_sf_tensor.dtype,
+                tuple(b_tensor.shape),
+                b_sf_tensor.numel(),
+                split_k,
+            )
+            cached = cls.packed_weight_cache.get(cache_key)
+            if cached is not None:
+                _, _, b_packed, b_sf_packed = cached
+                return b_packed, b_sf_packed
+
+            b_packed = _copy_nvfp4_fp4_splitk_l(b_tensor, split_k)
+            b_sf_packed = _copy_nvfp4_swizzled_sf_splitk_l(
+                b_sf_tensor, n, real_k, split_k)
+            cls.packed_weight_cache[cache_key] = (
+                b_tensor, b_sf_tensor, b_packed, b_sf_packed)
+            return b_packed, b_sf_packed
+
+        def _forward_packed_l(
+            self,
+            a_tensor: torch.Tensor,
+            b_tensor: torch.Tensor,
+            a_sf_tensor: torch.Tensor,
+            b_sf_tensor: torch.Tensor,
+            alpha_tensor: torch.Tensor,
+            m: int,
+            n: int,
+            real_k: int,
+            sf_m: int,
+            sf_n: int,
+            sf_k: int,
+            c_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            if self.atomic_reduce:
+                raise ValueError("Packed split-K does not support atomic reduce.")
+
+            chunk_real_k = real_k // self.split_k
+            chunk_sf_k = pad_up(chunk_real_k // 16, 4)
+            if sf_k != chunk_sf_k * self.split_k:
+                raise ValueError(
+                    f"Packed split-K requires equal padded scale chunks, got sf_k={sf_k}, chunk_sf_k={chunk_sf_k}, split={self.split_k}"
+                )
+
+            a_packed = _copy_nvfp4_fp4_splitk_l(
+                a_tensor, self.split_k, "nvfp4_splitk_l_act_fp4")
+            a_sf_packed = _copy_nvfp4_swizzled_sf_splitk_l(
+                a_sf_tensor, m, real_k, self.split_k,
+                "nvfp4_splitk_l_act_sf")
+            b_packed, b_sf_packed = self._get_packed_weight(
+                b_tensor, b_sf_tensor, n, real_k, self.split_k)
+            partial = _nvfp4_splitk_temp_buffer(
+                [self.split_k, m, n], self.output_dtype,
+                "nvfp4_splitk_l_partial", a_tensor.device)
+
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a_packed.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b_packed.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf_packed.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf_packed.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            c_ptr = make_ptr(cutlass.BFloat16,
+                             partial.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            cache_key = (
+                "packed_l",
+                16,
+                self.mma_tiler_mn,
+                self.cluster_shape_mn,
+                self.use_prefetch,
+                self.split_k,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    16,
+                    self.mma_tiler_mn,
+                    self.cluster_shape_mn,
+                    self.use_prefetch,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    chunk_real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    chunk_sf_k // 4,
+                    self.split_k,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    False,
+                    options="--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(
+                m,
+                n,
+                chunk_real_k,
+                sf_m // 128,
+                sf_n // 128,
+                chunk_sf_k // 4,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_cute_tensor,
+                stream,
+            )
+            _splitk_reduce_bf16(partial, c_tensor)
+            return c_tensor
+
+        def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
+            sf_vec_size = 16
+            m = a_tensor.shape[0]
+            n = b_tensor.shape[0]
+            real_k = a_tensor.shape[1] * 2
+
+            if self.split_k <= 1 or real_k % self.split_k != 0:
+                raise ValueError(
+                    f"CuteDSL split-K requires split_k>1 and divisible K, got K={real_k}, split={self.split_k}"
+                )
+
+            sf_m = pad_up(m, 128)
+            sf_n = pad_up(n, 128)
+            sf_k = pad_up(real_k // sf_vec_size, 4)
+            expected_a_sf_size = sf_m * sf_k
+            expected_b_sf_size = sf_n * sf_k
+            if a_sf_tensor.numel() != expected_a_sf_size:
+                raise ValueError(
+                    f"CuteDSL split-K act scale size mismatch. Expected {expected_a_sf_size}, got {a_sf_tensor.numel()}"
+                )
+            if b_sf_tensor.numel() != expected_b_sf_size:
+                raise ValueError(
+                    f"CuteDSL split-K weight scale size mismatch. Expected {expected_b_sf_size}, got {b_sf_tensor.numel()}"
+                )
+            if alpha_tensor.numel() != 1:
+                raise ValueError(
+                    f"CuteDSL split-K alpha size mismatch. Expected 1, got {alpha_tensor.numel()}"
+                )
+
+            a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+            b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
+            c_tensor, _ = torch.ops.trtllm.allocate_output(
+                a_tensor, self.output_buffer_kind, self.group, [m, n],
+                self.output_dtype)
+            if not c_tensor.is_contiguous():
+                raise ValueError(
+                    "CuteDSL split-K reduction requires contiguous output, "
+                    f"got strides={c_tensor.stride()}")
+            if self.packed_l:
+                return self._forward_packed_l(a_tensor, b_tensor, a_sf_tensor,
+                                              b_sf_tensor, alpha_tensor, m, n,
+                                              real_k, sf_m, sf_n, sf_k,
+                                              c_tensor)
+            if self.atomic_reduce:
+                c_tensor.zero_()
+                c_ptr_tensor = c_tensor
+            else:
+                partial = torch.empty((self.split_k, m, n),
+                                      dtype=self.output_dtype,
+                                      device=a_tensor.device)
+                c_ptr_tensor = partial
+
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf_tensor.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf_tensor.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            c_ptr = make_ptr(cutlass.BFloat16,
+                             c_ptr_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            cache_key = (
+                sf_vec_size,
+                self.mma_tiler_mn,
+                self.cluster_shape_mn,
+                self.use_prefetch,
+                self.split_k,
+                self.atomic_reduce,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    sf_vec_size,
+                    self.mma_tiler_mn,
+                    self.cluster_shape_mn,
+                    self.use_prefetch,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_splitk_atomic
+                    if self.atomic_reduce else gemm.wrapper_splitk,
+                    m,
+                    n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    self.split_k,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    options="--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(
+                m,
+                n,
+                real_k,
+                sf_m // 128,
+                sf_n // 128,
+                sf_k // 4,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_cute_tensor,
+                stream,
+            )
+            if not self.atomic_reduce:
+                _splitk_reduce_bf16(partial, c_tensor)
+            return c_tensor
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_gemm_splitk_blackwell",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def cute_dsl_nvfp4_gemm_splitk_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
+        group: Optional[List[int]] = None,
+        split_k: int = 2,
+        atomic_reduce: bool = False,
+    ) -> torch.Tensor:
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL split-K NVFP4 backend requires SM 100 or SM 103, got SM {sm_version}."
+            )
+        mma_tiler_mn, cluster_shape_mn, use_prefetch = (
+            _nvfp4_splitk_tactic_from_env())
+        packed_l = _nvfp4_splitk_parse_bool(
+            "TRTLLM_NVFP4_GEMM_SPLITK_PACKED", False)
+        runner = CuteDSLNVFP4SplitKBlackwellRunner(
+            output_dtype,
+            output_buffer_kind,
+            group,
+            split_k=split_k,
+            atomic_reduce=atomic_reduce,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            use_prefetch=use_prefetch,
+            packed_l=packed_l,
+        )
+        return runner.forward(
+            [input, weight, input_scale, weight_scale, alpha])
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_gemm_splitk_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
+        group: Optional[List[int]] = None,
+        split_k: int = 2,
+        atomic_reduce: bool = False,
+    ):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-2]
+        return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+    class CuteDSLNVFP4QbWqBVariableNBlackwellRunner(TunableRunner):
+        """L=2 same-A q_b/wq_b runner using variable-N dense persistence."""
+
+        kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
+        kernel_cache = dict()
+
+        def __init__(
+            self,
+            qb_out: int,
+            wq_out: int,
+            output_dtype: torch.dtype,
+            output_buffer_kind: int = int(BufferKind.DEFAULT),
+            group: Optional[List[int]] = None,
+            mma_tiler_mn: Tuple[int, int] = (128, 256),
+            cluster_shape_mn: Tuple[int, int] = (1, 2),
+            use_prefetch: bool = False,
+        ):
+            super().__init__()
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b variable-N only supports bfloat16 output, got {output_dtype}"
+                )
+            self.qb_out = int(qb_out)
+            self.wq_out = int(wq_out)
+            self.output_dtype = output_dtype
+            self.output_buffer_kind = int(output_buffer_kind)
+            self.group = group
+            self.mma_tiler_mn = mma_tiler_mn
+            self.cluster_shape_mn = cluster_shape_mn
+            self.use_prefetch = use_prefetch
+
+        def unique_id(self):
+            return (
+                self.qb_out,
+                self.wq_out,
+                self.output_dtype,
+                self.output_buffer_kind,
+                tuple(self.group) if self.group is not None else None,
+                self.mma_tiler_mn,
+                self.cluster_shape_mn,
+                self.use_prefetch,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    inputs: List[torch.Tensor],
+                    tactic: int = 0) -> torch.Tensor:
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs[:5]
+            output_tensor = inputs[5] if len(inputs) > 5 else None
+            sf_vec_size = 16
+            m = a_tensor.shape[0]
+            real_k = a_tensor.shape[1] * 2
+            n_max = self.qb_out
+            n_l1 = self.wq_out
+
+            if b_tensor.shape[0] != self.qb_out + self.wq_out:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b variable-N expected fused weight rows "
+                    f"{self.qb_out + self.wq_out}, got {b_tensor.shape[0]}")
+            if not b_tensor.is_contiguous():
+                raise ValueError("CuteDSL q_b/wq_b fused weight must be contiguous")
+            if not b_sf_tensor.is_contiguous():
+                raise ValueError(
+                    "CuteDSL q_b/wq_b fused weight scale must be contiguous")
+            if self.qb_out < self.wq_out:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b variable-N expects qb_out>=wq_out, got {self.qb_out}<{self.wq_out}"
+                )
+            if self.wq_out % self.mma_tiler_mn[1] != 0:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b variable-N requires wq_out divisible by tile_n={self.mma_tiler_mn[1]}, got {self.wq_out}"
+                )
+
+            sf_m = pad_up(m, 128)
+            sf_k = pad_up(real_k // sf_vec_size, 4)
+            sf_n_qb = pad_up(self.qb_out, 128)
+            sf_n_wq = pad_up(self.wq_out, 128)
+            expected_a_sf_size = sf_m * sf_k
+            expected_b_sf_size = (sf_n_qb + sf_n_wq) * sf_k
+            if a_sf_tensor.numel() != expected_a_sf_size:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b act scale size mismatch. Expected {expected_a_sf_size}, got {a_sf_tensor.numel()}"
+                )
+            if b_sf_tensor.numel() != expected_b_sf_size:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b weight scale size mismatch. Expected {expected_b_sf_size}, got {b_sf_tensor.numel()}"
+                )
+            if alpha_tensor.numel() != 1:
+                raise ValueError(
+                    f"CuteDSL q_b/wq_b alpha size mismatch. Expected 1, got {alpha_tensor.numel()}"
+                )
+
+            a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+            b_sf_tensor = b_sf_tensor.reshape((sf_n_qb + sf_n_wq) * sf_k)
+            if output_tensor is None:
+                c_tensor, _ = torch.ops.trtllm.allocate_output(
+                    a_tensor, self.output_buffer_kind, self.group,
+                    [2, m, n_max], self.output_dtype)
+            else:
+                expected_shape = (2, m, n_max)
+                if tuple(output_tensor.shape) != expected_shape:
+                    raise ValueError(
+                        f"CuteDSL q_b/wq_b output shape mismatch. Expected {expected_shape}, got {tuple(output_tensor.shape)}"
+                    )
+                if output_tensor.dtype != self.output_dtype:
+                    raise ValueError(
+                        f"CuteDSL q_b/wq_b output dtype mismatch. Expected {self.output_dtype}, got {output_tensor.dtype}"
+                    )
+                c_tensor = output_tensor
+            if not c_tensor.is_contiguous():
+                raise ValueError(
+                    "CuteDSL q_b/wq_b variable-N requires contiguous output, "
+                    f"got strides={c_tensor.stride()}")
+
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf_tensor.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf_tensor.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            c_ptr = make_ptr(cutlass.BFloat16,
+                             c_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            cache_key = (
+                sf_vec_size,
+                self.qb_out,
+                self.wq_out,
+                self.mma_tiler_mn,
+                self.cluster_shape_mn,
+                self.use_prefetch,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    sf_vec_size,
+                    self.mma_tiler_mn,
+                    self.cluster_shape_mn,
+                    self.use_prefetch,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_variable_n_l1,
+                    m,
+                    n_max,
+                    n_l1,
+                    real_k,
+                    sf_m // 128,
+                    sf_n_qb // 128,
+                    sf_k // 4,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    options="--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(
+                m,
+                n_max,
+                real_k,
+                sf_m // 128,
+                sf_n_qb // 128,
+                sf_k // 4,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_cute_tensor,
+                stream,
+            )
+            return c_tensor
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_qb_wqb_gemm_blackwell",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def cute_dsl_nvfp4_qb_wqb_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        qb_out: int,
+        wq_out: int,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
+        group: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL q_b/wq_b variable-N backend requires SM 100 or SM 103, got SM {sm_version}."
+            )
+        runner = CuteDSLNVFP4QbWqBVariableNBlackwellRunner(
+            qb_out,
+            wq_out,
+            output_dtype,
+            output_buffer_kind,
+            group,
+            mma_tiler_mn=(128, 256),
+            cluster_shape_mn=(1, 2),
+            use_prefetch=False,
+        )
+        return runner.forward([input, weight, input_scale, weight_scale, alpha])
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out",
+        mutates_args=("output", ),
+        device_types="cuda",
+    )
+    def cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        qb_out: int,
+        wq_out: int,
+        output_dtype: torch.dtype,
+    ) -> None:
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL q_b/wq_b variable-N backend requires SM 100 or SM 103, got SM {sm_version}."
+            )
+        runner = CuteDSLNVFP4QbWqBVariableNBlackwellRunner(
+            qb_out,
+            wq_out,
+            output_dtype,
+            mma_tiler_mn=(128, 256),
+            cluster_shape_mn=(1, 2),
+            use_prefetch=False,
+        )
+        runner.forward(
+            [input, weight, input_scale, weight_scale, alpha, output])
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_qb_wqb_gemm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        qb_out: int,
+        wq_out: int,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
+        group: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        return mat_a.new_empty((2, mat_a.size(0), qb_out),
+                               dtype=torch.bfloat16)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        qb_out: int,
+        wq_out: int,
+        output_dtype: torch.dtype,
+    ) -> None:
+        expected_shape = (2, mat_a.size(0), qb_out)
+        assert tuple(output.shape) == expected_shape
+        assert output.dtype == torch.bfloat16
 
     class CuteDSLNVFP4SwigluBlackwellRunner(TunableRunner):
         """Runner for dense GEMM + SwiGLU fusion on Blackwell GPUs using CuteDSL.
@@ -6518,6 +7381,150 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (
             batch_size, m, n), "CuTe DSL bf16 bmm output shape is incorrect"
 
+    _bf16_gate_lbatch_cache = dict()
+
+    @torch.library.custom_op("trtllm::cute_dsl_bf16_gate_lbatch_blackwell",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_bf16_gate_lbatch_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        use_2cta_instrs: bool = False,
+        tile_m: int = 64,
+        tile_n: int = 64,
+        cluster_m: int = 1,
+        cluster_n: int = 1,
+    ) -> None:
+        """Compute the two equal BF16 MLA gate halves in one persistent launch.
+
+        input:  [M, K]
+        weight: [2N, K], first N rows are half 0 and second N rows half 1
+        output: [M, 2N], written in the same layout as two torch.mm(out=...)
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL BF16 gate lbatch only supports SM 100 family.")
+        if input.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+            raise ValueError("BF16 gate lbatch requires bf16 input/weight.")
+        if output.dtype != torch.bfloat16:
+            raise ValueError("BF16 gate lbatch requires bf16 output.")
+        if input.dim() != 2 or weight.dim() != 2 or output.dim() != 2:
+            raise ValueError("BF16 gate lbatch expects 2D input/weight/output.")
+
+        m, k = input.shape
+        two_n, weight_k = weight.shape
+        if weight_k != k or two_n % 2:
+            raise ValueError("weight must have shape [2N, K] matching input K.")
+        n = two_n // 2
+        if output.shape != (m, two_n):
+            raise ValueError("output must have shape [M, 2N].")
+        if input.stride(-1) != 1:
+            input = input.contiguous()
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+        if not output.is_contiguous():
+            raise ValueError("BF16 gate lbatch output must be contiguous.")
+
+        mma_tiler_mn = (tile_m, tile_n)
+        cluster_shape_mn = (cluster_m, cluster_n)
+        batch_size = 2
+        if not PersistentDenseGemmKernel.can_implement(
+                cutlass.BFloat16,
+                cutlass.Float32,
+                cutlass.BFloat16,
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                m,
+                n,
+                k,
+                batch_size,
+                "k",
+                "k",
+                "n",
+        ):
+            raise ValueError(
+                "PersistentDenseGemmKernel cannot implement BF16 gate lbatch "
+                f"shape M={m}, N={n}, K={k}, tactic="
+                f"{use_2cta_instrs},{mma_tiler_mn},{cluster_shape_mn}.")
+
+        c_view = torch.as_strided(output, (m, n, batch_size),
+                                  (output.stride(0), output.stride(1), n))
+        a_ptr = make_ptr(cutlass.BFloat16,
+                         input.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16)
+        b_ptr = make_ptr(cutlass.BFloat16,
+                         weight.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16)
+        c_tensor = cute.runtime.from_dlpack(c_view).mark_layout_dynamic(
+            leading_dim=1)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
+                     output.dtype)
+        if cache_key not in _bf16_gate_lbatch_cache:
+            gemm = PersistentDenseGemmKernel(
+                cutlass.Float32,
+                use_2cta_instrs=use_2cta_instrs,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+            )
+            hardware_info = cutlass.utils.HardwareInfo()
+            max_active_clusters = hardware_info.get_max_active_clusters(
+                cluster_m * cluster_n)
+            _bf16_gate_lbatch_cache[cache_key] = cute.compile(
+                gemm.wrapper_strided,
+                m,
+                n,
+                k,
+                batch_size,
+                a_ptr,
+                b_ptr,
+                c_tensor,
+                input.stride(0),
+                0,
+                max_active_clusters=max_active_clusters,
+                stream=stream,
+                options="--opt-level 2",
+            )
+
+        compiled_gemm = _bf16_gate_lbatch_cache[cache_key]
+        compiled_gemm(
+            m,
+            n,
+            k,
+            batch_size,
+            a_ptr,
+            b_ptr,
+            c_tensor,
+            input.stride(0),
+            0,
+            stream=stream,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_bf16_gate_lbatch_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        use_2cta_instrs: bool = False,
+        tile_m: int = 64,
+        tile_n: int = 64,
+        cluster_m: int = 1,
+        cluster_n: int = 1,
+    ) -> None:
+        assert input.dtype == torch.bfloat16
+        assert weight.dtype == torch.bfloat16
+        assert output.dtype == torch.bfloat16
+        assert input.dim() == 2 and weight.dim() == 2 and output.dim() == 2
+        assert weight.shape[0] % 2 == 0
+        assert input.shape[1] == weight.shape[1]
+        assert output.shape == (input.shape[0], weight.shape[0])
+
     # ======================================================================
     # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
     # ======================================================================
@@ -6570,7 +7577,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             c_major = "n"
 
             use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            mma_tiler_mn_candi = [(64, 64), (64, 128), (128, 128),
+                                  (256, 128)]
             cluster_shape_mn_candi = [
                 (1, 1),
                 (1, 2),

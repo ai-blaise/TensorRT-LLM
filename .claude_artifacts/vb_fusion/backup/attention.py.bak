@@ -2,7 +2,7 @@ import functools
 import math
 import os
 import weakref
-from typing import List, Optional, Tuple, Union, cast
+from typing import List, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -22,8 +22,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata, _FusedKvAWkWpNvfp4, _FusedQbWqBNvfp4,
-    _hoist_sparse_mla_meta_enabled,
+    DSAtrtllmAttentionMetadata, _hoist_sparse_mla_meta_enabled,
     transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
@@ -33,9 +32,7 @@ from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, maybe_compiled_cat,
                      maybe_compiled_copy_)
-from .fused_lowrank_gate import (apply_fused_sigmoid_mul_quant_nvfp4_swizzled,
-                                 sigmoid_mul_quant_nvfp4_supported,
-                                 sigmoid_mul_supported)
+from .fused_lowrank_gate import sigmoid_mul_supported
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -1059,44 +1056,6 @@ def mla_dsa_proj(
     return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
 
 
-_PREKV_FP4_MIN_ROWS = int(
-    os.environ.get("TRTLLM_OPTRT_GATED_PREKV_QUANT_MIN_M", "2"))
-
-
-def _prekv_fp4_rows_supported(hidden_states: torch.Tensor) -> bool:
-    if hidden_states.dim() == 0:
-        return False
-    rows = hidden_states.numel() // hidden_states.shape[-1]
-    return rows >= _PREKV_FP4_MIN_ROWS
-
-
-def _prekv_fp4_payload_supported(hidden_states_fp4: torch.Tensor) -> bool:
-    if hidden_states_fp4.dim() == 0:
-        return False
-    return hidden_states_fp4.shape[0] >= _PREKV_FP4_MIN_ROWS
-
-
-@torch.library.custom_op("trtllm::mla_dsa_proj_with_fp4", mutates_args=())
-def mla_dsa_proj_with_fp4(
-    hidden_states: torch.Tensor,
-    hidden_states_fp4: torch.Tensor,
-    hidden_states_sf: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    """DSA MLA projection with a pre-quantized kv_a input."""
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    if not _prekv_fp4_payload_supported(hidden_states_fp4):
-        return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
-    kv_proj_input = Fp4QuantizedTensor(hidden_states_fp4,
-                                       hidden_states_sf,
-                                       is_sf_swizzled=True)
-    return mla_layer.forward_dsa_proj(position_ids,
-                                      hidden_states,
-                                      metadata,
-                                      kv_proj_input=kv_proj_input)
-
-
 @mla_dsa_proj.register_fake
 def _mla_dsa_proj_fake(
     hidden_states: torch.Tensor,
@@ -1145,17 +1104,6 @@ def _mla_dsa_proj_fake(
         q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights,
         q_scale
     ]
-
-
-@mla_dsa_proj_with_fp4.register_fake
-def _mla_dsa_proj_with_fp4_fake(
-    hidden_states: torch.Tensor,
-    hidden_states_fp4: torch.Tensor,
-    hidden_states_sf: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    return _mla_dsa_proj_fake(hidden_states, position_ids, layer_idx)
 
 
 @torch.library.custom_op("trtllm::mla_dsa_attn_inplace",
@@ -1231,28 +1179,6 @@ _gate_overlap_stream_singleton: Optional[torch.cuda.Stream] = None
 _GATE_OVERLAP_ENABLED = os.environ.get("TRTLLM_OPTRT_MLA_GATE_OVERLAP",
                                        "1") != "0"
 
-_GATE_CUTEDSL_BF16_MODE = os.environ.get(
-    "TRTLLM_OPTRT_MLA_GATE_CUTEDSL_BF16", "").strip().lower()
-
-_GATE_CUTEDSL_BF16_LBATCH_ENABLED = os.environ.get(
-    "TRTLLM_OPTRT_MLA_GATE_CUTEDSL_BF16_LBATCH", "0") == "1"
-
-_GATE_TORCH_MM_MODE = os.environ.get("TRTLLM_OPTRT_MLA_GATE_TORCH_MM",
-                                     "").strip().lower()
-
-_GATE_DSV3_FUSED_A_ENABLED = os.environ.get(
-    "TRTLLM_OPTRT_MLA_GATE_DSV3_FUSED_A", "0") == "1"
-
-
-def _o_proj_fp4_quant_scale(o_proj: Linear) -> Optional[torch.Tensor]:
-    if not getattr(o_proj, "has_nvfp4", False):
-        return None
-    if getattr(o_proj, "pre_quant_scale", None) is not None:
-        return None
-    if getattr(o_proj, "force_dynamic_quantization", False):
-        return None
-    return getattr(o_proj, "input_scale", None)
-
 
 def _gate_overlap_stream() -> torch.cuda.Stream:
     """Process-wide side stream for the MLA output-gate GEMM.
@@ -1284,55 +1210,6 @@ def _gate_proj_chunked(gate_proj: Linear,
     if (weight.dtype != hidden_states.dtype or hidden_states.dim() != 2
             or n % 2):
         return gate_proj(hidden_states)
-
-    if (_GATE_TORCH_MM_MODE == "full" and is_sm_100f()
-            and weight.dtype == torch.bfloat16
-            and hidden_states.dtype == torch.bfloat16):
-        gate = torch.empty(hidden_states.shape[0],
-                           n,
-                           dtype=hidden_states.dtype,
-                           device=hidden_states.device)
-        torch.mm(hidden_states, weight.t(), out=gate)
-        return gate
-
-    if (_GATE_CUTEDSL_BF16_MODE == "full" and is_sm_100f()
-            and weight.dtype == torch.bfloat16
-            and hasattr(torch.ops.trtllm, "cute_dsl_bf16_gemm_blackwell")):
-        gate = torch.empty(hidden_states.shape[0],
-                           n,
-                           dtype=hidden_states.dtype,
-                           device=hidden_states.device)
-        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
-            hidden_states.contiguous(), weight, gate)
-        return gate
-
-    if (_GATE_DSV3_FUSED_A_ENABLED and is_sm_100f()
-            and weight.dtype == torch.bfloat16
-            and hidden_states.dtype == torch.bfloat16
-            and hidden_states.shape[0] <= 64 and n == 16384
-            and weight.shape[1] == 7168
-            and hasattr(torch.ops.trtllm, "dsv3_gate_gemm_op")):
-        return torch.ops.trtllm.dsv3_gate_gemm_op(hidden_states.contiguous(),
-                                                  weight)
-
-    if (_GATE_CUTEDSL_BF16_LBATCH_ENABLED and is_sm_100f()
-            and weight.dtype == torch.bfloat16
-            and hidden_states.dtype == torch.bfloat16
-            and n == 16384 and weight.shape[1] == 7168
-            and hasattr(torch.ops.trtllm,
-                        "cute_dsl_bf16_gate_lbatch_blackwell")):
-        gate = torch.empty(hidden_states.shape[0],
-                           n,
-                           dtype=hidden_states.dtype,
-                           device=hidden_states.device)
-        if hidden_states.shape[0] >= 64:
-            torch.ops.trtllm.cute_dsl_bf16_gate_lbatch_blackwell(
-                hidden_states, weight, gate, False, 64, 64, 1, 1)
-        else:
-            torch.ops.trtllm.cute_dsl_bf16_gate_lbatch_blackwell(
-                hidden_states, weight, gate, False, 64, 128, 1, 1)
-        return gate
-
     half = n // 2
     gate = torch.empty(hidden_states.shape[0],
                        n,
@@ -1577,8 +1454,7 @@ class MLA(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
-            nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_absorption only
@@ -1589,11 +1465,6 @@ class MLA(nn.Module):
             ),
             requires_grad=False,
         )
-        # Set True per-call by _sparse_mla_decode_nvfp4 when the W_UV projection is
-        # fused into the NVFP4 sparse-decode kernel (bf16 W_UV path). When True,
-        # forward_absorption_generation writes the kernel output directly and skips
-        # the external v_b bmm tail. Defaults False (external bmm, original path).
-        self._vb_fused = False
 
         mapping_o = Mapping(
             world_size=pp_size * dp_size * tp_size * cp_size,
@@ -1636,19 +1507,6 @@ class MLA(nn.Module):
                 gather_output=False,
                 use_custom_cublas_mm=True)
 
-        debug_prefix = ("self_attn" if self.layer_idx is None else
-                        f"model.layers.{self.layer_idx}.self_attn")
-        self.kv_a_proj_with_mqa.debug_name = (
-            f"{debug_prefix}.kv_a_proj_with_mqa")
-        if hasattr(self, "q_proj"):
-            self.q_proj.debug_name = f"{debug_prefix}.q_proj"
-        if hasattr(self, "q_b_proj"):
-            self.q_b_proj.debug_name = f"{debug_prefix}.q_b_proj"
-        self.kv_b_proj.debug_name = f"{debug_prefix}.kv_b_proj"
-        self.o_proj.debug_name = f"{debug_prefix}.o_proj"
-        if self.gate_proj is not None:
-            self.gate_proj.debug_name = f"{debug_prefix}.gate_proj"
-
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
                 return 1.0
@@ -1689,8 +1547,6 @@ class MLA(nn.Module):
         self.gate_events = ([torch.cuda.Event(),
                              torch.cuda.Event()]
                             if self.gate_proj is not None else None)
-        self._fused_kva_wk_wp_nvfp4 = None
-        self._fused_qb_wq_b_nvfp4 = None
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
@@ -1941,9 +1797,7 @@ class MLA(nn.Module):
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
                      output: torch.Tensor,
-                     latent_cache_gen: Optional[torch.Tensor] = None,
-                     kv_proj_input: Optional[Union[
-                         torch.Tensor, Fp4QuantizedTensor]] = None) -> None:
+                     latent_cache_gen: Optional[torch.Tensor] = None) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
 
@@ -1964,17 +1818,16 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        kv_input = kv_proj_input if kv_proj_input is not None else hidden_states
-
         if self.is_lite:
-            compressed_kv, k_pe = self.kv_a_proj_with_mqa(kv_input).split(
+            compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
         else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(kv_input).split([
-                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
-            ], -1)
+            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                hidden_states).split([
+                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+                ], -1)
 
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self.q_a_layernorm(q),
@@ -2061,10 +1914,7 @@ class MLA(nn.Module):
     def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
                               hidden_states: torch.Tensor,
                               attn_metadata: AttentionMetadata,
-                              output: torch.Tensor,
-                              kv_proj_input: Optional[Union[
-                                  torch.Tensor, Fp4QuantizedTensor]] = None
-                              ) -> None:
+                              output: torch.Tensor) -> None:
         """
         Forward pass for the MLA module with DSA (always in MQA mode).
         Writes result into output tensor in-place.
@@ -2078,40 +1928,19 @@ class MLA(nn.Module):
             attn_metadata (AttentionMetadata): The attention metadata.
             output (torch.Tensor): The output tensor to write results into.
         """
-        proj_outputs = self.forward_dsa_proj(position_ids,
-                                             hidden_states,
-                                             attn_metadata,
-                                             kv_proj_input=kv_proj_input)
+        proj_outputs = self.forward_dsa_proj(position_ids, hidden_states,
+                                             attn_metadata)
         q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
         indexer_intermediates = proj_outputs[4:]
         self.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
                               indexer_intermediates, position_ids,
                               attn_metadata, output)
 
-    def _prepare_dsa_qb_fp4_input(
-        self, q: torch.Tensor
-    ) -> Optional[Tuple[Fp4QuantizedTensor, torch.Tensor]]:
-        if os.environ.get("TRTLLM_INDEXER_REUSE_QB_FP4", "0") != "1":
-            return None
-        q_b_proj = getattr(self, "q_b_proj", None)
-        if q_b_proj is None or not getattr(q_b_proj, "has_nvfp4", False):
-            return None
-        if (getattr(q_b_proj, "input_scale", None) is None
-                or getattr(q_b_proj, "pre_quant_scale", None) is not None
-                or getattr(q_b_proj, "force_dynamic_quantization", False)):
-            return None
-        q_fp4, q_sf = torch.ops.trtllm.fp4_quantize(
-            q, q_b_proj.input_scale, q_b_proj.scaling_vector_size, False)
-        return Fp4QuantizedTensor(q_fp4, q_sf,
-                                  is_sf_swizzled=True), q_b_proj.input_scale
-
     def forward_dsa_proj(
         self,
         position_ids: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        kv_proj_input: Optional[Union[torch.Tensor,
-                                      Fp4QuantizedTensor]] = None,
     ) -> List[torch.Tensor]:
         """Token-wise projections for DSA MLA (CUDA-graph-capturable Op 1).
 
@@ -2131,23 +1960,8 @@ class MLA(nn.Module):
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
 
-        indexer_skip_topk = bool(
-            getattr(getattr(self.mqa, "indexer", None), "skip_topk", False))
-        precomputed_indexer_k: Optional[torch.Tensor] = None
-        precomputed_weights: Optional[torch.Tensor] = None
-        if (self._fused_kva_wk_wp_nvfp4 is not None
-                and not indexer_skip_topk):
-            q, compressed_kv, k_pe, precomputed_indexer_k, precomputed_weights = (
-                self._fused_kva_wk_wp_nvfp4(
-                    kv_proj_input if kv_proj_input is not None else
-                    hidden_states))
-        else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-                kv_proj_input if kv_proj_input is not None else
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank,
-                    self.qk_rope_head_dim
-                ], -1)
+        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
 
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
@@ -2159,20 +1973,7 @@ class MLA(nn.Module):
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
-        prequant_q_input: Optional[Fp4QuantizedTensor] = None
-        prequant_q_scale: Optional[torch.Tensor] = None
-        precomputed_wq_b: Optional[torch.Tensor] = None
-        precomputed_wq_b_scale = 1.0
-        if self._fused_qb_wq_b_nvfp4 is not None and not indexer_skip_topk:
-            q, precomputed_wq_b, precomputed_wq_b_scale = (
-                self._fused_qb_wq_b_nvfp4(q))
-        else:
-            prequant_q = self._prepare_dsa_qb_fp4_input(q)
-            if prequant_q is not None:
-                prequant_q_input, prequant_q_scale = prequant_q
-                q = self.q_b_proj(prequant_q_input)
-            else:
-                q = self.q_b_proj(q)
+        q = self.q_b_proj(q)
 
         use_short_mha_for_ctx = self._should_use_short_mha(
             attn_metadata, position_ids)
@@ -2187,25 +1988,8 @@ class MLA(nn.Module):
         # access to batch-specific metadata or the k cache. Returns q_scale
         # as a 5th element so the FP4 dispatch can forward it to the kernel;
         # the FP8 path ignores it in forward_dsa_attn.
-        prequant_indexer_input = (
-            kv_proj_input if isinstance(kv_proj_input, Fp4QuantizedTensor) else
-            None)
-        prequant_indexer_scale = (
-            getattr(self.kv_a_proj_with_mqa, "input_scale", None)
-            if prequant_indexer_input is not None else None)
         q_fp8, k_fp8, k_scale, weights, q_scale = (
-            self.mqa.indexer.pre_indexer_proj(
-                qr,
-                hidden_states,
-                position_ids,
-                prequant_hidden_states=prequant_indexer_input,
-                prequant_hidden_states_scale=prequant_indexer_scale,
-                prequant_q=prequant_q_input,
-                prequant_q_scale=prequant_q_scale,
-                precomputed_wq_b=precomputed_wq_b,
-                precomputed_wq_b_scale=precomputed_wq_b_scale,
-                precomputed_indexer_k=precomputed_indexer_k,
-                precomputed_weights=precomputed_weights))
+            self.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
 
         return [
             q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
@@ -2826,14 +2610,6 @@ class MLA(nn.Module):
         ``sparse_mla_decode_nvfp4`` (h_q hard-padded to 128, d_v=512), and
         returns ``[num_tokens, num_heads_tp_cp * kv_lora_rank]`` to feed the
         existing v_b_proj BMM tail.
-
-        When the v_b (W_UV) epilogue fusion is eligible (bf16 W_UV, no
-        CP-layersplit), this instead calls ``sparse_mla_decode_nvfp4_vfuse``,
-        which fuses the per-head projection into the kernel and returns the
-        already-projected ``[num_tokens, num_heads_tp_cp * v_head_dim]``. In that
-        case ``self._vb_fused`` is set to ``True`` so the caller skips the
-        external bmm. Otherwise ``self._vb_fused`` is ``False`` and the latent is
-        returned for the existing bmm tail.
         """
         kv_cache_manager = attn_metadata.kv_cache_manager
         tokens_per_block = kv_cache_manager.tokens_per_block
@@ -2882,44 +2658,6 @@ class MLA(nn.Module):
         # [num_tokens, topk] -> [batch, s_q, topk]
         indices = topk_indices_pool.view(num_seqs, s_q, -1).contiguous()
 
-        # v_b (W_UV) epilogue fusion: when W_UV is bf16 and CP-layersplit is NOT
-        # active (so v_b_proj rows map 1:1 onto the leading q head rows), call the
-        # fused op which projects latent[512] @ W_UV -> v_head_dim inside the
-        # decode/combine epilogue and returns the projected output directly. The
-        # external bmm in forward_absorption_generation is then skipped. For fp8
-        # W_UV or under CP-layersplit, fall back to the latent path + external bmm.
-        use_vb_fusion = (self.v_b_proj.dtype == torch.bfloat16
-                         and self.num_heads_tp == self.num_heads_tp_cp)
-        if use_vb_fusion:
-            # Pad v_b_proj to the kernel-required 128 heads (padded head rows
-            # produce don't-care output rows that are sliced off below). v_b_proj
-            # is [num_heads_tp_cp, v_head_dim, kv_lora_rank].
-            if self.num_heads_tp_cp != padding:
-                v_b_proj_padded = self.v_b_proj.new_zeros(
-                    (padding, self.v_head_dim, self.kv_lora_rank))
-                v_b_proj_padded[:self.num_heads_tp_cp] = self.v_b_proj
-            else:
-                v_b_proj_padded = self.v_b_proj
-            v_b_proj_padded = v_b_proj_padded.contiguous()
-
-            out = torch.ops.trtllm.sparse_mla_decode_nvfp4_vfuse(
-                q_concat,
-                kv,
-                kv_scales,
-                indices,
-                v_b_proj_padded,
-                d_v=self.kv_lora_rank,
-                v_head_dim=self.v_head_dim,
-                sm_scale=self.softmax_scale,
-            )[0]
-            self._vb_fused = True
-            # out: [batch, s_q, 128, v_head_dim] -> drop head padding.
-            out = out.view([num_tokens, padding, self.v_head_dim])
-            out = out[:, :self.num_heads_tp_cp, :]
-            return out.reshape(
-                [num_tokens, self.num_heads_tp_cp * self.v_head_dim])
-
-        self._vb_fused = False
         out = self._run_sparse_mla_decode_nvfp4_op(
             q_concat, kv, kv_scales, indices, attn_metadata, num_seqs, s_q)
         # out: [batch, s_q, 128, kv_lora_rank] -> drop head padding.
@@ -3350,11 +3088,6 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-        # Reset the v_b-fusion flag for this step; only the NVFP4 sparse-decode
-        # path below re-sets it True (per-call) when it fuses the W_UV projection.
-        # This keeps non-NVFP4 dispatch branches on the external bmm tail.
-        self._vb_fused = False
-
         hisparse_coordinator = getattr(attn_metadata, "hisparse_coordinator",
                                        None)
         if bool(getattr(hisparse_coordinator, "enabled", False)):
@@ -3403,23 +3136,6 @@ class MLA(nn.Module):
             )
         fused_q = None
         attn_out_latent = self._select_layersplit_local_heads(attn_out_latent)
-
-        if self._vb_fused:
-            # The NVFP4 sparse-decode kernel already applied the per-head W_UV
-            # projection; `attn_out_latent` is the projected output
-            # [num_tokens, num_heads_tp_cp * v_head_dim]. Write `output` directly
-            # and skip the external v_b bmm. (Only reached for bf16 W_UV without
-            # CP-layersplit -- see _sparse_mla_decode_nvfp4's eligibility gate.)
-            assert (attn_out_latent.shape[0] == q.shape[0]
-                    and attn_out_latent.shape[1]
-                    == self.num_heads_tp_cp * self.v_head_dim)
-            output.view([num_tokens, self.num_heads_tp_cp,
-                         self.v_head_dim]).copy_(
-                             attn_out_latent.view([
-                                 num_tokens, self.num_heads_tp_cp,
-                                 self.v_head_dim
-                             ]))
-            return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (attn_out_latent.shape[0] == q.shape[0]
@@ -3715,18 +3431,10 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
-        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
     ) -> torch.Tensor:
 
-        hidden_states_before_cp = hidden_states
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
-        if hidden_states is not hidden_states_before_cp:
-            hidden_states_fp4 = None
-        elif (hidden_states_fp4 is not None
-              and not _prekv_fp4_payload_supported(
-                  hidden_states_fp4.fp4_tensor)):
-            hidden_states_fp4 = None
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
@@ -3750,14 +3458,8 @@ class MLA(nn.Module):
 
         if self.register_to_config:
             if self.is_dsa:
-                if hidden_states_fp4 is not None:
-                    proj_outputs = torch.ops.trtllm.mla_dsa_proj_with_fp4(
-                        hidden_states, hidden_states_fp4.fp4_tensor,
-                        hidden_states_fp4.scaling_factor, position_ids,
-                        self.layer_idx_str)
-                else:
-                    proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                        hidden_states, position_ids, self.layer_idx_str)
+                proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+                    hidden_states, position_ids, self.layer_idx_str)
                 q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                 indexer_intermediates = proj_outputs[4:]
                 torch.ops.trtllm.mla_dsa_attn_inplace(
@@ -3773,30 +3475,20 @@ class MLA(nn.Module):
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
                                        attn_metadata,
-                                       output=attn_output,
-                                       kv_proj_input=hidden_states_fp4)
+                                       output=attn_output)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
                               output=attn_output,
-                              latent_cache_gen=latent_cache_gen,
-                              kv_proj_input=hidden_states_fp4)
+                              latent_cache_gen=latent_cache_gen)
 
         if self.gate_proj is not None:
             if gate_overlapped:
                 self.gate_events[1].wait()
             else:
                 gate = self.gate_proj(hidden_states)
-            fp4_quant_scale = _o_proj_fp4_quant_scale(self.o_proj)
-            if sigmoid_mul_quant_nvfp4_supported(attn_output, gate,
-                                                 fp4_quant_scale):
-                attn_fp4, attn_sf = apply_fused_sigmoid_mul_quant_nvfp4_swizzled(
-                    attn_output, gate, fp4_quant_scale)
-                attn_output = Fp4QuantizedTensor(attn_fp4,
-                                                 attn_sf,
-                                                 is_sf_swizzled=True)
-            elif sigmoid_mul_supported(attn_output, gate):
+            if sigmoid_mul_supported(attn_output, gate):
                 attn_output = torch.ops.trtllm.fused_sigmoid_mul(
                     attn_output, gate)
             else:
@@ -3830,31 +3522,6 @@ class MLA(nn.Module):
         return weight_param, scale_param
 
     def post_load_weights(self):
-        if (self.mqa is not None and os.environ.get(
-                "TRTLLM_INDEXER_FUSE_KVA_WKWP", "0") == "1"):
-            indexer = getattr(self.mqa, "indexer", None)
-            if (indexer is not None and not getattr(indexer, "skip_topk",
-                                                    False)):
-                if (getattr(indexer, "_fused_wk_wp_nvfp4", None) is None
-                        and hasattr(indexer, "post_load_weights")):
-                    indexer.post_load_weights()
-                fused_wk_wp = getattr(indexer, "_fused_wk_wp_nvfp4", None)
-                if fused_wk_wp is not None:
-                    self._fused_kva_wk_wp_nvfp4 = _FusedKvAWkWpNvfp4.build(
-                        self.kv_a_proj_with_mqa, fused_wk_wp,
-                        self.q_lora_rank, self.kv_lora_rank,
-                        self.qk_rope_head_dim,
-                        self._mla_proj_nvfp4_backends)
-
-        if (self.mqa is not None
-                and os.environ.get("TRTLLM_INDEXER_FUSE_QB_WQB", "0") == "1"):
-            indexer = getattr(self.mqa, "indexer", None)
-            if (indexer is not None and hasattr(self, "q_b_proj")
-                    and not getattr(indexer, "skip_topk", False)):
-                self._fused_qb_wq_b_nvfp4 = _FusedQbWqBNvfp4.build(
-                    self.q_b_proj, indexer.wq_b,
-                    getattr(indexer, "_indexer_nvfp4_backends", None))
-
         has_fp8_block_scales = (
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())

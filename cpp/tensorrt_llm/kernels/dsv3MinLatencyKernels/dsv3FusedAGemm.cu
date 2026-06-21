@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,7 @@ namespace kernels::dsv3MinLatencyKernels
 {
 
 __device__ void hmma_16_8_16_f32acc_bf16ab(
-    float (&d_reg)[4], const bf16_t (&a_reg)[8], const bf16_t (&b_reg)[4], float const (&c_reg)[4])
+    float (&d_reg)[4], bf16_t const (&a_reg)[8], bf16_t const (&b_reg)[4], float const (&c_reg)[4])
 {
     uint32_t a0 = *reinterpret_cast<uint32_t const*>(a_reg + 0);
     uint32_t a1 = *reinterpret_cast<uint32_t const*>(a_reg + 2);
@@ -74,8 +74,8 @@ __device__ void ldgsts_128(void const* gPtr, void* sPtr, uint32_t pred)
 __device__ void ldsm_x4(void* smem_ptr, uint32_t* reg_ptr)
 {
     asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(reg_ptr[0]), "=r"(reg_ptr[1]), "=r"(reg_ptr[2]), "=r"(reg_ptr[3])
-                 : "r"(__nvvm_get_smem_pointer(smem_ptr)));
+        : "=r"(reg_ptr[0]), "=r"(reg_ptr[1]), "=r"(reg_ptr[2]), "=r"(reg_ptr[3])
+        : "r"(__nvvm_get_smem_pointer(smem_ptr)));
 }
 
 template <class Type>
@@ -361,17 +361,19 @@ struct MmaComputer
     static constexpr int k_phase_cnt = per_warp_tile_k / 16;
     static constexpr int m_iter_cnt = (tile_m + 15) / 16;
     static constexpr int n_iter_cnt = (tile_n + 7) / 8; // Possible to have non-1 n_iter_cnt for ab_swap m16 case.
-    static_assert(m_iter_cnt == 1);
-    static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
+    static_assert(tile_m % 16 == 0);
+    static_assert(m_iter_cnt >= 1 && m_iter_cnt <= 8);
+    static_assert(n_iter_cnt >= 1 && n_iter_cnt <= 4);
 
-    __device__ MmaComputer(
-        bf16_t* gmem_c_local_, bf16_t* smem_a_, bf16_t* smem_b_, uint64_t* smem_barrier_, int warp_idx_, int gemm_n_)
+    __device__ MmaComputer(bf16_t* gmem_c_local_, bf16_t* smem_a_, bf16_t* smem_b_, uint64_t* smem_barrier_,
+        int warp_idx_, int gemm_n_, int output_ld_)
         : gmem_c(gmem_c_local_)
         , smem_a(smem_a_)
         , smem_b(smem_b_)
         , smem_barrier(smem_barrier_)
         , warp_idx(warp_idx_ - (thread_cnt / 32))
         , gemm_n(gemm_n_)
+        , output_ld(output_ld_)
     {
     }
 
@@ -393,13 +395,17 @@ public:
     {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll
-        for (int i = 0; i < k_phase_cnt; i++)
+        for (int m_iter_idx = 0; m_iter_idx < m_iter_cnt; m_iter_idx++)
         {
-            int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
-            int m_idx = linear_idx % tile_m;
-            int k_idx = linear_idx / tile_m + warp_k_offset_in_tile_k;
-            k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
-            a_smem_offsets[0][i] = m_idx * tile_k + k_idx;
+#pragma unroll
+            for (int i = 0; i < k_phase_cnt; i++)
+            {
+                int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
+                int m_idx = m_iter_idx * 16 + linear_idx % 16;
+                int k_idx = linear_idx / 16 + warp_k_offset_in_tile_k;
+                k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
+                a_smem_offsets[m_iter_idx][i] = m_idx * tile_k + k_idx;
+            }
         }
 #pragma unroll
         for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++)
@@ -426,11 +432,15 @@ public:
             wait_barrier(smem_barrier + 0 + stage_idx * 2, phase_bit);
 
 #pragma unroll
-            for (int i = 0; i < k_phase_cnt; i++)
+            for (int m_iter_idx = 0; m_iter_idx < m_iter_cnt; m_iter_idx++)
             {
-                int smem_offset = a_smem_offsets[0][i];
-                bf16_t* smem_ptr_this_iter = smem_a + stage_idx * tile_m * tile_k + smem_offset;
-                ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[0][i]));
+#pragma unroll
+                for (int i = 0; i < k_phase_cnt; i++)
+                {
+                    int smem_offset = a_smem_offsets[m_iter_idx][i];
+                    bf16_t* smem_ptr_this_iter = smem_a + stage_idx * tile_m * tile_k + smem_offset;
+                    ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[m_iter_idx][i]));
+                }
             }
 
 #pragma unroll
@@ -449,10 +459,14 @@ public:
             for (int k_iter_idx = 0; k_iter_idx < k_phase_cnt; k_iter_idx++)
             {
 #pragma unroll
-                for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++)
+                for (int m_iter_idx = 0; m_iter_idx < m_iter_cnt; m_iter_idx++)
                 {
-                    hmma_16_8_16_f32acc_bf16ab(acc_reg[0][n_iter_idx], a_reg[0][k_iter_idx],
-                        b_reg[n_iter_idx][k_iter_idx], acc_reg[0][n_iter_idx]);
+#pragma unroll
+                    for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++)
+                    {
+                        hmma_16_8_16_f32acc_bf16ab(acc_reg[m_iter_idx][n_iter_idx], a_reg[m_iter_idx][k_iter_idx],
+                            b_reg[n_iter_idx][k_iter_idx], acc_reg[m_iter_idx][n_iter_idx]);
+                    }
                 }
             }
             ::arrive_barrier(smem_barrier + 1 + stage_idx * 2);
@@ -471,15 +485,6 @@ public:
         constexpr int thread_m = 2;
         constexpr int thread_n = 2 * n_iter_cnt;
         constexpr int cta_mma_n = n_iter_cnt * 8;
-        float acc_reg_reorg[thread_m][thread_n];
-
-        for (int i = 0; i < thread_m; i++)
-        {
-            for (int j = 0; j < thread_n; j++)
-            {
-                acc_reg_reorg[i][j] = acc_reg[0][j / 2][(j % 2) + (i * 2)];
-            }
-        }
 
         // 4 x cosize(smem_c_layout)
         float* smem_c = reinterpret_cast<float*>(smem_a);
@@ -494,15 +499,31 @@ public:
 
 // This should be optimized to STS.64 but can not be STS.128 due to the bank index.
 #pragma unroll
-        for (int m_idx_thread = 0; m_idx_thread < thread_m; m_idx_thread++)
+        for (int m_iter_idx = 0; m_iter_idx < m_iter_cnt; m_iter_idx++)
         {
+            float acc_reg_reorg[thread_m][thread_n];
+
 #pragma unroll
-            for (int n_idx_thread = 0; n_idx_thread < thread_n; n_idx_thread++)
+            for (int i = 0; i < thread_m; i++)
             {
-                int m_idx = (lane_idx / 4) + m_idx_thread * 8;
-                int n_idx = ((lane_idx % 4) * 2) + (n_idx_thread % 2) + (n_idx_thread / 2) * 8;
-                smem_c[cosize_smem_c * warp_idx + smem_c_index_func(m_idx, n_idx)]
-                    = acc_reg_reorg[m_idx_thread][n_idx_thread];
+#pragma unroll
+                for (int j = 0; j < thread_n; j++)
+                {
+                    acc_reg_reorg[i][j] = acc_reg[m_iter_idx][j / 2][(j % 2) + (i * 2)];
+                }
+            }
+
+#pragma unroll
+            for (int m_idx_thread = 0; m_idx_thread < thread_m; m_idx_thread++)
+            {
+#pragma unroll
+                for (int n_idx_thread = 0; n_idx_thread < thread_n; n_idx_thread++)
+                {
+                    int m_idx = m_iter_idx * 16 + (lane_idx / 4) + m_idx_thread * 8;
+                    int n_idx = ((lane_idx % 4) * 2) + (n_idx_thread % 2) + (n_idx_thread / 2) * 8;
+                    smem_c[cosize_smem_c * warp_idx + smem_c_index_func(m_idx, n_idx)]
+                        = acc_reg_reorg[m_idx_thread][n_idx_thread];
+                }
             }
         }
         asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
@@ -532,7 +553,7 @@ public:
                 int n_idx = linear_idx / tile_m;
                 if (m_idx < tile_m && n_idx < gemm_n)
                 {
-                    gmem_c[n_idx * gemm_m + m_idx] = acc_final[reg_idx];
+                    gmem_c[n_idx * output_ld + m_idx] = acc_final[reg_idx];
                 }
             }
         }
@@ -545,6 +566,7 @@ public:
     uint64_t* smem_barrier;
     int warp_idx;
     int gemm_n;
+    int output_ld;
     int stage_idx = 0;
     int phase_bit = 0;
     int lane_idx = threadIdx.x % 32;
@@ -561,7 +583,7 @@ public:
 // AB swapped, kernel is k-major, k-major, m-major
 template <int batch_size, int gemm_m, int gemm_k, int tile_m, int tile_n, int tile_k, int stage_cnt>
 __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
-    bf16_t* output, bf16_t const* mat_a, bf16_t const* mat_b, int gemm_n)
+    bf16_t* output, bf16_t const* mat_a, bf16_t const* mat_b, int gemm_n, int output_ld)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     constexpr int load_thread_cnt = 128;
@@ -573,7 +595,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     static_assert(gemm_m % tile_m == 0);
     static_assert(tile_k == 128 || tile_k == 256 || tile_k == 512
         || tile_k == 1024); // tile_k must be larger than 64 since 4 warp splitK.
-    static_assert(tile_m == 16);
+    static_assert(tile_m % 16 == 0);
+    static_assert(tile_m <= 128);
     constexpr int g2s_vec_bytes = 16;
     constexpr int a_elem_bytes = 2;
     constexpr int b_elem_bytes = 2;
@@ -591,7 +614,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     int cta_n_idx = tile_n * blockIdx.y;
     bf16_t const* gmem_a_local = mat_a + cta_m_idx * gemm_k;
     bf16_t const* gmem_b_local = mat_b + cta_n_idx * gemm_k;
-    bf16_t* gmem_c_local = output + cta_n_idx * gemm_m + cta_m_idx;
+    bf16_t* gmem_c_local = output + cta_n_idx * output_ld + cta_m_idx;
 
     int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 
@@ -622,7 +645,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     else
     {
         MmaComputer<gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt> mma_computer(
-            gmem_c_local, smem_a, smem_b, smem_barrier, warp_idx, gemm_n);
+            gmem_c_local, smem_a, smem_b, smem_barrier, warp_idx, gemm_n, output_ld);
         mma_computer.prepare();
         mma_computer.issue_mainloop();
         mma_computer.epi();
@@ -630,8 +653,9 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 #endif
 }
 
-template <typename T, int kHdIn, int kHdOut, int kTileN>
-void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream)
+template <typename T, int kHdIn, int kHdOut, int kTileM, int kTileN>
+void invokeFusedAGemmStridedTiled(
+    T* output, T const* mat_a, T const* mat_b, int num_tokens, int output_ld, cudaStream_t const stream)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     if (sm < 90)
@@ -644,7 +668,7 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
     constexpr int gemm_k = kHdIn;  // 7168
     constexpr int batch_size = 1;
     std::swap(mat_a, mat_b);
-    constexpr int tile_m = 16;
+    constexpr int tile_m = kTileM;
     constexpr int tile_n = kTileN;                       // 8 or 16
     constexpr int tile_k = std::max(256, 1024 / tile_n); // 256
     constexpr int max_stage_cnt = 1024 * 192 / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
@@ -676,13 +700,119 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
     }
     TLLM_CUDA_CHECK(
         cudaLaunchKernelEx(&config, fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>,
-            output, mat_a, mat_b, gemm_n));
+            output, mat_a, mat_b, gemm_n, output_ld));
 }
+
+template <typename T, int kHdIn, int kHdOut, int kTileN>
+void invokeFusedAGemmStrided(
+    T* output, T const* mat_a, T const* mat_b, int num_tokens, int output_ld, cudaStream_t const stream)
+{
+    invokeFusedAGemmStridedTiled<T, kHdIn, kHdOut, 16, kTileN>(output, mat_a, mat_b, num_tokens, output_ld, stream);
+}
+
+template <typename T, int kHdIn, int kHdOut, int kTileN>
+void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream)
+{
+    invokeFusedAGemmStrided<T, kHdIn, kHdOut, kTileN>(output, mat_a, mat_b, num_tokens, kHdOut, stream);
+}
+
+template void invokeFusedAGemmStrided<__nv_bfloat16, 7168, 2112, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStrided<__nv_bfloat16, 7168, 2112, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStrided<__nv_bfloat16, 7168, 2112, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStrided<__nv_bfloat16, 7168, 8192, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStrided<__nv_bfloat16, 7168, 8192, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStrided<__nv_bfloat16, 7168, 8192, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 16, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 16, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 16, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 32, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 32, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 32, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 64, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 64, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 64, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 128, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 128, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 8192, 128, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 16, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 16, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 16, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 32, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 32, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 32, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 64, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 64, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 64, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 128, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 128, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
+
+template void invokeFusedAGemmStridedTiled<__nv_bfloat16, 7168, 16384, 128, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, int output_ld, cudaStream_t);
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 32>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 } // namespace kernels::dsv3MinLatencyKernels
 

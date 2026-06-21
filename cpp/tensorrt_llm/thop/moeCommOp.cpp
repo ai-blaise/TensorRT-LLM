@@ -41,7 +41,9 @@ void setMoeCommFieldInfo(tensorrt_llm::kernels::MoeCommFieldInfo& fieldInfo, tor
 c10::List<torch::Tensor> moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum,
     torch::Tensor sendIndiceTensor, torch::Tensor recvRankCumSum, torch::Tensor recvIndiceTensor,
     torch::Tensor allWorkspaces, int64_t outputAllocationCount, int64_t epRank, int64_t epSize,
-    std::optional<c10::List<bool>> needZeroOutput = std::nullopt, c10::optional<bool> useLowPrecision = std::nullopt)
+    std::optional<c10::List<bool>> needZeroOutput = std::nullopt, c10::optional<bool> useLowPrecision = std::nullopt,
+    c10::optional<int64_t> tokenSelectedSlotsIndex = std::nullopt,
+    c10::optional<int64_t> invalidTokenExpertId = std::nullopt)
 {
     CHECK_INPUT(sendRankCumSum, torch::kInt32);
     CHECK_INPUT(sendIndiceTensor, torch::kInt32);
@@ -73,38 +75,75 @@ c10::List<torch::Tensor> moeCommOp(c10::List<torch::Tensor> inputs, torch::Tenso
     recvIndices.rankCountCumSum = recvRankCumSum.data_ptr<int>();
     recvIndices.rankLocalIndices = recvIndiceTensor.data_ptr<int>();
 
-    int fieldCount = inputs.size();
-    TORCH_CHECK(fieldCount <= tensorrt_llm::kernels::MOE_COMM_FIELD_MAX_COUNT, "Number of fields (", fieldCount,
+    auto const inputCount = inputs.size();
+    int64_t tokenSlotsIndex = -1;
+    size_t tokenSlotsIndexSize = 0;
+    int tokenSlotsTopK = 0;
+    if (tokenSelectedSlotsIndex.has_value())
+    {
+        tokenSlotsIndex = tokenSelectedSlotsIndex.value();
+        TORCH_CHECK(tokenSlotsIndex >= 0, "tokenSelectedSlotsIndex out of range");
+        tokenSlotsIndexSize = static_cast<size_t>(tokenSlotsIndex);
+        TORCH_CHECK(tokenSlotsIndexSize < inputCount, "tokenSelectedSlotsIndex out of range");
+        torch::Tensor const tokenSlotsInput = inputs.get(tokenSlotsIndexSize);
+        CHECK_INPUT(tokenSlotsInput, torch::kInt32);
+        TORCH_CHECK(tokenSlotsInput.dim() == 2, "tokenSelectedSlots tensor must be a 2D tensor");
+        tokenSlotsTopK = static_cast<int>(tokenSlotsInput.size(1));
+        TORCH_CHECK(tokenSlotsTopK > 0, "tokenSelectedSlots tensor must have at least one column");
+        TORCH_CHECK(!needZeroOutput.has_value() || !needZeroOutput.value()[tokenSlotsIndexSize],
+            "needZeroOutput is not supported for tokenSelectedSlots basic field");
+    }
+    TORCH_CHECK(!invalidTokenExpertId.has_value() || tokenSlotsIndex >= 0,
+        "invalidTokenExpertId requires tokenSelectedSlotsIndex");
+
+    int const normalFieldCount = static_cast<int>(inputCount - (tokenSlotsIndex >= 0 ? 1 : 0));
+    TORCH_CHECK(normalFieldCount <= tensorrt_llm::kernels::MOE_COMM_FIELD_MAX_COUNT, "Number of fields (",
+        normalFieldCount,
         ") exceeds maximum allowed (", tensorrt_llm::kernels::MOE_COMM_FIELD_MAX_COUNT, ")");
     tensorrt_llm::kernels::FusedMoeFieldInfo sendFieldInfo, recvFieldInfo;
     sendFieldInfo.isBasicInterleaved = false;
     recvFieldInfo.isBasicInterleaved = false;
-    sendFieldInfo.fieldCount = fieldCount;
-    recvFieldInfo.fieldCount = fieldCount;
+    sendFieldInfo.fieldCount = normalFieldCount;
+    recvFieldInfo.fieldCount = normalFieldCount;
     sendFieldInfo.expertScales = nullptr;
     recvFieldInfo.expertScales = nullptr;
     sendFieldInfo.tokenSelectedSlots = nullptr;
     recvFieldInfo.tokenSelectedSlots = nullptr;
 
-    for (int i = 0; i < fieldCount; i++)
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int normalFieldIndex = 0;
+    for (size_t i = 0; i < inputCount; i++)
     {
-        torch::Tensor const& t = inputs[i];
-        setMoeCommFieldInfo(sendFieldInfo.fieldsInfo[i], t);
-        if (needZeroOutput.has_value() && needZeroOutput.value()[i])
+        torch::Tensor const t = inputs.get(i);
+        bool const needZero = needZeroOutput.has_value() && needZeroOutput.value()[i];
+        torch::Tensor output;
+        if (needZero)
         {
-            outputs.push_back(torch::zeros({outputAllocationCount, t.size(1)}, t.options()));
+            output = torch::zeros({outputAllocationCount, t.size(1)}, t.options());
         }
         else
         {
-            outputs.push_back(torch::empty({outputAllocationCount, t.size(1)}, t.options()));
+            output = torch::empty({outputAllocationCount, t.size(1)}, t.options());
         }
-        setMoeCommFieldInfo(recvFieldInfo.fieldsInfo[i], outputs[i]);
+        outputs.push_back(output);
+        if (tokenSlotsIndex >= 0 && i == tokenSlotsIndexSize)
+        {
+            sendFieldInfo.tokenSelectedSlots = t.data_ptr<int32_t>();
+            recvFieldInfo.tokenSelectedSlots = output.data_ptr<int32_t>();
+            continue;
+        }
+        setMoeCommFieldInfo(sendFieldInfo.fieldsInfo[normalFieldIndex], t);
+        setMoeCommFieldInfo(recvFieldInfo.fieldsInfo[normalFieldIndex], output);
+        ++normalFieldIndex;
     }
-    sendFieldInfo.fillFieldPlacementInfo(0, false);
-    recvFieldInfo.fillFieldPlacementInfo(0, false);
+    bool const hasBasicFields = tokenSlotsIndex >= 0;
+    sendFieldInfo.fillFieldPlacementInfo(tokenSlotsTopK, hasBasicFields);
+    recvFieldInfo.fillFieldPlacementInfo(tokenSlotsTopK, hasBasicFields);
 
     tensorrt_llm::kernels::FusedMoeCommKernelParam params;
     params.worldInfo = worldInfo;
+    params.expertParallelInfo.topK = hasBasicFields ? tokenSlotsTopK : 1;
     params.sendIndices = sendIndices;
     params.recvIndices = recvIndices;
     params.sendFieldInfo = sendFieldInfo;
@@ -114,17 +153,25 @@ c10::List<torch::Tensor> moeCommOp(c10::List<torch::Tensor> inputs, torch::Tenso
     bool useLowPrecisionVal = useLowPrecision.value_or(false);
     params.isLowPrecision = useLowPrecisionVal;
     params.sendFieldInfo.fillMetaInfo(
-        &(params.sendCommMeta), params.expertParallelInfo.topK, false, false, useLowPrecisionVal);
+        &(params.sendCommMeta), params.expertParallelInfo.topK, false, hasBasicFields, useLowPrecisionVal);
     params.recvFieldInfo.fillMetaInfo(
-        &(params.recvCommMeta), params.expertParallelInfo.topK, false, false, useLowPrecisionVal);
+        &(params.recvCommMeta), params.expertParallelInfo.topK, false, hasBasicFields, useLowPrecisionVal);
 
     tensorrt_llm::kernels::FusedMoeWorkspace fusedMoeWorkspace;
     tensorrt_llm::kernels::constructWorkspace(
         &fusedMoeWorkspace, allWorkspaces.data_ptr<uint64_t>(), allWorkspaces.stride(0), epSize);
 
-    auto stream = at::cuda::getCurrentCUDAStream();
-
     tensorrt_llm::kernels::moeAllToAll(params, fusedMoeWorkspace, stream);
+
+    if (invalidTokenExpertId.has_value())
+    {
+        TORCH_CHECK(outputAllocationCount % epSize == 0, "outputAllocationCount must be divisible by epSize");
+        int const maxTokenCountPerRank = static_cast<int>(outputAllocationCount / epSize);
+        torch::Tensor const tokenSlotsOutput = outputs.get(tokenSlotsIndexSize);
+        tensorrt_llm::kernels::moe_prepare::memsetExpertIds(tokenSlotsOutput.data_ptr<int>(),
+            recvRankCumSum.data_ptr<int>(), maxTokenCountPerRank, tokenSlotsTopK,
+            static_cast<int>(invalidTokenExpertId.value()), static_cast<int>(epSize), stream);
+    }
 
     return outputs;
 }
@@ -262,7 +309,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_comm(Tensor[] inputs, Tensor send_rank_cum_sum, Tensor send_indices, Tensor "
         "recv_rank_cum_sum, Tensor recv_indices, Tensor all_workspaces, int output_allocation_count, int ep_rank, int "
-        "ep_size, bool[]? need_zero_output=None, bool? use_low_precision=None) -> Tensor[]");
+        "ep_size, bool[]? need_zero_output=None, bool? use_low_precision=None, int? token_selected_slots_index=None, "
+        "int? invalid_token_expert_id=None) -> "
+        "Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

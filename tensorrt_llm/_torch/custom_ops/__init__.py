@@ -42,9 +42,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from .cute_dsl_custom_ops import (
         cute_dsl_nvfp4_dense_gemm_swiglu_blackwell,
         cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell,
-        cute_dsl_nvfp4_gemm_blackwell)
+        cute_dsl_nvfp4_gemm_blackwell,
+        cute_dsl_nvfp4_qb_wqb_gemm_blackwell,
+        cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out)
     __all__ += [
         'cute_dsl_nvfp4_gemm_blackwell',
+        'cute_dsl_nvfp4_qb_wqb_gemm_blackwell',
+        'cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out',
         'cute_dsl_nvfp4_dense_gemm_swiglu_blackwell',
         'cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell',
     ]

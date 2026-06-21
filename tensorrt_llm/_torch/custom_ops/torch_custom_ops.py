@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import json
 import os
 import threading
 from dataclasses import replace
@@ -51,11 +52,52 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      last_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellRunner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4BlackwellRunner,
+        cute_dsl_nvfp4_gemm_splitk_blackwell,
+        cute_dsl_nvfp4_qb_wqb_gemm_blackwell,
+        cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out,
+    )
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+_nvfp4_splitk_logged_shapes = set()
+_nvfp4_splitk_skip_logged = set()
+_nvfp4_gemm_debug_logged = set()
+_nvfp4_qb_cutedsl_logged_shapes = set()
+_nvfp4_splitk_shape_env = None
+_nvfp4_splitk_shape_table = dict()
+
+
+def _parse_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(f"Invalid boolean env value {name}={raw!r}")
+
+
+def _log_nvfp4_splitk_skip(reason: str) -> None:
+    if os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_DEBUG", "0") != "1":
+        return
+    if reason in _nvfp4_splitk_skip_logged:
+        return
+    logger.warning(f"NVFP4 split-K skip: {reason}")
+    _nvfp4_splitk_skip_logged.add(reason)
+
+
+def _log_nvfp4_gemm_debug(message: str, key: Tuple) -> None:
+    if os.environ.get("TRTLLM_NVFP4_GEMM_DEBUG_SHAPES", "0") != "1":
+        return
+    if key in _nvfp4_gemm_debug_logged:
+        return
+    logger.warning(message)
+    _nvfp4_gemm_debug_logged.add(key)
 
 
 def _smc_cuda_sync_probe(label: str) -> None:
@@ -67,6 +109,135 @@ def _smc_cuda_sync_probe(label: str) -> None:
         torch.cuda.synchronize()
     except Exception as exc:
         raise RuntimeError(f"SMC CUDA sync probe failed after {label}") from exc
+
+
+def _nvfp4_splitk_enabled() -> bool:
+    return os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_O_PROJ", "0") == "1" or bool(
+        os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_SHAPES", "").strip())
+
+
+def _parse_nvfp4_splitk_atomic_value(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"invalid atomic flag {value!r}")
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "y", "on"):
+            return True
+        if normalized in ("0", "false", "no", "n", "off"):
+            return False
+    raise ValueError(f"invalid atomic flag {value!r}")
+
+
+def _parse_nvfp4_splitk_entry(
+        entry: object,
+        default_atomic: bool) -> Tuple[int, int, int, bool]:
+    if isinstance(entry, dict):
+        n = int(entry.get("n", entry.get("N")))
+        k = int(entry.get("k", entry.get("K")))
+        split_k = int(entry.get("split", entry.get("split_k", entry.get("S", 2))))
+        atomic_reduce = _parse_nvfp4_splitk_atomic_value(
+            entry.get("atomic", entry.get("atomic_reduce")), default_atomic)
+        return n, k, split_k, atomic_reduce
+
+    if isinstance(entry, (list, tuple)):
+        if len(entry) not in (3, 4):
+            raise ValueError(f"expected [N,K,split[,atomic]], got {entry!r}")
+        n = int(entry[0])
+        k = int(entry[1])
+        split_k = int(entry[2])
+        atomic_reduce = default_atomic if len(entry) == 3 else _parse_nvfp4_splitk_atomic_value(
+            entry[3], default_atomic)
+        return n, k, split_k, atomic_reduce
+
+    if isinstance(entry, str):
+        fields = [field.strip() for field in entry.split(",") if field.strip()]
+        if len(fields) not in (3, 4):
+            raise ValueError(f"expected N,K,split[,atomic], got {entry!r}")
+        n = int(fields[0])
+        k = int(fields[1])
+        split_k = int(fields[2])
+        if len(fields) == 3:
+            atomic_reduce = default_atomic
+        else:
+            atomic_reduce = _parse_nvfp4_splitk_atomic_value(
+                fields[3], default_atomic)
+        return n, k, split_k, atomic_reduce
+
+    raise ValueError(f"unsupported split-K entry {entry!r}")
+
+
+def _get_nvfp4_splitk_shape_table() -> dict:
+    global _nvfp4_splitk_shape_env
+    global _nvfp4_splitk_shape_table
+
+    raw = os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_SHAPES", "").strip()
+    atomic_env = os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_ATOMIC")
+    cache_key = (raw, atomic_env)
+    if cache_key == _nvfp4_splitk_shape_env:
+        return _nvfp4_splitk_shape_table
+
+    table = dict()
+    try:
+        default_atomic = _parse_env_bool("TRTLLM_NVFP4_GEMM_SPLITK_ATOMIC", False)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                records = [record.strip() for record in raw.split(";") if record.strip()]
+            else:
+                if isinstance(parsed, dict):
+                    records = []
+                    for key, value in parsed.items():
+                        n, k = [int(field.strip()) for field in str(key).split(",", maxsplit=1)]
+                        if isinstance(value, dict):
+                            record = {"n": n, "k": k, **value}
+                        elif isinstance(value, (list, tuple)):
+                            record = [n, k, *value]
+                        else:
+                            record = [n, k, value]
+                        records.append(record)
+                elif isinstance(parsed, list):
+                    records = parsed
+                else:
+                    raise ValueError("JSON value must be a dict or list")
+
+            for record in records:
+                n, k, split_k, atomic_reduce = _parse_nvfp4_splitk_entry(record, default_atomic)
+                if min(n, k, split_k) <= 0:
+                    raise ValueError(f"non-positive shape entry {record!r}")
+                table[(n, k)] = (split_k, atomic_reduce)
+    except (TypeError, ValueError) as exc:
+        logger.warning(f"Invalid TRTLLM_NVFP4_GEMM_SPLITK_SHAPES: {exc}")
+        table = dict()
+
+    _nvfp4_splitk_shape_env = cache_key
+    _nvfp4_splitk_shape_table = table
+    return table
+
+
+def _lookup_nvfp4_splitk_shape(n: int,
+                               real_k: int) -> Optional[Tuple[int, bool]]:
+    shape_entry = _get_nvfp4_splitk_shape_table().get((n, real_k))
+    if shape_entry is not None:
+        return shape_entry
+
+    if os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_O_PROJ", "0") != "1":
+        return None
+
+    target_n = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_N", "7168"))
+    target_k = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_K", "16384"))
+    if n != target_n or real_k != target_k:
+        return None
+
+    split_k = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_SPLIT", "2"))
+    atomic_reduce = _parse_env_bool("TRTLLM_NVFP4_GEMM_SPLITK_ATOMIC", False)
+    return split_k, atomic_reduce
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -791,6 +962,9 @@ def _(
 
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
+    cutedsl_fallback_tactic_cache = dict()
+    cutedsl_fallback_tactic_table_env = None
+    cutedsl_fallback_tactic_table = dict()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -823,6 +997,215 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     def _is_only_backend(self, backend_name: str) -> bool:
         """Check if this is the only backend in allowed_backends (explicitly forced)."""
         return self.allowed_backends == [backend_name]
+
+    @staticmethod
+    def _normalize_cutedsl_fallback_tactic(value) -> Optional[Tuple]:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+
+        mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = value
+        if not isinstance(mma_tiler_mn, (list, tuple)) or len(
+                mma_tiler_mn) != 2:
+            return None
+        if not isinstance(cluster_shape_mn, (list, tuple)) or len(
+                cluster_shape_mn) != 2:
+            return None
+        if not isinstance(swap_ab, bool) or not isinstance(
+                use_prefetch, bool):
+            return None
+
+        try:
+            return (
+                (int(mma_tiler_mn[0]), int(mma_tiler_mn[1])),
+                (int(cluster_shape_mn[0]), int(cluster_shape_mn[1])),
+                swap_ab,
+                use_prefetch,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _get_cutedsl_fallback_tactic_table(cls) -> dict:
+        env_value = os.environ.get(
+            "TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_TACTIC_TABLE", "")
+        if env_value == cls.cutedsl_fallback_tactic_table_env:
+            return cls.cutedsl_fallback_tactic_table
+
+        cls.cutedsl_fallback_tactic_table_env = env_value
+        cls.cutedsl_fallback_tactic_table = dict()
+        if not env_value:
+            return cls.cutedsl_fallback_tactic_table
+
+        try:
+            parsed = json.loads(env_value)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                f"Failed to parse TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_TACTIC_TABLE: {exc}"
+            )
+            return cls.cutedsl_fallback_tactic_table
+
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_TACTIC_TABLE must be a JSON object"
+            )
+            return cls.cutedsl_fallback_tactic_table
+
+        for shape_key, shape_value in parsed.items():
+            if not isinstance(shape_key, str):
+                continue
+            try:
+                shape = tuple(int(part.strip())
+                              for part in shape_key.split(","))
+            except ValueError:
+                continue
+
+            if len(shape) == 2:
+                n, real_k = shape
+                if isinstance(shape_value, dict):
+                    for m_key, tactic_value in shape_value.items():
+                        tactic = cls._normalize_cutedsl_fallback_tactic(
+                            tactic_value)
+                        if tactic is None:
+                            continue
+                        if m_key == "*":
+                            cls.cutedsl_fallback_tactic_table[(None, n,
+                                                               real_k)] = tactic
+                            continue
+                        try:
+                            m = int(m_key)
+                        except (TypeError, ValueError):
+                            continue
+                        cls.cutedsl_fallback_tactic_table[(m, n,
+                                                           real_k)] = tactic
+                else:
+                    tactic = cls._normalize_cutedsl_fallback_tactic(shape_value)
+                    if tactic is not None:
+                        cls.cutedsl_fallback_tactic_table[(None, n,
+                                                           real_k)] = tactic
+            elif len(shape) == 3:
+                m, n, real_k = shape
+                tactic = cls._normalize_cutedsl_fallback_tactic(shape_value)
+                if tactic is not None:
+                    cls.cutedsl_fallback_tactic_table[(m, n, real_k)] = tactic
+
+        return cls.cutedsl_fallback_tactic_table
+
+    @classmethod
+    def _lookup_cutedsl_fallback_tactic(cls, m: int, n: int,
+                                        real_k: int) -> Optional[Tuple]:
+        table = cls._get_cutedsl_fallback_tactic_table()
+        tactic = table.get((m, n, real_k))
+        if tactic is not None:
+            return tactic
+        wildcard_tactic = table.get((None, n, real_k))
+        if wildcard_tactic is not None:
+            return wildcard_tactic
+        if os.environ.get(
+                "TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_NEAREST_M",
+                "0") != "1":
+            return None
+
+        matching_m = sorted(
+            key_m for key_m, key_n, key_k in table
+            if key_m is not None and key_n == n and key_k == real_k)
+        for candidate_m in matching_m:
+            if candidate_m >= m:
+                return table[(candidate_m, n, real_k)]
+        if matching_m:
+            return table[(matching_m[-1], n, real_k)]
+        return None
+
+    def _get_cutedsl_fallback_tactic(
+            self, inputs: List[torch.Tensor]) -> Optional[Tuple[str, Tuple]]:
+        if os.environ.get("TRTLLM_NVFP4_GEMM_FALLBACK_PREFER_CUTEDSL",
+                          "0") != "1":
+            return None
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return None
+        if self.output_dtype != torch.bfloat16:
+            return None
+
+        try:
+            max_m = int(
+                os.environ.get("TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_MAX_M",
+                               "64"))
+        except ValueError:
+            max_m = 64
+
+        if inputs[0].dim() != 2 or inputs[1].dim() != 2:
+            return None
+
+        m = inputs[0].shape[0]
+        n = inputs[1].shape[0]
+        real_k = inputs[0].shape[1] * 2
+        if max_m <= 0 or m > max_m:
+            return None
+
+        policy = os.environ.get(
+            "TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_POLICY", "all")
+        if policy == "high_impact":
+            high_impact_shapes = {
+                # o_proj
+                (7168, 16384),
+                # dense / expert gate_up in the production TP/EP shape
+                (36864, 7168),
+                # dense / expert down in the production TP/EP shape
+                (7168, 18432),
+            }
+            if (n, real_k) not in high_impact_shapes:
+                return None
+
+        cache_key = (
+            self.output_buffer_kind,
+            self.output_dtype,
+            tuple(self.group) if self.group is not None else None,
+            m,
+            n,
+            real_k,
+            inputs[2].numel(),
+            inputs[3].numel(),
+        )
+        if cache_key in self.__class__.cutedsl_fallback_tactic_cache:
+            return self.__class__.cutedsl_fallback_tactic_cache[cache_key]
+
+        tactic = None
+
+        def pad_up(value: int, alignment: int) -> int:
+            return ((value + alignment - 1) // alignment) * alignment
+
+        sm_version = get_sm_version()
+        sf_m = pad_up(m, 128)
+        sf_k = pad_up(real_k // 16, 4)
+        sf_n = pad_up(n, 128)
+        if (sm_version in (100, 103) and real_k % 32 == 0 and n % 8 == 0
+                and inputs[2].numel() == sf_m * sf_k
+                and inputs[3].numel() == sf_n * sf_k):
+            table_tactic = self._lookup_cutedsl_fallback_tactic(m, n, real_k)
+            if table_tactic is not None:
+                tactic = ("cutedsl", table_tactic)
+            elif os.environ.get(
+                    "TRTLLM_NVFP4_GEMM_FALLBACK_CUTEDSL_TACTIC_TABLE", ""):
+                _log_nvfp4_gemm_debug(
+                    f"NVFP4 GEMM CuTeDSL table miss for M={m}, N={n}, K={real_k}, "
+                    f"act_sf={inputs[2].numel()}, weight_sf={inputs[3].numel()}",
+                    ("cutedsl_table_miss", m, n, real_k, inputs[2].numel(),
+                     inputs[3].numel()),
+                )
+                tactic = None
+            else:
+                # This is the conservative non-transposed N-major tactic already
+                # used as the CuTeDSL runner's built-in fallback. Avoid
+                # get_valid_tactics() here: that expands the autotune search
+                # space and can trigger expensive runtime JIT during decode
+                # warmup.
+                tactic = ("cutedsl", ((128, 128), (1, 1), False, False))
+
+        if tactic is not None:
+            logger.warning(
+                f"NVFP4 GEMM fallback selected CuTeDSL for M={m}, N={n}, K={real_k}, tactic={tactic[1]}"
+            )
+        self.__class__.cutedsl_fallback_tactic_cache[cache_key] = tactic
+        return tactic
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -941,6 +1324,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         if tactic == -1:
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
+            cutedsl_tactic = self._get_cutedsl_fallback_tactic(inputs)
+            if cutedsl_tactic is not None:
+                tactic = cutedsl_tactic
+
             # The autotuner only tunes the max-token (prefill) shape during
             # warmup (_run_autotuner_warmup runs a single forward at
             # curr_max_num_tokens); decode shapes (small M) are never profiled,
@@ -950,16 +1337,25 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             # qkv_a projection (M=1, N=2112, N%128=64) that CUTLASS tiles
             # poorly. Prefer cuBLASLt's heuristic in the decode regime; keep
             # CUTLASS for larger M (its historical, prefill-tuned default).
-            m = inputs[0].shape[0]
-            if m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION and \
-                    "cublaslt" in self.allowed_backends:
-                tactic = ("cublaslt", -1)
-            elif "cutlass" in self.allowed_backends:
-                tactic = ("cutlass", -1)
-            else:
-                tactic = (self.allowed_backends[0], -1)
+            if tactic == -1:
+                m = inputs[0].shape[0]
+                if m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION and \
+                        "cublaslt" in self.allowed_backends:
+                    tactic = ("cublaslt", -1)
+                elif "cutlass" in self.allowed_backends:
+                    tactic = ("cutlass", -1)
+                else:
+                    tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 GEMM dispatch M={inputs[0].shape[0]}, N={inputs[1].shape[0]}, "
+            f"K={inputs[0].shape[1] * 2}, backend={backend}, tactic={sub_tactic}, "
+            f"allowed={self.allowed_backends}, output_buffer_kind={self.output_buffer_kind}",
+            ("dispatch", inputs[0].shape[0], inputs[1].shape[0],
+             inputs[0].shape[1] * 2, backend, str(sub_tactic),
+             tuple(self.allowed_backends), self.output_buffer_kind),
+        )
         if backend == "cuda_core":
             return CudaCoreNVFP4Runner(self.output_buffer_kind,
                                        self.output_dtype,
@@ -982,6 +1378,274 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                            tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
+
+
+def _try_nvfp4_gemm_splitk_projection(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int,
+    group: Optional[List[int]],
+) -> Optional[torch.Tensor]:
+    if not _nvfp4_splitk_enabled():
+        return None
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        _log_nvfp4_splitk_skip("CuTe DSL unavailable")
+        return None
+    if output_dtype != torch.bfloat16:
+        _log_nvfp4_splitk_skip(f"output_dtype={output_dtype}")
+        return None
+    supported_output_kinds = (int(BufferKind.DEFAULT),
+                              int(BufferKind.NCCL_WINDOW))
+    if int(output_buffer_kind) not in supported_output_kinds:
+        _log_nvfp4_splitk_skip(f"output_buffer_kind={output_buffer_kind}")
+        return None
+    if act_fp4.dim() != 2 or weight.dim() != 2:
+        _log_nvfp4_splitk_skip(
+            f"input dims act={act_fp4.dim()} weight={weight.dim()}")
+        return None
+
+    try:
+        min_m = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_MIN_M", "0"))
+        max_m = int(os.environ.get("TRTLLM_NVFP4_GEMM_SPLITK_MAX_M", "64"))
+        if min_m < 0 or max_m <= 0 or min_m > max_m:
+            _log_nvfp4_splitk_skip(f"min_m={min_m} max_m={max_m}")
+            return None
+    except ValueError:
+        logger.warning("Invalid TRTLLM_NVFP4_GEMM_SPLITK_* env value")
+        return None
+
+    m = act_fp4.shape[0]
+    n = weight.shape[0]
+    real_k = act_fp4.shape[1] * 2
+    if m < min_m or m > max_m:
+        _log_nvfp4_splitk_skip(f"M={m} min_m={min_m} max_m={max_m}")
+        return None
+
+    try:
+        shape_entry = _lookup_nvfp4_splitk_shape(n, real_k)
+    except ValueError:
+        logger.warning("Invalid TRTLLM_NVFP4_GEMM_SPLITK_* env value")
+        return None
+    if shape_entry is None:
+        _log_nvfp4_splitk_skip(
+            f"shape M={m} N={n} K={real_k}; not in split-K allow-list")
+        return None
+    split_k, atomic_reduce = shape_entry
+    if split_k <= 1 or real_k % split_k != 0:
+        _log_nvfp4_splitk_skip(f"K={real_k} split_k={split_k}")
+        return None
+
+    def pad_up_local(value: int, alignment: int) -> int:
+        return ((value + alignment - 1) // alignment) * alignment
+
+    sf_m = pad_up_local(m, 128)
+    sf_k = pad_up_local(real_k // 16, 4)
+    sf_n = pad_up_local(n, 128)
+    if act_sf.numel() != sf_m * sf_k:
+        _log_nvfp4_splitk_skip(
+            f"act_sf numel={act_sf.numel()} expected={sf_m * sf_k}")
+        return None
+    if weight_scale.numel() != sf_n * sf_k:
+        _log_nvfp4_splitk_skip(
+            f"weight_scale numel={weight_scale.numel()} expected={sf_n * sf_k}"
+        )
+        return None
+    if alpha.numel() != 1:
+        _log_nvfp4_splitk_skip(f"alpha numel={alpha.numel()}")
+        return None
+
+    log_key = (m, n, real_k, split_k, atomic_reduce, int(output_buffer_kind))
+    if log_key not in _nvfp4_splitk_logged_shapes:
+        logger.warning(
+            f"NVFP4 split-K projection selected for M={m}, N={n}, K={real_k}, "
+            f"split={split_k}, atomic={atomic_reduce}, "
+            f"output_buffer_kind={output_buffer_kind}"
+        )
+        _nvfp4_splitk_logged_shapes.add(log_key)
+    return cute_dsl_nvfp4_gemm_splitk_blackwell(
+        act_fp4,
+        weight,
+        act_sf,
+        weight_scale,
+        alpha,
+        output_dtype,
+        output_buffer_kind,
+        group,
+        split_k,
+        atomic_reduce,
+    )
+
+
+def _try_nvfp4_gemm_cutedsl_fallback(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int,
+    backends_list: List[str],
+    group: Optional[List[int]],
+) -> Optional[torch.Tensor]:
+    if os.environ.get("TRTLLM_NVFP4_GEMM_FALLBACK_PREFER_CUTEDSL",
+                      "0") != "1":
+        return None
+
+    explicit_single_backend = len(backends_list) == 1 and backends_list[
+        0] != "cutedsl"
+    override_explicit = os.environ.get(
+        "TRTLLM_NVFP4_GEMM_FALLBACK_OVERRIDE_EXPLICIT", "0") == "1"
+    if explicit_single_backend and not override_explicit:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 GEMM CuTeDSL pre-dispatch skip: explicit allowed_backends={backends_list[0]}",
+            ("cutedsl_predispatch_skip_explicit", backends_list[0]),
+        )
+        return None
+
+    inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
+    runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
+                                    output_dtype,
+                                    backends_list,
+                                    group=group)
+    tactic = runner._get_cutedsl_fallback_tactic(inputs)
+    if tactic is None:
+        return None
+
+    _, sub_tactic = tactic
+    _log_nvfp4_gemm_debug(
+        f"NVFP4 GEMM CuTeDSL pre-dispatch selected for M={act_fp4.shape[0]}, "
+        f"N={weight.shape[0]}, K={act_fp4.shape[1] * 2}, tactic={sub_tactic}, "
+        f"allowed={backends_list}, output_buffer_kind={output_buffer_kind}",
+        ("cutedsl_predispatch", act_fp4.shape[0], weight.shape[0],
+         act_fp4.shape[1] * 2, str(sub_tactic), tuple(backends_list),
+         output_buffer_kind),
+    )
+    return CuteDSLNVFP4BlackwellRunner(output_dtype, output_buffer_kind,
+                                       group)(inputs, tactic=sub_tactic)
+
+
+def _try_nvfp4_gemm_qb_cutedsl(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int,
+    group: Optional[List[int]],
+) -> Optional[torch.Tensor]:
+    if os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL", "0") != "1":
+        return None
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        _log_nvfp4_gemm_debug(
+            "NVFP4 q_b CuTeDSL skip: CuTeDSL unavailable",
+            ("qb_cutedsl_skip_unavailable", ),
+        )
+        return None
+    if output_dtype != torch.bfloat16:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: output_dtype={output_dtype}",
+            ("qb_cutedsl_skip_dtype", str(output_dtype)),
+        )
+        return None
+    if act_fp4.dim() != 2 or weight.dim() != 2:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: dims act={act_fp4.dim()} weight={weight.dim()}",
+            ("qb_cutedsl_skip_dims", act_fp4.dim(), weight.dim()),
+        )
+        return None
+
+    try:
+        min_m = int(os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_MIN_M",
+                                   "16"))
+        max_m = int(os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_MAX_M",
+                                   "64"))
+        target_n = int(os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_N",
+                                      "24576"))
+        target_k = int(os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_K",
+                                      "1536"))
+        tile_m = int(os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_TILE_M",
+                                    "128"))
+        tile_n = int(os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_TILE_N",
+                                    "64"))
+        cluster_m = int(
+            os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_CLUSTER_M", "2"))
+        cluster_n = int(
+            os.environ.get("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_CLUSTER_N", "1"))
+        swap_ab = _parse_env_bool("TRTLLM_NVFP4_GEMM_QB_CUTEDSL_SWAP_AB",
+                                  True)
+        use_prefetch = _parse_env_bool(
+            "TRTLLM_NVFP4_GEMM_QB_CUTEDSL_PREFETCH", False)
+    except ValueError:
+        logger.warning("Invalid TRTLLM_NVFP4_GEMM_QB_CUTEDSL_* env value")
+        return None
+
+    if min(tile_m, tile_n, cluster_m, cluster_n) <= 0:
+        logger.warning("Invalid non-positive TRTLLM_NVFP4_GEMM_QB_CUTEDSL tactic env value")
+        return None
+
+    m = act_fp4.shape[0]
+    n = weight.shape[0]
+    real_k = act_fp4.shape[1] * 2
+    if min_m < 0 or max_m <= 0 or min_m > max_m or m < min_m or m > max_m:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: M={m} min_m={min_m} max_m={max_m}",
+            ("qb_cutedsl_skip_m", m, min_m, max_m),
+        )
+        return None
+    if n != target_n or real_k != target_k:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: shape M={m} N={n} K={real_k}; "
+            f"target N={target_n} K={target_k}",
+            ("qb_cutedsl_skip_shape", m, n, real_k, target_n, target_k),
+        )
+        return None
+
+    def pad_up_local(value: int, alignment: int) -> int:
+        return ((value + alignment - 1) // alignment) * alignment
+
+    sf_m = pad_up_local(m, 128)
+    sf_k = pad_up_local(real_k // 16, 4)
+    sf_n = pad_up_local(n, 128)
+    if act_sf.numel() != sf_m * sf_k:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: act_sf numel={act_sf.numel()} expected={sf_m * sf_k}",
+            ("qb_cutedsl_skip_act_sf", act_sf.numel(), sf_m * sf_k),
+        )
+        return None
+    if weight_scale.numel() != sf_n * sf_k:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: weight_scale numel={weight_scale.numel()} expected={sf_n * sf_k}",
+            ("qb_cutedsl_skip_weight_sf", weight_scale.numel(), sf_n * sf_k),
+        )
+        return None
+    if alpha.numel() != 1:
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 q_b CuTeDSL skip: alpha numel={alpha.numel()}",
+            ("qb_cutedsl_skip_alpha", alpha.numel()),
+        )
+        return None
+
+    tactic = ((tile_m, tile_n), (cluster_m, cluster_n), swap_ab,
+              use_prefetch)
+    log_key = (m, n, real_k, min_m, max_m, int(output_buffer_kind),
+               tuple(group or ()), tactic)
+    if log_key not in _nvfp4_qb_cutedsl_logged_shapes:
+        logger.warning(
+            f"NVFP4 q_b CuTeDSL selected for M={m}, N={n}, K={real_k}, "
+            f"tactic={tactic}, output_buffer_kind={output_buffer_kind}"
+        )
+        _nvfp4_qb_cutedsl_logged_shapes.add(log_key)
+
+    return CuteDSLNVFP4BlackwellRunner(output_dtype, output_buffer_kind,
+                                       group)(
+                                           [act_fp4, weight, act_sf,
+                                            weight_scale, alpha],
+                                           tactic=tactic)
 
 
 @fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
@@ -1045,6 +1709,65 @@ def nvfp4_gemm(
         raise ValueError(
             f"allowed_backends cannot be empty. "
             f"Valid backends are: {sorted(valid_individual_backends)}.")
+
+    _log_nvfp4_gemm_debug(
+        f"NVFP4 GEMM input M={act_fp4.shape[0]}, N={weight.shape[0]}, "
+        f"K={act_fp4.shape[1] * 2}, allowed_backends={backends_list}, "
+        f"output_buffer_kind={output_buffer_kind}, act_sf={act_sf.numel()}, "
+        f"weight_sf={weight_scale.numel()}, group={group is not None}",
+        ("input", act_fp4.shape[0], weight.shape[0], act_fp4.shape[1] * 2,
+         tuple(backends_list), output_buffer_kind, act_sf.numel(),
+         weight_scale.numel(), group is not None),
+    )
+
+    qb_cutedsl_result = _try_nvfp4_gemm_qb_cutedsl(
+        act_fp4,
+        weight,
+        act_sf,
+        weight_scale,
+        alpha,
+        output_dtype,
+        output_buffer_kind,
+        group,
+    )
+    if qb_cutedsl_result is not None:
+        return qb_cutedsl_result
+
+    explicit_single_backend = len(backends_list) == 1 and backends_list[
+        0] != "cutedsl"
+    override_explicit = os.environ.get(
+        "TRTLLM_NVFP4_GEMM_SPLITK_OVERRIDE_EXPLICIT", "0") == "1"
+    if explicit_single_backend and not override_explicit:
+        if _nvfp4_splitk_enabled():
+            _log_nvfp4_splitk_skip(
+                f"explicit allowed_backends={backends_list[0]}")
+    else:
+        splitk_result = _try_nvfp4_gemm_splitk_projection(
+            act_fp4,
+            weight,
+            act_sf,
+            weight_scale,
+            alpha,
+            output_dtype,
+            output_buffer_kind,
+            group,
+        )
+        if splitk_result is not None:
+            return splitk_result
+
+    cutedsl_result = _try_nvfp4_gemm_cutedsl_fallback(
+        act_fp4,
+        weight,
+        act_sf,
+        weight_scale,
+        alpha,
+        output_dtype,
+        output_buffer_kind,
+        backends_list,
+        group,
+    )
+    if cutedsl_result is not None:
+        return cutedsl_result
 
     # Build runner with allowed backends
     runner = NVFP4GemmUnifiedRunner(output_buffer_kind,

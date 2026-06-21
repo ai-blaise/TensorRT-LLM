@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -668,6 +669,34 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
 
+        # Phase-3 persistent megakernel hook (additive, env-gated, default
+        # OFF via TRTLLM_OPTRT_MOE_MEGAKERNEL_V2). Evaluate this before the
+        # phase-1 hook below: BEST_CONFIG sets TRTLLM_OPTRT_MOE_MEGAKERNEL=1,
+        # whose early return would otherwise make the V2 path unreachable.
+        # Keep the default path untouched by avoiding the V2 import unless its
+        # env gate is explicitly enabled.
+        _megakernel_v2_on = False
+        run_mega_persistent_moe_v2 = None
+        _v2_env = os.environ.get("TRTLLM_OPTRT_MOE_MEGAKERNEL_V2", "0")
+        _v2_requested = _v2_env.strip().lower() not in (
+            "", "0", "off", "false", "no")
+        if self.use_fused_finalize and tile_size == 128:
+            if _v2_requested:
+                from ...cute_dsl_kernels.blackwell.moe_as_dense_gemm.mega_persistent_moe import (
+                    megakernel_v2_enabled,
+                    run_mega_persistent_moe_v2,
+                )
+                _megakernel_v2_on = megakernel_v2_enabled()
+        if _v2_requested:
+            logger.warning_once(
+                "CuteDslFusedMoE V2 gate:",
+                f"env={_v2_env!r}",
+                f"use_fused_finalize={self.use_fused_finalize}",
+                f"tile_size={tile_size}",
+                f"enabled={_megakernel_v2_on}",
+                key="cute_dsl_moe_megakernel_v2_gate"
+                f"_{self.use_fused_finalize}_{tile_size}_{_megakernel_v2_on}")
+
         # Phase-1 persistent decode-MoE megakernel hook (additive, env-gated,
         # default OFF via TRTLLM_OPTRT_MOE_MEGAKERNEL). When enabled, collapse the
         # moe_sort -> FC1(gather+SwiGLU+quant) -> FC2(finalize) chain into the
@@ -687,7 +716,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 _megakernel_on = megakernel_enabled()
             except Exception:  # noqa: BLE001 - never break the production path
                 _megakernel_on = False
-            if _megakernel_on:
+            if _megakernel_on and not _megakernel_v2_on:
                 logger.info_once(
                     "CuteDslFusedMoE: Phase-1 decode-MoE megakernel ENABLED "
                     "(trtllm::warp_decode_nvfp4_cursor_moe).",
@@ -715,20 +744,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 moe_output.copy_(megakernel_out)
                 return moe_output
 
-        # Phase-3 persistent megakernel hook (additive, env-gated, default
-        # OFF via TRTLLM_OPTRT_MOE_MEGAKERNEL_V2). Replaces the FC1+FC2
-        # kernel pair below with ONE persistent grid driven by an on-device
-        # work-item producer (moe_sort outputs read per invocation, so CUDA
-        # graphs captured at the bucket bound replay for any routing) and
-        # atomic-cursor scheduling. Same numerics as the explicit chain
-        # (phase-3 gates: valid-row intermediates bit-equal, output at the
-        # requant floor vs true f32). Requires fused finalize + tile 128.
-        _megakernel_v2_on = False
-        if self.use_fused_finalize and tile_size == 128:
-            from ...cute_dsl_kernels.blackwell.moe_as_dense_gemm.mega_persistent_moe import (
-                megakernel_v2_enabled, run_mega_persistent_moe_v2)
-            _megakernel_v2_on = megakernel_v2_enabled()
-
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
@@ -740,10 +755,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         if _megakernel_v2_on:
-            logger.info_once(
+            logger.warning_once(
                 "CuteDslFusedMoE: phase-3 persistent decode-MoE megakernel "
                 "ENABLED (TRTLLM_OPTRT_MOE_MEGAKERNEL_V2).",
                 key="cute_dsl_moe_megakernel_v2_on")
+            assert run_mega_persistent_moe_v2 is not None
             # Same aux-stream output memset the fused-finalize path uses (the
             # megakernel finalize scatter-adds into moe_output).
             self.event_dict[EventType.Main].record()
@@ -900,6 +916,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
+
+        _v2_env = os.environ.get("TRTLLM_OPTRT_MOE_MEGAKERNEL_V2", "0")
+        _v2_requested = _v2_env.strip().lower() not in (
+            "", "0", "off", "false", "no")
+        if _v2_requested:
+            logger.warning_once(
+                "CuteDslFusedMoE V2 requested on DWDP path:",
+                f"env={_v2_env!r}",
+                f"weight_buffers={len(weight_view.w3_w1_weight)}",
+                f"use_fused_finalize={self.use_fused_finalize}",
+                f"tile_size={tile_size}",
+                "current V2 persistent wrapper is single-B/non-DWDP only",
+                key="cute_dsl_moe_megakernel_v2_dwdp_path"
+                f"_{len(weight_view.w3_w1_weight)}_{tile_size}")
 
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -108,6 +108,113 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                    ref_output_tensor,
                                    atol=1e-5,
                                    rtol=1e-5)
+
+    def test_moe_alltoall_token_slots_basic_field(self):
+        torch.cuda.set_device(0)
+        input_entry_count = 6
+        output_entry_count = 10
+        vector_dim = 2
+        send_recv_count = 4
+
+        input_tensor = torch.arange(input_entry_count * vector_dim,
+                                    dtype=torch.int32,
+                                    device=torch.device('cuda')).reshape(
+                                        input_entry_count, vector_dim)
+
+        send_cumsum = torch.tensor([send_recv_count],
+                                   dtype=torch.int32,
+                                   device=torch.device('cuda'))
+        recv_cumsum = torch.tensor([send_recv_count],
+                                   dtype=torch.int32,
+                                   device=torch.device('cuda'))
+        send_indices = torch.tensor([0, 2, 3, 5],
+                                    dtype=torch.int32,
+                                    device=torch.device('cuda'))
+        recv_indices = torch.tensor([1, 4, 6, 8],
+                                    dtype=torch.int32,
+                                    device=torch.device('cuda'))
+
+        ref_output_tensor = torch.empty((output_entry_count, vector_dim),
+                                        dtype=torch.int32,
+                                        device=torch.device('cuda'))
+        ref_output_tensor[recv_indices] = input_tensor[send_indices]
+
+        workspace_size = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(1)
+        all_workspaces = torch.zeros(1,
+                                     workspace_size // 8,
+                                     dtype=torch.uint64,
+                                     device=torch.device('cuda'))
+        torch.ops.trtllm.moe_initialize_workspace(all_workspaces, 0, 1)
+
+        output_tensors = torch.ops.trtllm.moe_comm(
+            [input_tensor],
+            send_cumsum,
+            send_indices,
+            recv_cumsum,
+            recv_indices,
+            all_workspaces,
+            output_entry_count,
+            0,
+            1,
+            token_selected_slots_index=0)
+
+        torch.testing.assert_close(output_tensors[0][recv_indices],
+                                   ref_output_tensor[recv_indices])
+
+    def test_moe_alltoall_token_slots_basic_field_sanitize_tail(self):
+        torch.cuda.set_device(0)
+        input_entry_count = 6
+        output_entry_count = 10
+        vector_dim = 2
+        send_recv_count = 4
+
+        input_tensor = torch.arange(input_entry_count * vector_dim,
+                                    dtype=torch.int32,
+                                    device=torch.device('cuda')).reshape(
+                                        input_entry_count, vector_dim)
+
+        send_cumsum = torch.tensor([send_recv_count],
+                                   dtype=torch.int32,
+                                   device=torch.device('cuda'))
+        recv_cumsum = torch.tensor([send_recv_count],
+                                   dtype=torch.int32,
+                                   device=torch.device('cuda'))
+        send_indices = torch.tensor([0, 2, 3, 5],
+                                    dtype=torch.int32,
+                                    device=torch.device('cuda'))
+        recv_indices = torch.arange(send_recv_count,
+                                    dtype=torch.int32,
+                                    device=torch.device('cuda'))
+
+        workspace_size = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(1)
+        all_workspaces = torch.zeros(1,
+                                     workspace_size // 8,
+                                     dtype=torch.uint64,
+                                     device=torch.device('cuda'))
+        torch.ops.trtllm.moe_initialize_workspace(all_workspaces, 0, 1)
+
+        output_tensors = torch.ops.trtllm.moe_comm(
+            [input_tensor],
+            send_cumsum,
+            send_indices,
+            recv_cumsum,
+            recv_indices,
+            all_workspaces,
+            output_entry_count,
+            0,
+            1,
+            token_selected_slots_index=0,
+            invalid_token_expert_id=-1)
+
+        output_tensor = output_tensors[0]
+        torch.testing.assert_close(output_tensor[:send_recv_count],
+                                   input_tensor[send_indices])
+        torch.testing.assert_close(
+            output_tensor[send_recv_count:],
+            torch.full((output_entry_count - send_recv_count, vector_dim),
+                       -1,
+                       dtype=torch.int32,
+                       device=torch.device('cuda')))
 
     def do_warmup(self):
         torch.cuda.synchronize()

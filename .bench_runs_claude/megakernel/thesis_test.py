@@ -35,9 +35,12 @@ import statistics as st
 import sys
 import time
 import traceback
+import warnings
 
 import torch
 import torch.nn.functional as F
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dense_kernel_driver import DT, SVS, DenseBatchedGemm, quantize_batched
@@ -108,7 +111,7 @@ def cosine(a, b):
                                dim=0).item()
 
 
-def bench_shape(name, N, K, L, dev, check_corr=True):
+def bench_shape(name, N, K, L, dev, args, check_corr=True):
     M = 16
     torch.manual_seed(0)
     acts = torch.randn(L, M, K, dtype=DT, device=dev) * 0.1
@@ -128,39 +131,49 @@ def bench_shape(name, N, K, L, dev, check_corr=True):
     with autotune():
         ref_cublas = sep("cublaslt")
     torch.cuda.synchronize()
-    res["cublas_sep"] = time_graph(lambda: sep("cublaslt"))
+    res["cublas_sep"] = time_graph(lambda: sep("cublaslt"), args.iters,
+                                   args.warmup)
 
     # (b) cutedsl separate
-    try:
-        with autotune():
-            sep("cutedsl")
-        torch.cuda.synchronize()
-        res["cute_sep"] = time_graph(lambda: sep("cutedsl"))
-    except Exception as e:
+    if args.skip_cute_sep:
         res["cute_sep"] = float("nan")
-        print(f"#   [{name} L={L}] cutedsl sep FAILED: {type(e).__name__}: "
-              f"{str(e)[:120]}", flush=True)
+    else:
+        try:
+            with autotune():
+                sep("cutedsl")
+            torch.cuda.synchronize()
+            res["cute_sep"] = time_graph(lambda: sep("cutedsl"), args.iters,
+                                         args.warmup)
+        except Exception as e:
+            res["cute_sep"] = float("nan")
+            print(f"#   [{name} L={L}] cutedsl sep FAILED: {type(e).__name__}: "
+                  f"{str(e)[:120]}", flush=True)
 
     # (c) L-batch megakernel: sweep tactics, keep best correct one.
     c_out = torch.empty(L, M, N, dtype=DT, device=dev)
     best_t, best_tac, best_cos = float("inf"), None, 0.0
-    for mma, clus, pf in TACTICS:
+    tactics = TACTICS[:args.max_tactics] if args.max_tactics else TACTICS
+    for mma, clus, pf in tactics:
         try:
             drv = DenseBatchedGemm(M, N, K, L, mma_tiler_mn=mma,
                                    cluster_shape_mn=clus, use_prefetch=pf)
-            drv.run(a_fp4_l, a_sf_l, b_fp4_l, b_sf_l, alpha, c_out)
+            a_fp4, b_fp4, a_sf, b_sf = drv.pack_l_buffers(
+                a_fp4_l, a_sf_l, b_fp4_l, b_sf_l)
+            drv.run_packed(a_fp4, b_fp4, a_sf, b_sf, alpha, c_out)
             torch.cuda.synchronize()
             # Correctness for THIS tactic vs cublaslt per-GEMM ref.
             cmin = min(cosine(c_out[l], ref_cublas[l]) for l in range(L))
             if cmin < 0.98:
                 print(f"#   [{name} L={L}] tactic {mma},{clus},pf={pf} "
                       f"cosine={cmin:.4f} < 0.98, skipping", flush=True)
+                del drv, a_fp4, b_fp4, a_sf, b_sf
                 continue
-            t = time_graph(lambda: drv.run(a_fp4_l, a_sf_l, b_fp4_l, b_sf_l,
-                                           alpha, c_out))
+            t = time_graph(lambda: drv.run_packed(a_fp4, b_fp4, a_sf, b_sf,
+                                                  alpha, c_out), args.iters,
+                           args.warmup)
             if t < best_t:
                 best_t, best_tac, best_cos = t, (mma, clus, pf), cmin
-            del drv
+            del drv, a_fp4, b_fp4, a_sf, b_sf
         except Exception as e:
             msg = str(e)[:100]
             if "out of memory" in msg.lower():
@@ -202,6 +215,11 @@ def main():
                     help="comma list of L (problems per grid) to sweep")
     ap.add_argument("--device", type=int, default=-1,
                     help="-1 => auto-pick most-free device")
+    ap.add_argument("--max-tactics", type=int, default=0,
+                    help="limit megakernel tactic sweep; 0 means all tactics")
+    ap.add_argument("--skip-cute-sep", action="store_true")
+    ap.add_argument("--iters", type=int, default=300)
+    ap.add_argument("--warmup", type=int, default=50)
     args = ap.parse_args()
 
     if args.device >= 0:
@@ -230,7 +248,7 @@ def main():
         N, K = SHAPES[name]
         for L in Ls:
             try:
-                r = bench_shape(name, N, K, L, dev)
+                r = bench_shape(name, N, K, L, dev, args)
                 all_rows.append(r)
                 print(fmt_row(r), flush=True)
             except Exception as e:

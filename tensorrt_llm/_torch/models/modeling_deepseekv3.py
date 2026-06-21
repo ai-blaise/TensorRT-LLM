@@ -811,6 +811,15 @@ def _dsv3_mlp_nvfp4_backends() -> Optional[List[str]]:
     return [b.strip() for b in val.split(',') if b.strip()] or None
 
 
+def _dsv3_shared_expert_swiglu_fp4out_enabled(
+        quant_config: Optional[QuantConfig]) -> bool:
+    """Enable the shared-expert NVFP4 FC1+SwiGLU+FP4-out kernel when valid."""
+    if os.environ.get("TRTLLM_OPTRT_SHARED_EXPERT_SWIGLU_FP4OUT", "1") != "1":
+        return False
+    return (quant_config is not None
+            and quant_config.layer_quant_mode.has_nvfp4() and is_sm_100f())
+
+
 class DeepseekV3Linear(Linear):
     """
     A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
@@ -915,6 +924,9 @@ class DeepseekV3Attention(MLA):
             use_cute_dsl_blockscaling_mm,
             nvfp4_allowed_backends=self._mla_proj_nvfp4_backends,
         )
+        self.kv_a_proj_with_mqa.debug_name = (
+            "self_attn.kv_a_proj_with_mqa" if layer_idx is None else
+            f"model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa")
 
 
 class DeepseekV32Attention(MLA):
@@ -969,6 +981,9 @@ class DeepseekV32Attention(MLA):
             skip_create_weights_in_init,
             use_custom_cublas_mm=True,
             nvfp4_allowed_backends=self._mla_proj_nvfp4_backends)
+        self.kv_a_proj_with_mqa.debug_name = (
+            "self_attn.kv_a_proj_with_mqa" if layer_idx is None else
+            f"model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa")
 
 
 class DeepseekV3Gate(nn.Module):
@@ -1145,6 +1160,8 @@ class Deepseekv3MoE(nn.Module):
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
+        shared_swiglu_fp4out = _dsv3_shared_expert_swiglu_fp4out_enabled(
+            shared_quant_config)
 
         self.shared_experts = GatedMLP(
             hidden_size=hidden_size,
@@ -1154,7 +1171,10 @@ class Deepseekv3MoE(nn.Module):
             config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_blockscaling_mm=(
+                self.use_cute_dsl_blockscaling_mm or shared_swiglu_fp4out),
+            layer_idx=layer_idx,
+            is_shared_expert=True,
             nvfp4_allowed_backends=_dsv3_mlp_nvfp4_backends(),
         )
         self.shared_experts_use_fp4 = (
@@ -1477,6 +1497,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 config=model_config,
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=has_mlp_tp,
+                layer_idx=layer_idx,
                 use_cute_dsl_blockscaling_mm=model_config.
                 use_cute_dsl_blockscaling_mm,
                 nvfp4_allowed_backends=_dsv3_mlp_nvfp4_backends(),
@@ -1532,12 +1553,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self._premlp_quant_scale = None
         # Quantized kv_a_proj-input handoff: the INPUT gated norm emits NVFP4
         # (SWIZZLED sf) for self_attn.kv_a_proj_with_mqa, mirroring the dense
-        # post-attention handoff. Default OFF — opt-in until the DSA proj path
-        # (mla_dsa_proj custom op + forward_dsa_proj) is wired to consume it;
-        # the helpers below are inert until then.
+        # post-attention handoff. Default OFF so it can be A/B'd cleanly
+        # against the proven config.
         self._prekv_gate_quant_enabled = (
             self.has_gated_norm and os.environ.get(
                 "TRTLLM_OPTRT_GATED_PREKV_QUANT", "0") == "1")
+        self._prekv_gate_quant_min_rows = max(
+            1,
+            int(os.environ.get("TRTLLM_OPTRT_GATED_PREKV_QUANT_MIN_M", "2")))
         self._prekv_quant_scale = None
 
         # When enable_attention_dp is True, we normally skip attention all-reduce since each
@@ -1722,11 +1745,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             scale = None
             kv_a = getattr(getattr(self, "self_attn", None),
                            "kv_a_proj_with_mqa", None)
+            has_helix_cp = (self.mapping_with_cp is not None
+                            and self.mapping_with_cp.has_cp_helix())
             if (self._prekv_gate_quant_enabled and kv_a is not None
                     and getattr(kv_a, "has_nvfp4", False)
                     and getattr(kv_a, "input_scale", None) is not None
                     and getattr(kv_a, "pre_quant_scale", None) is None
-                    and not getattr(kv_a, "force_dynamic_quantization", False)):
+                    and not getattr(kv_a, "force_dynamic_quantization", False)
+                    and not has_helix_cp):
                 scale = kv_a.input_scale
             self._prekv_quant_scale = (scale, ) if scale is not None else ()
         return self._prekv_quant_scale[0] if self._prekv_quant_scale else None
@@ -1741,7 +1767,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         values quantized with kv_a_proj's input scale in SWIZZLED sf layout, or
         None). The fp4 feeds the Linear (kv_a_proj_with_mqa) directly; the bf16
         is kept for the DSA indexer (which does its own fp32 wk/wp GEMM).
-        NOTE: inert until forward + the DSA proj path are wired to consume it.
         """
         gate_down = self.input_gated_norm_down
         gate_up = self.input_gated_norm_up
@@ -1750,7 +1775,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         rank = gate_down.weight.shape[0]
         quant_scale = self._resolve_prekv_quant_scale()
-        if (quant_scale is not None
+        if (flat.shape[0] >= self._prekv_gate_quant_min_rows
+                and quant_scale is not None
                 and lowrank_gate_quant_nvfp4_swizzled_supported(
                     flat, rank, gate_down, quant_scale)):
             y, y_fp4, y_sf = apply_fused_lowrank_gate_quant_nvfp4_swizzled(
@@ -1772,13 +1798,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._maybe_apply_gated_norm(
-            hidden_states, self.input_gated_norm_down,
-            self.input_gated_norm_up)
+        hidden_states, hidden_states_fp4 = self._apply_input_gated_norm_quant(
+            hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
+            hidden_states_fp4=hidden_states_fp4,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),

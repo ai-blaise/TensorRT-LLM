@@ -80,7 +80,11 @@ class Backend:
                 )
                 register_ar_fusions(cls._custom_pass_instances, mapping,
                                     ub_enabled)
-                # Fallback: fuse remaining add+rmsnorm not preceded by allreduce
+                # Fallback: fuse remaining add+rmsnorm(+fp4 quant) not preceded
+                # by allreduce. The fp4 variant must run before the plain
+                # add+rmsnorm fallback or the norm node gets consumed first.
+                cls._custom_pass_instances.append(PatternMatcherPass())
+                register_add_norm_fp4_quant(cls._custom_pass_instances[-1])
                 cls._custom_pass_instances.append(PatternMatcherPass())
                 register_add_norm(cls._custom_pass_instances[-1])
             else:

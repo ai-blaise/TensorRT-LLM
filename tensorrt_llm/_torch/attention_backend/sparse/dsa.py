@@ -257,7 +257,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -2269,12 +2269,16 @@ class _FusedWkWpNvfp4:
     # Mirrors NVFP4LinearMethod._input_prepare quantization constants.
     _FP8_MAX = 448.0
     _E2M1_MAX = 6.0
+    _debug_logged = set()
+    _variable_n_missing_logged = set()
+    _reuse_logged = set()
+    _amax_debug_counts = {}
 
     def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor,
                  wk_out: int, wp_out: int, out_dtype: torch.dtype,
                  weight_scale_2_wk: torch.Tensor, wp_out_scale: float,
-                 input_scale: Optional[torch.Tensor],
-                 alpha: Optional[torch.Tensor], allowed_backends: str):
+                 input_scale: Optional[torch.Tensor], alpha: Optional[torch.Tensor],
+                 allowed_backends: str, debug_name: str):
         self.weight = weight
         self.weight_scale = weight_scale
         self.wk_out = wk_out
@@ -2287,6 +2291,128 @@ class _FusedWkWpNvfp4:
         self.input_scale = input_scale
         self.alpha = alpha
         self.allowed_backends = allowed_backends
+        self.debug_name = debug_name
+        self.apply_wq_post_scale = (
+            os.environ.get("TRTLLM_INDEXER_FUSE_QB_WQB_POST_SCALE", "0") == "1"
+        )
+
+    def _log_debug(self, hidden_states: torch.Tensor) -> None:
+        if (os.environ.get("TRTLLM_NVFP4_LINEAR_DEBUG", "0") != "1"
+                and os.environ.get("TRTLLM_NVFP4_GEMM_DEBUG_SHAPES", "0") != "1"):
+            return
+        key = (
+            self.debug_name,
+            hidden_states.shape[0],
+            self.weight.shape[0],
+            hidden_states.shape[-1],
+            self.wk_out,
+            self.wp_out,
+            self.allowed_backends,
+            self.input_scale is not None,
+        )
+        if key in self._debug_logged:
+            return
+        self._debug_logged.add(key)
+        logger.warning(
+            f"NVFP4 Indexer fused site={self.debug_name} "
+            f"M={hidden_states.shape[0]} N={self.weight.shape[0]} "
+            f"K={hidden_states.shape[-1]} wk_out={self.wk_out} "
+            f"weights_out={self.wp_out} allowed={self.allowed_backends} "
+            f"static_input_scale={self.input_scale is not None} "
+            f"weight_sf={self.weight_scale.numel()}")
+
+    def _log_prequant_reuse(self, hidden_states: torch.Tensor,
+                            reason: str) -> None:
+        if os.environ.get("TRTLLM_INDEXER_REUSE_PREKV_FP4_DEBUG",
+                          "0") != "1":
+            return
+        key = (self.debug_name, reason, hidden_states.shape[0],
+               hidden_states.shape[-1])
+        if key in self._reuse_logged:
+            return
+        self._reuse_logged.add(key)
+        logger.warning(
+            f"NVFP4 Indexer prequant site={self.debug_name} "
+            f"M={hidden_states.shape[0]} K={hidden_states.shape[-1]} "
+            f"reason={reason}")
+
+    def _log_prequant_amax(self, hidden_states: torch.Tensor,
+                           prequant_input_scale: torch.Tensor) -> None:
+        if os.environ.get("TRTLLM_INDEXER_REUSE_PREKV_FP4_AMAX_DEBUG",
+                          "0") != "1":
+            return
+        if torch.cuda.is_current_stream_capturing():
+            key = ("amax_capture_skipped", self.debug_name, hidden_states.shape[0],
+                   hidden_states.shape[-1])
+            if key in self._reuse_logged:
+                return
+            self._reuse_logged.add(key)
+            logger.warning(
+                f"NVFP4 Indexer prequant amax site={self.debug_name} "
+                f"M={hidden_states.shape[0]} K={hidden_states.shape[-1]} "
+                "reason=cuda_graph_capture_skipped")
+            return
+        limit = max(
+            1,
+            int(
+                os.environ.get(
+                    "TRTLLM_INDEXER_REUSE_PREKV_FP4_AMAX_DEBUG_LIMIT", "8")))
+        key = (self.debug_name, hidden_states.shape[0], hidden_states.shape[-1])
+        count = self._amax_debug_counts.get(key, 0)
+        if count >= limit:
+            return
+        self._amax_debug_counts[key] = count + 1
+
+        global_max = self._FP8_MAX * self._E2M1_MAX
+        amax = torch.amax(torch.abs(hidden_states)).float()
+        dynamic_scale = global_max / amax
+        static_scale = prequant_input_scale.float()
+        amax_over_static_calib = static_scale / dynamic_scale
+        logger.warning(
+            f"NVFP4 Indexer prequant amax site={self.debug_name} "
+            f"M={hidden_states.shape[0]} K={hidden_states.shape[-1]} "
+            f"sample={count + 1}/{limit} "
+            f"amax={amax.item():.6g} dynamic_scale={dynamic_scale.item():.6g} "
+            f"prequant_scale={static_scale.item():.6g} "
+            f"amax_over_static_calib={amax_over_static_calib.item():.6g}")
+
+    def _try_prequant_input(
+        self,
+        hidden_states: torch.Tensor,
+        prequant_input: Optional[Fp4QuantizedTensor],
+        prequant_input_scale: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if os.environ.get("TRTLLM_INDEXER_REUSE_PREKV_FP4", "0") != "1":
+            return None
+        if prequant_input is None or prequant_input_scale is None:
+            self._log_prequant_reuse(hidden_states, "missing_payload")
+            return None
+        if not prequant_input.is_sf_swizzled:
+            self._log_prequant_reuse(hidden_states, "linear_sf_layout")
+            return None
+        self._log_prequant_amax(hidden_states, prequant_input_scale)
+
+        if self.input_scale is not None:
+            # Exact reuse is only valid when the prequantized bytes were
+            # produced with the same static activation scale as this fused GEMM.
+            if prequant_input_scale is not self.input_scale:
+                self._log_prequant_reuse(hidden_states, "static_scale_mismatch")
+                return None
+            self._log_prequant_reuse(hidden_states, "reuse_static_scale")
+            return prequant_input.fp4_tensor, prequant_input.scaling_factor, self.alpha
+
+        if os.environ.get("TRTLLM_INDEXER_REUSE_PREKV_FP4_STATIC",
+                          "0") != "1":
+            self._log_prequant_reuse(hidden_states, "dynamic_indexer")
+            return None
+
+        # Experimental path: the checkpoint has no indexer activation scale, so
+        # the current indexer uses dynamic amax quantization. Reusing kv_a's
+        # prequantized input instead switches the indexer to kv_a's static
+        # activation scale. This must be A/B validated before becoming default.
+        alpha = (1.0 / prequant_input_scale.float()) * self.weight_scale_2_wk
+        self._log_prequant_reuse(hidden_states, "reuse_kv_static_scale")
+        return prequant_input.fp4_tensor, prequant_input.scaling_factor, alpha
 
     @classmethod
     def build(cls, wk: Linear, wp: Linear,
@@ -2351,24 +2477,36 @@ class _FusedWkWpNvfp4:
             input_scale=wk.input_scale if wk_static else None,
             alpha=wk.alpha if wk_static else None,
             allowed_backends=','.join(allowed_backends or
-                                      ['cutlass', 'cublaslt', 'cuda_core']))
+                                      ['cutlass', 'cublaslt', 'cuda_core']),
+            debug_name=(getattr(wk, "debug_name", None)
+                        or "dsa_indexer.wk").replace(".wk",
+                                                     ".fused_wk_weights_proj"))
 
     def __call__(
             self,
-            hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            hidden_states: torch.Tensor,
+            prequant_input: Optional[Fp4QuantizedTensor] = None,
+            prequant_input_scale: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the fused GEMM; returns (wk_out, weights_proj_out) slices."""
-        if self.input_scale is not None:
-            input_scale = self.input_scale
-            alpha = self.alpha
+        self._log_debug(hidden_states)
+        prequant = self._try_prequant_input(hidden_states, prequant_input,
+                                            prequant_input_scale)
+        if prequant is not None:
+            act_fp4, act_sf, alpha = prequant
         else:
-            # Dynamic activation quantization, computed ONCE for both parts
-            # (the unfused pair pays the amax reduction + quantize twice).
-            global_max = self._FP8_MAX * self._E2M1_MAX
-            amax = torch.amax(torch.abs(hidden_states)).float()
-            input_scale = global_max / amax
-            alpha = (amax / global_max) * self.weight_scale_2_wk
-        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-            hidden_states, input_scale, 16, False)
+            if self.input_scale is not None:
+                input_scale = self.input_scale
+                alpha = self.alpha
+            else:
+                # Dynamic activation quantization, computed ONCE for both parts
+                # (the unfused pair pays the amax reduction + quantize twice).
+                global_max = self._FP8_MAX * self._E2M1_MAX
+                amax = torch.amax(torch.abs(hidden_states)).float()
+                input_scale = global_max / amax
+                alpha = (amax / global_max) * self.weight_scale_2_wk
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                hidden_states, input_scale, 16, False)
         out = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
             self.weight,
@@ -2382,6 +2520,496 @@ class _FusedWkWpNvfp4:
         if self.wp_out_scale != 1.0:
             weights = weights * self.wp_out_scale
         return indexer_k, weights
+
+
+class _FusedKvAWkWpNvfp4:
+    """Single padded NVFP4 GEMM for MLA kv_a + DSA fused wk/weights_proj.
+
+    kv_a_proj_with_mqa emits q_lora, compressed_kv, and k_pe while the DSA
+    fused wk/weights_proj emits indexer_k and routing weights. Both consume the
+    same gated hidden-state tensor. This helper inserts dummy rows after kv_a so
+    DSA's swizzled 128-row block scales stay block-aligned:
+
+        kv_a real rows [0:kv_out]
+        kv_a pad rows  [kv_out:kv_out_pad]
+        wk/wp rows     [kv_out_pad:kv_out_pad + wkwp_out]
+    """
+
+    _debug_logged = set()
+
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor,
+                 kv_out: int, kv_out_padded: int, q_lora_rank: int,
+                 kv_lora_rank: int, qk_rope_head_dim: int, wk_out: int,
+                 wp_out: int, out_dtype: torch.dtype,
+                 input_scale: torch.Tensor, alpha: torch.Tensor,
+                 wkwp_out_scale: float, allowed_backends: str,
+                 cast_wkwp_to_fp32: bool, debug_name: str):
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.kv_out = kv_out
+        self.kv_out_padded = kv_out_padded
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.wk_out = wk_out
+        self.wp_out = wp_out
+        self.wkwp_out = wk_out + wp_out
+        self.out_dtype = out_dtype
+        self.input_scale = input_scale
+        self.alpha = alpha
+        self.wkwp_out_scale = wkwp_out_scale
+        self.allowed_backends = allowed_backends
+        self.cast_wkwp_to_fp32 = cast_wkwp_to_fp32
+        self.debug_name = debug_name
+
+    @staticmethod
+    def _is_nvfp4_linear(module: Linear) -> bool:
+        weight = getattr(module, "weight", None)
+        weight_scale = getattr(module, "weight_scale", None)
+        weight_scale_2 = getattr(module, "weight_scale_2", None)
+        return (weight is not None and weight.dtype == torch.uint8
+                and weight.dim() == 2 and weight_scale is not None
+                and weight_scale.dim() == 1 and weight_scale_2 is not None
+                and module.bias is None
+                and getattr(module, "pre_quant_scale", None) is None)
+
+    @staticmethod
+    def _alias_original_weights(kv_a: Linear, fused_wk_wp: _FusedWkWpNvfp4,
+                                weight: torch.Tensor,
+                                weight_scale: torch.Tensor,
+                                kv_scale_elems: int,
+                                kv_out_padded: int) -> None:
+        kv_a.weight.data = weight.narrow(0, 0, kv_a.out_features)
+        fused_wk_wp.weight = weight.narrow(0, kv_out_padded,
+                                           fused_wk_wp.weight.shape[0])
+        kv_a.weight_scale.data = weight_scale.narrow(0, 0, kv_scale_elems)
+        fused_wk_wp.weight_scale = weight_scale.narrow(
+            0, kv_scale_elems, fused_wk_wp.weight_scale.numel())
+
+    @classmethod
+    def build(cls, kv_a: Linear, fused_wk_wp: _FusedWkWpNvfp4,
+              q_lora_rank: int, kv_lora_rank: int, qk_rope_head_dim: int,
+              allowed_backends: Optional[List[str]]
+              ) -> Optional["_FusedKvAWkWpNvfp4"]:
+        debug = os.environ.get("TRTLLM_INDEXER_FUSE_KVA_WKWP_DEBUG",
+                               "0") == "1"
+
+        def debug_reject(reason: str) -> None:
+            if debug:
+                logger.warning(
+                    f"MLA kv_a/indexer wk/wp fusion disabled: {reason}")
+
+        if not cls._is_nvfp4_linear(kv_a):
+            debug_reject(
+                "kv_a is not an NVFP4 Linear without bias/pre_quant_scale "
+                f"(weight={getattr(getattr(kv_a, 'weight', None), 'dtype', None)}, "
+                f"weight_dim={getattr(getattr(kv_a, 'weight', None), 'dim', lambda: None)()}, "
+                f"has_scale={getattr(kv_a, 'weight_scale', None) is not None}, "
+                f"has_scale2={getattr(kv_a, 'weight_scale_2', None) is not None}, "
+                f"bias={getattr(kv_a, 'bias', None) is not None}, "
+                f"pre_quant_scale={getattr(kv_a, 'pre_quant_scale', None) is not None})"
+            )
+            return None
+        if getattr(kv_a, "force_dynamic_quantization", False):
+            debug_reject("kv_a.force_dynamic_quantization is set")
+            return None
+        if kv_a.input_scale is None:
+            logger.warning(
+                "MLA kv_a/indexer wk/wp fusion requires kv_a static "
+                "input_scale; keeping split projections.")
+            return None
+        if kv_a.weight.shape[1] != fused_wk_wp.weight.shape[1]:
+            debug_reject(
+                "input K mismatch "
+                f"kv_a_K={kv_a.weight.shape[1]} "
+                f"wkwp_K={fused_wk_wp.weight.shape[1]}")
+            return None
+        cast_wkwp_to_fp32 = False
+        if kv_a.dtype != fused_wk_wp.out_dtype:
+            allow_bf16_dsa = (os.environ.get(
+                "TRTLLM_INDEXER_FUSE_KVA_WKWP_BF16_DSA", "0") == "1")
+            if not (allow_bf16_dsa and kv_a.dtype == torch.bfloat16
+                    and fused_wk_wp.out_dtype == torch.float32):
+                debug_reject(
+                    f"dtype mismatch kv_a={kv_a.dtype} wkwp={fused_wk_wp.out_dtype}"
+                )
+                return None
+            cast_wkwp_to_fp32 = True
+
+        wkwp_scale_matches = (fused_wk_wp.input_scale is not None
+                              and torch.allclose(kv_a.input_scale,
+                                                 fused_wk_wp.input_scale))
+        if (not wkwp_scale_matches and os.environ.get(
+                "TRTLLM_INDEXER_FUSE_KVA_WKWP_STATIC", "0") != "1"):
+            logger.warning(
+                "MLA kv_a/indexer wk/wp activation scales differ or indexer "
+                "is dynamic; set TRTLLM_INDEXER_FUSE_KVA_WKWP_STATIC=1 to "
+                "test kv_a-scale reuse.")
+            return None
+
+        k_blocks = (kv_a.weight.shape[1] * 2) // 16
+        k_blocks_padded = (k_blocks + 3) // 4 * 4
+        kv_out_padded = (kv_a.out_features + 127) // 128 * 128
+        wkwp_out = fused_wk_wp.weight.shape[0]
+        wkwp_out_padded = (wkwp_out + 127) // 128 * 128
+        expected_kv_scales = kv_out_padded * k_blocks_padded
+        expected_wkwp_scales = wkwp_out_padded * k_blocks_padded
+        if kv_a.weight.shape[0] != kv_a.out_features:
+            debug_reject(
+                "kv_a weight/out feature mismatch "
+                f"weight_N={kv_a.weight.shape[0]} out_features={kv_a.out_features}"
+            )
+            return None
+        if kv_a.weight_scale.numel() != expected_kv_scales:
+            debug_reject(
+                "kv_a weight_scale size mismatch "
+                f"got={kv_a.weight_scale.numel()} expected={expected_kv_scales} "
+                f"kv_out_padded={kv_out_padded} k_blocks_padded={k_blocks_padded}"
+            )
+            return None
+        if fused_wk_wp.weight_scale.numel() != expected_wkwp_scales:
+            debug_reject(
+                "wkwp weight_scale size mismatch "
+                f"got={fused_wk_wp.weight_scale.numel()} "
+                f"expected={expected_wkwp_scales} "
+                f"wkwp_out={wkwp_out} wkwp_out_padded={wkwp_out_padded} "
+                f"k_blocks_padded={k_blocks_padded}")
+            return None
+
+        pad_rows = kv_out_padded - kv_a.out_features
+        pad_weight = kv_a.weight.new_zeros((pad_rows, kv_a.weight.shape[1]))
+        weight = torch.cat([kv_a.weight.data, pad_weight,
+                            fused_wk_wp.weight.data],
+                           dim=0)
+        weight_scale = torch.cat(
+            [kv_a.weight_scale.data, fused_wk_wp.weight_scale.data], dim=0)
+        expected_total_scales = (
+            (weight.shape[0] + 127) // 128 * 128 * k_blocks_padded)
+        if weight_scale.numel() != expected_total_scales:
+            debug_reject(
+                "fused weight_scale size mismatch "
+                f"got={weight_scale.numel()} expected={expected_total_scales} "
+                f"fused_N={weight.shape[0]} k_blocks_padded={k_blocks_padded}")
+            return None
+
+        kv_weight_scale_2 = kv_a.weight_scale_2.float()
+        wkwp_out_scale_tensor = fused_wk_wp.weight_scale_2_wk.float(
+        ) / kv_weight_scale_2
+        if (not torch.isfinite(wkwp_out_scale_tensor).all()
+                and kv_a.alpha is not None and kv_a.input_scale is not None):
+            kv_weight_scale_2 = kv_a.alpha.float() * kv_a.input_scale.float()
+            wkwp_out_scale_tensor = (
+                fused_wk_wp.weight_scale_2_wk.float() / kv_weight_scale_2)
+        if not torch.isfinite(wkwp_out_scale_tensor).all():
+            debug_reject(
+                "non-finite wkwp output scale "
+                f"wk_scale2={fused_wk_wp.weight_scale_2_wk.float()} "
+                f"kv_scale2={kv_weight_scale_2}")
+            return None
+        wkwp_out_scale = float(wkwp_out_scale_tensor.item())
+        if os.environ.get("TRTLLM_INDEXER_FUSE_KVA_WKWP_ALIAS_ORIGINALS",
+                          "0") == "1":
+            cls._alias_original_weights(kv_a, fused_wk_wp, weight,
+                                        weight_scale, expected_kv_scales,
+                                        kv_out_padded)
+
+        if debug:
+            logger.warning(
+                "MLA kv_a/indexer wk/wp fusion constructed: "
+                f"kv_N={kv_a.out_features} kv_N_padded={kv_out_padded} "
+                f"wkwp_N={wkwp_out} fused_N={weight.shape[0]} "
+                f"K={kv_a.weight.shape[1]} pad_rows={pad_rows} "
+                f"allowed={allowed_backends} "
+                f"wkwp_out_scale={wkwp_out_scale:.8g} "
+                f"cast_wkwp_to_fp32={cast_wkwp_to_fp32}")
+
+        return cls(
+            weight=weight,
+            weight_scale=weight_scale,
+            kv_out=kv_a.out_features,
+            kv_out_padded=kv_out_padded,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            wk_out=fused_wk_wp.wk_out,
+            wp_out=fused_wk_wp.wp_out,
+            out_dtype=kv_a.dtype,
+            input_scale=kv_a.input_scale,
+            alpha=kv_a.alpha,
+            wkwp_out_scale=wkwp_out_scale,
+            allowed_backends=','.join(allowed_backends or
+                                      ['cutlass', 'cublaslt', 'cuda_core']),
+            cast_wkwp_to_fp32=cast_wkwp_to_fp32,
+            debug_name=(getattr(kv_a, "debug_name", None)
+                        or "mla.kv_a_proj_with_mqa").replace(
+                            ".kv_a_proj_with_mqa",
+                            ".fused_kv_a_wk_weights_proj"))
+
+    def _log_debug(self, hidden_states: torch.Tensor) -> None:
+        if (os.environ.get("TRTLLM_NVFP4_LINEAR_DEBUG", "0") != "1"
+                and os.environ.get("TRTLLM_NVFP4_GEMM_DEBUG_SHAPES", "0") != "1"
+                and os.environ.get("TRTLLM_INDEXER_FUSE_KVA_WKWP_DEBUG",
+                                   "0") != "1"):
+            return
+        key = (self.debug_name, hidden_states.shape[0], self.weight.shape[0],
+               hidden_states.shape[-1], self.kv_out, self.kv_out_padded,
+               self.wk_out, self.wp_out, self.allowed_backends,
+               self.wkwp_out_scale, self.cast_wkwp_to_fp32)
+        if key in self._debug_logged:
+            return
+        self._debug_logged.add(key)
+        logger.warning(
+            f"NVFP4 MLA/Indexer fused site={self.debug_name} "
+            f"M={hidden_states.shape[0]} N={self.weight.shape[0]} "
+            f"K={hidden_states.shape[-1]} kv_out={self.kv_out} "
+            f"kv_out_padded={self.kv_out_padded} wkwp_out={self.wkwp_out} "
+            f"wk_out={self.wk_out} wp_out={self.wp_out} "
+            f"allowed={self.allowed_backends} "
+            f"wkwp_out_scale={self.wkwp_out_scale:.8g} "
+            f"cast_wkwp_to_fp32={self.cast_wkwp_to_fp32}")
+
+    def __call__(
+            self, hidden_states: Union[torch.Tensor, Fp4QuantizedTensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            act_fp4 = hidden_states.fp4_tensor
+            act_sf = hidden_states.scaling_factor
+            log_tensor = act_fp4
+        else:
+            log_tensor = hidden_states
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                hidden_states, self.input_scale, 16, False)
+        self._log_debug(log_tensor)
+        out = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4,
+            self.weight,
+            act_sf,
+            self.weight_scale,
+            self.alpha,
+            self.out_dtype,
+            allowed_backends=self.allowed_backends)
+        q, compressed_kv, k_pe = out[..., :self.kv_out].split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        wkwp = out[..., self.kv_out_padded:self.kv_out_padded + self.wkwp_out]
+        if self.cast_wkwp_to_fp32:
+            wkwp = wkwp.float()
+        if self.wkwp_out_scale != 1.0:
+            wkwp = wkwp * self.wkwp_out_scale
+        indexer_k, weights = wkwp.split([self.wk_out, self.wp_out], dim=-1)
+        return q, compressed_kv, k_pe, indexer_k, weights
+
+
+class _FusedQbWqBNvfp4:
+    """Single NVFP4 GEMM for MLA q_b_proj + DSA indexer wq_b.
+
+    Both projections consume the q_lora tensor after q_a_layernorm. q_b_proj
+    produces the MLA query tensor, while wq_b produces the sparse-indexer query
+    before RoPE/cat quantization. This helper concatenates their packed weights
+    along N and runs one wider NVFP4 GEMM, then splits the output slices.
+
+    The activation scale comes from q_b_proj. If wq_b would normally use a
+    different or dynamic activation scale, the path is experimental and must be
+    enabled explicitly by TRTLLM_INDEXER_FUSE_QB_WQB_STATIC=1.
+    """
+
+    _FP8_MAX = 448.0
+    _E2M1_MAX = 6.0
+    _debug_logged = set()
+
+    @staticmethod
+    def _alias_original_weights(q_b: Linear, wq_b: Linear,
+                                weight: torch.Tensor,
+                                weight_scale: torch.Tensor) -> None:
+        """Point the original linears at slices of the fused storage.
+
+        The fused q_b+wq_b path needs one contiguous N-concatenated tensor for
+        the regular NVFP4 GEMM. Keeping that tensor in addition to the original
+        q_b and wq_b weights can reduce KV/admission headroom at C32, so this
+        optional mode makes the original module parameters view the fused
+        storage instead of retaining duplicate allocations.
+        """
+
+        qb_out = q_b.out_features
+        wq_out = wq_b.out_features
+        qb_scale_elems = q_b.weight_scale.numel()
+        wq_scale_elems = wq_b.weight_scale.numel()
+
+        q_b.weight.data = weight.narrow(0, 0, qb_out)
+        wq_b.weight.data = weight.narrow(0, qb_out, wq_out)
+        q_b.weight_scale.data = weight_scale.narrow(0, 0, qb_scale_elems)
+        wq_b.weight_scale.data = weight_scale.narrow(
+            0, qb_scale_elems, wq_scale_elems)
+
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor,
+                 qb_out: int, wq_out: int, out_dtype: torch.dtype,
+                 weight_scale_2_qb: torch.Tensor, wq_out_scale: float,
+                 input_scale: Optional[torch.Tensor],
+                 alpha: Optional[torch.Tensor], allowed_backends: str,
+                 apply_wq_post_scale: bool, use_variable_n: bool,
+                 debug_name: str):
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.qb_out = qb_out
+        self.wq_out = wq_out
+        self.out_dtype = out_dtype
+        self.weight_scale_2_qb = weight_scale_2_qb
+        self.wq_out_scale = wq_out_scale
+        self.input_scale = input_scale
+        self.alpha = alpha
+        self.allowed_backends = allowed_backends
+        self.apply_wq_post_scale = apply_wq_post_scale
+        self.use_variable_n = use_variable_n
+        self.debug_name = debug_name
+
+    @staticmethod
+    def _is_nvfp4_linear(module: Linear) -> bool:
+        weight = getattr(module, "weight", None)
+        weight_scale = getattr(module, "weight_scale", None)
+        weight_scale_2 = getattr(module, "weight_scale_2", None)
+        return (weight is not None and weight.dtype == torch.uint8
+                and weight.dim() == 2 and weight_scale is not None
+                and weight_scale.dim() == 1 and weight_scale_2 is not None
+                and module.bias is None
+                and getattr(module, "pre_quant_scale", None) is None)
+
+    @classmethod
+    def build(cls, q_b: Linear, wq_b: Linear,
+              allowed_backends: Optional[List[str]]
+              ) -> Optional["_FusedQbWqBNvfp4"]:
+        if not (cls._is_nvfp4_linear(q_b) and cls._is_nvfp4_linear(wq_b)):
+            return None
+        if q_b.weight.shape[1] != wq_b.weight.shape[1]:
+            return None
+        if q_b.dtype != wq_b.dtype:
+            return None
+        if q_b.out_features % 128 != 0:
+            return None
+        if getattr(q_b, "force_dynamic_quantization", False):
+            return None
+
+        q_b_scale = getattr(q_b, "input_scale", None)
+        wq_b_scale = getattr(wq_b, "input_scale", None)
+        exact_scale_match = (q_b_scale is not None and wq_b_scale is not None
+                             and torch.allclose(q_b_scale, wq_b_scale))
+        if (not exact_scale_match and os.environ.get(
+                "TRTLLM_INDEXER_FUSE_QB_WQB_STATIC", "0") != "1"):
+            logger.warning(
+                "MLA q_b/indexer wq_b activation scales differ; set "
+                "TRTLLM_INDEXER_FUSE_QB_WQB_STATIC=1 to test q_b-scale reuse."
+            )
+            return None
+        if q_b_scale is None:
+            logger.warning(
+                "MLA q_b/indexer wq_b fusion requires q_b static input_scale; "
+                "keeping split projections.")
+            return None
+
+        k_blocks = (q_b.weight.shape[1] * 2) // 16
+        k_blocks_padded = (k_blocks + 3) // 4 * 4
+        for module in (q_b, wq_b):
+            n_padded = (module.out_features + 127) // 128 * 128
+            if module.weight.shape[0] != module.out_features:
+                return None
+            if module.weight_scale.numel() != n_padded * k_blocks_padded:
+                return None
+
+        weight = torch.cat([q_b.weight.data, wq_b.weight.data], dim=0)
+        weight_scale = torch.cat(
+            [q_b.weight_scale.data, wq_b.weight_scale.data], dim=0)
+        use_variable_n = (os.environ.get(
+            "TRTLLM_INDEXER_FUSE_QB_WQB_VARIABLE_N", "0") == "1")
+        if (use_variable_n or os.environ.get(
+                "TRTLLM_INDEXER_FUSE_QB_WQB_ALIAS_ORIGINALS", "0") == "1"):
+            cls._alias_original_weights(q_b, wq_b, weight, weight_scale)
+
+        wq_out_scale = float(
+            (wq_b.weight_scale_2.float() / q_b.weight_scale_2.float()).item())
+        return cls(
+            weight=weight,
+            weight_scale=weight_scale,
+            qb_out=q_b.out_features,
+            wq_out=wq_b.out_features,
+            out_dtype=q_b.dtype,
+            weight_scale_2_qb=q_b.weight_scale_2.data,
+            wq_out_scale=wq_out_scale,
+            input_scale=q_b_scale,
+            alpha=q_b.alpha,
+            allowed_backends=','.join(allowed_backends or
+                                      ['cutlass', 'cublaslt', 'cuda_core']),
+            apply_wq_post_scale=(os.environ.get(
+                "TRTLLM_INDEXER_FUSE_QB_WQB_POST_SCALE", "0") == "1"),
+            use_variable_n=use_variable_n,
+            debug_name=(getattr(q_b, "debug_name", None)
+                        or "mla.q_b_proj").replace(
+                            ".q_b_proj", ".fused_q_b_wq_b"))
+
+    def _log_debug(self, qr: torch.Tensor) -> None:
+        if (os.environ.get("TRTLLM_NVFP4_LINEAR_DEBUG", "0") != "1"
+                and os.environ.get("TRTLLM_NVFP4_GEMM_DEBUG_SHAPES", "0") != "1"
+                and os.environ.get("TRTLLM_INDEXER_FUSE_QB_WQB_DEBUG",
+                                   "0") != "1"):
+            return
+        key = (self.debug_name, qr.shape[0], self.weight.shape[0],
+               qr.shape[-1], self.qb_out, self.wq_out,
+               self.allowed_backends, self.wq_out_scale, self.use_variable_n)
+        if key in self._debug_logged:
+            return
+        self._debug_logged.add(key)
+        logger.warning(
+            f"NVFP4 MLA fused site={self.debug_name} M={qr.shape[0]} "
+            f"N={self.weight.shape[0]} K={qr.shape[-1]} qb_out={self.qb_out} "
+            f"wq_out={self.wq_out} allowed={self.allowed_backends} "
+            f"wq_out_scale={self.wq_out_scale:.8g} "
+            f"variable_n={self.use_variable_n}")
+
+    def __call__(self,
+                 qr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        self._log_debug(qr)
+        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+            qr, self.input_scale, 16, False)
+        variable_n_op = "cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out"
+        variable_n_available = hasattr(torch.ops.trtllm, variable_n_op)
+        if self.use_variable_n and variable_n_available:
+            out = torch.empty(2,
+                              qr.shape[0],
+                              self.qb_out,
+                              dtype=self.out_dtype,
+                              device=qr.device)
+            torch.ops.trtllm.cute_dsl_nvfp4_qb_wqb_gemm_blackwell_out(
+                act_fp4,
+                self.weight,
+                act_sf,
+                self.weight_scale,
+                self.alpha,
+                out,
+                self.qb_out,
+                self.wq_out,
+                self.out_dtype)
+            q_b_out = out[0, :, :self.qb_out]
+            wq_b_out = out[1, :, :self.wq_out]
+        else:
+            if self.use_variable_n and self.debug_name not in self._variable_n_missing_logged:
+                logger.warning(
+                    f"NVFP4 MLA fused site={self.debug_name} falling back to "
+                    f"concatenated q_b/wq_b GEMM because trtllm::{variable_n_op} "
+                    "is not registered")
+                self._variable_n_missing_logged.add(self.debug_name)
+            out = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4,
+                self.weight,
+                act_sf,
+                self.weight_scale,
+                self.alpha,
+                self.out_dtype,
+                allowed_backends=self.allowed_backends)
+            q_b_out = out[..., :self.qb_out]
+            wq_b_out = out[..., self.qb_out:self.qb_out + self.wq_out]
+        if self.apply_wq_post_scale and self.wq_out_scale != 1.0:
+            wq_b_out = wq_b_out * self.wq_out_scale
+            return q_b_out, wq_b_out, 1.0
+        return q_b_out, wq_b_out, self.wq_out_scale
+
 
 
 class Indexer(nn.Module):
@@ -2501,6 +3129,12 @@ class Indexer(nn.Module):
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True,
             nvfp4_allowed_backends=self._indexer_nvfp4_backends)
+        self.wq_b.debug_name = f"dsa_indexer.layer{layer_idx}.wq_b"
+        self.wk.debug_name = f"dsa_indexer.layer{layer_idx}.wk"
+        self.weights_proj.debug_name = (
+            f"dsa_indexer.layer{layer_idx}.weights_proj")
+        self._wq_prequant_reuse_logged: Set[Tuple[str, str, int, int]] = set()
+        self._wq_prequant_amax_counts: Dict[Tuple[int, int], int] = {}
 
         # Fused wk + weights_proj weight for single F.linear FP32 GEMM under allow_tf32.
         # Maps to TF32 tensor cores on Ampere+.
@@ -4759,10 +5393,127 @@ class Indexer(nn.Module):
         weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
 
-    def _qk_projection_and_rope(self, qr: torch.Tensor, indexer_k: torch.Tensor,
-                                position_ids: torch.Tensor):
+    def _log_wq_prequant_reuse(self, qr: torch.Tensor, reason: str) -> None:
+        if os.environ.get("TRTLLM_INDEXER_REUSE_QB_FP4_DEBUG", "0") != "1":
+            return
+        key = (getattr(self.wq_b, "debug_name", "dsa_indexer.wq_b"), reason,
+               qr.shape[0], qr.shape[-1])
+        if key in self._wq_prequant_reuse_logged:
+            return
+        self._wq_prequant_reuse_logged.add(key)
+        logger.warning(
+            f"NVFP4 Indexer q-prequant site={key[0]} M={qr.shape[0]} "
+            f"K={qr.shape[-1]} reason={reason}")
+
+    def _log_wq_prequant_amax(self, qr: torch.Tensor,
+                              prequant_q_scale: torch.Tensor) -> None:
+        if os.environ.get("TRTLLM_INDEXER_REUSE_QB_FP4_AMAX_DEBUG",
+                          "0") != "1":
+            return
+        if torch.cuda.is_current_stream_capturing():
+            self._log_wq_prequant_reuse(qr, "amax_capture_skipped")
+            return
+        limit = max(
+            1,
+            int(
+                os.environ.get(
+                    "TRTLLM_INDEXER_REUSE_QB_FP4_AMAX_DEBUG_LIMIT", "8")))
+        key = (qr.shape[0], qr.shape[-1])
+        count = self._wq_prequant_amax_counts.get(key, 0)
+        if count >= limit:
+            return
+        self._wq_prequant_amax_counts[key] = count + 1
+
+        global_max = 448.0 * 6.0
+        amax = torch.amax(torch.abs(qr)).float()
+        dynamic_scale = global_max / amax
+        static_scale = prequant_q_scale.float()
+        amax_over_static_calib = static_scale / dynamic_scale
+        logger.warning(
+            f"NVFP4 Indexer q-prequant amax site={self.wq_b.debug_name} "
+            f"M={qr.shape[0]} K={qr.shape[-1]} sample={count + 1}/{limit} "
+            f"amax={amax.item():.6g} dynamic_scale={dynamic_scale.item():.6g} "
+            f"prequant_scale={static_scale.item():.6g} "
+            f"amax_over_static_calib={amax_over_static_calib.item():.6g}")
+
+    def _try_prequant_wq_b(
+        self,
+        qr: torch.Tensor,
+        prequant_q: Optional[Fp4QuantizedTensor],
+        prequant_q_scale: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if os.environ.get("TRTLLM_INDEXER_REUSE_QB_FP4", "0") != "1":
+            return None
+        if prequant_q is None or prequant_q_scale is None:
+            self._log_wq_prequant_reuse(qr, "missing_payload")
+            return None
+        if not prequant_q.is_sf_swizzled:
+            self._log_wq_prequant_reuse(qr, "linear_sf_layout")
+            return None
+        if getattr(self.wq_b, "pre_quant_scale", None) is not None:
+            self._log_wq_prequant_reuse(qr, "pre_quant_scale")
+            return None
+        if getattr(self.wq_b, "force_dynamic_quantization", False):
+            self._log_wq_prequant_reuse(qr, "force_dynamic")
+            return None
+        self._log_wq_prequant_amax(qr, prequant_q_scale)
+
+        input_scale = getattr(self.wq_b, "input_scale", None)
+        if input_scale is not None and prequant_q_scale is input_scale:
+            self._log_wq_prequant_reuse(qr, "reuse_static_scale")
+            return prequant_q.fp4_tensor, prequant_q.scaling_factor, self.wq_b.alpha
+
+        if os.environ.get("TRTLLM_INDEXER_REUSE_QB_FP4_STATIC", "0") != "1":
+            reason = "dynamic_indexer" if input_scale is None else "scale_mismatch"
+            self._log_wq_prequant_reuse(qr, reason)
+            return None
+
+        alpha = (1.0 / prequant_q_scale.float()) * self.wq_b.weight_scale_2
+        self._log_wq_prequant_reuse(qr, "reuse_qb_static_scale")
+        return prequant_q.fp4_tensor, prequant_q.scaling_factor, alpha
+
+    def _project_wq_b(
+        self,
+        qr: torch.Tensor,
+        prequant_q: Optional[Fp4QuantizedTensor],
+        prequant_q_scale: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        prequant = self._try_prequant_wq_b(qr, prequant_q, prequant_q_scale)
+        if prequant is None:
+            return self.wq_b(qr)
+        act_fp4, act_sf, alpha = prequant
+        allowed_backends = getattr(self.wq_b, "nvfp4_allowed_backends_str",
+                                   None)
+        if allowed_backends is None:
+            allowed_backends = getattr(self.wq_b, "nvfp4_allowed_backends", [
+                "cutlass", "cublaslt", "cuda_core"
+            ])
+            if not isinstance(allowed_backends, str):
+                allowed_backends = ",".join(allowed_backends)
+        q = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4,
+            self.wq_b.weight,
+            act_sf,
+            self.wq_b.weight_scale,
+            alpha,
+            self.wq_b.dtype,
+            allowed_backends=allowed_backends)
+        if q.shape[-1] > self.wq_b.out_features:
+            q = q[..., :self.wq_b.out_features].contiguous()
+        return q
+
+    def _qk_projection_and_rope(
+        self,
+        qr: torch.Tensor,
+        indexer_k: torch.Tensor,
+        position_ids: torch.Tensor,
+        prequant_q: Optional[Fp4QuantizedTensor],
+        prequant_q_scale: Optional[torch.Tensor],
+        precomputed_wq_b: Optional[torch.Tensor] = None,
+    ):
         """Project Q/K and apply RoPE"""
-        q = self.wq_b(qr)
+        q = (precomputed_wq_b if precomputed_wq_b is not None else
+             self._project_wq_b(qr, prequant_q, prequant_q_scale))
         k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
@@ -4773,14 +5524,21 @@ class Indexer(nn.Module):
         k_pe = k_pe[:, 0, :]
         return q_pe, q_nope, k_pe, k_nope
 
-    def _qk_projection_no_rope(self, qr: torch.Tensor,
-                               indexer_k: torch.Tensor):
+    def _qk_projection_no_rope(
+        self,
+        qr: torch.Tensor,
+        indexer_k: torch.Tensor,
+        prequant_q: Optional[Fp4QuantizedTensor],
+        prequant_q_scale: Optional[torch.Tensor],
+        precomputed_wq_b: Optional[torch.Tensor] = None,
+    ):
         """Project Q/K and split pe/nope WITHOUT applying RoPE.
 
         Used by the fused RoPE+cat+FP4-quant path, which folds RoPE into the
         quantize kernel and so needs the pre-RoPE pe slices.
         """
-        q = self.wq_b(qr)
+        q = (precomputed_wq_b if precomputed_wq_b is not None else
+             self._project_wq_b(qr, prequant_q, prequant_q_scale))
         k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
@@ -4805,7 +5563,15 @@ class Indexer(nn.Module):
 
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
-        position_ids: torch.Tensor
+        position_ids: torch.Tensor,
+        prequant_hidden_states: Optional[Fp4QuantizedTensor] = None,
+        prequant_hidden_states_scale: Optional[torch.Tensor] = None,
+        prequant_q: Optional[Fp4QuantizedTensor] = None,
+        prequant_q_scale: Optional[torch.Tensor] = None,
+        precomputed_wq_b: Optional[torch.Tensor] = None,
+        precomputed_wq_b_scale: float = 1.0,
+        precomputed_indexer_k: Optional[torch.Tensor] = None,
+        precomputed_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor]:
         """Pure token-wise projections (CUDA-graph-capturable).
@@ -4855,9 +5621,14 @@ class Indexer(nn.Module):
                                               dtype=torch.float32)
             return q_fp8, k_fp8, k_scale, weights, q_scale
 
-        if (self._fused_wk_wp_nvfp4 is not None
+        if precomputed_indexer_k is not None and precomputed_weights is not None:
+            indexer_k = precomputed_indexer_k
+            weights = precomputed_weights
+        elif (self._fused_wk_wp_nvfp4 is not None
                 and isinstance(hidden_states, torch.Tensor)):
-            indexer_k, weights = self._fused_wk_wp_nvfp4(hidden_states)
+            indexer_k, weights = self._fused_wk_wp_nvfp4(
+                hidden_states, prequant_hidden_states,
+                prequant_hidden_states_scale)
         elif self._fused_wk_wp_weight is not None:
             hidden_float = _to_float(hidden_states)
             with _tf32_matmul_enabled():
@@ -4882,7 +5653,8 @@ class Indexer(nn.Module):
             # rotary_emb -> _prep_q_or_k, but removes the RoPE kernel launch
             # and the BF16 q_pe/k_pe round-trip (~3-4 us/F-layer, graphed).
             q_pe, q_nope, k_pe, k_nope = self._qk_projection_no_rope(
-                qr, indexer_k)
+                qr, indexer_k, prequant_q, prequant_q_scale,
+                precomputed_wq_b)
             if self._rope_cat_cos_sin is None:
                 self._rope_cat_cos_sin = self.rotary_emb.rotary_cos_sin.view(
                     self.rotary_emb.max_positions, -1).to(torch.float32)
@@ -4906,7 +5678,8 @@ class Indexer(nn.Module):
             k_fp8, k_scale = k
         else:
             q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
-                qr, indexer_k, position_ids)
+                qr, indexer_k, position_ids, prequant_q, prequant_q_scale,
+                precomputed_wq_b)
             q, k = maybe_execute_in_parallel(
                 lambda: self._prep_q_or_k(q_pe, q_nope),
                 lambda: self._prep_q_or_k(k_pe, k_nope),
@@ -4930,6 +5703,8 @@ class Indexer(nn.Module):
             q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
             q_scale = q_scale.view(-1, self.n_heads, 1)
             weights = self._weight_scale(weights, q_scale)
+        if precomputed_wq_b_scale != 1.0:
+            weights = weights * precomputed_wq_b_scale
 
         return q_fp8, k_fp8, k_scale, weights, q_scale
 

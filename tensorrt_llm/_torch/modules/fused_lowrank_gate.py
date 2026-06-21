@@ -12,13 +12,17 @@ The REAP graft adds two glue chains to every DeepSeek-V3.2 decoder layer:
 
 2. Attention output gate (1x/layer, attention.py MLA forward):
        attn_output = attn_output * sigmoid(gate)
-   `fused_sigmoid_mul` collapses the two elementwise kernels into one.
+   `fused_sigmoid_mul` collapses the two elementwise kernels into one. When
+   the consumer is an NVFP4 projection, the C++ op
+   `fused_sigmoid_mul_quant_nvfp4_swizzled` additionally packs the gated
+   activation directly for the projection.
 
 Rounding points mirror the eager chain (silu -> bf16, up-GEMM output -> bf16,
 sigmoid -> bf16, final mul in fp32 -> bf16) so outputs match at bf16 ulp level.
 """
 
 import os
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -41,6 +45,10 @@ _GATE_DISABLED = os.environ.get("TRTLLM_OPTRT_FUSED_LOWRANK_GATE",
 _GATE_IMPL = os.environ.get("TRTLLM_OPTRT_LOWRANK_GATE_IMPL", "cute").lower()
 _SIGMOID_MUL_DISABLED = os.environ.get("TRTLLM_OPTRT_FUSED_SIGMOID_MUL",
                                        "1") in ("0", "false", "False")
+_SIGMOID_MUL_QUANT_DISABLED = os.environ.get(
+    "TRTLLM_OPTRT_FUSED_SIGMOID_MUL_QUANT_NVFP4", "0") not in ("1", "true",
+                                                              "True")
+_SIGMOID_MUL_QUANT_LIB_LOADED = False
 
 _KSPLITS = 7
 _BLOCK_K = 1024
@@ -422,6 +430,13 @@ def apply_fused_lowrank_gate_quant_nvfp4_swizzled(
         flat, wd_bf16, wu_t, quant_scale)
 
 
+def apply_fused_sigmoid_mul_quant_nvfp4_swizzled(
+        x: torch.Tensor, gate: torch.Tensor,
+        quant_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.trtllm.fused_sigmoid_mul_quant_nvfp4_swizzled(
+        x, gate, quant_scale)
+
+
 def lowrank_gate_supported(flat: torch.Tensor, rank: int) -> bool:
     return (HAS_TRITON and not _GATE_DISABLED and _GATE_IMPL != "eager"
             and flat.is_cuda and flat.dtype == torch.bfloat16
@@ -461,3 +476,35 @@ def sigmoid_mul_supported(x: torch.Tensor, gate: torch.Tensor) -> bool:
             and x.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16
             and x.is_contiguous() and gate.is_contiguous()
             and x.shape == gate.shape)
+
+
+def _sigmoid_mul_quant_nvfp4_op_available() -> bool:
+    _load_sigmoid_mul_quant_nvfp4_op()
+    try:
+        torch.ops.trtllm.fused_sigmoid_mul_quant_nvfp4_swizzled.default
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
+def _load_sigmoid_mul_quant_nvfp4_op() -> None:
+    global _SIGMOID_MUL_QUANT_LIB_LOADED
+    if _SIGMOID_MUL_QUANT_LIB_LOADED:
+        return
+    _SIGMOID_MUL_QUANT_LIB_LOADED = True
+    lib_path = (Path(__file__).resolve().parents[2] / "libs" /
+                "libsigmoid_quant_ext.so")
+    if lib_path.exists():
+        torch.ops.load_library(str(lib_path))
+
+
+def sigmoid_mul_quant_nvfp4_supported(
+        x: torch.Tensor, gate: torch.Tensor,
+        quant_scale: Optional[torch.Tensor]) -> bool:
+    return (not _SIGMOID_MUL_QUANT_DISABLED
+            and _sigmoid_mul_quant_nvfp4_op_available() and x.is_cuda
+            and x.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16
+            and x.dim() == 2 and gate.dim() == 2 and x.is_contiguous()
+            and gate.is_contiguous() and x.shape == gate.shape
+            and x.shape[-1] % 16 == 0 and quant_scale is not None
+            and quant_scale.dtype == torch.float32)

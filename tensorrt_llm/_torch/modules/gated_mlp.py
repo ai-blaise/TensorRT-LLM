@@ -97,6 +97,10 @@ class GatedMLP(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
             nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
+        debug_prefix = "mlp" if layer_idx is None else f"model.layers.{layer_idx}.mlp"
+        if is_shared_expert:
+            debug_prefix = f"{debug_prefix}.shared_experts"
+        self.gate_up_proj.debug_name = f"{debug_prefix}.gate_up_proj"
 
         if is_shared_expert:
             down_type = LoraModuleType.SHARED_EXPERT_4H_TO_H
@@ -127,6 +131,7 @@ class GatedMLP(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
             nvfp4_allowed_backends=nvfp4_allowed_backends,
         )
+        self.down_proj.debug_name = f"{debug_prefix}.down_proj"
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora

@@ -116,3 +116,4 @@ enroot/tensorrt_llm.devel.sqsh
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
+.bench_runs_claude/

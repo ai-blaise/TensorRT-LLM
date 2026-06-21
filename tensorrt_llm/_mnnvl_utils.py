@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -628,6 +628,8 @@ class MnnvlMoe:
         workspace: torch.Tensor,
         ep_rank: int,
         ep_size: int,
+        token_selected_slots_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # Convert single tensor to list for unified handling
         is_single_tensor = not isinstance(x, list)
@@ -639,6 +641,9 @@ class MnnvlMoe:
 
         # Filter out None values
         valid_list = [tensor is not None for tensor in x]
+        valid_original_indices = [
+            idx for idx, is_valid in enumerate(valid_list) if is_valid
+        ]
         valid_tensors = [tensor for tensor in x if tensor is not None]
 
         if len(valid_tensors) == 0:
@@ -656,6 +661,15 @@ class MnnvlMoe:
                         f"All tensors must have the same first dimension, got {tensor.shape[0]} vs {first_dim}"
                     )
 
+            valid_token_selected_slots_index = None
+            if token_selected_slots_index is not None:
+                assert 0 <= token_selected_slots_index < len(x), (
+                    "token_selected_slots_index out of range")
+                assert valid_list[token_selected_slots_index], (
+                    "token_selected_slots_index cannot refer to None")
+                valid_token_selected_slots_index = valid_original_indices.index(
+                    token_selected_slots_index)
+
             # Process only valid tensors
             output_tensors = torch.ops.trtllm.moe_comm(
                 valid_tensors,
@@ -667,6 +681,8 @@ class MnnvlMoe:
                 alltoall_info.local_token_allocation_count,
                 ep_rank,
                 ep_size,
+                token_selected_slots_index=valid_token_selected_slots_index,
+                invalid_token_expert_id=invalid_token_expert_id,
             )
 
             # Restore None positions in output

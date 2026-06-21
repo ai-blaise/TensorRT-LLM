@@ -48,6 +48,245 @@ def _allow_odd_m_cute_dsl_fp8_blockscale() -> bool:
     return os.environ.get("TRTLLM_ALLOW_ODD_M_CUTE_DSL_FP8", "0") == "1"
 
 
+_nvfp4_linear_debug_logged = set()
+_nvfp4_qb_linear_cutedsl_logged = set()
+_nvfp4_o_linear_cutedsl_logged = set()
+
+
+def _parse_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(f"Invalid boolean env value {name}={raw!r}")
+
+
+def _log_nvfp4_linear_debug(module: nn.Module, act_fp4: torch.Tensor,
+                            act_sf: torch.Tensor, alpha: torch.Tensor,
+                            output_buffer_kind: int, group,
+                            allowed_backends: str) -> None:
+    if os.environ.get("TRTLLM_NVFP4_LINEAR_DEBUG", "0") != "1":
+        return
+
+    debug_name = getattr(module, "debug_name", None) or module.__class__.__name__
+    m = act_fp4.shape[0]
+    k = act_fp4.shape[1] * 2
+    padded_n = module.weight.shape[0]
+    key = (
+        debug_name,
+        m,
+        padded_n,
+        k,
+        module.out_features,
+        module.in_features,
+        allowed_backends,
+        output_buffer_kind,
+        group is not None,
+    )
+    if key in _nvfp4_linear_debug_logged:
+        return
+
+    _nvfp4_linear_debug_logged.add(key)
+    logger.warning(
+        f"NVFP4 Linear site={debug_name} M={m} N={padded_n} K={k} "
+        f"logical_out={module.out_features} logical_in={module.in_features} "
+        f"tp_mode={module.tp_mode} tp_size={module.tp_size} "
+        f"reduce_output={module.reduce_output} allowed={allowed_backends} "
+        f"output_buffer_kind={output_buffer_kind} group={group is not None} "
+        f"act_sf={act_sf.numel()} weight_sf={module.weight_scale.numel()} "
+        f"alpha={alpha.numel()}")
+
+
+def _try_nvfp4_qb_linear_cutedsl(
+    module: nn.Module,
+    act_fp4: torch.Tensor,
+    act_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    output_buffer_kind: int,
+    group,
+) -> Optional[torch.Tensor]:
+    if os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL", "0") != "1":
+        return None
+    if module.dtype != torch.bfloat16:
+        return None
+    if act_fp4.dim() != 2 or module.weight.dim() != 2:
+        return None
+
+    try:
+        min_m = int(os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_MIN_M",
+                                   "32"))
+        max_m = int(os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_MAX_M",
+                                   "64"))
+        target_n = int(os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_N",
+                                      "24576"))
+        target_k = int(os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_K",
+                                      "1536"))
+        tile_m = int(os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_TILE_M",
+                                    "128"))
+        tile_n = int(os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_TILE_N",
+                                    "64"))
+        cluster_m = int(
+            os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_CLUSTER_M", "2"))
+        cluster_n = int(
+            os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_CLUSTER_N", "1"))
+        swap_ab = _parse_env_bool("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_SWAP_AB",
+                                  True)
+        use_prefetch = _parse_env_bool(
+            "TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_PREFETCH", False)
+    except ValueError:
+        logger.warning("Invalid TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_* env value")
+        return None
+
+    if min(tile_m, tile_n, cluster_m, cluster_n) <= 0:
+        logger.warning(
+            "Invalid non-positive TRTLLM_NVFP4_LINEAR_QB_CUTEDSL tactic env value"
+        )
+        return None
+
+    m = act_fp4.shape[0]
+    n = module.weight.shape[0]
+    real_k = act_fp4.shape[1] * 2
+    if min_m < 0 or max_m <= 0 or min_m > max_m or m < min_m or m > max_m:
+        return None
+    if n != target_n or real_k != target_k:
+        return None
+
+    sf_m = fp4_utils.pad_up(m, 128)
+    sf_k = fp4_utils.pad_up(real_k // 16, 4)
+    sf_n = fp4_utils.pad_up(n, 128)
+    if act_sf.numel() != sf_m * sf_k:
+        return None
+    if module.weight_scale.numel() != sf_n * sf_k:
+        return None
+    if alpha.numel() != 1:
+        return None
+    if get_sm_version() not in (100, 103):
+        return None
+
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return None
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4BlackwellRunner
+
+    tactic = ((tile_m, tile_n), (cluster_m, cluster_n), swap_ab,
+              use_prefetch)
+    debug_name = getattr(module, "debug_name", None) or module.__class__.__name__
+    log_key = (debug_name, m, n, real_k, int(output_buffer_kind), tactic)
+    if (os.environ.get("TRTLLM_NVFP4_LINEAR_QB_CUTEDSL_DEBUG", "0") == "1"
+            and log_key not in _nvfp4_qb_linear_cutedsl_logged):
+        logger.warning(
+            f"NVFP4 q_b Linear CuTeDSL selected site={debug_name} "
+            f"M={m} N={n} K={real_k} tactic={tactic} "
+            f"output_buffer_kind={output_buffer_kind}")
+        _nvfp4_qb_linear_cutedsl_logged.add(log_key)
+
+    return CuteDSLNVFP4BlackwellRunner(module.dtype, output_buffer_kind,
+                                       group)(
+                                           [
+                                               act_fp4, module.weight, act_sf,
+                                               module.weight_scale, alpha
+                                           ],
+                                           tactic=tactic)
+
+
+def _try_nvfp4_o_linear_cutedsl(
+    module: nn.Module,
+    act_fp4: torch.Tensor,
+    act_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    output_buffer_kind: int,
+    group,
+) -> Optional[torch.Tensor]:
+    if os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL", "0") != "1":
+        return None
+    if module.dtype != torch.bfloat16:
+        return None
+    if act_fp4.dim() != 2 or module.weight.dim() != 2:
+        return None
+
+    try:
+        min_m = int(os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_MIN_M",
+                                   "16"))
+        max_m = int(os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_MAX_M",
+                                   "64"))
+        target_n = int(os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_N",
+                                      "7168"))
+        target_k = int(os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_K",
+                                      "16384"))
+        tile_m = int(os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_TILE_M",
+                                    "128"))
+        tile_n = int(os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_TILE_N",
+                                    "64"))
+        cluster_m = int(
+            os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_CLUSTER_M", "1"))
+        cluster_n = int(
+            os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_CLUSTER_N", "1"))
+        swap_ab = _parse_env_bool("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_SWAP_AB",
+                                  True)
+        use_prefetch = _parse_env_bool(
+            "TRTLLM_NVFP4_LINEAR_O_CUTEDSL_PREFETCH", False)
+    except ValueError:
+        logger.warning("Invalid TRTLLM_NVFP4_LINEAR_O_CUTEDSL_* env value")
+        return None
+
+    if min(tile_m, tile_n, cluster_m, cluster_n) <= 0:
+        logger.warning(
+            "Invalid non-positive TRTLLM_NVFP4_LINEAR_O_CUTEDSL tactic env value"
+        )
+        return None
+
+    m = act_fp4.shape[0]
+    n = module.weight.shape[0]
+    real_k = act_fp4.shape[1] * 2
+    if min_m < 0 or max_m <= 0 or min_m > max_m or m < min_m or m > max_m:
+        return None
+    if n != target_n or real_k != target_k:
+        return None
+
+    sf_m = fp4_utils.pad_up(m, 128)
+    sf_k = fp4_utils.pad_up(real_k // 16, 4)
+    sf_n = fp4_utils.pad_up(n, 128)
+    if act_sf.numel() != sf_m * sf_k:
+        return None
+    if module.weight_scale.numel() != sf_n * sf_k:
+        return None
+    if alpha.numel() != 1:
+        return None
+    if get_sm_version() not in (100, 103):
+        return None
+
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return None
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4BlackwellRunner
+
+    tactic = ((tile_m, tile_n), (cluster_m, cluster_n), swap_ab,
+              use_prefetch)
+    debug_name = getattr(module, "debug_name", None) or module.__class__.__name__
+    log_key = (debug_name, m, n, real_k, int(output_buffer_kind), tactic)
+    if (os.environ.get("TRTLLM_NVFP4_LINEAR_O_CUTEDSL_DEBUG", "0") == "1"
+            and log_key not in _nvfp4_o_linear_cutedsl_logged):
+        logger.warning(
+            f"NVFP4 o_proj Linear CuTeDSL selected site={debug_name} "
+            f"M={m} N={n} K={real_k} tactic={tactic} "
+            f"output_buffer_kind={output_buffer_kind}")
+        _nvfp4_o_linear_cutedsl_logged.add(log_key)
+
+    return CuteDSLNVFP4BlackwellRunner(module.dtype, output_buffer_kind,
+                                       group)(
+                                           [
+                                               act_fp4, module.weight, act_sf,
+                                               module.weight_scale, alpha
+                                           ],
+                                           tactic=tactic)
+
+
 def _set_buffer(module: nn.Module, name: str,
                 value: Optional[torch.Tensor]) -> None:
     if name in module._buffers:
@@ -1447,8 +1686,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
-        # Convert list to comma-separated string for torch.compile compatibility
-        allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        # Use a comma-separated string for torch.compile compatibility.
+        allowed_backends_str = module.nvfp4_allowed_backends_str
         output_buffer_kind = (
             int(BufferKind.NCCL_WINDOW)
             if self.supports_nccl_symmetric_memory_window_output
@@ -1458,16 +1697,26 @@ class NVFP4LinearMethod(LinearMethodBase):
         group = (module.mapping.tp_group
                  if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                  and module.mapping is not None else None)
-        output = torch.ops.trtllm.nvfp4_gemm(
-            act_fp4,
-            module.weight,
-            act_sf,
-            module.weight_scale,
-            alpha,
-            module.dtype,
-            output_buffer_kind=output_buffer_kind,
-            allowed_backends=allowed_backends_str,
-            group=group)
+        _log_nvfp4_linear_debug(module, act_fp4, act_sf, alpha,
+                                output_buffer_kind, group,
+                                allowed_backends_str)
+        output = _try_nvfp4_qb_linear_cutedsl(module, act_fp4, act_sf, alpha,
+                                              output_buffer_kind, group)
+        if output is None:
+            output = _try_nvfp4_o_linear_cutedsl(module, act_fp4, act_sf,
+                                                alpha, output_buffer_kind,
+                                                group)
+        if output is None:
+            output = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4,
+                module.weight,
+                act_sf,
+                module.weight_scale,
+                alpha,
+                module.dtype,
+                output_buffer_kind=output_buffer_kind,
+                allowed_backends=allowed_backends_str,
+                group=group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -2839,6 +3088,7 @@ class Linear(nn.Module):
         super().__init__()
         self.has_bias = bias
         self.dtype = dtype
+        self.debug_name = None
         self.mapping = mapping or Mapping()
         # could be modified later
         self.quant_config = quant_config
@@ -2863,6 +3113,8 @@ class Linear(nn.Module):
         self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
             'cutlass', 'cublaslt', 'cuda_core'
         ]
+        self.nvfp4_allowed_backends_str = ','.join(
+            self.nvfp4_allowed_backends)
 
         local_in_features = in_features
         local_out_features = out_features

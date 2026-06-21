@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -151,9 +151,7 @@ class NVLinkTwoSided(Communication):
                 "NVLinkTwoSided dispatch requires prepare_dispatch() to be called first"
             )
 
-        all_rank_max_num_tokens = max(all_rank_num_tokens)
         original_token_count = hidden_states.shape[0]  # Store for combine
-        top_k = token_selected_slots.shape[1]
 
         # Dispatch quantized data using AllToAll
         hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
@@ -163,17 +161,9 @@ class NVLinkTwoSided(Communication):
                 self.alltoall_workspace,
                 self.ep_rank,
                 self.ep_size,
+                token_selected_slots_index=2,
+                invalid_token_expert_id=self.invalid_token_expert_id,
             )
-        )
-
-        # Set expert IDs after alltoall
-        torch.ops.trtllm.memset_expert_ids(
-            token_selected_slots,
-            alltoall_info.recv_rank_count_cumsum,
-            all_rank_max_num_tokens,
-            top_k,
-            self.invalid_token_expert_id,
-            self.ep_size,
         )
 
         # Store original_token_count for combine (alltoall_info already stored in prepare_dispatch)

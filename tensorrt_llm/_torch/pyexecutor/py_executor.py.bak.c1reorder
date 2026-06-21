@@ -3255,49 +3255,6 @@ class PyExecutor:
                             scheduled_batch, previous_tensors_device,
                             num_accepted_tokens_device)
 
-                    # C=1 host-scheduling reorder: dispatch the *current* batch's
-                    # sample (+ its D2H) immediately after the forward, BEFORE
-                    # blocking on the previous batch's sampler-event sync in
-                    # `_update_requests` below. At low concurrency this keeps the
-                    # GPU busy across that host-side `cudaEventSynchronize`,
-                    # because both forward N and sample N (and its device->host
-                    # copy) are already queued on the main stream when the host
-                    # blocks on iteration N-1's event.
-                    #
-                    # Correctness: sample N is dispatched on the main (default)
-                    # stream, exactly as before — only its *host dispatch* moves
-                    # earlier. Device-side ordering is unchanged: sample N's
-                    # scatter into the persistent `store.new_tokens` buffer and
-                    # iteration N-1's D2H readback of that buffer both execute on
-                    # the main stream, so they remain correctly serialized by
-                    # stream semantics without the host sync. `_sample_async` /
-                    # `setup_sampler_step` do not read any per-request state
-                    # written by `_update_requests(N-1)` (setup early-returns for
-                    # steady-state generation; it only touches context-last-chunk
-                    # and ADP-dummy requests). The next forward's input token is
-                    # fed device->device (model_engine input_ids copy), so it
-                    # never needs the host token produced by N-1's readback.
-                    guided_decoder_failed_requests = None
-                    with self.perf_manager.record_perf_events(
-                            None, gpu_sample_end) as sample_timing:
-                        if self.guided_decoder is not None:
-                            # add_batch must be called again to have updated new tokens.
-                            self.guided_decoder.add_batch(scheduled_batch)
-                            guided_decoder_failed_requests = self.guided_decoder.execute(
-                                batch_outputs['logits'])
-
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
-
-                    assert sample_state is not None, "Sampling failed"
-
-                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
-                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
-                    # causing _sample_async to fail when accessing context_chunk_size property.
-                    self._handle_guided_decoder_errors(
-                        scheduled_batch, guided_decoder_failed_requests)
-                    self._update_request_states(scheduled_batch)
-
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
 
@@ -3326,10 +3283,29 @@ class PyExecutor:
                     self.drafter.cleanup_previous_draft_resources()
 
                 if not self._is_kv_manager_v2:
-                    # forward N and sample N were already dispatched above (the
-                    # C=1 reorder), so pausing here still happens after the
-                    # already-computed forward outputs were consumed by sampling.
                     self._pause_requests(scheduled_batch.paused_requests)
+
+                if can_queue:
+                    guided_decoder_failed_requests = None
+                    with self.perf_manager.record_perf_events(
+                            None, gpu_sample_end) as sample_timing:
+                        if self.guided_decoder is not None:
+                            # add_batch must be called again to have updated new tokens.
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            guided_decoder_failed_requests = self.guided_decoder.execute(
+                                batch_outputs['logits'])
+
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
+
+                    assert sample_state is not None, "Sampling failed"
+
+                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                    # causing _sample_async to fail when accessing context_chunk_size property.
+                    self._handle_guided_decoder_errors(
+                        scheduled_batch, guided_decoder_failed_requests)
+                    self._update_request_states(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
