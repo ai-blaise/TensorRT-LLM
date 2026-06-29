@@ -2634,11 +2634,33 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
-        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
-                                           request_ids[:num_context], 1, 0)
-        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
-                                           request_ids[num_context:],
-                                           beam_width, num_context)
+        context_request_ids = request_ids[:num_context]
+        generation_request_ids = request_ids[num_context:]
+        try:
+            self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                               context_request_ids, 1, 0)
+        except Exception as exc:
+            logger.error(
+                "OPTRT_COPY_BATCH_BLOCK_OFFSETS_FAILED "
+                f"manager={self._debug_role()} phase=context "
+                f"request_ids={list(context_request_ids)} "
+                f"all_request_ids={list(request_ids)} beam_width={beam_width} "
+                f"num_context={num_context} num_seqs={num_seqs} "
+                f"error={type(exc).__name__}: {exc}")
+            raise
+        try:
+            self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                               generation_request_ids,
+                                               beam_width, num_context)
+        except Exception as exc:
+            logger.error(
+                "OPTRT_COPY_BATCH_BLOCK_OFFSETS_FAILED "
+                f"manager={self._debug_role()} phase=generation "
+                f"request_ids={list(generation_request_ids)} "
+                f"all_request_ids={list(request_ids)} beam_width={beam_width} "
+                f"num_context={num_context} num_seqs={num_seqs} "
+                f"error={type(exc).__name__}: {exc}")
+            raise
 
         for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
             dst_tensor[pool_idx, :num_seqs].copy_(
@@ -3969,8 +3991,18 @@ class KVCacheManagerV2(BaseResourceManager):
                                  num_contexts: int, num_seqs: int):
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
 
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts,
-                                                    beam_width)
+        try:
+            copy_idx = self.index_mapper.get_copy_index(
+                request_ids, num_contexts, beam_width)
+        except Exception as exc:
+            logger.error(
+                "OPTRT_COPY_BATCH_BLOCK_OFFSETS_FAILED "
+                f"manager={self._debug_role()} phase=index_mapper "
+                f"all_request_ids={list(request_ids)} beam_width={beam_width} "
+                f"num_context={num_contexts} num_seqs={num_seqs} "
+                f"kv_cache_map_keys={list(self.kv_cache_map.keys())[:128]} "
+                f"error={type(exc).__name__}: {exc}")
+            raise
         assert copy_idx.shape[0] == num_seqs
 
         copy_batch_block_offsets_to_device(self.host_kv_cache_block_offsets,

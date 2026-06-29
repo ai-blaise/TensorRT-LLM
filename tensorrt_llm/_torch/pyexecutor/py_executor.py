@@ -5,10 +5,11 @@ import os
 import threading
 import time
 import traceback
+from collections import Counter
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -66,6 +67,12 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
+from .persistent_decode_engine import (PersistentDecodeEngine,
+                                       PersistentDecodeEngineResult,
+                                       PersistentDecodeSampleStepResult,
+                                       PersistentDecodeWindowCallbacks,
+                                       PersistentDecodeWindowResult,
+                                       create_persistent_decode_backend)
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
@@ -103,6 +110,65 @@ _IDLE_DISAGG_TRANSFER_POLL_S = float(
 # iteration. Set to 1 to restore per-iteration stats.
 _STATS_DECIMATE_ENV_VAR_NAME = "TRTLLM_OPTRT_STATS_DECIMATE"
 _STATS_DECIMATE_DEFAULT = 16
+_FINALIZATION_DEBUG_ENV_NAME = "TRTLLM_OPTRT_FINALIZATION_DEBUG"
+_FINALIZATION_DEBUG_RANKS_ENV_NAME = "TRTLLM_OPTRT_FINALIZATION_DEBUG_RANKS"
+_FINALIZATION_DEBUG_EVERY_ENV_NAME = "TRTLLM_OPTRT_FINALIZATION_DEBUG_EVERY"
+_FINALIZATION_DEBUG_EVERY_DEFAULT = 1024
+_PERSISTENT_WINDOW_ADMISSION_DEBUG_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_WINDOW_ADMISSION_DEBUG")
+_PERSISTENT_WINDOW_EXECUTE_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_EXECUTE_WINDOW")
+_PERSISTENT_WINDOW_TIMING_DEBUG_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_WINDOW_TIMING_DEBUG")
+_PERSISTENT_WINDOW_TIMING_EVERY_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_WINDOW_TIMING_EVERY")
+_PERSISTENT_WINDOW_TIMING_RANKS_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_WINDOW_TIMING_RANKS")
+_PERSISTENT_WINDOW_TIMING_EVERY_DEFAULT = 128
+_PERSISTENT_RESIDENT_COHORT_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_COHORT")
+_PERSISTENT_RESIDENT_TARGETS_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_TARGETS")
+_PERSISTENT_RESIDENT_ALLOW_STREAMING_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_ALLOW_STREAMING")
+_PERSISTENT_RESIDENT_DEFER_HOST_UPDATES_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_DEFER_HOST_UPDATES")
+_PERSISTENT_RESIDENT_FLEX_STEPS_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_FLEX_STEPS")
+_PERSISTENT_RESIDENT_TERMINAL_WINDOW_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_TERMINAL_WINDOW")
+_PERSISTENT_RESIDENT_ASYNC_TOKEN_EGRESS_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_ASYNC_TOKEN_EGRESS")
+_PERSISTENT_RESIDENT_DEFER_TOKEN_EGRESS_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_DEFER_TOKEN_EGRESS_UNTIL_RESPONSE")
+_PERSISTENT_ALLOW_PYTHON_WINDOW_LOOP_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_ALLOW_PYTHON_WINDOW_LOOP")
+_PERSISTENT_RESIDENT_REQUIRE_NATIVE_WINDOW_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_RESIDENT_REQUIRE_NATIVE_WINDOW")
+_PERSISTENT_RESIDENT_DISAGG_BOOTSTRAP_STEPS_ENV_NAME = (
+    "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE_DISAGG_BOOTSTRAP_STEPS")
+_PERSISTENT_RESIDENT_TARGETS_DEFAULT = (4, 8, 16, 32)
+_PERSISTENT_RESIDENT_DISAGG_BOOTSTRAP_STEPS_DEFAULT = 2
+_OPTRT_RESIDENT_FIRST_TOKEN_BOUNDARY_REASON = "before_first_token_boundary"
+_OPTRT_RESIDENT_INSUFFICIENT_REMAINING_REASON = (
+    "insufficient_remaining_decode_steps")
+_OPTRT_RESIDENT_REMOTE_BLOCKED_REASON = "remote_rank_blocked"
+_OPTRT_RESIDENT_DISAGG_BOOTSTRAP_STEP_REASON = (
+    "disagg_decode_bootstrap_steps")
+_OPTRT_RESIDENT_DISAGG_BOOTSTRAP_REASONS_ORDERED = (
+    "disagg_generation_init_active",
+    "disagg_generation_transfer_active",
+    "disagg_generation_transfer_complete_active",
+    _OPTRT_RESIDENT_DISAGG_BOOTSTRAP_STEP_REASON,
+)
+_OPTRT_RESIDENT_DISAGG_BOOTSTRAP_REASONS = frozenset({
+    *_OPTRT_RESIDENT_DISAGG_BOOTSTRAP_REASONS_ORDERED,
+})
+_OPTRT_RESIDENT_REQUIRE_NATIVE_WINDOW_BOOTSTRAP_REASONS = frozenset({
+    _OPTRT_RESIDENT_FIRST_TOKEN_BOUNDARY_REASON,
+    _OPTRT_RESIDENT_INSUFFICIENT_REMAINING_REASON,
+}) | _OPTRT_RESIDENT_DISAGG_BOOTSTRAP_REASONS
+_ATTENTION_DP_DUMMY_REQUEST_ID_BASE = (1 << 64) - 1_000_001
 
 
 def _parse_stats_decimate() -> int:
@@ -133,6 +199,204 @@ def _optrt_nixl_transfer_proof(message: str) -> None:
     if os.environ.get("TRTLLM_OPTRT_NIXL_TRANSFER_PROOF", "0") != "1":
         return
     print(f"OPTRT_NIXL_TRANSFER_PROOF {message}", flush=True)
+
+
+def _optrt_finalization_rank_enabled(rank: int | None) -> bool:
+    raw = os.environ.get(_FINALIZATION_DEBUG_RANKS_ENV_NAME, "0").strip()
+    if raw in ("*", "all", "ALL"):
+        return True
+    enabled = {item.strip() for item in raw.split(",") if item.strip()}
+    return str(rank) in enabled
+
+
+def _optrt_rank_enabled(env_name: str, rank: int | None) -> bool:
+    raw = os.environ.get(env_name, "0").strip()
+    if raw in ("*", "all", "ALL"):
+        return True
+    enabled = {item.strip() for item in raw.split(",") if item.strip()}
+    return str(rank) in enabled
+
+
+def _optrt_finalization_debug_enabled(rank: int | None) -> bool:
+    return (os.environ.get(_FINALIZATION_DEBUG_ENV_NAME, "0") == "1"
+            and _optrt_finalization_rank_enabled(rank))
+
+
+def _optrt_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _optrt_env_flag(name: str) -> bool:
+    return os.environ.get(name, "0") == "1"
+
+
+def _optrt_env_int_tuple(env_name: str,
+                         default: Tuple[int, ...]) -> Tuple[int, ...]:
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            logger.warning(
+                f"Invalid {env_name} entry {item!r}; using default "
+                f"{default}")
+            return default
+        if value <= 0:
+            logger.warning(
+                f"Invalid {env_name} entry {value}; using default {default}")
+            return default
+        values.append(value)
+
+    if not values:
+        logger.warning(f"{env_name} is empty; using default {default}")
+        return default
+    return tuple(sorted(set(values)))
+
+
+def _optrt_safe_attr(obj: Any, attr: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, attr)
+    except Exception:
+        return default
+
+
+def _optrt_safe_call(obj: Any,
+                     attr: str,
+                     *args: Any,
+                     default: Any = None) -> Any:
+    try:
+        fn = getattr(obj, attr)
+        return fn(*args)
+    except Exception:
+        return default
+
+
+def _optrt_state_name(request: Any) -> str:
+    state = _optrt_safe_attr(request, "state", None)
+    name = _optrt_safe_attr(state, "name", None)
+    if name is not None:
+        return str(name)
+    return str(state)
+
+
+def _optrt_request_token_count(request: Any) -> Any:
+    return _optrt_safe_call(request, "get_num_tokens", 0, default=None)
+
+
+def _optrt_request_snapshot(request: Any) -> Dict[str, Any]:
+    return {
+        "id":
+        _optrt_safe_attr(request, "py_request_id", None),
+        "state":
+        _optrt_state_name(request),
+        "tokens":
+        _optrt_request_token_count(request),
+        "prompt":
+        _optrt_safe_attr(request, "py_prompt_len", None),
+        "max_new":
+        _optrt_safe_attr(request, "py_max_new_tokens", None),
+        "py_decoding_iter":
+        _optrt_safe_attr(request, "py_decoding_iter", None),
+        "decoding_iter":
+        _optrt_safe_attr(request, "decoding_iter", None),
+        "cached_tokens":
+        _optrt_safe_attr(request, "cached_tokens", None),
+        "finished":
+        _optrt_safe_attr(request, "is_finished", None),
+        "finished_len":
+        _optrt_safe_attr(request, "is_finished_due_to_length", None),
+        "finished_cancel":
+        _optrt_safe_attr(request, "is_finished_due_to_cancellation", None),
+        "gen_only":
+        _optrt_safe_call(request, "is_generation_only_request", default=None),
+        "streaming":
+        _optrt_safe_attr(request, "streaming", None),
+        "attention_dp_dummy":
+        _optrt_safe_attr(request, "is_attention_dp_dummy", None),
+        "cuda_graph_dummy":
+        _optrt_safe_attr(request, "is_cuda_graph_dummy", None),
+        "dummy_request":
+        _optrt_safe_attr(request, "is_dummy_request", None),
+        "dummy":
+        _optrt_safe_attr(request, "is_dummy", None),
+        "disagg_gen_init":
+        _optrt_safe_attr(request, "is_disagg_generation_init_state", None),
+        "disagg_gen_trans":
+        _optrt_safe_attr(request,
+                         "is_disagg_generation_transmission_in_progress",
+                         None),
+        "disagg_gen_complete":
+        _optrt_safe_attr(request,
+                         "is_disagg_generation_transmission_complete", None),
+        "disagg_ctx_trans":
+        _optrt_safe_attr(request, "is_disagg_context_transmission_state",
+                         None),
+        "disagg_ctx_complete":
+        _optrt_safe_attr(request, "is_disagg_context_complete_state", None),
+    }
+
+
+def _optrt_attention_dp_dummy_request_id(rank: int | None) -> int:
+    rank_offset = 0 if rank is None else int(rank)
+    return _ATTENTION_DP_DUMMY_REQUEST_ID_BASE - rank_offset
+
+
+def _optrt_debug_sequence_head(value: Any,
+                               limit: int = 8) -> Tuple[List[Any], Any]:
+    if value is None:
+        return [], None
+    if isinstance(value, dict):
+        items = list(value.items())
+        return items[:limit], len(items)
+    if isinstance(value, (list, tuple)):
+        return list(value[:limit]), len(value)
+    try:
+        materialized = list(value)
+    except Exception:
+        return [str(value)], None
+    return materialized[:limit], len(materialized)
+
+
+def _optrt_count_nested_items(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return sum(_optrt_count_nested_items(item) or 0
+                   for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        if all(not isinstance(item, (dict, list, tuple, set))
+               for item in value):
+            return len(value)
+        return sum(_optrt_count_nested_items(item) or 0 for item in value)
+    return 1
+
+
+def _optrt_response_snapshot(req_id: int,
+                             response: LlmResponse | None) -> Dict[str, Any]:
+    if response is None:
+        return {"request_id": req_id, "response": None}
+    result = _optrt_safe_attr(response, "result", None)
+    return {
+        "request_id": req_id,
+        "response_request_id": _optrt_safe_attr(response, "request_id", None),
+        "client_id": _optrt_safe_attr(response, "client_id", None),
+        "error": _optrt_safe_call(response, "has_error", default=None),
+        "error_msg": _optrt_safe_attr(response, "error_msg", None),
+        "is_final": _optrt_safe_attr(result, "is_final", None),
+    }
 
 
 class PPCommTag(IntEnum):
@@ -515,6 +779,81 @@ class PyExecutor:
         )
 
         self.previous_batch: Optional[BatchState] = None
+        self._optrt_persistent_decode_engine = PersistentDecodeEngine(
+            self.dist)
+        self._optrt_persistent_resident_backend = (
+            create_persistent_decode_backend())
+        self._optrt_finalization_debug = _optrt_finalization_debug_enabled(
+            self.dist.rank)
+        self._optrt_finalization_every = max(
+            1,
+            _optrt_env_int(_FINALIZATION_DEBUG_EVERY_ENV_NAME,
+                           _FINALIZATION_DEBUG_EVERY_DEFAULT))
+        self._optrt_persistent_window_admission_debug = _optrt_env_flag(
+            _PERSISTENT_WINDOW_ADMISSION_DEBUG_ENV_NAME)
+        self._optrt_persistent_window_execute = _optrt_env_flag(
+            _PERSISTENT_WINDOW_EXECUTE_ENV_NAME)
+        self._optrt_persistent_window_timing_debug = (
+            _optrt_env_flag(_PERSISTENT_WINDOW_TIMING_DEBUG_ENV_NAME)
+            and _optrt_rank_enabled(_PERSISTENT_WINDOW_TIMING_RANKS_ENV_NAME,
+                                    self.dist.rank))
+        self._optrt_persistent_window_timing_every = max(
+            1,
+            _optrt_env_int(_PERSISTENT_WINDOW_TIMING_EVERY_ENV_NAME,
+                           _PERSISTENT_WINDOW_TIMING_EVERY_DEFAULT))
+        self._optrt_resident_cohort_execute = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_COHORT_ENV_NAME)
+        self._optrt_resident_target_requests = _optrt_env_int_tuple(
+            _PERSISTENT_RESIDENT_TARGETS_ENV_NAME,
+            _PERSISTENT_RESIDENT_TARGETS_DEFAULT)
+        self._optrt_resident_allow_streaming = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_ALLOW_STREAMING_ENV_NAME)
+        self._optrt_resident_defer_host_updates = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_DEFER_HOST_UPDATES_ENV_NAME)
+        self._optrt_resident_flex_steps = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_FLEX_STEPS_ENV_NAME)
+        self._optrt_resident_terminal_window = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_TERMINAL_WINDOW_ENV_NAME)
+        self._optrt_resident_async_token_egress = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_ASYNC_TOKEN_EGRESS_ENV_NAME)
+        self._optrt_resident_defer_token_egress_until_response = (
+            _optrt_env_flag(_PERSISTENT_RESIDENT_DEFER_TOKEN_EGRESS_ENV_NAME))
+        self._optrt_resident_require_native_window = _optrt_env_flag(
+            _PERSISTENT_RESIDENT_REQUIRE_NATIVE_WINDOW_ENV_NAME)
+        self._optrt_resident_disagg_bootstrap_steps = max(
+            0,
+            _optrt_env_int(
+                _PERSISTENT_RESIDENT_DISAGG_BOOTSTRAP_STEPS_ENV_NAME,
+                _PERSISTENT_RESIDENT_DISAGG_BOOTSTRAP_STEPS_DEFAULT))
+        self._optrt_resident_deferred_sample_backlog: List[SampleState] = []
+        self._optrt_defer_attention_dp_dummy_cleanup = False
+        self._optrt_resident_sampling_backend_state: Dict[str, Any] = {
+            "backend": "pyexecutor_sampling_bridge_v1",
+            "ready": True,
+            "reason": "resident_sampling_bridge_ready",
+            "metadata": {
+                "native": False,
+                "last_reason": "not_run",
+            },
+        }
+        self._optrt_resident_window_loop_backend_state: Dict[str, Any] = {
+            "backend": "pyexecutor_window_loop_v1",
+            "ready": True,
+            "reason": "resident_window_loop_bridge_ready",
+            "metadata": {
+                "native": False,
+            },
+        }
+        self._optrt_resident_native_token_stats: Counter[str] = Counter()
+        self._optrt_persistent_window_timing_windows = 0
+        self._optrt_persistent_window_timing_owned_steps = 0
+        self._optrt_persistent_window_timing_requested_steps = 0
+        self._optrt_persistent_window_timing_stage_ns: Counter[str] = Counter()
+        self._optrt_persistent_window_timing_stage_counts: Counter[str] = Counter(
+        )
+        self._optrt_persistent_window_timing_break_reasons: Counter[str] = Counter(
+        )
+        self._optrt_persistent_window_last_break_reason = "not_started"
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
@@ -2475,6 +2814,1784 @@ class PyExecutor:
         for req in dropped_context_requests:
             self.kv_cache_manager.revert_allocate_context(req)
 
+    def _optrt_persistent_window_stage_start(self) -> int:
+        if not self._optrt_persistent_window_timing_debug:
+            return 0
+        return time.perf_counter_ns()
+
+    def _optrt_persistent_window_stage_end(self, stage: str,
+                                           start_ns: int) -> None:
+        if not self._optrt_persistent_window_timing_debug or start_ns == 0:
+            return
+        self._optrt_persistent_window_timing_stage_ns[
+            stage] += time.perf_counter_ns() - start_ns
+        self._optrt_persistent_window_timing_stage_counts[stage] += 1
+
+    def _optrt_persistent_window_record_timing(
+            self, owned_steps: int, requested_window_steps: int,
+            break_reason: str) -> None:
+        if not self._optrt_persistent_window_timing_debug:
+            return
+
+        self._optrt_persistent_window_timing_windows += 1
+        self._optrt_persistent_window_timing_owned_steps += owned_steps
+        self._optrt_persistent_window_timing_requested_steps += requested_window_steps
+        self._optrt_persistent_window_timing_break_reasons[break_reason] += 1
+
+        if (self._optrt_persistent_window_timing_windows %
+                self._optrt_persistent_window_timing_every != 0):
+            return
+
+        windows = self._optrt_persistent_window_timing_windows
+        stage_summary = {}
+        for stage, total_ns in sorted(
+                self._optrt_persistent_window_timing_stage_ns.items()):
+            count = self._optrt_persistent_window_timing_stage_counts[stage]
+            avg_us = (total_ns / count) / 1_000.0 if count else 0.0
+            total_us = total_ns / 1_000.0
+            stage_summary[stage] = {
+                "count": count,
+                "avg_us": avg_us,
+                "total_us": total_us,
+            }
+        summary = {
+            "rank":
+            self.dist.rank,
+            "tp_rank":
+            self.dist.tp_rank,
+            "windows":
+            windows,
+            "owned_steps":
+            self._optrt_persistent_window_timing_owned_steps,
+            "requested_steps":
+            self._optrt_persistent_window_timing_requested_steps,
+            "avg_owned_steps":
+            (self._optrt_persistent_window_timing_owned_steps / windows),
+            "break_reasons":
+            dict(sorted(
+                self._optrt_persistent_window_timing_break_reasons.items())),
+            "stages":
+            stage_summary,
+        }
+        logger.info(f"OPTRT_PERSISTENT_DECODE_WINDOW_TIMING {summary}")
+
+        self._optrt_persistent_window_timing_windows = 0
+        self._optrt_persistent_window_timing_owned_steps = 0
+        self._optrt_persistent_window_timing_requested_steps = 0
+        self._optrt_persistent_window_timing_stage_ns.clear()
+        self._optrt_persistent_window_timing_stage_counts.clear()
+        self._optrt_persistent_window_timing_break_reasons.clear()
+
+    def _optrt_persistent_window_active_summary(self) -> Dict[str, Any]:
+        real_generation_requests = 0
+        dummy_requests = 0
+        state_counts: Counter[str] = Counter()
+        disagg_init_requests = 0
+        disagg_transfer_requests = 0
+        disagg_transfer_complete_requests = 0
+        blocking_reason = None
+
+        for request in self.active_requests:
+            if self._optrt_is_dummy_request(request):
+                dummy_requests += 1
+                continue
+
+            state_name = _optrt_state_name(request)
+            state_counts[state_name] += 1
+
+            if request.is_disagg_generation_init_state:
+                disagg_init_requests += 1
+                blocking_reason = blocking_reason or "disagg_generation_init_active"
+                continue
+            if request.is_disagg_generation_transmission_in_progress:
+                disagg_transfer_requests += 1
+                blocking_reason = blocking_reason or "disagg_generation_transfer_active"
+                continue
+            if request.is_disagg_generation_transmission_complete:
+                disagg_transfer_complete_requests += 1
+                blocking_reason = (
+                    blocking_reason
+                    or "disagg_generation_transfer_complete_active")
+                continue
+            if request.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                blocking_reason = blocking_reason or f"active_state_{state_name}"
+                continue
+
+            real_generation_requests += 1
+
+        return {
+            "active_requests": len(self.active_requests),
+            "active_real_generation_requests": real_generation_requests,
+            "active_dummy_requests": dummy_requests,
+            "active_state_counts": tuple(sorted(state_counts.items())),
+            "active_disagg_generation_init_requests": disagg_init_requests,
+            "active_disagg_generation_transfer_requests":
+            disagg_transfer_requests,
+            "active_disagg_generation_transfer_complete_requests":
+            disagg_transfer_complete_requests,
+            "active_blocking_reason": blocking_reason,
+        }
+
+    def _optrt_persistent_decode_window_admitted(self) -> bool:
+        plan = self._optrt_persistent_decode_engine.last_plan
+        requested_window_steps = (
+            plan.requested_window_steps
+            if plan is not None else
+            self._optrt_persistent_decode_engine.requested_window_steps)
+        if requested_window_steps <= 1:
+            return False
+
+        active_summary = self._optrt_persistent_window_active_summary()
+        active_blocking_reason = active_summary["active_blocking_reason"]
+        window_contract_ready = bool(plan is not None
+                                     and plan.window_contract_ready)
+        window_contract_reason = (
+            plan.window_contract_reason if plan is not None else
+            "missing_plan")
+        plan_real_generation_requests = (
+            plan.real_generation_requests if plan is not None else 0)
+        attention_dp_enabled = (
+            plan.attention_dp_enabled if plan is not None else
+            self.enable_attention_dp)
+        adp_window_enabled = (
+            plan.adp_window_enabled if plan is not None else
+            self._optrt_persistent_decode_engine.adp_window_enabled)
+        local_blocked = 0 if (window_contract_ready
+                              and active_blocking_reason is None) else 1
+        local_real_requests = int(
+            active_summary["active_real_generation_requests"])
+        if self.enable_attention_dp:
+            any_blocked = self.dist.tp_allreduce(local_blocked,
+                                                 op=ReduceOp.MAX)
+            total_real_requests = self.dist.tp_allreduce(local_real_requests,
+                                                         op=ReduceOp.SUM)
+            admitted = any_blocked == 0 and total_real_requests > 0
+        else:
+            any_blocked = local_blocked
+            total_real_requests = local_real_requests
+            admitted = plan.window_contract_ready and local_real_requests > 0
+
+        if self._optrt_persistent_window_admission_debug:
+            summary = {
+                "rank": self.dist.rank,
+                "tp_rank": self.dist.tp_rank,
+                "admitted": admitted,
+                "local_blocked": local_blocked,
+                "any_blocked": any_blocked,
+                "local_real_requests": local_real_requests,
+                "total_real_requests": total_real_requests,
+                "plan_real_generation_requests":
+                plan_real_generation_requests,
+                "window_contract_ready": window_contract_ready,
+                "window_contract_reason": window_contract_reason,
+                "active_blocking_reason": active_blocking_reason,
+                "requested_window_steps": requested_window_steps,
+                "attention_dp_enabled": attention_dp_enabled,
+                "adp_window_enabled": adp_window_enabled,
+            }
+            summary.update(active_summary)
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_WINDOW_ADMISSION "
+                f"{summary}")
+
+        return admitted
+
+    @staticmethod
+    def _optrt_is_dummy_request(request: LlmRequest) -> bool:
+        return bool(request.is_attention_dp_dummy
+                    or request.is_cuda_graph_dummy
+                    or request.is_dummy_request)
+
+    def _optrt_persistent_window_local_state(self) -> Tuple[Optional[str],
+                                                            int,
+                                                            Dict[str, Any]]:
+        empty_summary = {
+            "active_requests": len(self.active_requests),
+            "active_real_generation_requests": 0,
+            "active_dummy_requests": 0,
+            "active_state_counts": (),
+            "active_disagg_generation_init_requests": 0,
+            "active_disagg_generation_transfer_requests": 0,
+            "active_disagg_generation_transfer_complete_requests": 0,
+            "active_blocking_reason": None,
+        }
+        if self.guided_decoder is not None:
+            return "guided_decoder_present", 0, empty_summary
+        if (self.model_engine.enable_spec_decode
+                or getattr(self, "use_spec_decode", False)):
+            return "spec_decode_enabled", 0, empty_summary
+
+        real_generation_requests = 0
+        active_summary = self._optrt_persistent_window_active_summary()
+        active_blocking_reason = active_summary["active_blocking_reason"]
+        if active_blocking_reason is not None:
+            return active_blocking_reason, 0, active_summary
+
+        for request in self.active_requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if request.py_beam_width != 1:
+                return "beam_width_gt_one", real_generation_requests, active_summary
+            if request.py_return_log_probs:
+                return "return_log_probs_present", real_generation_requests, active_summary
+            if get_draft_token_length(request) > 0:
+                return "draft_tokens_present", real_generation_requests, active_summary
+            remaining_decode_steps = request.py_max_new_tokens - request.py_decoding_iter
+            if remaining_decode_steps <= 1:
+                return "insufficient_remaining_decode_steps", real_generation_requests, active_summary
+            real_generation_requests += 1
+
+        if real_generation_requests == 0 and not self.enable_attention_dp:
+            return "no_real_generation_requests", 0, active_summary
+        return None, real_generation_requests, active_summary
+
+    def _optrt_persistent_window_continue_admitted(self) -> bool:
+        reason, local_real_requests, active_summary = (
+            self._optrt_persistent_window_local_state())
+        local_blocked = 0 if reason is None else 1
+        if self.enable_attention_dp:
+            any_blocked = self.dist.tp_allreduce(local_blocked,
+                                                 op=ReduceOp.MAX)
+            total_real_requests = self.dist.tp_allreduce(local_real_requests,
+                                                         op=ReduceOp.SUM)
+            admitted = any_blocked == 0 and total_real_requests > 0
+        else:
+            any_blocked = local_blocked
+            total_real_requests = local_real_requests
+            admitted = local_blocked == 0 and local_real_requests > 0
+
+        if self._optrt_persistent_window_admission_debug:
+            summary = {
+                "rank": self.dist.rank,
+                "tp_rank": self.dist.tp_rank,
+                "admitted": admitted,
+                "local_blocked": local_blocked,
+                "any_blocked": any_blocked,
+                "local_real_requests": local_real_requests,
+                "total_real_requests": total_real_requests,
+                "reason": reason or "ready",
+            }
+            summary.update(active_summary)
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_WINDOW_CONTINUE "
+                f"{summary}")
+        return admitted
+
+    def _optrt_resident_cohort_request_ids(
+            self, scheduled_batch: ScheduledRequests) -> Tuple[int, ...]:
+        return tuple(
+            int(request.py_request_id)
+            for request in scheduled_batch.generation_requests)
+
+    def _optrt_resident_native_backend_selected(self) -> bool:
+        return (
+            getattr(self._optrt_persistent_resident_backend, "name", None)
+            == "deepseek_native_resident")
+
+    def _optrt_resident_allow_empty_adp_rank(self) -> bool:
+        return bool(self.enable_attention_dp
+                    and self._optrt_resident_native_backend_selected())
+
+    def _optrt_should_defer_attention_dp_dummy_cleanup(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        if not self._optrt_resident_cohort_execute:
+            return False
+        if not self._optrt_resident_allow_empty_adp_rank():
+            return False
+        return any(
+            request.is_attention_dp_dummy
+            for request in scheduled_batch.generation_requests)
+
+    def _optrt_cleanup_attention_dp_dummy_requests(self) -> None:
+        dummy_requests = [
+            request for request in self.active_requests
+            if request.is_attention_dp_dummy
+        ]
+        for request in dummy_requests:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
+
+    def _optrt_resident_prepare_resources(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        if self._is_kv_manager_v2:
+            return
+
+        if self.enable_attention_dp:
+            real_generation_requests = [
+                request for request in scheduled_batch.generation_requests
+                if not self._optrt_is_dummy_request(request)
+            ]
+            if (len(real_generation_requests) !=
+                    len(scheduled_batch.generation_requests)):
+                filtered_batch = ScheduledRequests()
+                filtered_batch.context_requests_chunking = (
+                    scheduled_batch.context_requests_chunking)
+                filtered_batch.context_requests_last_chunk = (
+                    scheduled_batch.context_requests_last_chunk)
+                filtered_batch.generation_requests = real_generation_requests
+                filtered_batch.paused_requests = scheduled_batch.paused_requests
+                if filtered_batch.batch_size == 0:
+                    return
+                scheduled_batch = filtered_batch
+
+        self.resource_manager.prepare_resources(scheduled_batch)
+
+    def _optrt_resident_cohort_local_state(
+        self,
+        scheduled_batch: ScheduledRequests,
+        requested_window_steps: int,
+        *,
+        require_full_window: bool,
+    ) -> Tuple[Optional[str], int, Dict[str, Any]]:
+        active_summary = self._optrt_persistent_window_active_summary()
+        summary = dict(active_summary)
+        summary.update({
+            "scheduled_context_requests":
+            scheduled_batch.num_context_requests,
+            "scheduled_generation_requests":
+            scheduled_batch.num_generation_requests,
+            "scheduled_paused_requests":
+            len(scheduled_batch.paused_requests),
+        })
+
+        if self.guided_decoder is not None:
+            return "guided_decoder_present", 0, summary
+        if (self.model_engine.enable_spec_decode
+                or getattr(self, "use_spec_decode", False)
+                or self.drafter is not None):
+            return "spec_decode_enabled", 0, summary
+        if self.kv_connector_manager is not None:
+            return "kv_connector_present", 0, summary
+        if scheduled_batch.num_context_requests:
+            return "context_requests_present", 0, summary
+        if scheduled_batch.paused_requests:
+            return "paused_requests_present", 0, summary
+
+        scheduled_generation_requests = scheduled_batch.generation_requests
+        local_real_requests = 0
+        scheduled_dummy_requests = 0
+        for request in scheduled_generation_requests:
+            if self._optrt_is_dummy_request(request):
+                scheduled_dummy_requests += 1
+            else:
+                local_real_requests += 1
+        summary["scheduled_dummy_requests"] = scheduled_dummy_requests
+        summary["scheduled_real_generation_requests"] = local_real_requests
+
+        if (active_summary["active_dummy_requests"] != 0
+                and not self.enable_attention_dp):
+            return "active_dummy_requests_present", local_real_requests, summary
+        if scheduled_dummy_requests != 0 and not self.enable_attention_dp:
+            return "scheduled_dummy_requests_present", local_real_requests, summary
+        if local_real_requests == 0 and not self.enable_attention_dp:
+            return "no_real_generation_requests", 0, summary
+
+        for request in scheduled_generation_requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if request.is_disagg_generation_init_state:
+                return "disagg_generation_init_active", local_real_requests, summary
+            if request.is_disagg_generation_transmission_in_progress:
+                return "disagg_generation_transfer_active", local_real_requests, summary
+            if request.is_disagg_generation_transmission_complete:
+                return (
+                    "disagg_generation_transfer_complete_active",
+                    local_real_requests,
+                    summary,
+                )
+            if request.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                return (
+                    f"request_state_{_optrt_state_name(request)}",
+                    local_real_requests,
+                    summary,
+                )
+
+        if (active_summary["active_real_generation_requests"] !=
+                local_real_requests):
+            return (
+                "partial_active_generation_batch",
+                local_real_requests,
+                summary,
+            )
+
+        for request in scheduled_generation_requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if request.is_finished:
+                return "request_finished", local_real_requests, summary
+            if request.py_beam_width != 1:
+                return "beam_width_gt_one", local_real_requests, summary
+            if request.py_return_log_probs:
+                return "return_log_probs_present", local_real_requests, summary
+            if request.py_return_generation_logits:
+                return "return_generation_logits_present", local_real_requests, summary
+            if (getattr(request, "streaming", False)
+                    and not self._optrt_resident_allow_streaming):
+                return "streaming_request_present", local_real_requests, summary
+            if request.py_stop_words_list:
+                return "stop_words_present", local_real_requests, summary
+            if get_draft_token_length(request) > 0:
+                return "draft_tokens_present", local_real_requests, summary
+            if (self._optrt_resident_disagg_bootstrap_steps > 0
+                    and getattr(request, "py_disaggregated_params", None)
+                    is not None):
+                completed_bootstrap_steps = int(
+                    getattr(request,
+                            "py_optrt_disagg_resident_bootstrap_steps", 0))
+                if completed_bootstrap_steps < self._optrt_resident_disagg_bootstrap_steps:
+                    summary[
+                        "disagg_resident_bootstrap_steps"] = completed_bootstrap_steps
+                    summary[
+                        "disagg_resident_bootstrap_required"] = self._optrt_resident_disagg_bootstrap_steps
+                    return (_OPTRT_RESIDENT_DISAGG_BOOTSTRAP_STEP_REASON,
+                            local_real_requests, summary)
+            if request.py_decoding_iter < 1:
+                return (_OPTRT_RESIDENT_FIRST_TOKEN_BOUNDARY_REASON,
+                        local_real_requests, summary)
+            if (request.py_decoding_iter == 1
+                    and not self._optrt_resident_native_backend_selected()):
+                return (_OPTRT_RESIDENT_FIRST_TOKEN_BOUNDARY_REASON,
+                        local_real_requests, summary)
+
+            remaining_decode_steps = (
+                request.py_max_new_tokens - request.py_decoding_iter)
+            if self._optrt_resident_terminal_window:
+                required_remaining_steps = (
+                    requested_window_steps if require_full_window else 0)
+                insufficient_remaining_steps = (
+                    remaining_decode_steps < required_remaining_steps)
+            else:
+                required_remaining_steps = (
+                    requested_window_steps + 1 if require_full_window else 1)
+                insufficient_remaining_steps = (
+                    remaining_decode_steps <= required_remaining_steps)
+            if insufficient_remaining_steps:
+                return "insufficient_remaining_decode_steps", local_real_requests, summary
+
+        return None, local_real_requests, summary
+
+    def _optrt_resident_cohort_collective_admitted(
+        self,
+        local_reason: Optional[str],
+        local_real_requests: int,
+        *,
+        require_target_total: bool,
+    ) -> Tuple[bool, int, int, int, bool]:
+        local_blocked = 0 if local_reason is None else 1
+        local_has_real = 1 if local_real_requests > 0 else 0
+
+        if self.enable_attention_dp:
+            allow_empty_adp_rank = self._optrt_resident_allow_empty_adp_rank()
+            any_blocked = self.dist.tp_allreduce(local_blocked,
+                                                 op=ReduceOp.MAX)
+            total_real_requests = self.dist.tp_allreduce(local_real_requests,
+                                                         op=ReduceOp.SUM)
+            min_has_real = self.dist.tp_allreduce(local_has_real,
+                                                  op=ReduceOp.MIN)
+            target_match = (
+                not require_target_total
+                or total_real_requests in self._optrt_resident_target_requests)
+            admitted = (any_blocked == 0 and total_real_requests > 0
+                        and (min_has_real == 1 or allow_empty_adp_rank)
+                        and target_match)
+            return admitted, any_blocked, total_real_requests, min_has_real, target_match
+
+        target_match = (
+            not require_target_total
+            or local_real_requests in self._optrt_resident_target_requests)
+        admitted = local_blocked == 0 and local_has_real == 1 and target_match
+        return admitted, local_blocked, local_real_requests, local_has_real, target_match
+
+    def _optrt_resident_any_cohort_reason(
+        self,
+        local_reason: Optional[str],
+        target_reason: str,
+    ) -> bool:
+        local_matches = int(local_reason == target_reason)
+        if self.enable_attention_dp:
+            return bool(
+                self.dist.tp_allreduce(local_matches, op=ReduceOp.MAX))
+        return bool(local_matches)
+
+    def _optrt_resident_collective_block_reason(
+        self,
+        local_reason: Optional[str],
+    ) -> str:
+        ordered_reasons = (
+            _OPTRT_RESIDENT_FIRST_TOKEN_BOUNDARY_REASON,
+            _OPTRT_RESIDENT_INSUFFICIENT_REMAINING_REASON,
+            *_OPTRT_RESIDENT_DISAGG_BOOTSTRAP_REASONS_ORDERED,
+        )
+        for reason in ordered_reasons:
+            if self._optrt_resident_any_cohort_reason(local_reason, reason):
+                return reason
+        return local_reason or _OPTRT_RESIDENT_REMOTE_BLOCKED_REASON
+
+    def _optrt_resident_cohort_admitted(
+        self,
+        scheduled_batch: ScheduledRequests,
+        requested_window_steps: int,
+    ) -> Tuple[bool, str]:
+        local_reason, local_real_requests, summary = (
+            self._optrt_resident_cohort_local_state(
+                scheduled_batch,
+                requested_window_steps,
+                require_full_window=True))
+        admitted, any_blocked, total_real_requests, min_has_real, target_match = (
+            self._optrt_resident_cohort_collective_admitted(
+                local_reason,
+                local_real_requests,
+                require_target_total=True))
+
+        reason = local_reason or "ready"
+        collective_block_reason = None
+        allow_empty_adp_rank = self._optrt_resident_allow_empty_adp_rank()
+        if any_blocked == 0 and not target_match:
+            reason = "target_concurrency_mismatch"
+        elif (any_blocked == 0 and min_has_real == 0
+              and not allow_empty_adp_rank):
+            reason = "empty_rank_in_cohort"
+        elif not admitted:
+            collective_block_reason = (
+                self._optrt_resident_collective_block_reason(local_reason))
+            reason = collective_block_reason
+
+        if self._optrt_persistent_window_admission_debug:
+            log_summary = {
+                "rank": self.dist.rank,
+                "tp_rank": self.dist.tp_rank,
+                "admitted": admitted,
+                "reason": reason,
+                "local_real_requests": local_real_requests,
+                "any_blocked": any_blocked,
+                "total_real_requests": total_real_requests,
+                "min_has_real": min_has_real,
+                "target_match": target_match,
+                "collective_block_reason": collective_block_reason,
+                "allow_empty_adp_rank": allow_empty_adp_rank,
+                "targets": self._optrt_resident_target_requests,
+                "requested_window_steps": requested_window_steps,
+            }
+            log_summary.update(summary)
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_RESIDENT_COHORT_ADMISSION "
+                f"{log_summary}")
+
+        return admitted, reason
+
+    def _optrt_resident_cohort_continue_admitted(
+        self,
+        scheduled_batch: ScheduledRequests,
+        cohort_request_ids: Tuple[int, ...],
+        requested_window_steps: int,
+    ) -> Tuple[bool, str]:
+        local_reason, local_real_requests, summary = (
+            self._optrt_resident_cohort_local_state(
+                scheduled_batch,
+                requested_window_steps,
+                require_full_window=False))
+        if (local_reason is None
+                and self._optrt_resident_cohort_request_ids(scheduled_batch)
+                != cohort_request_ids):
+            local_reason = "cohort_request_ids_changed"
+
+        admitted, any_blocked, total_real_requests, min_has_real, target_match = (
+            self._optrt_resident_cohort_collective_admitted(
+                local_reason,
+                local_real_requests,
+                require_target_total=False))
+        allow_empty_adp_rank = self._optrt_resident_allow_empty_adp_rank()
+        reason = local_reason or "ready"
+        if (any_blocked == 0 and min_has_real == 0
+                and not allow_empty_adp_rank):
+            reason = "empty_rank_in_cohort"
+        elif not admitted:
+            reason = self._optrt_resident_collective_block_reason(local_reason)
+
+        if (self._optrt_persistent_window_admission_debug
+                and not admitted):
+            log_summary = {
+                "rank": self.dist.rank,
+                "tp_rank": self.dist.tp_rank,
+                "admitted": admitted,
+                "reason": reason,
+                "local_real_requests": local_real_requests,
+                "any_blocked": any_blocked,
+                "total_real_requests": total_real_requests,
+                "min_has_real": min_has_real,
+                "target_match": target_match,
+                "allow_empty_adp_rank": allow_empty_adp_rank,
+                "cohort_request_ids": cohort_request_ids,
+            }
+            log_summary.update(summary)
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_RESIDENT_COHORT_CONTINUE "
+                f"{log_summary}")
+
+        return admitted, reason
+
+    def _optrt_resident_min_remaining_decode_steps(
+            self, scheduled_batch: ScheduledRequests) -> int:
+        local_min_remaining: Optional[int] = None
+        local_real_requests = 0
+        for request in scheduled_batch.generation_requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            local_real_requests += 1
+            remaining_decode_steps = (
+                request.py_max_new_tokens - request.py_decoding_iter)
+            if local_min_remaining is None:
+                local_min_remaining = remaining_decode_steps
+            else:
+                local_min_remaining = min(local_min_remaining,
+                                          remaining_decode_steps)
+
+        if self.enable_attention_dp:
+            no_local_real_request_min_remaining = 1 << 30
+            local_value = (
+                local_min_remaining
+                if local_min_remaining is not None else
+                no_local_real_request_min_remaining)
+            min_remaining = int(
+                self.dist.tp_allreduce(local_value, op=ReduceOp.MIN))
+            total_real_requests = int(
+                self.dist.tp_allreduce(local_real_requests, op=ReduceOp.SUM))
+            if total_real_requests == 0:
+                return 0
+            return min_remaining
+
+        return int(
+            local_min_remaining if local_min_remaining is not None else 0)
+
+    def _optrt_resident_effective_window_steps(
+        self,
+        scheduled_batch: ScheduledRequests,
+        requested_window_steps: int,
+    ) -> int:
+        if not self._optrt_resident_flex_steps:
+            return requested_window_steps
+
+        min_remaining_decode_steps = (
+            self._optrt_resident_min_remaining_decode_steps(scheduled_batch))
+        terminal_reserve_steps = (
+            0 if self._optrt_resident_terminal_window else 2)
+        max_safe_owned_steps = max(
+            1, min_remaining_decode_steps - terminal_reserve_steps)
+        return max(1, min(requested_window_steps, max_safe_owned_steps))
+
+    def _optrt_resident_sample_has_finished_requests(
+        self,
+        sample_state: SampleState,
+    ) -> Tuple[bool, str]:
+        local_finished = 0
+        local_reason = "not_finished"
+
+        if sample_state.sampler_event is not None:
+            sample_state.sampler_event.synchronize()
+
+        host_state = sample_state.host
+        finish_reasons = (
+            None if host_state is None else
+            getattr(host_state, "finish_reasons", None))
+        if finish_reasons is not None:
+            for request in sample_state.requests:
+                if self._optrt_is_dummy_request(request):
+                    continue
+                seq_slot = request.py_seq_slot
+                if seq_slot is None:
+                    local_finished = 1
+                    local_reason = "missing_seq_slot"
+                    break
+                try:
+                    finish_reason = int(finish_reasons[0, seq_slot, 0].item())
+                except Exception:
+                    local_finished = 1
+                    local_reason = "finish_reason_read_failed"
+                    break
+                if finish_reason != FinishReason.NOT_FINISHED.value:
+                    local_finished = 1
+                    local_reason = f"finish_reason_{finish_reason}"
+                    break
+
+        if self.enable_attention_dp:
+            any_finished = self.dist.tp_allreduce(local_finished,
+                                                  op=ReduceOp.MAX)
+        else:
+            any_finished = local_finished
+
+        if any_finished:
+            return True, local_reason
+        return False, "not_finished"
+
+    def _optrt_resident_can_defer_host_updates(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        if not self._optrt_resident_defer_host_updates:
+            return False
+
+        local_can_defer = 1
+        local_reason = "ready"
+        for request in scheduled_batch.generation_requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            request_id = getattr(request, "request_id", None)
+            if (getattr(request, "streaming", False)
+                    and not self._optrt_resident_allow_streaming):
+                local_can_defer = 0
+                local_reason = f"request_{request_id}_streaming"
+                break
+            if request.py_beam_width != 1:
+                local_can_defer = 0
+                local_reason = f"request_{request_id}_beam_width"
+                break
+            if request.py_return_log_probs or request.py_return_generation_logits:
+                local_can_defer = 0
+                local_reason = f"request_{request_id}_extra_outputs"
+                break
+            if request.py_stop_words_list:
+                local_can_defer = 0
+                local_reason = f"request_{request_id}_stop_words"
+                break
+            if getattr(request, "py_end_id", None) != -1:
+                local_can_defer = 0
+                local_reason = (f"request_{request_id}_end_id:"
+                                f"{getattr(request, 'py_end_id', None)}")
+                break
+            if get_draft_token_length(request) > 0:
+                local_can_defer = 0
+                local_reason = f"request_{request_id}_draft_tokens"
+                break
+
+        if self.enable_attention_dp:
+            can_defer = self.dist.tp_allreduce(local_can_defer,
+                                               op=ReduceOp.MIN) == 1
+        else:
+            can_defer = local_can_defer == 1
+
+        if (not can_defer and
+                (self._optrt_persistent_window_admission_debug
+                 or self._optrt_persistent_window_timing_debug)):
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_RESIDENT_DEFER_HOST_UPDATES "
+                f"{{'rank': {self.dist.rank}, "
+                f"'tp_rank': {self.dist.tp_rank}, "
+                f"'can_defer': {can_defer}, "
+                f"'local_can_defer': {local_can_defer}, "
+                f"'local_reason': '{local_reason}', "
+                f"'generation_requests': "
+                f"{len(scheduled_batch.generation_requests)}}}")
+
+        return can_defer
+
+    def _optrt_resident_can_accumulate_token_egress(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        if not self._optrt_resident_defer_token_egress_until_response:
+            return False
+
+        local_can_accumulate = 1
+        for request in scheduled_batch.generation_requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if getattr(request, "streaming", False):
+                local_can_accumulate = 0
+                break
+            if request.py_beam_width != 1:
+                local_can_accumulate = 0
+                break
+            if request.py_return_log_probs or request.py_return_generation_logits:
+                local_can_accumulate = 0
+                break
+            if request.py_stop_words_list:
+                local_can_accumulate = 0
+                break
+            if getattr(request, "py_end_id", None) != -1:
+                local_can_accumulate = 0
+                break
+            if get_draft_token_length(request) > 0:
+                local_can_accumulate = 0
+                break
+
+        if self.enable_attention_dp:
+            return self.dist.tp_allreduce(local_can_accumulate,
+                                          op=ReduceOp.MIN) == 1
+        return local_can_accumulate == 1
+
+    def _optrt_resident_defer_update_requests(
+            self, sample_state: SampleState) -> None:
+        for request in sample_state.requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+
+            start_iter = int(request.py_decoding_iter)
+            request.add_new_token(0, 0)
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            request.py_decoding_iter += 1
+            self._optrt_resident_mark_stream_boundary_if_crossed(
+                request, start_iter, int(request.py_decoding_iter))
+
+    def _optrt_resident_stream_boundary_crossed(
+        self,
+        start_iter: int,
+        end_iter: int,
+    ) -> bool:
+        if end_iter <= start_iter:
+            return False
+        stream_interval = max(1, int(self.stream_interval))
+        return end_iter // stream_interval > start_iter // stream_interval
+
+    def _optrt_resident_mark_stream_boundary_if_crossed(
+        self,
+        request: LlmRequest,
+        start_iter: int,
+        end_iter: int,
+    ) -> None:
+        if not getattr(request, "streaming", False):
+            return
+        if self._optrt_resident_stream_boundary_crossed(start_iter, end_iter):
+            setattr(request, "optrt_resident_pending_stream_emit", True)
+
+    def _optrt_resident_defer_window_update_requests(
+        self,
+        sample_state: SampleState,
+        placeholder_steps: int,
+    ) -> None:
+        if placeholder_steps <= 0:
+            return
+
+        for request in sample_state.requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+
+            beam_tokens = list(request.get_tokens(0))
+            generated_tokens = beam_tokens[request.py_orig_prompt_len:]
+            generated_tokens.extend([0] * placeholder_steps)
+            request.set_generated_tokens([generated_tokens])
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            start_iter = int(request.py_decoding_iter)
+            request.py_decoding_iter += placeholder_steps
+            self._optrt_resident_mark_stream_boundary_if_crossed(
+                request, start_iter, int(request.py_decoding_iter))
+
+    def _optrt_resident_sample_uses_request_order(
+            self, sample_state: SampleState) -> bool:
+        return bool(getattr(sample_state, "optrt_resident_request_order",
+                            False))
+
+    def _optrt_resident_select_sample_tokens(
+        self,
+        new_tokens: Any,
+        requests: List[LlmRequest],
+        seq_slots: List[int],
+        *,
+        request_order: bool,
+    ) -> List[int]:
+        if request_order:
+            selected_tokens = new_tokens[0, :len(requests), 0]
+        else:
+            selected_tokens = new_tokens[0, seq_slots, 0]
+        tolist = getattr(selected_tokens, "tolist", None)
+        tokens = tolist() if callable(tolist) else list(selected_tokens)
+        return [int(token) for token in tokens]
+
+    def _optrt_resident_request_reached_length(self,
+                                               request: LlmRequest) -> bool:
+        max_new_tokens = getattr(request, "py_max_new_tokens", None)
+        if not isinstance(max_new_tokens, int):
+            return False
+        try:
+            generated_tokens = (
+                request.get_num_tokens(0) - request.py_orig_prompt_len)
+        except Exception:
+            return False
+        return generated_tokens >= max_new_tokens
+
+    def _optrt_resident_update_request_placeholders(
+        self,
+        requests: List[LlmRequest],
+    ) -> None:
+        for request in requests:
+            start_iter = int(request.py_decoding_iter)
+            request.add_new_token(0, 0)
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            request.py_decoding_iter += 1
+            self._optrt_resident_mark_stream_boundary_if_crossed(
+                request, start_iter, int(request.py_decoding_iter))
+            if self._optrt_resident_request_reached_length(request):
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_finished_reason(FinishReason.LENGTH, 0)
+
+    def _optrt_resident_sample_defer_materialization(
+            self, sample_state: SampleState) -> bool:
+        return bool(
+            getattr(sample_state, "optrt_resident_defer_materialization",
+                    False))
+
+    def _optrt_resident_window_owned_steps(
+            self, sample_state: SampleState) -> int:
+        owned_steps = getattr(sample_state, "optrt_resident_window_owned_steps",
+                              1)
+        try:
+            return max(1, int(owned_steps))
+        except (TypeError, ValueError):
+            return 1
+
+    def _optrt_resident_update_window_requests(
+        self,
+        sample_state: SampleState,
+        requests: List[LlmRequest],
+        seq_slots: List[int],
+        owned_steps: int,
+    ) -> None:
+        new_tokens = getattr(sample_state,
+                             "optrt_resident_window_host_new_tokens", None)
+        if new_tokens is None:
+            device_window_new_tokens = getattr(
+                sample_state, "optrt_resident_window_device_new_tokens", None)
+            if device_window_new_tokens is not None:
+                new_tokens = self._optrt_resident_device_tokens_to_host(
+                    device_window_new_tokens)
+        if new_tokens is None:
+            host_state = sample_state.host
+            new_tokens = (
+                None if host_state is None else
+                getattr(host_state, "new_tokens", None))
+            if new_tokens is None:
+                device_state = sample_state.device
+                device_new_tokens = (
+                    None if device_state is None else
+                    getattr(device_state, "new_tokens", None))
+                if device_new_tokens is not None:
+                    new_tokens = self._optrt_resident_device_tokens_to_host(
+                        device_new_tokens)
+        if new_tokens is None:
+            return
+
+        request_order = self._optrt_resident_sample_uses_request_order(
+            sample_state)
+        for request_idx, (request, seq_slot) in enumerate(
+                zip(requests, seq_slots)):
+            selected_slot = request_idx if request_order else seq_slot
+            selected_tokens = new_tokens[:owned_steps, selected_slot, 0]
+            tolist = getattr(selected_tokens, "tolist", None)
+            tokens = tolist() if callable(tolist) else list(selected_tokens)
+            window_tokens = [int(token) for token in tokens]
+            if len(window_tokens) != owned_steps:
+                continue
+
+            beam_tokens = list(request.get_tokens(0))
+            generated_tokens = beam_tokens[request.py_orig_prompt_len:]
+            placeholder_steps = owned_steps - 1
+            if len(generated_tokens) < placeholder_steps:
+                continue
+            if placeholder_steps:
+                generated_tokens = generated_tokens[:-placeholder_steps]
+            generated_tokens.extend(window_tokens)
+            request.set_generated_tokens([generated_tokens])
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            start_iter = int(request.py_decoding_iter)
+            request.py_decoding_iter += 1
+            self._optrt_resident_mark_stream_boundary_if_crossed(
+                request, start_iter, int(request.py_decoding_iter))
+            if self._optrt_resident_request_reached_length(request):
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_finished_reason(FinishReason.LENGTH, 0)
+
+    def _optrt_resident_update_requests(
+            self, sample_state: SampleState) -> None:
+        if sample_state.sampler_event is not None:
+            sample_state.sampler_event.synchronize()
+
+        requests: List[LlmRequest] = []
+        seq_slots: List[int] = []
+        for request in sample_state.requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+            seq_slot = request.py_seq_slot
+            if seq_slot is None:
+                continue
+            requests.append(request)
+            seq_slots.append(seq_slot)
+
+        if not requests:
+            return
+
+        self._optrt_resident_native_token_stats[
+            "resident_native_update_requests"] += 1
+        owned_steps = self._optrt_resident_window_owned_steps(sample_state)
+        if owned_steps > 1:
+            self._optrt_resident_native_token_stats[
+                "resident_native_window_update_requests"] += 1
+            self._optrt_resident_update_window_requests(
+                sample_state,
+                requests,
+                seq_slots,
+                owned_steps,
+            )
+            return
+
+        if self._optrt_resident_sample_defer_materialization(sample_state):
+            self._optrt_resident_enqueue_deferred_samples([sample_state])
+            self._optrt_resident_native_token_stats[
+                "resident_native_final_deferred_samples"] += 1
+            self._optrt_resident_update_request_placeholders(requests)
+            return
+
+        host_state = sample_state.host
+        new_tokens = (
+            None if host_state is None else
+            getattr(host_state, "new_tokens", None))
+        if new_tokens is None:
+            device_state = sample_state.device
+            device_new_tokens = (
+                None if device_state is None else
+                getattr(device_state, "new_tokens", None))
+            if device_new_tokens is not None:
+                new_tokens = self._optrt_resident_device_tokens_to_host(
+                    device_new_tokens)
+        if new_tokens is None:
+            return
+
+        host_tokens = self._optrt_resident_select_sample_tokens(
+            new_tokens,
+            requests,
+            seq_slots,
+            request_order=self._optrt_resident_sample_uses_request_order(
+                sample_state),
+        )
+        for request, token in zip(requests, host_tokens):
+            request.add_new_token(token, 0)
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            request.py_decoding_iter += 1
+            if self._optrt_resident_request_reached_length(request):
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_finished_reason(FinishReason.LENGTH, 0)
+
+    def _optrt_resident_capture_deferred_sample(
+        self,
+        sample_state: SampleState,
+    ) -> Tuple[Dict[int, List[int]], Dict[int, LlmRequest]]:
+        tokens_by_request: Dict[int, List[int]] = {}
+        requests_by_id: Dict[int, LlmRequest] = {}
+
+        if sample_state.sampler_event is not None:
+            sample_state.sampler_event.synchronize()
+
+        host_state = sample_state.host
+        new_tokens = (
+            None if host_state is None else
+            getattr(host_state, "new_tokens", None))
+        if new_tokens is None:
+            device_state = sample_state.device
+            device_new_tokens = (
+                None if device_state is None else
+                getattr(device_state, "new_tokens", None))
+            if device_new_tokens is not None:
+                new_tokens = self._optrt_resident_device_tokens_to_host(
+                    device_new_tokens)
+                self._optrt_resident_native_token_stats[
+                    "resident_native_deferred_device_to_host"] += 1
+        if new_tokens is None:
+            return tokens_by_request, requests_by_id
+
+        requests = []
+        seq_slots = []
+        for request in sample_state.requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            seq_slot = request.py_seq_slot
+            if seq_slot is None:
+                continue
+            requests.append(request)
+            seq_slots.append(seq_slot)
+
+        if not requests:
+            return tokens_by_request, requests_by_id
+
+        host_tokens = self._optrt_resident_select_sample_tokens(
+            new_tokens,
+            requests,
+            seq_slots,
+            request_order=self._optrt_resident_sample_uses_request_order(
+                sample_state),
+        )
+        for request, token in zip(requests, host_tokens):
+            request_id = int(request.py_request_id)
+            tokens_by_request.setdefault(request_id, []).append(token)
+            requests_by_id[request_id] = request
+
+        return tokens_by_request, requests_by_id
+
+    def _optrt_resident_materialize_deferred_captures(
+        self,
+        captures: List[Tuple[Dict[int, List[int]], Dict[int, LlmRequest]]],
+    ) -> None:
+        tokens_by_request: Dict[int, List[int]] = {}
+        requests_by_id: Dict[int, LlmRequest] = {}
+
+        for captured_tokens_by_request, captured_requests_by_id in captures:
+            for request_id, tokens in captured_tokens_by_request.items():
+                tokens_by_request.setdefault(request_id, []).extend(tokens)
+            requests_by_id.update(captured_requests_by_id)
+
+        for request_id, tokens in tokens_by_request.items():
+            request = requests_by_id[request_id]
+            beam_tokens = list(request.get_tokens(0))
+            generated_tokens = beam_tokens[request.py_orig_prompt_len:]
+            if len(generated_tokens) < len(tokens):
+                continue
+            generated_tokens[-len(tokens):] = tokens
+            request.set_generated_tokens([generated_tokens])
+
+    def _optrt_resident_materialize_deferred_samples(
+            self, sample_states: List[SampleState]) -> None:
+        captures: List[Tuple[Dict[int, List[int]], Dict[int, LlmRequest]]] = []
+        for sample_state in sample_states:
+            captures.append(
+                self._optrt_resident_capture_deferred_sample(sample_state))
+        self._optrt_resident_materialize_deferred_captures(captures)
+
+    def _optrt_resident_enqueue_deferred_samples(
+            self, sample_states: List[SampleState]) -> None:
+        self._optrt_resident_deferred_sample_backlog.extend(sample_states)
+
+    def _optrt_resident_snapshot_device_new_tokens(self,
+                                                   new_tokens: Any) -> Any:
+        detach = getattr(new_tokens, "detach", None)
+        snapshot = detach() if callable(detach) else new_tokens
+        clone = getattr(snapshot, "clone", None)
+        self._optrt_resident_native_token_stats[
+            "resident_native_device_token_snapshots"] += 1
+        return clone() if callable(clone) else snapshot
+
+    def _optrt_resident_device_tokens_to_host(self, new_tokens: Any) -> Any:
+        detach = getattr(new_tokens, "detach", None)
+        host_tokens = detach() if callable(detach) else new_tokens
+        cpu = getattr(host_tokens, "cpu", None)
+        self._optrt_resident_native_token_stats[
+            "resident_native_device_to_host"] += 1
+        return cpu() if callable(cpu) else host_tokens
+
+    def _optrt_expand_resident_window_tokens_to_seq_slots(
+        self,
+        *,
+        source_sample_state: SampleState,
+        window_tokens: Any,
+        owned_steps: int,
+    ) -> Tuple[Any, bool]:
+        """Return tokens indexed by request seq slots when the source is compact."""
+
+        shape = getattr(window_tokens, "shape", None)
+        if shape is None or len(shape) < 3:
+            return window_tokens, True
+
+        requests = list(source_sample_state.requests)
+        if not requests:
+            return window_tokens, True
+
+        seq_slots: List[int] = []
+        for request in requests:
+            seq_slot = getattr(request, "py_seq_slot", None)
+            if seq_slot is None:
+                return window_tokens, True
+            try:
+                seq_slots.append(int(seq_slot))
+            except (TypeError, ValueError):
+                return window_tokens, True
+
+        source_device = getattr(source_sample_state, "device", None)
+        source_new_tokens = (
+            None if source_device is None else
+            getattr(source_device, "new_tokens", None))
+        source_shape = getattr(source_new_tokens, "shape", None)
+        source_slots = (
+            int(source_shape[1])
+            if source_shape is not None and len(source_shape) >= 2 else 0)
+        required_slots = max(seq_slots) + 1
+        current_slots = int(shape[1])
+
+        if current_slots >= required_slots:
+            return window_tokens, False
+        if current_slots < len(requests):
+            return window_tokens, True
+
+        slot_count = max(required_slots, source_slots)
+        expanded = window_tokens.new_zeros(
+            (int(owned_steps), slot_count, int(shape[2])))
+        active_window_tokens = window_tokens[:int(owned_steps)]
+        for request_idx, seq_slot in enumerate(seq_slots):
+            expanded[:, seq_slot, :] = active_window_tokens[:, request_idx, :]
+        self._optrt_resident_native_token_stats[
+            "resident_native_window_seq_slot_expansions"] += 1
+        return expanded, False
+
+    def _optrt_make_resident_window_sample_state(
+        self,
+        *,
+        source_sample_state: SampleState,
+        new_tokens: Any,
+        owned_steps: int,
+        request_order: bool = True,
+    ) -> SampleState:
+        window_device_new_tokens = self._optrt_resident_snapshot_device_new_tokens(
+            new_tokens)
+        window_device_new_tokens, request_order = (
+            self._optrt_expand_resident_window_tokens_to_seq_slots(
+                source_sample_state=source_sample_state,
+                window_tokens=window_device_new_tokens,
+                owned_steps=owned_steps,
+            ))
+        device_new_tokens = window_device_new_tokens
+        if owned_steps > 1:
+            device_new_tokens = window_device_new_tokens[owned_steps -
+                                                         1:owned_steps]
+        sample_state = SampleState(
+            requests=list(source_sample_state.requests),
+            device=SampleStateTensors(new_tokens=device_new_tokens),
+            host=None,
+            sampler_event=None,
+        )
+        setattr(sample_state, "optrt_resident_native_sample", True)
+        setattr(sample_state, "optrt_resident_request_order", request_order)
+        setattr(sample_state, "optrt_resident_window_owned_steps",
+                int(owned_steps))
+        setattr(sample_state, "optrt_resident_window_device_new_tokens",
+                window_device_new_tokens)
+        return sample_state
+
+    def _optrt_resident_native_sample_backend_state(
+            self) -> Optional[Dict[str, Any]]:
+        model_state = (
+            self.model_engine.optrt_persistent_decode_model_backend_state())
+        metadata = model_state.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        native_execution_state = metadata.get("native_execution_state")
+        if not isinstance(native_execution_state, dict):
+            return None
+        sample_backend_state = native_execution_state.get(
+            "sample_backend_state")
+        if not isinstance(sample_backend_state, dict):
+            return None
+        return dict(sample_backend_state)
+
+    def _optrt_resident_sample_backend_state(self) -> Dict[str, Any]:
+        native_sample_state = self._optrt_resident_native_sample_backend_state()
+        if native_sample_state is not None:
+            return native_sample_state
+        return dict(self._optrt_resident_sampling_backend_state)
+
+    def _optrt_resident_native_window_backend_state(
+            self) -> Optional[Dict[str, Any]]:
+        model_window_state = getattr(
+            self.model_engine,
+            "optrt_persistent_decode_model_window_backend_state",
+            None,
+        )
+        if callable(model_window_state):
+            state = model_window_state()
+            if isinstance(state, dict) and state.get("backend") is not None:
+                return dict(state)
+
+        model_state = (
+            self.model_engine.optrt_persistent_decode_model_backend_state())
+        metadata = model_state.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        native_execution_state = metadata.get("native_execution_state")
+        if not isinstance(native_execution_state, dict):
+            return None
+        window_backend_state = native_execution_state.get(
+            "window_backend_state")
+        if not isinstance(window_backend_state, dict):
+            return None
+        return dict(window_backend_state)
+
+    def _optrt_resident_window_backend_state(self) -> Dict[str, Any]:
+        native_window_state = self._optrt_resident_native_window_backend_state()
+        if native_window_state is not None and (
+                bool(native_window_state.get("ready", False)) or not
+                _optrt_env_flag(_PERSISTENT_ALLOW_PYTHON_WINDOW_LOOP_ENV_NAME)):
+            return native_window_state
+        return dict(self._optrt_resident_window_loop_backend_state)
+
+    def _optrt_resident_window_step(
+        self,
+        scheduled_batch: ScheduledRequests,
+        sample_state: SampleState,
+        requested_window_steps: int,
+    ) -> Optional[PersistentDecodeWindowResult]:
+        execute_window = getattr(
+            self.model_engine,
+            "optrt_try_execute_resident_decode_window",
+            None,
+        )
+        if not callable(execute_window):
+            return None
+        result = execute_window(
+            sample_state=sample_state,
+            requested_window_steps=requested_window_steps,
+            make_sample_state=self._optrt_make_resident_window_sample_state,
+        )
+        if result is None:
+            return None
+        if not bool(getattr(result, "executed", True)):
+            return PersistentDecodeWindowResult(
+                scheduled_batch=scheduled_batch,
+                sample_state=getattr(result, "sample_state", sample_state),
+                owned_steps=int(getattr(result, "owned_steps", 1)),
+                requested_window_steps=int(
+                    getattr(result, "requested_window_steps",
+                            requested_window_steps)),
+                break_reason=str(
+                    getattr(result, "break_reason",
+                            "resident_native_window_step_failed")),
+                executed=False,
+            )
+        owned_steps = int(getattr(result, "owned_steps", 1))
+        break_reason = str(
+            getattr(result, "break_reason", "resident_native_window_executed"))
+        if owned_steps > 1:
+            self._optrt_resident_defer_window_update_requests(
+                sample_state, owned_steps - 1)
+        return PersistentDecodeWindowResult(
+            scheduled_batch=scheduled_batch,
+            sample_state=getattr(result, "sample_state", sample_state),
+            owned_steps=owned_steps,
+            requested_window_steps=int(
+                getattr(result, "requested_window_steps",
+                        requested_window_steps)),
+            break_reason=break_reason,
+            executed=True,
+        )
+
+    def _optrt_resident_sample_step(
+        self,
+        scheduled_batch: ScheduledRequests,
+        batch_outputs: Dict[str, Any],
+    ) -> PersistentDecodeSampleStepResult:
+        native_new_tokens = batch_outputs.get(
+            "resident_sample_device_new_tokens")
+        native_sample_state = self._optrt_resident_native_sample_backend_state()
+        if native_new_tokens is not None and native_sample_state is not None:
+            device_new_tokens = self._optrt_resident_snapshot_device_new_tokens(
+                native_new_tokens)
+            self._optrt_resident_native_token_stats[
+                "resident_native_sample_states"] += 1
+            sampling_requests = list(
+                getattr(scheduled_batch, "context_requests_last_chunk", [])
+            ) + list(getattr(scheduled_batch, "generation_requests", []))
+            sample_state = SampleState(
+                requests=sampling_requests,
+                device=SampleStateTensors(new_tokens=device_new_tokens),
+                host=None,
+                sampler_event=None,
+            )
+            setattr(sample_state, "optrt_resident_native_sample", True)
+            setattr(sample_state, "optrt_resident_request_order", True)
+            setattr(sample_state, "optrt_resident_defer_materialization",
+                    True)
+            reason = str(
+                native_sample_state.get(
+                    "reason", "resident_sampling_native_executed"))
+            return PersistentDecodeSampleStepResult(
+                sample_state=sample_state,
+                backend=str(
+                    native_sample_state.get(
+                        "backend", "deepseek_resident_sampler_native_v1")),
+                reason=reason,
+                executed=bool(native_sample_state.get("ready", True)),
+                metadata=native_sample_state.get("metadata")
+                if isinstance(native_sample_state.get("metadata"), dict) else
+                None,
+            )
+
+        sample_state = self._sample_async(scheduled_batch, batch_outputs)
+        executed = sample_state is not None
+        reason = (
+            "resident_sampling_bridge_executed"
+            if executed else "resident_sampling_bridge_failed")
+        self._optrt_resident_sampling_backend_state = {
+            "backend": "pyexecutor_sampling_bridge_v1",
+            "ready": True,
+            "reason": "resident_sampling_bridge_ready",
+            "metadata": {
+                "native": False,
+                "last_reason": reason,
+                "executed": executed,
+            },
+        }
+        return PersistentDecodeSampleStepResult(
+            sample_state=sample_state,
+            backend="pyexecutor_sampling_bridge_v1",
+            reason=reason,
+            executed=executed,
+            metadata={
+                "native": False,
+            },
+        )
+
+    def _optrt_resident_sample_state_request_ids(
+            self, sample_state: SampleState) -> set[int]:
+        request_ids: set[int] = set()
+        for request in sample_state.requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            request_ids.add(int(request.py_request_id))
+        return request_ids
+
+    def _optrt_resident_materialize_deferred_backlog_for_request(
+            self, request: LlmRequest) -> None:
+        if not self._optrt_resident_deferred_sample_backlog:
+            return
+
+        request_id = int(request.py_request_id)
+        selected_sample_states: List[SampleState] = []
+        remaining_sample_states: List[SampleState] = []
+        for sample_state in self._optrt_resident_deferred_sample_backlog:
+            sample_request_ids = self._optrt_resident_sample_state_request_ids(
+                sample_state)
+            if request_id in sample_request_ids:
+                selected_sample_states.append(sample_state)
+            else:
+                remaining_sample_states.append(sample_state)
+
+        if not selected_sample_states:
+            return
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self._optrt_resident_materialize_deferred_samples(
+            selected_sample_states)
+        self._optrt_persistent_window_stage_end(
+            "resident_materialize_response_backlog", stage_start)
+        self._optrt_resident_deferred_sample_backlog = remaining_sample_states
+
+    def _optrt_try_execute_resident_decode_cohort(
+        self,
+        scheduled_batch: ScheduledRequests,
+        sample_state: SampleState,
+    ) -> Tuple[ScheduledRequests, SampleState, int, bool]:
+        plan = self._optrt_persistent_decode_engine.last_plan
+        configured_window_steps = (
+            plan.requested_window_steps
+            if plan is not None else
+            self._optrt_persistent_decode_engine.requested_window_steps)
+        requested_window_steps = self._optrt_resident_effective_window_steps(
+            scheduled_batch, configured_window_steps)
+        if not self._optrt_resident_cohort_execute:
+            return scheduled_batch, sample_state, 1, False
+        if requested_window_steps <= 1:
+            return scheduled_batch, sample_state, 1, True
+
+        def prepare_resources(batch: ScheduledRequests) -> None:
+            self._optrt_resident_prepare_resources(batch)
+
+        def forward_step(batch: ScheduledRequests,
+                         new_tensors_device: Any) -> Any:
+            return self._forward_step(batch, new_tensors_device, None)
+
+        def increment_iter_counter() -> None:
+            self.iter_counter += 1
+
+        def log_execution(summary: Dict[str, Any]) -> None:
+            if not (self._optrt_persistent_window_admission_debug
+                    or self._optrt_persistent_window_timing_debug):
+                return
+            log_summary = {
+                "rank": self.dist.rank,
+                "tp_rank": self.dist.tp_rank,
+                "native_token_stats":
+                dict(sorted(self._optrt_resident_native_token_stats.items())),
+            }
+            log_summary.update(summary)
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_RESIDENT_COHORT_EXECUTED "
+                f"{log_summary}")
+
+        callbacks = PersistentDecodeWindowCallbacks(
+            initial_admitted=self._optrt_resident_cohort_admitted,
+            continue_admitted=self._optrt_resident_cohort_continue_admitted,
+            request_ids=self._optrt_resident_cohort_request_ids,
+            can_defer_host_updates=self._optrt_resident_can_defer_host_updates,
+            defer_update_requests=self._optrt_resident_defer_update_requests,
+            sample_has_finished_requests=(
+                self._optrt_resident_sample_has_finished_requests),
+            update_requests=self._update_requests,
+            prepare_resources=prepare_resources,
+            forward_step=forward_step,
+            sample_async=self._sample_async,
+            update_request_states=self._update_request_states,
+            increment_iter_counter=increment_iter_counter,
+            materialize_deferred_samples=(
+                self._optrt_resident_materialize_deferred_samples),
+            stage_start=self._optrt_persistent_window_stage_start,
+            stage_end=self._optrt_persistent_window_stage_end,
+            record_timing=self._optrt_persistent_window_record_timing,
+            log_execution=log_execution,
+            resident_sample_step=self._optrt_resident_sample_step,
+            capture_deferred_sample=(
+                self._optrt_resident_capture_deferred_sample),
+            materialize_deferred_captures=(
+                self._optrt_resident_materialize_deferred_captures),
+            can_accumulate_token_egress=(
+                self._optrt_resident_can_accumulate_token_egress),
+            enqueue_deferred_samples=(
+                self._optrt_resident_enqueue_deferred_samples),
+            model_body_backend_state=(
+                self.model_engine.
+                optrt_persistent_decode_model_backend_state),
+            model_graph_backend_state=(
+                self.model_engine.
+                optrt_persistent_decode_model_graph_state),
+            sample_backend_state=self._optrt_resident_sample_backend_state,
+            window_backend_state=self._optrt_resident_window_backend_state,
+            resident_window_step=self._optrt_resident_window_step,
+            async_token_egress=self._optrt_resident_async_token_egress,
+        )
+        result = (
+            self._optrt_persistent_resident_backend.execute_decode_window(
+                scheduled_batch=scheduled_batch,
+                sample_state=sample_state,
+                requested_window_steps=requested_window_steps,
+                configured_window_steps=configured_window_steps,
+                flex_steps=self._optrt_resident_flex_steps,
+                callbacks=callbacks,
+            ))
+        if not result.executed:
+            break_reason = str(
+                getattr(result, "break_reason",
+                        "resident_window_declined_without_reason"))
+            if (self._optrt_resident_require_native_window and break_reason not
+                    in
+                    _OPTRT_RESIDENT_REQUIRE_NATIVE_WINDOW_BOOTSTRAP_REASONS):
+                raise RuntimeError(
+                    "Native resident decode window was required for this run, "
+                    f"but the backend declined: {break_reason}")
+            # In attention-DP serving, the native resident backend can decline
+            # after the matched cohort admission collectives. Falling through to
+            # the older fallback persistent-window path would introduce a second
+            # set of window-admission collectives in the same iteration and can
+            # desynchronize ranks. Treat the decline as handled so execution
+            # returns to the already-matched one-step PyExecutor path.
+            if self.enable_attention_dp:
+                return scheduled_batch, sample_state, 1, True
+            return scheduled_batch, sample_state, 1, False
+        return result.scheduled_batch, result.sample_state, result.owned_steps, True
+
+    def _optrt_prepare_persistent_window_batch(
+            self) -> Optional[ScheduledRequests]:
+        self._optrt_persistent_window_last_break_reason = "not_started"
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        continue_admitted = self._optrt_persistent_window_continue_admitted()
+        self._optrt_persistent_window_stage_end("continue_admission",
+                                                stage_start)
+        if not continue_admitted:
+            self._optrt_persistent_window_last_break_reason = "continue_not_admitted"
+            return None
+
+        if self.enable_attention_dp:
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._pad_attention_dp_dummy_request(force_if_empty=True)
+            self._optrt_persistent_window_stage_end("pad_adp_dummy",
+                                                    stage_start)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        scheduled_batch, _, _ = self._schedule()
+        self._optrt_persistent_window_stage_end("schedule", stage_start)
+        if not self._is_kv_manager_v2:
+            self._terminate_requests(scheduled_batch.paused_requests)
+        if scheduled_batch.context_requests:
+            self._optrt_persistent_window_last_break_reason = "context_requests_present"
+            return None
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        can_queue, _ = self._can_queue(scheduled_batch)
+        self._optrt_persistent_window_stage_end("can_queue", stage_start)
+        if not can_queue:
+            self._revert_gen_alloc(scheduled_batch)
+            self._optrt_persistent_window_last_break_reason = "cannot_queue"
+            return None
+
+        if self.kv_cache_transceiver:
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._prepare_disagg_gen_transmission_complete(scheduled_batch)
+            self._optrt_persistent_window_stage_end("disagg_prepare_complete",
+                                                    stage_start)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self._handle_dynamic_draft_len(scheduled_batch)
+        self._optrt_persistent_window_stage_end("dynamic_draft_len",
+                                                stage_start)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self.resource_manager.prepare_resources(scheduled_batch)
+        self._optrt_persistent_window_stage_end("prepare_resources",
+                                                stage_start)
+
+        if self.kv_connector_manager:
+            stage_start = self._optrt_persistent_window_stage_start()
+            self.kv_connector_manager.handle_metadata()
+            self._kv_connector_start_batch(scheduled_batch)
+            can_queue, _ = self._can_queue(scheduled_batch)
+            self._optrt_persistent_window_stage_end("kv_connector",
+                                                    stage_start)
+            if not can_queue:
+                self._revert_gen_alloc(scheduled_batch)
+                self._optrt_persistent_window_last_break_reason = "kv_connector_cannot_queue"
+                return None
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        scheduled_batch.generation_requests = sorted(
+            scheduled_batch.generation_requests,
+            key=lambda req: int(req.py_batch_idx is not None),
+        )
+        self._optrt_persistent_window_stage_end("sort_generation_requests",
+                                                stage_start)
+
+        if self.kv_cache_transceiver:
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._handle_first_token_response(scheduled_batch)
+            self._optrt_persistent_window_stage_end(
+                "handle_first_token_response", stage_start)
+
+        self._optrt_persistent_window_last_break_reason = "prepared"
+        return scheduled_batch
+
+    def _optrt_process_persistent_window_previous(
+            self, scheduled_batch: ScheduledRequests,
+            sample_state: SampleState) -> None:
+        stage_start = self._optrt_persistent_window_stage_start()
+        self.previous_batch = BatchState(
+            scheduled_requests=scheduled_batch,
+            sample_state=sample_state,
+            iter_stats=None,
+        )
+        self._optrt_persistent_window_stage_end("set_previous_batch",
+                                                stage_start)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self._update_requests(sample_state)
+        self._optrt_persistent_window_stage_end("update_requests",
+                                                stage_start)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self._send_kv_async(scheduled_batch.all_requests())
+        self._optrt_persistent_window_stage_end("send_kv_async", stage_start)
+
+        if self.enable_early_first_token_response:
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._emit_first_token_responses(scheduled_batch)
+            self._optrt_persistent_window_stage_end(
+                "emit_first_token_responses", stage_start)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self._flush_pending_transfer_responses()
+        self._optrt_persistent_window_stage_end(
+            "flush_pending_transfer_responses", stage_start)
+
+        if not self._is_kv_manager_v2:
+            self._pause_requests(scheduled_batch.paused_requests)
+
+        stage_start = self._optrt_persistent_window_stage_start()
+        self._process_previous_batch()
+        self._optrt_persistent_window_stage_end("process_previous_batch",
+                                                stage_start)
+
+    def _optrt_try_execute_persistent_decode_window(
+        self,
+        scheduled_batch: ScheduledRequests,
+        sample_state: SampleState,
+    ) -> Tuple[ScheduledRequests, SampleState, int]:
+        plan = self._optrt_persistent_decode_engine.last_plan
+        requested_window_steps = (
+            plan.requested_window_steps
+            if plan is not None else
+            self._optrt_persistent_decode_engine.requested_window_steps)
+        if (not self._optrt_persistent_window_execute
+                or requested_window_steps <= 1):
+            return scheduled_batch, sample_state, 1
+        if (not self.enable_attention_dp
+                and (plan is None or not plan.window_contract_ready)):
+            return scheduled_batch, sample_state, 1
+        if not self._optrt_persistent_decode_window_admitted():
+            return scheduled_batch, sample_state, 1
+
+        window_start = self._optrt_persistent_window_stage_start()
+        break_reason = "completed_requested_window"
+        owned_steps = 1
+        current_batch = scheduled_batch
+        current_sample_state = sample_state
+        while owned_steps < requested_window_steps:
+            next_batch = self._optrt_prepare_persistent_window_batch()
+            if next_batch is None:
+                break_reason = self._optrt_persistent_window_last_break_reason
+                break
+
+            stage_start = self._optrt_persistent_window_stage_start()
+            next_outputs = self._forward_step(next_batch,
+                                              current_sample_state.device,
+                                              None)
+            self._optrt_persistent_window_stage_end("forward_step",
+                                                    stage_start)
+
+            stage_start = self._optrt_persistent_window_stage_start()
+            next_sample_state = self._sample_async(next_batch, next_outputs)
+            self._optrt_persistent_window_stage_end("sample_async",
+                                                    stage_start)
+            if next_sample_state is None:
+                break_reason = "sample_failed"
+                break
+
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._update_request_states(next_batch)
+            self._optrt_persistent_window_stage_end("update_request_states",
+                                                    stage_start)
+
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._optrt_process_persistent_window_previous(
+                current_batch, current_sample_state)
+            self._optrt_persistent_window_stage_end("process_previous_total",
+                                                    stage_start)
+
+            stage_start = self._optrt_persistent_window_stage_start()
+            self._update_generation_requests_that_will_complete_next_iteration(
+                next_batch.generation_requests)
+            self._optrt_persistent_window_stage_end("mark_will_complete",
+                                                    stage_start)
+
+            current_batch = next_batch
+            current_sample_state = next_sample_state
+            owned_steps += 1
+            self.iter_counter += 1
+
+        self._optrt_persistent_window_stage_end("total_window", window_start)
+        self._optrt_persistent_window_record_timing(
+            owned_steps, requested_window_steps, break_reason)
+
+        if owned_steps > 1 and self._optrt_persistent_window_admission_debug:
+            summary = {
+                "rank": self.dist.rank,
+                "tp_rank": self.dist.tp_rank,
+                "owned_steps": owned_steps,
+                "requested_window_steps": requested_window_steps,
+            }
+            logger.info(
+                "OPTRT_PERSISTENT_DECODE_WINDOW_EXECUTED "
+                f"{summary}")
+        return current_batch, current_sample_state, owned_steps
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -2551,6 +4668,27 @@ class PyExecutor:
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+        self._optrt_finalization_log(
+            "after_schedule",
+            self.active_requests,
+            include_all_requests=True,
+            periodic=True,
+            new_request_ids=[
+                request.py_request_id for request in new_requests
+            ],
+            scheduled_request_ids=[
+                request.py_request_id
+                for request in scheduled_batch.all_requests()
+            ],
+            batch_size=scheduled_batch.batch_size,
+            context_requests=scheduled_batch.num_context_requests,
+            generation_requests=len(scheduled_batch.generation_requests),
+            paused_requests=len(scheduled_batch.paused_requests),
+            num_fitting_reqs=num_fitting_reqs,
+            fitting_disagg_gen_init_request_ids=[
+                request.py_request_id
+                for request in fitting_disagg_gen_init_requests
+            ])
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -2585,6 +4723,21 @@ class PyExecutor:
             else:
                 any_need_check = int(local_need_check)
             if any_need_check > 0:
+                self._optrt_finalization_log(
+                    "disagg_ctx_need_check",
+                    self.active_requests,
+                    include_all_requests=True,
+                    local_need_check=local_need_check,
+                    any_need_check=any_need_check,
+                    all_gen_first=all_gen_first,
+                    num_fitting_reqs=num_fitting_reqs,
+                    fitting_disagg_gen_init_request_ids=[
+                        request.py_request_id
+                        for request in fitting_disagg_gen_init_requests
+                    ],
+                    inflight_transfer_request_ids=list(
+                        self.async_transfer_manager.requests_in_transfer().
+                        keys()))
                 if local_need_check and not all_gen_first:
                     logger.warning(
                         "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
@@ -3116,6 +5269,21 @@ class PyExecutor:
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
+                self._optrt_finalization_log(
+                    "can_queue_decision",
+                    self.active_requests,
+                    include_all_requests=not can_queue,
+                    periodic=not can_queue,
+                    can_queue=can_queue,
+                    can_queue_this_rank=can_queue_this_rank,
+                    scheduled_request_ids=[
+                        request.py_request_id
+                        for request in scheduled_batch.all_requests()
+                    ],
+                    batch_size=scheduled_batch.batch_size,
+                    context_requests=scheduled_batch.num_context_requests,
+                    generation_requests=len(scheduled_batch.
+                                            generation_requests))
 
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -3251,9 +5419,37 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        batch_outputs = self._forward_step(
-                            scheduled_batch, previous_tensors_device,
-                            num_accepted_tokens_device)
+                        execute_persistent_step = None
+                        if self._optrt_persistent_decode_engine.takeover_enabled:
+
+                            def execute_persistent_step(
+                            ) -> PersistentDecodeEngineResult:
+                                step_outputs = self._forward_step(
+                                    scheduled_batch, previous_tensors_device,
+                                    num_accepted_tokens_device)
+                                step_sample_state = self._sample_async(
+                                    scheduled_batch, step_outputs)
+                                return PersistentDecodeEngineResult(
+                                    step_outputs, step_sample_state)
+
+                        persistent_result = (
+                            self._optrt_persistent_decode_engine.try_execute(
+                                scheduled_batch=scheduled_batch,
+                                previous_sample_state=previous_tensors,
+                                current_sample_state_device=previous_tensors_device,
+                                has_draft_batch=has_draft_batch,
+                                use_previous_draft_tokens=use_previous_draft_tokens,
+                                guided_decoder_present=self.guided_decoder is not None,
+                                enable_spec_decode=self.model_engine.enable_spec_decode,
+                                attention_dp_enabled=self.enable_attention_dp,
+                                execute_step=execute_persistent_step,
+                            ))
+                        if persistent_result is None:
+                            batch_outputs = self._forward_step(
+                                scheduled_batch, previous_tensors_device,
+                                num_accepted_tokens_device)
+                        else:
+                            batch_outputs = persistent_result.batch_outputs
 
                     # C=1 host-scheduling reorder: dispatch the *current* batch's
                     # sample (+ its D2H) immediately after the forward, BEFORE
@@ -3286,8 +5482,11 @@ class PyExecutor:
                             guided_decoder_failed_requests = self.guided_decoder.execute(
                                 batch_outputs['logits'])
 
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
+                        if persistent_result is None:
+                            sample_state = self._sample_async(
+                                scheduled_batch, batch_outputs)
+                        else:
+                            sample_state = persistent_result.sample_state
 
                     assert sample_state is not None, "Sampling failed"
 
@@ -3296,12 +5495,39 @@ class PyExecutor:
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
-                    self._update_request_states(scheduled_batch)
+                    defer_attention_dp_dummy_cleanup = self._optrt_should_defer_attention_dp_dummy_cleanup(
+                        scheduled_batch)
+                    self._optrt_finalization_log(
+                        "before_update_request_states",
+                        scheduled_batch.all_requests(),
+                        defer_attention_dp_dummy_cleanup=(
+                            defer_attention_dp_dummy_cleanup))
+                    self._optrt_defer_attention_dp_dummy_cleanup = (
+                        defer_attention_dp_dummy_cleanup)
+                    try:
+                        self._update_request_states(scheduled_batch)
+                    finally:
+                        self._optrt_defer_attention_dp_dummy_cleanup = False
+                    self._optrt_finalization_log(
+                        "after_update_request_states",
+                        scheduled_batch.all_requests())
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    self._optrt_finalization_log(
+                        "before_update_requests",
+                        self.previous_batch.scheduled_requests.all_requests())
                     self._update_requests(self.previous_batch.sample_state)
+                    self._optrt_finalization_log(
+                        "after_update_requests",
+                        self.previous_batch.scheduled_requests.all_requests())
 
+                    self._optrt_finalization_log(
+                        "before_send_kv_async",
+                        self.previous_batch.scheduled_requests.all_requests())
                     self._send_kv_async(
+                        self.previous_batch.scheduled_requests.all_requests())
+                    self._optrt_finalization_log(
+                        "after_send_kv_async",
                         self.previous_batch.scheduled_requests.all_requests())
 
                 if self.enable_early_first_token_response:
@@ -3332,7 +5558,13 @@ class PyExecutor:
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    self._optrt_finalization_log(
+                        "before_process_previous_batch",
+                        self.previous_batch.scheduled_requests.all_requests())
                     self._process_previous_batch()
+                    self._optrt_finalization_log(
+                        "after_process_previous_batch",
+                        self.previous_batch.scheduled_requests.all_requests())
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
                 else:
@@ -3342,8 +5574,25 @@ class PyExecutor:
                 # If set before, the response of a request may be incorrect, as it will
                 # use the wrong indices for generation logits when streaming is enabled.
                 if can_queue:
+                    self._optrt_finalization_log(
+                        "before_mark_will_complete_next_iteration",
+                        scheduled_batch.generation_requests)
                     self._update_generation_requests_that_will_complete_next_iteration(
                         scheduled_batch.generation_requests)
+                    self._optrt_finalization_log(
+                        "after_mark_will_complete_next_iteration",
+                        scheduled_batch.generation_requests)
+                    try:
+                        scheduled_batch, sample_state, _, resident_admitted = (
+                            self._optrt_try_execute_resident_decode_cohort(
+                                scheduled_batch, sample_state))
+                    finally:
+                        if defer_attention_dp_dummy_cleanup:
+                            self._optrt_cleanup_attention_dp_dummy_requests()
+                    if not resident_admitted:
+                        scheduled_batch, sample_state, _ = (
+                            self._optrt_try_execute_persistent_decode_window(
+                                scheduled_batch, sample_state))
 
                 if can_queue:
                     self.perf_manager.save_timing_to_requests(
@@ -3461,19 +5710,96 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    def _optrt_finalization_should_log_request(self,
+                                               request: LlmRequest) -> bool:
+        if not self._optrt_finalization_debug:
+            return False
+
+        if _optrt_safe_attr(request, "is_finished", False):
+            return True
+
+        py_decoding_iter = _optrt_safe_attr(request, "py_decoding_iter", None)
+        if py_decoding_iter in (0, 1, 2):
+            return True
+
+        max_new_tokens = _optrt_safe_attr(request, "py_max_new_tokens", None)
+        if isinstance(py_decoding_iter, int) and isinstance(
+                max_new_tokens, int):
+            return max_new_tokens - py_decoding_iter <= 2
+
+        state = _optrt_state_name(request)
+        return not state.endswith("GENERATION_IN_PROGRESS")
+
+    def _optrt_finalization_log(self,
+                                phase: str,
+                                requests: Optional[Iterable[LlmRequest]] = None,
+                                include_all_requests: bool = False,
+                                periodic: bool = False,
+                                **kwargs: Any) -> None:
+        if not self._optrt_finalization_debug:
+            return
+
+        if periodic and self.iter_counter % self._optrt_finalization_every != 0:
+            return
+
+        payload: Dict[str, Any] = {
+            "phase": phase,
+            "rank": self.dist.rank,
+            "iter": self.iter_counter,
+            "active": len(self.active_requests),
+        }
+        if requests is not None:
+            request_snapshots = [
+                _optrt_request_snapshot(request) for request in requests
+                if include_all_requests
+                or self._optrt_finalization_should_log_request(request)
+            ]
+            if request_snapshots:
+                payload["requests"] = request_snapshots
+        payload.update(kwargs)
+        if "requests" not in payload and kwargs.get("response_count") == 0:
+            if phase.startswith("enqueue_responses") or phase.startswith(
+                    "await_"):
+                return
+        if ("requests" not in payload and phase.startswith("await_")
+                and not kwargs.get("queued_response_ids")
+                and kwargs.get("response_count", 0) == 0):
+            return
+        if "requests" in payload or kwargs:
+            logger.info(f"OPTRT_FINALIZATION {payload}")
+
     def _process_previous_batch(self):
+        self._optrt_finalization_log(
+            "process_previous_batch_enter",
+            self.previous_batch.scheduled_requests.all_requests())
         self._handle_canceled_requests()
+        self._optrt_finalization_log(
+            "process_previous_batch_after_canceled",
+            self.previous_batch.scheduled_requests.all_requests())
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
         finished_requests = self._handle_responses(
             emit_first_iter=not self.enable_early_first_token_response)
+        self._optrt_finalization_log(
+            "process_previous_batch_after_responses",
+            self.previous_batch.scheduled_requests.all_requests(),
+            finished_request_ids=[
+                request.py_request_id for request in finished_requests
+            ],
+        )
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
+        self._optrt_finalization_log(
+            "process_previous_batch_before_update_resources",
+            scheduled_requests.all_requests())
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
+        self._optrt_finalization_log(
+            "process_previous_batch_after_update_resources",
+            scheduled_requests.all_requests())
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -4061,14 +6387,36 @@ class PyExecutor:
         return True
 
     @nvtx_range("_pad_attention_dp_dummy_request")
-    def _pad_attention_dp_dummy_request(self):
+    def _add_attention_dp_dummy_request(self) -> None:
+        dummy_request_id = _optrt_attention_dp_dummy_request_id(self.dist.rank)
+        dummy_request_ids = [dummy_request_id]
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        llm_request = self.kv_cache_manager.add_dummy_requests(
+            request_ids=dummy_request_ids,
+            is_gen=True,
+            prepare_resource=True,
+            max_num_draft_tokens=self.max_total_draft_tokens,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )[0]
+        llm_request.is_attention_dp_dummy = True
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            spec_resource_manager.add_dummy_requests(dummy_request_ids)
+        self.active_requests.append(llm_request)
+
+    def _pad_attention_dp_dummy_request(self,
+                                        force_if_empty: bool = False) -> None:
         """
         Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
         """
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        if not force_if_empty:
+            assert self.expected_num_active_requests >= len(
+                self.active_requests)
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
@@ -4076,22 +6424,11 @@ class PyExecutor:
 
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
-        if num_active_request == 0 and self.expected_num_active_requests > 0:
-            draft_kv_cache_manager = self.resource_manager.get_resource_manager(
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=[0],
-                is_gen=True,
-                prepare_resource=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-            )[0]
-            llm_request.is_attention_dp_dummy = True
-            spec_resource_manager = self.resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests([0])
-            self.active_requests.append(llm_request)
+        should_pad = (
+            num_active_request == 0
+            and (force_if_empty or self.expected_num_active_requests > 0))
+        if should_pad:
+            self._add_attention_dp_dummy_request()
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
@@ -4149,6 +6486,55 @@ class PyExecutor:
                                 req,
                                 phase="after_recv")
 
+    def _maybe_finish_disagg_first_gen_request(self, req: LlmRequest,
+                                               first_gen_tokens: List[int],
+                                               beam_width: int) -> None:
+        if beam_width != 1 or not first_gen_tokens or req.is_finished:
+            return
+
+        first_gen_token = first_gen_tokens[0]
+        num_tokens = req.get_num_tokens(0)
+        generated_tokens = num_tokens - req.py_orig_prompt_len
+        finish_reason = None
+        if first_gen_token == req.py_end_id:
+            finish_reason = FinishReason.END_ID
+        elif generated_tokens >= req.py_max_new_tokens or num_tokens >= self.max_seq_len:
+            finish_reason = FinishReason.LENGTH
+        elif self._first_gen_token_matches_stop_words(req, first_gen_token):
+            finish_reason = FinishReason.STOP_WORDS
+
+        if finish_reason is not None:
+            req.finish_by(finish_reason, 0)
+            req.decoding_iter = req.py_decoding_iter
+            _optrt_kv_debug(
+                "executor_disagg_gen_trans_complete_first_token_finished",
+                req,
+                first_gen_token=first_gen_token,
+                finish_reason=getattr(finish_reason, "name",
+                                      str(finish_reason)))
+
+    @staticmethod
+    def _first_gen_token_matches_stop_words(req: LlmRequest,
+                                            first_gen_token: int) -> bool:
+        if not req.py_stop_words_list:
+            return False
+        stop_words, prefix_sum = req.py_stop_words_list
+        if -1 in prefix_sum:
+            prefix_sum = prefix_sum[:prefix_sum.index(-1)]
+        if not prefix_sum:
+            return False
+
+        tokens = req.get_tokens(0)
+        offset = 0
+        for offset_end in prefix_sum:
+            stop_word = stop_words[offset:offset_end]
+            offset = offset_end
+            if len(stop_word) == 1 and first_gen_token == stop_word[0]:
+                return True
+            if len(stop_word) <= len(tokens) and tokens[-len(stop_word):] == stop_word:
+                return True
+        return False
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         _optrt_kv_debug(
@@ -4197,6 +6583,7 @@ class PyExecutor:
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
                 req.py_kv_transfer_timed_out = False
+                req.py_optrt_disagg_resident_bootstrap_steps = 0
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 _optrt_kv_debug(
@@ -4233,6 +6620,8 @@ class PyExecutor:
                     first_gen_tokens=first_gen_tokens)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+                self._maybe_finish_disagg_first_gen_request(
+                    req, first_gen_tokens, beam_width)
                 _optrt_kv_debug("executor_disagg_gen_trans_complete_done",
                                 req,
                                 beam_width=beam_width)
@@ -4519,6 +6908,116 @@ class PyExecutor:
                         req)
         self._check_cache_transfer_errors("generation requests")
 
+    def _optrt_kv_forward_request_snapshot(
+            self, request: LlmRequest) -> Dict[str, Any]:
+        snapshot = _optrt_request_snapshot(request)
+        params = _optrt_safe_attr(request, "py_disaggregated_params", None)
+        if params is not None:
+            snapshot["disagg_request_type"] = _optrt_safe_attr(
+                params, "request_type", None)
+            snapshot["disagg_schedule_style"] = _optrt_safe_attr(
+                params, "schedule_style", None)
+            snapshot["ctx_request_id"] = _optrt_safe_attr(
+                params, "ctx_request_id", None)
+            snapshot["disagg_request_id"] = _optrt_safe_attr(
+                params, "disagg_request_id", None)
+
+        for attr in ("py_batch_idx", "py_seq_slot", "context_chunk_size",
+                     "context_current_position", "prompt_len",
+                     "py_orig_prompt_len", "py_kv_transfer_start_time",
+                     "py_kv_transfer_timed_out",
+                     "py_optrt_disagg_resident_bootstrap_steps"):
+            snapshot[attr] = _optrt_safe_attr(request, attr, None)
+
+        kv_cache_manager = self.kv_cache_manager
+        if kv_cache_manager is None:
+            snapshot["kv_manager"] = None
+            return snapshot
+
+        snapshot["kv_manager"] = type(kv_cache_manager).__name__
+        try:
+            cache_indices = kv_cache_manager.get_cache_indices(request)
+        except Exception as exc:
+            snapshot["kv_indices_error"] = (
+                f"{type(exc).__name__}: {exc}")
+        else:
+            head, total = _optrt_debug_sequence_head(cache_indices)
+            snapshot["kv_indices_total_items"] = _optrt_count_nested_items(
+                cache_indices)
+            snapshot["kv_indices_top_len"] = total
+            snapshot["kv_indices_head"] = head
+
+        try:
+            snapshot["kv_token_count"] = kv_cache_manager.get_num_tokens(
+                request)
+        except Exception as exc:
+            snapshot["kv_token_count_error"] = (
+                f"{type(exc).__name__}: {exc}")
+
+        kv_cache_map = _optrt_safe_attr(kv_cache_manager, "kv_cache_map", None)
+        if kv_cache_map is not None:
+            request_id = _optrt_safe_attr(request, "py_request_id", None)
+            snapshot["kv_cache_map_has_request"] = request_id in kv_cache_map
+            snapshot["kv_cache_map_size"] = len(kv_cache_map)
+
+        index_mapper = _optrt_safe_attr(kv_cache_manager, "index_mapper", None)
+        if index_mapper is not None:
+            snapshot["index_mapper_type"] = type(index_mapper).__name__
+            for attr in ("size", "num_free_slots"):
+                value = _optrt_safe_call(index_mapper, attr, default=None)
+                if value is not None:
+                    snapshot[f"index_mapper_{attr}"] = value
+
+        return snapshot
+
+    def _optrt_log_forward_failure(
+            self, scheduled_requests: ScheduledRequests,
+            error: Exception) -> None:
+        context_requests = list(scheduled_requests.context_requests)
+        generation_requests = list(scheduled_requests.generation_requests)
+        all_scheduled = context_requests + generation_requests
+        active_by_id = {
+            _optrt_safe_attr(request, "py_request_id", None): request
+            for request in self.active_requests
+        }
+        active_scheduled = [
+            active_by_id.get(_optrt_safe_attr(request, "py_request_id", None),
+                             request) for request in all_scheduled
+        ]
+        payload = {
+            "rank":
+            self.dist.rank,
+            "tp_rank":
+            self.dist.tp_rank,
+            "pp_rank":
+            self.dist.pp_rank,
+            "iter":
+            self.iter_counter,
+            "error":
+            f"{type(error).__name__}: {error}",
+            "num_context_requests":
+            len(context_requests),
+            "num_generation_requests":
+            len(generation_requests),
+            "context_request_ids": [
+                _optrt_safe_attr(request, "py_request_id", None)
+                for request in context_requests
+            ],
+            "generation_request_ids": [
+                _optrt_safe_attr(request, "py_request_id", None)
+                for request in generation_requests
+            ],
+            "active_request_ids": [
+                _optrt_safe_attr(request, "py_request_id", None)
+                for request in self.active_requests
+            ],
+            "requests": [
+                self._optrt_kv_forward_request_snapshot(request)
+                for request in active_scheduled
+            ],
+        }
+        logger.error(f"OPTRT_FORWARD_FAILURE_DIAGNOSTIC {payload}")
+
     def _forward_step(
             self,
             scheduled_requests: ScheduledRequests,
@@ -4568,6 +7067,7 @@ class PyExecutor:
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
+            self._optrt_log_forward_failure(scheduled_requests, e)
             logger.error(
                 f"Encountered an error in forward function: {error_msg}")
             self._handle_errors(error_msg)
@@ -4588,13 +7088,8 @@ class PyExecutor:
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        if not self._optrt_defer_attention_dp_dummy_cleanup:
+            self._optrt_cleanup_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
@@ -4688,12 +7183,38 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _optrt_note_normal_disagg_decode_update(
+            self, sample_state: SampleState) -> None:
+        if self._optrt_resident_disagg_bootstrap_steps <= 0:
+            return
+        for request in sample_state.requests:
+            if self._optrt_is_dummy_request(request):
+                continue
+            if getattr(request, "py_disaggregated_params", None) is None:
+                continue
+            completed_steps = getattr(
+                request, "py_optrt_disagg_resident_bootstrap_steps", None)
+            if completed_steps is None:
+                continue
+            try:
+                completed_steps = int(completed_steps)
+            except (TypeError, ValueError):
+                completed_steps = 0
+            request.py_optrt_disagg_resident_bootstrap_steps = min(
+                completed_steps + 1,
+                self._optrt_resident_disagg_bootstrap_steps)
+
     @nvtx_range("_update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
         try:
+            if bool(getattr(sample_state, "optrt_resident_native_sample",
+                            False)):
+                self._optrt_resident_update_requests(sample_state)
+                return
             self.sampler.update_requests(sample_state, resource_manager)
+            self._optrt_note_normal_disagg_decode_update(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -4824,17 +7345,30 @@ class PyExecutor:
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
         # but the dummy ID is reused every iteration).
+        route = "disagg_pp_handler"
         if (self._disagg_pp_termination_handler is not None
                 and not request.is_dummy_request):
+            self._optrt_finalization_log("terminate_request",
+                                         [request],
+                                         route=route)
             self._disagg_pp_termination_handler.terminate(request)
         else:
+            route = "direct"
+            self._optrt_finalization_log("terminate_request",
+                                         [request],
+                                         route=route)
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        self._optrt_finalization_log("do_terminate_request_enter", [request])
         self.resource_manager.free_resources(request)
+        self._optrt_finalization_log("do_terminate_request_after_free",
+                                     [request])
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+            self._optrt_finalization_log(
+                "do_terminate_request_after_wait_queue_pop", [request])
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -4889,7 +7423,22 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
+        if self._optrt_finalization_debug:
+            responses = list(responses)
+            self._optrt_finalization_log(
+                "enqueue_responses_enter",
+                response_count=len(responses),
+                responses=[
+                    _optrt_response_snapshot(req_id, response)
+                    for req_id, response in responses
+                ],
+            )
+
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
+            self._optrt_finalization_log(
+                "enqueue_responses_skip_rank",
+                tp_group=list(self.dist.mapping.tp_group),
+                gather_all_responses=self.gather_all_responses)
             return
 
         if self.enable_attention_dp and self.dist.world_size != 1:
@@ -4904,6 +7453,16 @@ class PyExecutor:
                         if resp is not None:
                             gather_responses.extend(resp)
                     responses = gather_responses
+        if self._optrt_finalization_debug:
+            responses = list(responses)
+            self._optrt_finalization_log(
+                "enqueue_responses_after_gather",
+                response_count=len(responses),
+                responses=[
+                    _optrt_response_snapshot(req_id, response)
+                    for req_id, response in responses
+                ],
+            )
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
@@ -4921,7 +7480,15 @@ class PyExecutor:
                             req_id] is not None:
                         self.result_wait_queues[req_id].put_response.remote(
                             resp.client_id, resp)
+                self._optrt_finalization_log(
+                    "enqueue_responses_before_notify",
+                    response_count=len(responses),
+                    queued_response_ids=list(self.responses.keys()))
                 self.response_cv.notify_all()
+                self._optrt_finalization_log(
+                    "enqueue_responses_after_notify",
+                    response_count=len(responses),
+                    queued_response_ids=list(self.responses.keys()))
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
@@ -4953,6 +7520,8 @@ class PyExecutor:
                 response = req.create_response(False, self.dist.rank)
                 if logits_snapshot is not None and response is not None:
                     response.result.generation_logits = logits_snapshot
+                if response is None:
+                    continue
                 new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
@@ -5002,6 +7571,30 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    def _finish_generation_to_complete_by_length(
+            self, request: LlmRequest) -> None:
+        if (request.state != LlmRequestState.GENERATION_TO_COMPLETE
+                or request.is_finished):
+            return
+
+        if request.py_beam_width != 1:
+            return
+
+        num_tokens = request.get_num_tokens(0)
+        generated_tokens = num_tokens - request.py_orig_prompt_len
+        if generated_tokens < request.py_max_new_tokens and num_tokens < self.max_seq_len:
+            return
+
+        request.finish_by(FinishReason.LENGTH, 0)
+        request.decoding_iter = request.py_decoding_iter
+        self._optrt_finalization_log(
+            "handle_responses_terminal_length_finished",
+            [request],
+            num_tokens=num_tokens,
+            generated_tokens=generated_tokens,
+            max_new_tokens=request.py_max_new_tokens,
+            max_seq_len=self.max_seq_len)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -5013,6 +7606,9 @@ class PyExecutor:
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
+        self._optrt_finalization_log("handle_responses_enter",
+                                     self.active_requests,
+                                     emit_first_iter=emit_first_iter)
 
         batch_token_time = self.perf_manager.get_timestamp()
         # S5 decimation: per-request C++ perf-metric refreshes run on sampled
@@ -5025,9 +7621,13 @@ class PyExecutor:
 
         for request in self.active_requests:
             req_id = request.py_request_id
+            self._optrt_finalization_log("handle_responses_request_enter",
+                                         [request])
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
+                self._optrt_finalization_log("handle_responses_dummy",
+                                             [request])
                 continue
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
@@ -5039,6 +7639,8 @@ class PyExecutor:
                         requests=[request],
                         charge_budget=False)
                 continue
+
+            self._finish_generation_to_complete_by_length(request)
 
             if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
@@ -5072,21 +7674,46 @@ class PyExecutor:
                     request.py_perf_metrics_started = True
                     request.update_perf_metrics(self.iter_counter)
 
-            request_done = False
+            request_done = request.is_finished
+            pending_stream_emit = bool(
+                getattr(request, "optrt_resident_pending_stream_emit", False))
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
                            or request.py_decoding_iter % self.stream_interval
-                           == 0)
+                           == 0 or pending_stream_emit)
             # The early-emit prototype issues the (non-terminal) iter-1
             # response from `_emit_first_token_responses`; suppress it here.
             if (not emit_first_iter and request.py_decoding_iter == 1
                     and not request.is_finished):
                 should_emit = False
             if should_emit:
+                if pending_stream_emit:
+                    setattr(request, "optrt_resident_pending_stream_emit",
+                            False)
+                if request_done or getattr(request, "streaming", False):
+                    self._optrt_resident_materialize_deferred_backlog_for_request(
+                        request)
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
+                elif request_done:
+                    self._optrt_finalization_log(
+                        "handle_responses_finished_no_payload",
+                        [request],
+                        should_emit=should_emit)
+                self._optrt_finalization_log(
+                    "handle_responses_emit",
+                    [request],
+                    should_emit=should_emit,
+                    request_done=request_done,
+                    response=_optrt_response_snapshot(req_id, response))
+            else:
+                self._optrt_finalization_log(
+                    "handle_responses_no_emit",
+                    [request],
+                    should_emit=should_emit,
+                    emit_first_iter=emit_first_iter)
 
             if request_done:
                 if (self.drafter is not None and getattr(
@@ -5132,10 +7759,40 @@ class PyExecutor:
 
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
+        self._optrt_finalization_log(
+            "handle_responses_before_enqueue",
+            response_count=len(new_responses),
+            responses=[
+                _optrt_response_snapshot(req_id, response)
+                for req_id, response in new_responses
+            ],
+            terminate_ids=[
+                request.py_request_id for request in requests_to_terminate
+            ],
+            new_active_ids=[
+                request.py_request_id for request in new_active_requests
+            ])
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
+        self._optrt_finalization_log(
+            "handle_responses_after_enqueue",
+            terminate_ids=[
+                request.py_request_id for request in requests_to_terminate
+            ],
+            new_active_ids=[
+                request.py_request_id for request in new_active_requests
+            ])
         for request in requests_to_terminate:
             self._terminate_request(request)
+        self._optrt_finalization_log(
+            "handle_responses_exit",
+            terminated_ids=[
+                request.py_request_id for request in requests_to_terminate
+            ],
+            transfer_finished_ids=[
+                request.py_request_id
+                for request in requests_finished_by_transfer
+            ])
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,
@@ -5147,9 +7804,23 @@ class PyExecutor:
 
         responses = []
         with self.response_cv:
+            self._optrt_finalization_log("await_any_response_wait_enter",
+                                         timeout=timeout,
+                                         queued_response_ids=list(
+                                             self.responses.keys()))
             self.response_cv.wait_for(any_responses_ready, timeout=timeout)
             for req_id, response in self.responses.items():
                 responses += response
+            self._optrt_finalization_log(
+                "await_any_response_wait_exit",
+                timeout=timeout,
+                response_count=len(responses),
+                queued_response_ids=list(self.responses.keys()),
+                responses=[
+                    _optrt_response_snapshot(
+                        _optrt_safe_attr(response, "request_id", -1),
+                        response) for response in responses
+                ])
             self.responses = {}
 
         return responses
@@ -5163,9 +7834,25 @@ class PyExecutor:
             def key_has_response():
                 return id in self.responses.keys()
 
+            self._optrt_finalization_log("await_single_response_wait_enter",
+                                         timeout=timeout,
+                                         requested_id=id,
+                                         queued_response_ids=list(
+                                             self.responses.keys()))
             self.response_cv.wait_for(key_has_response, timeout=timeout)
             response = self.responses[id]
             self.responses.pop(id)
+            self._optrt_finalization_log(
+                "await_single_response_wait_exit",
+                timeout=timeout,
+                requested_id=id,
+                response_count=len(response),
+                queued_response_ids=list(self.responses.keys()),
+                responses=[
+                    _optrt_response_snapshot(
+                        _optrt_safe_attr(resp, "request_id", id), resp)
+                    for resp in response
+                ])
             return response
 
     def _terminate_requests(self, requests_to_terminate):

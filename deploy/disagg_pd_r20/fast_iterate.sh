@@ -317,8 +317,9 @@ if [[ "$BUILD" == 1 ]]; then
     if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
       tmp_base="/tmp/optrt-base-${BASE_IMAGE##*:}.tar"
       sudo /usr/local/bin/k3s ctr -n k8s.io images export "$tmp_base" "$BASE_IMAGE"
+      sudo chmod 0644 "$tmp_base"
       docker load -i "$tmp_base"
-      rm -f "$tmp_base"
+      rm -f "$tmp_base" || sudo rm -f "$tmp_base"
     fi
     DOCKER_BUILDKIT=1 docker build \
       --build-arg "BASE_IMAGE=$BASE_IMAGE" \

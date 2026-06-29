@@ -50,9 +50,12 @@ void invokeIndexerHisaBlockScoresNvfp4(uint8_t const* qValues, int32_t const* qS
     int32_t maxBlocks, int32_t nextN, int32_t blockSize, int64_t qStride0, int64_t qStride1, int64_t qStride2,
     cudaStream_t stream = 0);
 
-void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* blockTable,
-    int32_t* candidatePageTable, int32_t numRows, int32_t blockTopK, int32_t pageTableStride, int32_t nextN,
-    int32_t pagesPerHisaBlock, cudaStream_t stream = 0);
+void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* blockTable, int32_t* candidatePageTable,
+    int32_t numRows, int32_t blockTopK, int32_t pageTableStride, int32_t nextN, int32_t pagesPerHisaBlock,
+    cudaStream_t stream = 0);
+
+void invokeIndexerHisaBlockCounts(
+    int32_t const* prefixLens, int32_t* blockCounts, int32_t numRows, int32_t blockSize, cudaStream_t stream = 0);
 
 // scoreStride0 is candidateScores' row stride in elements. The DeepGEMM paged
 // MQA logits output is row-padded (stride0 > candidateLen), so flat indexing
@@ -62,8 +65,8 @@ void invokeIndexerHisaMaskScores(float* candidateScores, int32_t const* topBlock
     cudaStream_t stream = 0);
 
 void invokeIndexerHisaRemapSelected(int32_t const* selected, int32_t const* topBlocks, int32_t const* prefixLens,
-    int32_t* topkIndices, int32_t numRows, int32_t selectedTopK, int32_t indexTopK, int32_t blockTopK, int32_t blockSize,
-    cudaStream_t stream = 0);
+    int32_t* topkIndices, int32_t numRows, int32_t selectedTopK, int32_t indexTopK, int32_t blockTopK,
+    int32_t blockSize, cudaStream_t stream = 0);
 
 } // namespace kernels
 

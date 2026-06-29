@@ -1,6 +1,7 @@
 import uuid
 from collections import defaultdict
 from itertools import chain
+import os
 from typing import Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
@@ -96,6 +97,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        self._optrt_transfer_debug = os.environ.get(
+            "TRTLLM_OPTRT_DISAGG_TRANSFER_DEBUG", "0"
+        ) == "1"
+        try:
+            self._optrt_transfer_debug_every = max(
+                1, int(os.environ.get("TRTLLM_OPTRT_DISAGG_TRANSFER_DEBUG_EVERY", "64"))
+            )
+        except ValueError:
+            self._optrt_transfer_debug_every = 64
+        self._optrt_gen_transfer_debug_count = 0
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -327,6 +338,127 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 failed.append(rid)
         return completed, failed
 
+    @staticmethod
+    def _optrt_debug_name(value):
+        name = getattr(value, "name", None)
+        if name is not None:
+            return name
+        value = getattr(value, "value", value)
+        return str(value)
+
+    @staticmethod
+    def _optrt_safe_getattr(obj, attr: str, default=None):
+        try:
+            return getattr(obj, attr)
+        except Exception:
+            return default
+
+    def _optrt_session_debug_summary(self, rid: int, session, req: LlmRequest):
+        kv_tasks = self._optrt_safe_getattr(session, "_kv_tasks")
+        if kv_tasks is None:
+            kv_tasks = self._optrt_safe_getattr(session, "kv_tasks", [])
+
+        task_summaries = []
+        for idx, task in enumerate(kv_tasks):
+            task_summaries.append(
+                {
+                    "idx": idx,
+                    "status": self._optrt_debug_name(
+                        self._optrt_safe_getattr(task, "status")
+                    ),
+                    "expected_transfers": self._optrt_safe_getattr(
+                        task, "expected_transfers"
+                    ),
+                    "last_slice_count": self._optrt_safe_getattr(
+                        task, "last_slice_count"
+                    ),
+                    "transferred_count": self._optrt_safe_getattr(
+                        task, "transferred_count"
+                    ),
+                    "is_done": self._optrt_safe_getattr(task, "is_done"),
+                }
+            )
+
+        params = req.py_disaggregated_params
+        status = self._optrt_safe_getattr(session, "status")
+        try:
+            is_completed = session.is_completed()
+        except Exception as exc:
+            is_completed = f"error:{type(exc).__name__}"
+        try:
+            has_failed = session.has_failed()
+        except Exception as exc:
+            has_failed = f"error:{type(exc).__name__}"
+
+        return {
+            "rank": self._dist.rank,
+            "tp_rank": self._mapping.tp_rank,
+            "dp_rank": self._dp_rank,
+            "rid": rid,
+            "req_id": req.py_request_id,
+            "req_state": self._optrt_debug_name(req.state),
+            "ctx_request_id": getattr(params, "ctx_request_id", None),
+            "disagg_request_id": getattr(params, "disagg_request_id", None),
+            "session_request_id": self._optrt_safe_getattr(session, "request_id"),
+            "session_disagg_request_id": self._optrt_safe_getattr(
+                session, "disagg_request_id"
+            ),
+            "session_status": self._optrt_debug_name(status),
+            "is_completed": is_completed,
+            "has_failed": has_failed,
+            "need_aux": self._need_aux_transfer(req),
+            "aux_status": self._optrt_debug_name(
+                self._optrt_safe_getattr(session, "_aux_status")
+            ),
+            "aux_count": self._optrt_safe_getattr(session, "_aux_count"),
+            "aux_slot": self._optrt_safe_getattr(session, "aux_slot"),
+            "kv_task_count": len(kv_tasks),
+            "kv_tasks": tuple(task_summaries),
+            "sender_endpoints": tuple(
+                sorted(self._optrt_safe_getattr(session, "_sender_endpoints", ()))
+            ),
+        }
+
+    def _optrt_log_gen_transfer_debug(
+        self,
+        *,
+        at_least_request_num: Optional[int],
+        block_all: bool,
+        wait_num: int,
+        local_completed: List[int],
+        local_failed: List[int],
+        to_process: List[int],
+        completed: List[int],
+        failed: List[int],
+        cancelled: List[int],
+    ):
+        if not self._optrt_transfer_debug or not self._recv_sessions:
+            return
+        self._optrt_gen_transfer_debug_count += 1
+        if (
+            self._optrt_gen_transfer_debug_count != 1
+            and self._optrt_gen_transfer_debug_count % self._optrt_transfer_debug_every != 0
+            and not to_process
+        ):
+            return
+
+        sessions = tuple(
+            self._optrt_session_debug_summary(rid, session, self._recv_reqs[rid])
+            for rid, session in self._recv_sessions.items()
+        )
+        logger.info(
+            "OPTRT_DISAGG_GEN_TRANSFER_DEBUG "
+            f"{{'rank': {self._dist.rank}, 'tp_rank': {self._mapping.tp_rank}, "
+            f"'at_least_request_num': {at_least_request_num}, "
+            f"'block_all': {block_all}, 'wait_num': {wait_num}, "
+            f"'local_completed': {tuple(local_completed)}, "
+            f"'local_failed': {tuple(local_failed)}, "
+            f"'to_process': {tuple(to_process)}, "
+            f"'completed': {tuple(completed)}, "
+            f"'failed': {tuple(failed)}, 'cancelled': {tuple(cancelled)}, "
+            f"'sessions': {sessions}}}"
+        )
+
     def _build_to_process(
         self, sessions: dict, consensus: list, wait_num: int, block_all: bool
     ) -> list:
@@ -380,6 +512,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self._need_aux_transfer(req):
             session.pack_aux(req)
             session.send_aux()
+            if self._optrt_transfer_debug:
+                logger.info(
+                    "OPTRT_DISAGG_SEND_AUX "
+                    f"{{'rank': {self._dist.rank}, "
+                    f"'tp_rank': {self._mapping.tp_rank}, "
+                    f"'rid': {rid}, 'req_id': {req.py_request_id}, "
+                    f"'session_status': "
+                    f"'{self._optrt_debug_name(session.status)}', "
+                    f"'session_disagg_request_id': "
+                    f"{self._optrt_safe_getattr(session, 'disagg_request_id')}, "
+                    f"'aux_slot': {self._optrt_safe_getattr(session, 'aux_slot')}}}"
+                )
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
             req_id=rid,
@@ -442,6 +586,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions[rid] = session
         session.receive(self._create_kv_slice(req))
         self._recv_reqs[rid] = req
+        if self._optrt_transfer_debug:
+            logger.info(
+                "OPTRT_DISAGG_RECV_START "
+                f"{self._optrt_session_debug_summary(rid, session, req)}"
+            )
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
@@ -525,6 +674,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif result == WaitResult.FAILED:
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
+
+        self._optrt_log_gen_transfer_debug(
+            at_least_request_num=at_least_request_num,
+            block_all=block_all,
+            wait_num=wait_num,
+            local_completed=local_completed,
+            local_failed=local_failed,
+            to_process=to_process,
+            completed=completed,
+            failed=failed,
+            cancelled=cancelled,
+        )
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
         cancelled, failed, completed = self._gen_consensus_outcome(

@@ -161,7 +161,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$CTX/libs" "$CTX/smoke"
-tar --exclude='__pycache__' --exclude='*.pyc' -C "$(dirname "$PACKAGE_DIR")" \
+tar --exclude='__pycache__' --exclude='*.pyc' --exclude='*.so' -C "$(dirname "$PACKAGE_DIR")" \
   -cf - "$(basename "$PACKAGE_DIR")" | tar -C "$CTX" -xf -
 cp "$TH_COMMON_LIB" "$CTX/libs/libth_common.so"
 copy_colon_files() {
@@ -176,6 +176,7 @@ copy_colon_files() {
       echo "$label not found or empty: $path" >&2
       exit 2
     fi
+    rm -f "$dest/$(basename "$path")"
     cp "$path" "$dest/$(basename "$path")"
   done
 }
@@ -203,6 +204,7 @@ RUN chmod 0755 /opt/ai-blaise/hisparse/native_planner_copy_smoke.py \
     /opt/ai-blaise/hisparse/sparse_mla_kvarn_hot_smoke.py \
     /opt/ai-blaise/hisparse/serving_import_smoke.py \
     && echo "${OPTRT_SOURCE_SHA}" > /opt/ai-blaise/optrt_hisparse_serving_import_source_sha \
+    && /opt/dynamo/venv/bin/python3 -c "import pathlib; root = pathlib.Path('${SITE_PACKAGES}') / 'tensorrt_llm'; required = ('bindings*.so', 'deep_gemm_cpp_tllm*.so'); missing = {pattern: list(root.glob(pattern)) for pattern in required if not any(path.is_file() and not path.is_symlink() for path in root.glob(pattern))}; assert not missing, f'missing real TensorRT-LLM binary extensions under {root}: {missing}'" \
     && /opt/dynamo/venv/bin/python3 -m py_compile \
       /opt/ai-blaise/hisparse/native_planner_copy_smoke.py \
       /opt/ai-blaise/hisparse/sparse_mla_kvarn_hot_smoke.py \

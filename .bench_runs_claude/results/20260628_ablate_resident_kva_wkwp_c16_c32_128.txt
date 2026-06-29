@@ -1,0 +1,4 @@
+# label=resident_kva_wkwp_live_c16_c32_128 mode=stream url=http://10.42.0.165:8000/v1/completions osl=128 text_reps=160
+#   C reqs  ok    ISL TTFT_p50_ms TTFT_p95_ms user_tok_s_p50 agg_out_tok_s  wall_s
+   16   32  32   4161       93414      114270           3.93          27.6   148.3
+   32   32  32   4161        4433        6532           6.56         226.0    18.1

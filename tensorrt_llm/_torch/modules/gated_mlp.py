@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from typing import List, Optional, Union
 
@@ -14,6 +15,24 @@ from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .swiglu import swiglu
+
+
+_FP4OUT_SWIGLU_MIN_BATCH_ENV_NAME = (
+    "TRTLLM_OPTRT_DEEPSEEK_RESIDENT_SHARED_FP4OUT_SWIGLU_MIN_BATCH")
+
+
+def _read_fp4out_swiglu_min_batch() -> int:
+    value = os.environ.get(_FP4OUT_SWIGLU_MIN_BATCH_ENV_NAME, "1")
+    try:
+        return max(int(value), 1)
+    except ValueError:
+        logger.warning(
+            "%s must be an integer; using 1",
+            _FP4OUT_SWIGLU_MIN_BATCH_ENV_NAME)
+        return 1
+
+
+_FP4OUT_SWIGLU_MIN_BATCH = _read_fp4out_swiglu_min_batch()
 
 
 class GatedMLP(nn.Module):
@@ -227,7 +246,7 @@ class GatedMLP(nn.Module):
         # Get quantized inputs from Linear's NVFP4 pipeline
         act_fp4, act_sf, alpha = module.quant_method._input_prepare(module, x)
 
-        if fp4_out:
+        if fp4_out and act_fp4.shape[0] >= _FP4OUT_SWIGLU_MIN_BATCH:
             # FC2's input_scale serves as norm_const for SFC quantization
             global_sf = self.down_proj.input_scale
             fp4_output, out_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell(

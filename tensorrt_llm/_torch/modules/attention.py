@@ -29,6 +29,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
+from ..models.deepseek_stage_profiler import DeepseekStageTimer
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, maybe_compiled_cat,
@@ -1443,6 +1444,22 @@ class MLA(nn.Module):
             self.mapping = mapping_with_cp
         else:
             self.mapping = config.mapping
+        self._optrt_stage_timer = DeepseekStageTimer(
+            rank=getattr(self.mapping, "rank", None),
+            layer_idx=layer_idx,
+            layer_kind="dsa" if self.is_dsa else "dense",
+            component="mla",
+            stages=(
+                "cp_allgather",
+                "create_output",
+                "gate_proj",
+                "dsa_proj",
+                "dsa_attn",
+                "mla_impl",
+                "gate_apply",
+                "o_proj",
+            ),
+        )
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
@@ -2061,10 +2078,10 @@ class MLA(nn.Module):
     def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
                               hidden_states: torch.Tensor,
                               attn_metadata: AttentionMetadata,
-                              output: torch.Tensor,
-                              kv_proj_input: Optional[Union[
-                                  torch.Tensor, Fp4QuantizedTensor]] = None
-                              ) -> None:
+        output: torch.Tensor,
+        kv_proj_input: Optional[Union[
+            torch.Tensor, Fp4QuantizedTensor]] = None
+    ) -> None:
         """
         Forward pass for the MLA module with DSA (always in MQA mode).
         Writes result into output tensor in-place.
@@ -2078,15 +2095,24 @@ class MLA(nn.Module):
             attn_metadata (AttentionMetadata): The attention metadata.
             output (torch.Tensor): The output tensor to write results into.
         """
+        stage_timer = self._optrt_stage_timer
+        if stage_timer.enabled:
+            stage_timer.start("dsa_proj")
         proj_outputs = self.forward_dsa_proj(position_ids,
                                              hidden_states,
                                              attn_metadata,
                                              kv_proj_input=kv_proj_input)
+        if stage_timer.enabled:
+            stage_timer.end("dsa_proj")
         q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
         indexer_intermediates = proj_outputs[4:]
+        if stage_timer.enabled:
+            stage_timer.start("dsa_attn")
         self.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
                               indexer_intermediates, position_ids,
                               attn_metadata, output)
+        if stage_timer.enabled:
+            stage_timer.end("dsa_attn")
 
     def _prepare_dsa_qb_fp4_input(
         self, q: torch.Tensor
@@ -3718,9 +3744,14 @@ class MLA(nn.Module):
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
     ) -> torch.Tensor:
 
+        stage_timer = self._optrt_stage_timer
         hidden_states_before_cp = hidden_states
+        if stage_timer.enabled:
+            stage_timer.start("cp_allgather")
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
+        if stage_timer.enabled:
+            stage_timer.end("cp_allgather")
         if hidden_states is not hidden_states_before_cp:
             hidden_states_fp4 = None
         elif (hidden_states_fp4 is not None
@@ -3728,8 +3759,12 @@ class MLA(nn.Module):
                   hidden_states_fp4.fp4_tensor)):
             hidden_states_fp4 = None
 
+        if stage_timer.enabled:
+            stage_timer.start("create_output")
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
+        if stage_timer.enabled:
+            stage_timer.end("create_output")
 
         # The output-gate GEMM reads only hidden_states and is consumed only
         # by the sigmoid-mul after attention, yet it streams ~num_heads *
@@ -3741,6 +3776,8 @@ class MLA(nn.Module):
                            and _GATE_OVERLAP_ENABLED and do_multi_stream()
                            and not torch.compiler.is_compiling())
         if gate_overlapped:
+            if stage_timer.enabled:
+                stage_timer.start("gate_proj")
             gate_stream = _gate_overlap_stream()
             self.gate_events[0].record()
             with torch.cuda.stream(gate_stream):
@@ -3750,6 +3787,8 @@ class MLA(nn.Module):
 
         if self.register_to_config:
             if self.is_dsa:
+                if stage_timer.enabled:
+                    stage_timer.start("dsa_proj")
                 if hidden_states_fp4 is not None:
                     proj_outputs = torch.ops.trtllm.mla_dsa_proj_with_fp4(
                         hidden_states, hidden_states_fp4.fp4_tensor,
@@ -3758,17 +3797,27 @@ class MLA(nn.Module):
                 else:
                     proj_outputs = torch.ops.trtllm.mla_dsa_proj(
                         hidden_states, position_ids, self.layer_idx_str)
+                if stage_timer.enabled:
+                    stage_timer.end("dsa_proj")
                 q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                 indexer_intermediates = proj_outputs[4:]
+                if stage_timer.enabled:
+                    stage_timer.start("dsa_attn")
                 torch.ops.trtllm.mla_dsa_attn_inplace(
                     q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
                     position_ids, self.layer_idx_str, attn_output)
+                if stage_timer.enabled:
+                    stage_timer.end("dsa_attn")
             else:
+                if stage_timer.enabled:
+                    stage_timer.start("mla_impl")
                 torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
                                                        position_ids,
                                                        self.layer_idx_str,
                                                        attn_output,
                                                        latent_cache_gen)
+                if stage_timer.enabled:
+                    stage_timer.end("mla_impl")
         elif self.is_dsa:
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
@@ -3776,18 +3825,30 @@ class MLA(nn.Module):
                                        output=attn_output,
                                        kv_proj_input=hidden_states_fp4)
         else:
+            if stage_timer.enabled:
+                stage_timer.start("mla_impl")
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen,
                               kv_proj_input=hidden_states_fp4)
+            if stage_timer.enabled:
+                stage_timer.end("mla_impl")
 
         if self.gate_proj is not None:
             if gate_overlapped:
                 self.gate_events[1].wait()
+                if stage_timer.enabled:
+                    stage_timer.end("gate_proj")
             else:
+                if stage_timer.enabled:
+                    stage_timer.start("gate_proj")
                 gate = self.gate_proj(hidden_states)
+                if stage_timer.enabled:
+                    stage_timer.end("gate_proj")
+            if stage_timer.enabled:
+                stage_timer.start("gate_apply")
             fp4_quant_scale = _o_proj_fp4_quant_scale(self.o_proj)
             if sigmoid_mul_quant_nvfp4_supported(attn_output, gate,
                                                  fp4_quant_scale):
@@ -3801,12 +3862,18 @@ class MLA(nn.Module):
                     attn_output, gate)
             else:
                 attn_output = attn_output * torch.sigmoid(gate)
+            if stage_timer.enabled:
+                stage_timer.end("gate_apply")
 
+        if stage_timer.enabled:
+            stage_timer.start("o_proj")
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
                                                   all_reduce_params,
                                                   self.mapping, self.mapping_o,
                                                   self.layer_idx)
+        if stage_timer.enabled:
+            stage_timer.end("o_proj")
         return attn_output
 
     def resmooth_parameters(self,

@@ -19,6 +19,7 @@ namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 namespace
@@ -33,8 +34,8 @@ constexpr int64_t kScaleBytesPerToken = 36;
 
 int32_t checkedInt32(int64_t value, char const* name)
 {
-    TORCH_CHECK(value >= std::numeric_limits<int32_t>::min() && value <= std::numeric_limits<int32_t>::max(),
-        name, " does not fit int32: ", value);
+    TORCH_CHECK(value >= std::numeric_limits<int32_t>::min() && value <= std::numeric_limits<int32_t>::max(), name,
+        " does not fit int32: ", value);
     return static_cast<int32_t>(value);
 }
 
@@ -156,7 +157,7 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
     bool const computeSchedulerMetadata = !tileSchedulerMetadata.has_value();
     auto const numSmParts = computeSchedulerMetadata
         ? tk::getSparseMlaDecodeNvfp4NumSmPartsForShape(
-            checkedInt32(b, "batch"), checkedInt32(sQ, "s_q"), checkedInt32(topK, "topk"))
+              checkedInt32(b, "batch"), checkedInt32(sQ, "s_q"), checkedInt32(topK, "topk"))
         : checkedInt32(tileSchedulerMetadata->size(0), "tile_scheduler_metadata.size(0)");
     auto metadata = computeSchedulerMetadata
         ? th::empty({numSmParts, tk::getSparseMlaDecodeNvfp4MetadataWidth()}, q.options().dtype(at::ScalarType::Int))
@@ -227,17 +228,18 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
 // v_head_dim] directly, dropping the external bmm. Milestone scope: bf16 W_UV
 // only (the caller keeps the external bmm for fp8 W_UV). The original op is left
 // intact as the fallback.
-std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvfp4_vfuse(th::Tensor const& q,
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvfp4_vfuse_impl(th::Tensor const& q,
     th::Tensor const& kv, th::Tensor const& kvScales, th::Tensor const& indices, th::Tensor const& vBProj,
-    std::optional<th::Tensor> const& topkLength, std::optional<th::Tensor> const& attnSink,
-    std::optional<th::Tensor> const& tileSchedulerMetadata, std::optional<th::Tensor> const& numSplits, int64_t dV,
-    int64_t vHeadDim, double smScale)
+    std::optional<th::Tensor> const& output, std::optional<th::Tensor> const& topkLength,
+    std::optional<th::Tensor> const& attnSink, std::optional<th::Tensor> const& tileSchedulerMetadata,
+    std::optional<th::Tensor> const& numSplits, int64_t dV, int64_t vHeadDim, double smScale)
 {
     checkCudaTensor(q, "q");
     checkSameDevice(q, kv, "kv");
     checkSameDevice(q, kvScales, "kv_scales");
     checkSameDevice(q, indices, "indices");
     checkSameDevice(q, vBProj, "v_b_proj");
+    checkOptionalSameDevice(q, output, "out");
     checkOptionalSameDevice(q, topkLength, "topk_length");
     checkOptionalSameDevice(q, attnSink, "attn_sink");
     checkOptionalSameDevice(q, tileSchedulerMetadata, "tile_scheduler_metadata");
@@ -249,6 +251,7 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
     TORCH_CHECK(indices.scalar_type() == at::ScalarType::Int, "indices must be int32");
     TORCH_CHECK(vBProj.scalar_type() == at::ScalarType::BFloat16,
         "v_b_proj must be bf16 for the fused op (fp8 W_UV must use the external bmm)");
+    checkOptionalDtype(output, q.scalar_type(), "out");
     checkOptionalDtype(topkLength, at::ScalarType::Int, "topk_length");
     checkOptionalDtype(attnSink, at::ScalarType::Float, "attn_sink");
     checkOptionalDtype(tileSchedulerMetadata, at::ScalarType::Int, "tile_scheduler_metadata");
@@ -281,6 +284,13 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
     TORCH_CHECK(vBProj.size(0) == hQ && vBProj.size(1) == vHeadDim && vBProj.size(2) == dV,
         "v_b_proj must have shape [h_q=128, v_head_dim, kv_lora_rank=512]");
     TORCH_CHECK(vHeadDim == 128, "fused v_b currently supports only v_head_dim=128");
+    if (output.has_value())
+    {
+        TORCH_CHECK(output->dim() == 4, "out must have shape [batch, s_q, h_q, v_head_dim]");
+        TORCH_CHECK(
+            output->size(0) == b && output->size(1) == sQ && output->size(2) == hQ && output->size(3) == vHeadDim,
+            "out shape must match [batch, s_q, h_q, v_head_dim]");
+    }
     if (topkLength.has_value())
     {
         TORCH_CHECK(topkLength->dim() == 1 && topkLength->size(0) == b, "topk_length must be [batch]");
@@ -297,6 +307,10 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
         "kv_scales tokens must be packed-contiguous with stride(1)=36");
     TORCH_CHECK(indices.stride(2) == 1, "indices last dimension must be contiguous");
     TORCH_CHECK(vBProj.stride(2) == 1, "v_b_proj last (kv_lora_rank) dimension must be contiguous");
+    if (output.has_value())
+    {
+        TORCH_CHECK(output->stride(3) == 1, "out last dimension must be contiguous");
+    }
     checkOptionalContiguous(topkLength, "topk_length");
     checkOptionalContiguous(attnSink, "attn_sink");
     checkOptionalContiguous(tileSchedulerMetadata, "tile_scheduler_metadata");
@@ -306,13 +320,13 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
 
     c10::cuda::CUDAGuard deviceGuard(q.device());
     // Output is the projected v_head_dim-wide tensor (the external bmm is dropped).
-    auto out = th::empty({b, sQ, hQ, vHeadDim}, q.options());
+    auto out = output.has_value() ? *output : th::empty({b, sQ, hQ, vHeadDim}, q.options());
     auto lse = th::empty({b, sQ, hQ}, q.options().dtype(at::ScalarType::Float));
 
     bool const computeSchedulerMetadata = !tileSchedulerMetadata.has_value();
     auto const numSmParts = computeSchedulerMetadata
         ? tk::getSparseMlaDecodeNvfp4NumSmPartsForShape(
-            checkedInt32(b, "batch"), checkedInt32(sQ, "s_q"), checkedInt32(topK, "topk"))
+              checkedInt32(b, "batch"), checkedInt32(sQ, "s_q"), checkedInt32(topK, "topk"))
         : checkedInt32(tileSchedulerMetadata->size(0), "tile_scheduler_metadata.size(0)");
     auto metadata = computeSchedulerMetadata
         ? th::empty({numSmParts, tk::getSparseMlaDecodeNvfp4MetadataWidth()}, q.options().dtype(at::ScalarType::Int))
@@ -385,7 +399,28 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvf
     return {out, lse.transpose(1, 2), metadata, splits};
 }
 
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvfp4_vfuse(th::Tensor const& q,
+    th::Tensor const& kv, th::Tensor const& kvScales, th::Tensor const& indices, th::Tensor const& vBProj,
+    std::optional<th::Tensor> const& topkLength, std::optional<th::Tensor> const& attnSink,
+    std::optional<th::Tensor> const& tileSchedulerMetadata, std::optional<th::Tensor> const& numSplits, int64_t dV,
+    int64_t vHeadDim, double smScale)
+{
+    return sparse_mla_decode_nvfp4_vfuse_impl(q, kv, kvScales, indices, vBProj, std::nullopt, topkLength, attnSink,
+        tileSchedulerMetadata, numSplits, dV, vHeadDim, smScale);
+}
+
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> sparse_mla_decode_nvfp4_vfuse_out(th::Tensor const& q,
+    th::Tensor const& kv, th::Tensor const& kvScales, th::Tensor const& indices, th::Tensor const& vBProj,
+    th::Tensor const& output, std::optional<th::Tensor> const& topkLength, std::optional<th::Tensor> const& attnSink,
+    std::optional<th::Tensor> const& tileSchedulerMetadata, std::optional<th::Tensor> const& numSplits, int64_t dV,
+    int64_t vHeadDim, double smScale)
+{
+    return sparse_mla_decode_nvfp4_vfuse_impl(q, kv, kvScales, indices, vBProj, output, topkLength, attnSink,
+        tileSchedulerMetadata, numSplits, dV, vHeadDim, smScale);
+}
+
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -399,10 +434,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? topk_length=None, Tensor? attn_sink=None, Tensor? tile_scheduler_metadata=None, "
         "Tensor? num_splits=None, int d_v=512, int v_head_dim=128, float sm_scale=1.) -> (Tensor, Tensor, Tensor, "
         "Tensor)");
+    m.def(
+        "sparse_mla_decode_nvfp4_vfuse_out(Tensor q, Tensor kv, Tensor kv_scales, Tensor indices, Tensor v_b_proj, "
+        "Tensor(a!) out, Tensor? topk_length=None, Tensor? attn_sink=None, Tensor? tile_scheduler_metadata=None, "
+        "Tensor? num_splits=None, int d_v=512, int v_head_dim=128, float sm_scale=1.) -> (Tensor(a!), Tensor, Tensor, "
+        "Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("sparse_mla_decode_nvfp4", &tensorrt_llm::torch_ext::sparse_mla_decode_nvfp4);
     m.impl("sparse_mla_decode_nvfp4_vfuse", &tensorrt_llm::torch_ext::sparse_mla_decode_nvfp4_vfuse);
+    m.impl("sparse_mla_decode_nvfp4_vfuse_out", &tensorrt_llm::torch_ext::sparse_mla_decode_nvfp4_vfuse_out);
 }

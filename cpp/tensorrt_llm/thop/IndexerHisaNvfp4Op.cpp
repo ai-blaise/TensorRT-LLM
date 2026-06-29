@@ -29,7 +29,6 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-
 void indexer_hisa_update_page_reps_nvfp4(th::Tensor const& kCache, th::Tensor& pageReps, th::Tensor& pageCounts,
     th::Tensor const& slotMappingFp8, int64_t numTokens)
 {
@@ -54,10 +53,10 @@ void indexer_hisa_update_page_reps_nvfp4(th::Tensor const& kCache, th::Tensor& p
     auto stream = at::cuda::getCurrentCUDAStream(kCache.get_device());
     tk::invokeIndexerHisaUpdatePageRepsNvfp4(kCache.data_ptr<uint8_t>(), pageReps.data_ptr<float>(),
         pageCounts.data_ptr<int32_t>(), slotMappingFp8.data_ptr<int64_t>(), static_cast<int32_t>(numTokens),
-        static_cast<int32_t>(kCache.size(0)), static_cast<int32_t>(kCache.size(1)), static_cast<int32_t>(kCache.size(2)),
-        static_cast<int32_t>(kCache.size(3)), static_cast<int64_t>(kCache.stride(0)),
-        static_cast<int64_t>(kCache.stride(1)), static_cast<int64_t>(kCache.stride(2)),
-        static_cast<int64_t>(kCache.stride(3)), stream);
+        static_cast<int32_t>(kCache.size(0)), static_cast<int32_t>(kCache.size(1)),
+        static_cast<int32_t>(kCache.size(2)), static_cast<int32_t>(kCache.size(3)),
+        static_cast<int64_t>(kCache.stride(0)), static_cast<int64_t>(kCache.stride(1)),
+        static_cast<int64_t>(kCache.stride(2)), static_cast<int64_t>(kCache.stride(3)), stream);
 }
 
 th::Tensor indexer_hisa_block_reps_from_pages_nvfp4(th::Tensor const& pageReps, th::Tensor const& pageCounts,
@@ -85,11 +84,11 @@ th::Tensor indexer_hisa_block_reps_from_pages_nvfp4(th::Tensor const& pageReps, 
     int32_t batchSize = static_cast<int32_t>(blockTable.size(0));
     TORCH_CHECK(kvLens.size(0) >= batchSize, "kv_lens must contain at least one length per block_table row");
     auto addressableBlocks = (blockTable.size(1) * pageSize + 127) / 128;
-    TORCH_CHECK(maxBlocks <= addressableBlocks,
-        "max_blocks exceeds the number of logical blocks addressable by block_table");
+    TORCH_CHECK(
+        maxBlocks <= addressableBlocks, "max_blocks exceeds the number of logical blocks addressable by block_table");
 
-    auto reps = th::empty({batchSize, maxBlocks, 128},
-        th::TensorOptions().dtype(torch::kFloat32).device(pageReps.device()));
+    auto reps
+        = th::empty({batchSize, maxBlocks, 128}, th::TensorOptions().dtype(torch::kFloat32).device(pageReps.device()));
     auto stream = at::cuda::getCurrentCUDAStream(pageReps.get_device());
     tk::invokeIndexerHisaBlockRepsFromPagesNvfp4(pageReps.data_ptr<float>(), pageCounts.data_ptr<int32_t>(),
         blockTable.data_ptr<int32_t>(), kvLens.data_ptr<int32_t>(), reps.data_ptr<float>(), batchSize,
@@ -97,7 +96,6 @@ th::Tensor indexer_hisa_block_reps_from_pages_nvfp4(th::Tensor const& pageReps, 
         static_cast<int32_t>(pageReps.size(0)), static_cast<int32_t>(pageSize), stream);
     return reps;
 }
-
 
 std::tuple<th::Tensor, th::Tensor> indexer_hisa_quantize_block_reps_nvfp4(th::Tensor const& blockReps)
 {
@@ -111,10 +109,10 @@ std::tuple<th::Tensor, th::Tensor> indexer_hisa_quantize_block_reps_nvfp4(th::Te
     int64_t totalRows = batchSize * maxBlocks;
     TORCH_CHECK(totalRows <= std::numeric_limits<int32_t>::max(), "too many block representative rows");
 
-    auto packed = th::empty({batchSize, maxBlocks, 64},
-        th::TensorOptions().dtype(torch::kInt8).device(blockReps.device()));
-    auto scales = th::empty({batchSize, maxBlocks},
-        th::TensorOptions().dtype(torch::kInt32).device(blockReps.device()));
+    auto packed
+        = th::empty({batchSize, maxBlocks, 64}, th::TensorOptions().dtype(torch::kInt8).device(blockReps.device()));
+    auto scales
+        = th::empty({batchSize, maxBlocks}, th::TensorOptions().dtype(torch::kInt32).device(blockReps.device()));
     if (totalRows == 0)
     {
         return {packed, scales};
@@ -125,7 +123,6 @@ std::tuple<th::Tensor, th::Tensor> indexer_hisa_quantize_block_reps_nvfp4(th::Te
         scales.data_ptr<int32_t>(), static_cast<int32_t>(totalRows), stream);
     return {packed, scales};
 }
-
 
 std::tuple<th::Tensor, th::Tensor> indexer_hisa_quantized_block_reps_from_pages_nvfp4(th::Tensor const& pageReps,
     th::Tensor const& pageCounts, th::Tensor const& blockTable, th::Tensor const& kvLens, int64_t maxBlocks,
@@ -153,13 +150,12 @@ std::tuple<th::Tensor, th::Tensor> indexer_hisa_quantized_block_reps_from_pages_
     int32_t batchSize = static_cast<int32_t>(blockTable.size(0));
     TORCH_CHECK(kvLens.size(0) >= batchSize, "kv_lens must contain at least one length per block_table row");
     auto addressableBlocks = (blockTable.size(1) * pageSize + 127) / 128;
-    TORCH_CHECK(maxBlocks <= addressableBlocks,
-        "max_blocks exceeds the number of logical blocks addressable by block_table");
+    TORCH_CHECK(
+        maxBlocks <= addressableBlocks, "max_blocks exceeds the number of logical blocks addressable by block_table");
 
-    auto packed = th::empty({batchSize, maxBlocks, 64},
-        th::TensorOptions().dtype(torch::kInt8).device(pageReps.device()));
-    auto scales = th::empty({batchSize, maxBlocks},
-        th::TensorOptions().dtype(torch::kInt32).device(pageReps.device()));
+    auto packed
+        = th::empty({batchSize, maxBlocks, 64}, th::TensorOptions().dtype(torch::kInt8).device(pageReps.device()));
+    auto scales = th::empty({batchSize, maxBlocks}, th::TensorOptions().dtype(torch::kInt32).device(pageReps.device()));
     if (batchSize == 0 || maxBlocks == 0)
     {
         return {packed, scales};
@@ -174,13 +170,12 @@ std::tuple<th::Tensor, th::Tensor> indexer_hisa_quantized_block_reps_from_pages_
     return {packed, scales};
 }
 
-
 th::Tensor indexer_hisa_block_scores_nvfp4(th::Tensor const& qValues, th::Tensor const& qScales,
     th::Tensor const& weights, th::Tensor const& blockReps, th::Tensor const& prefixLens, int64_t blockTopK,
     int64_t nextN, int64_t blockSize)
 {
-    TORCH_CHECK(qValues.is_cuda() && qScales.is_cuda() && weights.is_cuda() && blockReps.is_cuda()
-            && prefixLens.is_cuda(),
+    TORCH_CHECK(
+        qValues.is_cuda() && qScales.is_cuda() && weights.is_cuda() && blockReps.is_cuda() && prefixLens.is_cuda(),
         "q_values, q_scales, weights, block_reps, and prefix_lens must be CUDA tensors");
     TORCH_CHECK(qValues.get_device() == qScales.get_device() && qValues.get_device() == weights.get_device()
             && qValues.get_device() == blockReps.get_device() && qValues.get_device() == prefixLens.get_device(),
@@ -205,8 +200,8 @@ th::Tensor indexer_hisa_block_scores_nvfp4(th::Tensor const& qValues, th::Tensor
         "block_reps must contain one row per batch element");
     TORCH_CHECK(blockTopK > 0 && blockTopK <= blockReps.size(1), "invalid block_topk");
 
-    auto blockScores = th::empty({qValues.size(0), blockReps.size(1)},
-        th::TensorOptions().dtype(torch::kFloat32).device(qValues.device()));
+    auto blockScores = th::empty(
+        {qValues.size(0), blockReps.size(1)}, th::TensorOptions().dtype(torch::kFloat32).device(qValues.device()));
     auto stream = at::cuda::getCurrentCUDAStream(qValues.get_device());
     tk::invokeIndexerHisaBlockScoresNvfp4(qValues.data_ptr<uint8_t>(), qScales.data_ptr<int32_t>(),
         weights.data_ptr<float>(), blockReps.data_ptr<float>(), prefixLens.data_ptr<int32_t>(),
@@ -217,9 +212,8 @@ th::Tensor indexer_hisa_block_scores_nvfp4(th::Tensor const& qValues, th::Tensor
     return blockScores;
 }
 
-
-th::Tensor indexer_hisa_candidate_pages(th::Tensor const& topBlocks, th::Tensor const& blockTable, int64_t nextN,
-    int64_t pagesPerHisaBlock)
+th::Tensor indexer_hisa_candidate_pages(
+    th::Tensor const& topBlocks, th::Tensor const& blockTable, int64_t nextN, int64_t pagesPerHisaBlock)
 {
     TORCH_CHECK(topBlocks.is_cuda() && blockTable.is_cuda(), "top_blocks and block_table must be CUDA tensors");
     TORCH_CHECK(topBlocks.get_device() == blockTable.get_device(), "top_blocks and block_table must be on same device");
@@ -243,8 +237,23 @@ th::Tensor indexer_hisa_candidate_pages(th::Tensor const& topBlocks, th::Tensor 
     return out;
 }
 
-void indexer_hisa_mask_scores(th::Tensor& candidateScores, th::Tensor const& topBlocks, th::Tensor const& prefixLens,
-    int64_t blockSize)
+th::Tensor indexer_hisa_block_counts(th::Tensor const& prefixLens, int64_t blockSize)
+{
+    TORCH_CHECK(prefixLens.is_cuda(), "prefix_lens must be a CUDA tensor");
+    TORCH_CHECK(prefixLens.scalar_type() == torch::kInt32, "prefix_lens must be int32");
+    TORCH_CHECK(prefixLens.dim() == 1, "prefix_lens must be 1D");
+    TORCH_CHECK(prefixLens.is_contiguous(), "prefix_lens must be contiguous");
+    TORCH_CHECK(blockSize > 0, "block_size must be positive");
+
+    auto out = th::empty_like(prefixLens);
+    auto stream = at::cuda::getCurrentCUDAStream(prefixLens.get_device());
+    tk::invokeIndexerHisaBlockCounts(prefixLens.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
+        static_cast<int32_t>(prefixLens.size(0)), static_cast<int32_t>(blockSize), stream);
+    return out;
+}
+
+void indexer_hisa_mask_scores(
+    th::Tensor& candidateScores, th::Tensor const& topBlocks, th::Tensor const& prefixLens, int64_t blockSize)
 {
     TORCH_CHECK(candidateScores.is_cuda() && topBlocks.is_cuda() && prefixLens.is_cuda(),
         "candidate_scores, top_blocks, and prefix_lens must be CUDA tensors");
@@ -290,8 +299,8 @@ th::Tensor indexer_hisa_remap_selected(th::Tensor const& selected, th::Tensor co
     TORCH_CHECK(blockSize > 0, "block_size must be positive");
     TORCH_CHECK(indexTopK > 0, "index_topk must be positive");
 
-    auto out = th::empty({selected.size(0), indexTopK},
-        th::TensorOptions().dtype(torch::kInt32).device(selected.device()));
+    auto out
+        = th::empty({selected.size(0), indexTopK}, th::TensorOptions().dtype(torch::kInt32).device(selected.device()));
     auto stream = at::cuda::getCurrentCUDAStream(selected.get_device());
     tk::invokeIndexerHisaRemapSelected(selected.data_ptr<int32_t>(), topBlocks.data_ptr<int32_t>(),
         prefixLens.data_ptr<int32_t>(), out.data_ptr<int32_t>(), static_cast<int32_t>(selected.size(0)),
@@ -300,8 +309,8 @@ th::Tensor indexer_hisa_remap_selected(th::Tensor const& selected, th::Tensor co
     return out;
 }
 
-th::Tensor indexer_hisa_mean_pool_nvfp4(th::Tensor const& kCache, th::Tensor const& blockTable,
-    th::Tensor const& kvLens, int64_t maxBlocks)
+th::Tensor indexer_hisa_mean_pool_nvfp4(
+    th::Tensor const& kCache, th::Tensor const& blockTable, th::Tensor const& kvLens, int64_t maxBlocks)
 {
     TORCH_CHECK(kCache.is_cuda() && blockTable.is_cuda() && kvLens.is_cuda(),
         "k_cache, block_table, and kv_lens must be CUDA tensors");
@@ -310,8 +319,7 @@ th::Tensor indexer_hisa_mean_pool_nvfp4(th::Tensor const& kCache, th::Tensor con
     TORCH_CHECK(kCache.scalar_type() == torch::kUInt8, "k_cache must be uint8");
     TORCH_CHECK(blockTable.scalar_type() == torch::kInt32, "block_table must be int32");
     TORCH_CHECK(kvLens.scalar_type() == torch::kInt32, "kv_lens must be int32");
-    TORCH_CHECK(kCache.dim() == 4,
-        "k_cache must be [num_blocks, block_size, 1, per_token_size], got %d dimensions",
+    TORCH_CHECK(kCache.dim() == 4, "k_cache must be [num_blocks, block_size, 1, per_token_size], got %d dimensions",
         static_cast<int>(kCache.dim()));
     TORCH_CHECK(blockTable.dim() == 2, "block_table must be a 2D tensor");
     TORCH_CHECK(kvLens.dim() == 1, "kv_lens must be a 1D tensor");
@@ -322,11 +330,11 @@ th::Tensor indexer_hisa_mean_pool_nvfp4(th::Tensor const& kCache, th::Tensor con
     int32_t batchSize = static_cast<int32_t>(blockTable.size(0));
     TORCH_CHECK(kvLens.size(0) >= batchSize, "kv_lens must contain at least one length per block_table row");
     auto addressableBlocks = (blockTable.size(1) * kCache.size(1) + 127) / 128;
-    TORCH_CHECK(maxBlocks <= addressableBlocks,
-        "max_blocks exceeds the number of logical blocks addressable by block_table");
+    TORCH_CHECK(
+        maxBlocks <= addressableBlocks, "max_blocks exceeds the number of logical blocks addressable by block_table");
 
-    auto reps = th::empty({batchSize, maxBlocks, 128},
-        th::TensorOptions().dtype(torch::kFloat32).device(kCache.device()));
+    auto reps
+        = th::empty({batchSize, maxBlocks, 128}, th::TensorOptions().dtype(torch::kFloat32).device(kCache.device()));
     if (batchSize == 0 || maxBlocks == 0)
     {
         return reps;
@@ -336,9 +344,10 @@ th::Tensor indexer_hisa_mean_pool_nvfp4(th::Tensor const& kCache, th::Tensor con
     tk::invokeIndexerHisaMeanPoolNvfp4(kCache.data_ptr<uint8_t>(), blockTable.data_ptr<int32_t>(),
         kvLens.data_ptr<int32_t>(), reps.data_ptr<float>(), batchSize, static_cast<int32_t>(maxBlocks),
         static_cast<int32_t>(blockTable.stride(0)), static_cast<int32_t>(kCache.size(0)),
-        static_cast<int32_t>(kCache.size(1)), static_cast<int32_t>(kCache.size(2)), static_cast<int32_t>(kCache.size(3)),
-        static_cast<int64_t>(kCache.stride(0)), static_cast<int64_t>(kCache.stride(1)),
-        static_cast<int64_t>(kCache.stride(2)), static_cast<int64_t>(kCache.stride(3)), stream);
+        static_cast<int32_t>(kCache.size(1)), static_cast<int32_t>(kCache.size(2)),
+        static_cast<int32_t>(kCache.size(3)), static_cast<int64_t>(kCache.stride(0)),
+        static_cast<int64_t>(kCache.stride(1)), static_cast<int64_t>(kCache.stride(2)),
+        static_cast<int64_t>(kCache.stride(3)), stream);
     return reps;
 }
 
@@ -349,25 +358,43 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("indexer_hisa_mean_pool_nvfp4(Tensor k_cache, Tensor block_table, Tensor kv_lens, int max_blocks) -> Tensor");
-    m.def("indexer_hisa_update_page_reps_nvfp4(Tensor k_cache, Tensor(a!) page_reps, Tensor(b!) page_counts, Tensor slot_mapping_fp8, int num_tokens) -> ()");
-    m.def("indexer_hisa_block_reps_from_pages_nvfp4(Tensor page_reps, Tensor page_counts, Tensor block_table, Tensor kv_lens, int max_blocks, int page_size) -> Tensor");
+    m.def(
+        "indexer_hisa_update_page_reps_nvfp4(Tensor k_cache, Tensor(a!) page_reps, Tensor(b!) page_counts, Tensor "
+        "slot_mapping_fp8, int num_tokens) -> ()");
+    m.def(
+        "indexer_hisa_block_reps_from_pages_nvfp4(Tensor page_reps, Tensor page_counts, Tensor block_table, Tensor "
+        "kv_lens, int max_blocks, int page_size) -> Tensor");
     m.def("indexer_hisa_quantize_block_reps_nvfp4(Tensor block_reps) -> (Tensor, Tensor)");
-    m.def("indexer_hisa_quantized_block_reps_from_pages_nvfp4(Tensor page_reps, Tensor page_counts, Tensor block_table, Tensor kv_lens, int max_blocks, int page_size) -> (Tensor, Tensor)");
-    m.def("indexer_hisa_block_scores_nvfp4(Tensor q_values, Tensor q_scales, Tensor weights, Tensor block_reps, Tensor prefix_lens, int block_topk, int next_n, int block_size) -> Tensor");
-    m.def("indexer_hisa_candidate_pages(Tensor top_blocks, Tensor block_table, int next_n, int pages_per_hisa_block) -> Tensor");
-    m.def("indexer_hisa_mask_scores(Tensor(a!) candidate_scores, Tensor top_blocks, Tensor prefix_lens, int block_size) -> ()");
-    m.def("indexer_hisa_remap_selected(Tensor selected, Tensor top_blocks, Tensor prefix_lens, int block_size, int index_topk) -> Tensor");
+    m.def(
+        "indexer_hisa_quantized_block_reps_from_pages_nvfp4(Tensor page_reps, Tensor page_counts, Tensor block_table, "
+        "Tensor kv_lens, int max_blocks, int page_size) -> (Tensor, Tensor)");
+    m.def(
+        "indexer_hisa_block_scores_nvfp4(Tensor q_values, Tensor q_scales, Tensor weights, Tensor block_reps, Tensor "
+        "prefix_lens, int block_topk, int next_n, int block_size) -> Tensor");
+    m.def(
+        "indexer_hisa_candidate_pages(Tensor top_blocks, Tensor block_table, int next_n, int pages_per_hisa_block) -> "
+        "Tensor");
+    m.def("indexer_hisa_block_counts(Tensor prefix_lens, int block_size) -> Tensor");
+    m.def(
+        "indexer_hisa_mask_scores(Tensor(a!) candidate_scores, Tensor top_blocks, Tensor prefix_lens, int block_size) "
+        "-> ()");
+    m.def(
+        "indexer_hisa_remap_selected(Tensor selected, Tensor top_blocks, Tensor prefix_lens, int block_size, int "
+        "index_topk) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("indexer_hisa_mean_pool_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_mean_pool_nvfp4);
     m.impl("indexer_hisa_update_page_reps_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_update_page_reps_nvfp4);
-    m.impl("indexer_hisa_block_reps_from_pages_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_block_reps_from_pages_nvfp4);
+    m.impl(
+        "indexer_hisa_block_reps_from_pages_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_block_reps_from_pages_nvfp4);
     m.impl("indexer_hisa_quantize_block_reps_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_quantize_block_reps_nvfp4);
-    m.impl("indexer_hisa_quantized_block_reps_from_pages_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_quantized_block_reps_from_pages_nvfp4);
+    m.impl("indexer_hisa_quantized_block_reps_from_pages_nvfp4",
+        &tensorrt_llm::torch_ext::indexer_hisa_quantized_block_reps_from_pages_nvfp4);
     m.impl("indexer_hisa_block_scores_nvfp4", &tensorrt_llm::torch_ext::indexer_hisa_block_scores_nvfp4);
     m.impl("indexer_hisa_candidate_pages", &tensorrt_llm::torch_ext::indexer_hisa_candidate_pages);
+    m.impl("indexer_hisa_block_counts", &tensorrt_llm::torch_ext::indexer_hisa_block_counts);
     m.impl("indexer_hisa_mask_scores", &tensorrt_llm::torch_ext::indexer_hisa_mask_scores);
     m.impl("indexer_hisa_remap_selected", &tensorrt_llm::torch_ext::indexer_hisa_remap_selected);
 }

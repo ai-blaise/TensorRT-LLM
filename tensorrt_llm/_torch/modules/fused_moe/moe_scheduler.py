@@ -180,6 +180,68 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         return outputs
 
+    def forward_precomputed_route(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        *,
+        do_finalize: bool,
+        output_dtype: Optional[torch.dtype],
+        all_rank_num_tokens: Optional[List[int]],
+        use_dp_padding: Optional[bool],
+    ) -> torch.Tensor:
+        """Run the production MoE path with externally computed top-k routing.
+
+        This is used by resident decode paths that already own the router stage.
+        It keeps the normal communication, backend, EPLB, and combine flow, but
+        bypasses the scheduler's router-logit top-k recomputation.
+        """
+        moe = self.moe
+
+        if all_rank_num_tokens is None:
+            all_rank_num_tokens = [x.shape[0]]
+
+        all_rank_max_num_tokens = max(all_rank_num_tokens)
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [
+                all_rank_max_num_tokens
+            ] * len(all_rank_num_tokens)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
+
+        num_chunks = moe.calculate_num_chunks(all_rank_num_tokens_padded)
+        moe.determine_communication_method(all_rank_num_tokens_padded,
+                                           num_chunks)
+
+        precomputed_route = (token_selected_experts, token_final_scales)
+        if num_chunks == 1:
+            outputs = self._forward_single_chunk(
+                x,
+                router_logits=token_selected_experts,
+                output_dtype=output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
+                use_dp_padding=use_dp_padding,
+                do_finalize=do_finalize,
+                precomputed_route=precomputed_route,
+            )
+        else:
+            outputs = self._forward_multiple_chunks(
+                x,
+                router_logits=token_selected_experts,
+                num_chunks=num_chunks,
+                output_dtype=output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
+                use_dp_padding=use_dp_padding,
+                do_finalize=do_finalize,
+                precomputed_route=precomputed_route,
+            )
+
+        if moe.use_dp and moe.parallel_size > 1:
+            outputs = outputs[:all_rank_num_tokens[moe.mapping.tp_rank]]
+
+        return outputs
+
     # ------------------------------------------------------------------
     # Communication-strategy probes (used by _forward_chunk_impl to gate
     # NVLink-specific EPLB stat-gather paths)
@@ -275,6 +337,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        precomputed_route: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -292,6 +355,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             is_last_call,
             do_finalize,
             workspace=workspace,
+            precomputed_route=precomputed_route,
         )
 
     def _forward_chunk_impl(
@@ -305,6 +369,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         is_last_call: bool,
         do_finalize: bool = True,
         workspace: Optional[dict] = None,
+        precomputed_route: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -325,7 +390,29 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
         # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
-        if moe.backend._supports_load_balancer():
+        if precomputed_route is not None:
+            assert moe.backend._supports_load_balancer(), (
+                f"Precomputed routing requires separated-routing backend; got "
+                f"{moe.backend.__class__.__name__}"
+            )
+            token_selected_experts, token_final_scales = precomputed_route
+            token_selected_experts = token_selected_experts.to(torch.int32)
+            assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
+            assert token_selected_experts.shape == token_final_scales.shape
+            if isinstance(moe.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
+                assert token_final_scales.dtype == torch.float32
+            if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
+                token_final_scales = token_final_scales.to(torch.bfloat16)
+            if moe.apply_router_weight_on_input:
+                assert x.dtype != torch.float8_e4m3fn, (
+                    "Current workaround for apply_router_weight_on_input does not support fp8 input"
+                )
+                x = x * token_final_scales.to(x.dtype)
+                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency)):
+                    token_final_scales = torch.ones_like(token_final_scales)
+                else:
+                    token_final_scales = None
+        elif moe.backend._supports_load_balancer():
             # Separated routing: ConfigurableMoE calls routing_method
             token_selected_experts, token_final_scales = moe.routing_method.apply(router_logits)
 
@@ -527,6 +614,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        precomputed_route: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Multiple-chunk path with optional aux-stream overlap."""
         moe = self.moe
@@ -555,6 +643,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         x_list = x.split(chunk_size_list)
         router_logits_list = router_logits.split(chunk_size_list)
+        precomputed_route_list: Tuple[Optional[Tuple[torch.Tensor, torch.Tensor]], ...]
+        if precomputed_route is None:
+            precomputed_route_list = (None, ) * len(x_list)
+        else:
+            selected_experts, final_scales = precomputed_route
+            precomputed_route_list = tuple(
+                zip(selected_experts.split(chunk_size_list),
+                    final_scales.split(chunk_size_list)))
 
         use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
 
@@ -579,17 +675,21 @@ class ExternalCommMoEScheduler(MoEScheduler):
             assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
             x_list = list(x_list)
             router_logits_list = list(router_logits_list)
+            precomputed_route_list_mutable = list(precomputed_route_list)
             for idx_chunk in range(num_chunks):
                 _x = x_list[idx_chunk]
                 if _x.numel() == 0:
                     chunked_used[idx_chunk] = False
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
+                    precomputed_route_list_mutable[
+                        idx_chunk] = precomputed_route_list_mutable[0]
                     all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
                         all_rank_num_tokens_list[0][moe.mapping.tp_rank]
                     )
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
+            precomputed_route_list = tuple(precomputed_route_list_mutable)
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
@@ -612,6 +712,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             is_last_call,
                             do_finalize,
                             workspace=workspace_0,
+                            precomputed_route=precomputed_route_list[idx_chunk],
                         )
                 else:
                     outputs = self._forward_chunk_impl(
@@ -624,6 +725,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         is_last_call,
                         do_finalize,
                         workspace=workspace_1,
+                        precomputed_route=precomputed_route_list[idx_chunk],
                     )
             else:
                 outputs = self._forward_chunk_impl(
@@ -636,6 +738,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     do_finalize,
                     workspace=workspace_0,
+                    precomputed_route=precomputed_route_list[idx_chunk],
                 )
 
             if chunked_used[idx_chunk]:

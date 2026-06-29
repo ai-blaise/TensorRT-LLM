@@ -58,13 +58,12 @@ __device__ __forceinline__ float loadNvfp4Value(uint8_t const* valuePtr, uint32_
 __device__ __forceinline__ uint32_t quantizeE2M1(float scaled)
 {
     float ax = fminf(fabsf(scaled), 6.0F);
-    uint32_t idx = static_cast<uint32_t>((ax > 0.25F) + (ax > 0.75F) + (ax > 1.25F) + (ax > 1.75F)
-        + (ax > 2.5F) + (ax > 3.5F) + (ax > 5.0F));
+    uint32_t idx = static_cast<uint32_t>(
+        (ax > 0.25F) + (ax > 0.75F) + (ax > 1.25F) + (ax > 1.75F) + (ax > 2.5F) + (ax > 3.5F) + (ax > 5.0F));
     uint32_t code = idx & 0x7U;
     uint32_t sign = (scaled < 0.0F && idx != 0U) ? 1U : 0U;
     return code | (sign << 3);
 }
-
 
 __device__ __forceinline__ int32_t flatIndexToPage(
     int64_t flatIdx, int32_t cacheDim1, int32_t cacheDim2, int32_t cacheDim3)
@@ -78,9 +77,9 @@ __device__ __forceinline__ int32_t flatIndexToPageOffset(
     return static_cast<int32_t>((flatIdx / (static_cast<int64_t>(cacheDim2) * cacheDim3)) % cacheDim1);
 }
 
-__global__ void indexerHisaResetPageCountsKernel(
-    int64_t const* __restrict__ slotMappingFp8, int32_t* __restrict__ pageCounts, int32_t numTokens, int32_t cacheDim0,
-    int32_t cacheDim1, int32_t cacheDim2, int32_t cacheDim3)
+__global__ void indexerHisaResetPageCountsKernel(int64_t const* __restrict__ slotMappingFp8,
+    int32_t* __restrict__ pageCounts, int32_t numTokens, int32_t cacheDim0, int32_t cacheDim1, int32_t cacheDim2,
+    int32_t cacheDim3)
 {
     int token = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (token >= numTokens)
@@ -103,9 +102,9 @@ __global__ void indexerHisaResetPageCountsKernel(
     }
 }
 
-__global__ void indexerHisaUpdatePageCountsKernel(
-    int64_t const* __restrict__ slotMappingFp8, int32_t* __restrict__ pageCounts, int32_t numTokens, int32_t cacheDim0,
-    int32_t cacheDim1, int32_t cacheDim2, int32_t cacheDim3)
+__global__ void indexerHisaUpdatePageCountsKernel(int64_t const* __restrict__ slotMappingFp8,
+    int32_t* __restrict__ pageCounts, int32_t numTokens, int32_t cacheDim0, int32_t cacheDim1, int32_t cacheDim2,
+    int32_t cacheDim3)
 {
     int token = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (token >= numTokens)
@@ -128,8 +127,8 @@ __global__ void indexerHisaUpdatePageCountsKernel(
 
 __global__ void indexerHisaRecomputePageRepsNvfp4Kernel(uint8_t const* __restrict__ kCache,
     float* __restrict__ pageReps, int32_t const* __restrict__ pageCounts, int64_t const* __restrict__ slotMappingFp8,
-    int32_t numTokens, int32_t cacheDim0, int32_t cacheDim1, int32_t cacheDim2, int32_t cacheDim3,
-    int64_t cacheStride0, int64_t cacheStride1, int64_t cacheStride2, int64_t cacheStride3)
+    int32_t numTokens, int32_t cacheDim0, int32_t cacheDim1, int32_t cacheDim2, int32_t cacheDim3, int64_t cacheStride0,
+    int64_t cacheStride1, int64_t cacheStride2, int64_t cacheStride3)
 {
     int dim = static_cast<int>(threadIdx.x);
     if (dim >= kIndexerHeadDim)
@@ -170,9 +169,9 @@ __global__ void indexerHisaRecomputePageRepsNvfp4Kernel(uint8_t const* __restric
 }
 
 __global__ void indexerHisaBlockRepsFromPagesKernel(float const* __restrict__ pageReps,
-    int32_t const* __restrict__ pageCounts, int32_t const* __restrict__ blockTable,
-    int32_t const* __restrict__ kvLens, float* __restrict__ reps, int32_t batchSize, int32_t maxBlocks,
-    int32_t pageTableStride, int32_t numPages, int32_t pageSize, int32_t pagesPerHisaBlock)
+    int32_t const* __restrict__ pageCounts, int32_t const* __restrict__ blockTable, int32_t const* __restrict__ kvLens,
+    float* __restrict__ reps, int32_t batchSize, int32_t maxBlocks, int32_t pageTableStride, int32_t numPages,
+    int32_t pageSize, int32_t pagesPerHisaBlock)
 {
     int dim = static_cast<int>(threadIdx.x);
     if (dim >= kIndexerHeadDim)
@@ -208,8 +207,8 @@ __global__ void indexerHisaBlockRepsFromPagesKernel(float const* __restrict__ pa
             int remaining = seqLen - logicalPage * pageSize;
             int count = min(max(pageCounts[physicalPage], 0), pageSize);
             count = min(count, max(remaining, 0));
-            weightedSum += pageReps[static_cast<int64_t>(physicalPage) * kIndexerHeadDim + dim]
-                * static_cast<float>(count);
+            weightedSum
+                += pageReps[static_cast<int64_t>(physicalPage) * kIndexerHeadDim + dim] * static_cast<float>(count);
             countSum += count;
         }
 
@@ -218,9 +217,7 @@ __global__ void indexerHisaBlockRepsFromPagesKernel(float const* __restrict__ pa
     }
 }
 
-
-
-__global__ __launch_bounds__(kWarpSize * kRowsPerQuantBlock) void indexerHisaQuantizeBlockRepsNvfp4Kernel(
+__global__ __launch_bounds__(kWarpSize* kRowsPerQuantBlock) void indexerHisaQuantizeBlockRepsNvfp4Kernel(
     float const* __restrict__ blockReps, int8_t* __restrict__ packed, int32_t* __restrict__ scales, int32_t totalRows)
 {
     int warpInBlock = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -275,12 +272,10 @@ __global__ __launch_bounds__(kWarpSize * kRowsPerQuantBlock) void indexerHisaQua
     }
 }
 
-
-__global__ __launch_bounds__(kWarpSize * kRowsPerQuantBlock) void indexerHisaQuantizedBlockRepsFromPagesKernel(
-    float const* __restrict__ pageReps, int32_t const* __restrict__ pageCounts,
-    int32_t const* __restrict__ blockTable, int32_t const* __restrict__ kvLens, int8_t* __restrict__ packed,
-    int32_t* __restrict__ scales, int32_t batchSize, int32_t maxBlocks, int32_t pageTableStride, int32_t numPages,
-    int32_t pageSize, int32_t pagesPerHisaBlock)
+__global__ __launch_bounds__(kWarpSize* kRowsPerQuantBlock) void indexerHisaQuantizedBlockRepsFromPagesKernel(
+    float const* __restrict__ pageReps, int32_t const* __restrict__ pageCounts, int32_t const* __restrict__ blockTable,
+    int32_t const* __restrict__ kvLens, int8_t* __restrict__ packed, int32_t* __restrict__ scales, int32_t batchSize,
+    int32_t maxBlocks, int32_t pageTableStride, int32_t numPages, int32_t pageSize, int32_t pagesPerHisaBlock)
 {
     int warpInBlock = static_cast<int>(threadIdx.x) / kWarpSize;
     int lane = static_cast<int>(threadIdx.x) % kWarpSize;
@@ -297,7 +292,8 @@ __global__ __launch_bounds__(kWarpSize * kRowsPerQuantBlock) void indexerHisaQua
     int maxLogicalPages = (seqLen + pageSize - 1) / pageSize;
     int firstLogicalPage = hisaBlock * pagesPerHisaBlock;
 
-    auto loadAverage = [&](int dim) {
+    auto loadAverage = [&](int dim)
+    {
         float weightedSum = 0.0F;
         int countSum = 0;
         for (int pageOffset = 0; pageOffset < pagesPerHisaBlock; ++pageOffset)
@@ -315,8 +311,8 @@ __global__ __launch_bounds__(kWarpSize * kRowsPerQuantBlock) void indexerHisaQua
             int remaining = seqLen - logicalPage * pageSize;
             int count = min(max(pageCounts[physicalPage], 0), pageSize);
             count = min(count, max(remaining, 0));
-            weightedSum += pageReps[static_cast<int64_t>(physicalPage) * kIndexerHeadDim + dim]
-                * static_cast<float>(count);
+            weightedSum
+                += pageReps[static_cast<int64_t>(physicalPage) * kIndexerHeadDim + dim] * static_cast<float>(count);
             countSum += count;
         }
         return countSum == 0 ? 0.0F : weightedSum / static_cast<float>(countSum);
@@ -363,7 +359,6 @@ __global__ __launch_bounds__(kWarpSize * kRowsPerQuantBlock) void indexerHisaQua
     }
 }
 
-
 __global__ void indexerHisaBlockScoresNvfp4Kernel(uint8_t const* __restrict__ qValues,
     int32_t const* __restrict__ qScales, float const* __restrict__ weights, float const* __restrict__ blockReps,
     int32_t const* __restrict__ prefixLens, float* __restrict__ blockScores, int32_t numRows, int32_t numHeads,
@@ -387,8 +382,8 @@ __global__ void indexerHisaBlockScoresNvfp4Kernel(uint8_t const* __restrict__ qV
             float const* rep = blockReps + (static_cast<int64_t>(batch) * maxBlocks + blockId) * kIndexerHeadDim;
             for (int head = 0; head < numHeads; ++head)
             {
-                uint8_t const* q = qValues + static_cast<int64_t>(row) * qStride0
-                    + static_cast<int64_t>(head) * qStride1;
+                uint8_t const* q
+                    = qValues + static_cast<int64_t>(row) * qStride0 + static_cast<int64_t>(head) * qStride1;
                 uint32_t scaleWord = static_cast<uint32_t>(qScales[row * numHeads + head]);
                 float dot = 0.0F;
 #pragma unroll 4
@@ -402,7 +397,6 @@ __global__ void indexerHisaBlockScoresNvfp4Kernel(uint8_t const* __restrict__ qV
         blockScores[row * maxBlocks + blockId] = score;
     }
 }
-
 
 __global__ void indexerHisaCandidatePagesKernel(int32_t const* __restrict__ topBlocks,
     int32_t const* __restrict__ blockTable, int32_t* __restrict__ candidatePageTable, int32_t numRows,
@@ -426,9 +420,9 @@ __global__ void indexerHisaCandidatePagesKernel(int32_t const* __restrict__ topB
     }
 }
 
-__global__ void indexerHisaMaskScoresKernel(float* __restrict__ candidateScores,
-    int32_t const* __restrict__ topBlocks, int32_t const* __restrict__ prefixLens, int32_t numRows, int32_t blockTopK,
-    int32_t candidateLen, int32_t blockSize, int64_t scoreStride0)
+__global__ void indexerHisaMaskScoresKernel(float* __restrict__ candidateScores, int32_t const* __restrict__ topBlocks,
+    int32_t const* __restrict__ prefixLens, int32_t numRows, int32_t blockTopK, int32_t candidateLen, int32_t blockSize,
+    int64_t scoreStride0)
 {
     int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     int total = numRows * candidateLen;
@@ -459,6 +453,18 @@ __global__ void indexerHisaMaskScoresKernel(float* __restrict__ candidateScores,
     {
         candidateScores[dst] = -FLT_MAX;
     }
+}
+
+__global__ void indexerHisaBlockCountsKernel(
+    int32_t const* __restrict__ prefixLens, int32_t* __restrict__ blockCounts, int32_t numRows, int32_t blockSize)
+{
+    int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= numRows)
+    {
+        return;
+    }
+    int32_t const prefix = prefixLens[row] > 0 ? prefixLens[row] : 0;
+    blockCounts[row] = (prefix + blockSize - 1) / blockSize;
 }
 
 __global__ void indexerHisaRemapSelectedKernel(int32_t const* __restrict__ selected,
@@ -529,8 +535,8 @@ __global__ void indexerHisaMeanPoolNvfp4Kernel(uint8_t const* __restrict__ kCach
                 continue;
             }
 
-            int64_t tokenBase = static_cast<int64_t>(physicalPage) * cacheStride0
-                + static_cast<int64_t>(pageOffset) * cacheStride1;
+            int64_t tokenBase
+                = static_cast<int64_t>(physicalPage) * cacheStride0 + static_cast<int64_t>(pageOffset) * cacheStride1;
             uint8_t const* tokenPtr = kCache + tokenBase;
             uint8_t const* valuePtr = tokenPtr;
             uint32_t scaleWord = *reinterpret_cast<uint32_t const*>(tokenPtr + kNVFP4ValueBytes * cacheStride3);
@@ -543,7 +549,6 @@ __global__ void indexerHisaMeanPoolNvfp4Kernel(uint8_t const* __restrict__ kCach
 }
 
 } // namespace
-
 
 void invokeIndexerHisaUpdatePageRepsNvfp4(uint8_t const* kCache, float* pageReps, int32_t* pageCounts,
     int64_t const* slotMappingFp8, int32_t numTokens, int32_t cacheDim0, int32_t cacheDim1, int32_t cacheDim2,
@@ -570,8 +575,8 @@ void invokeIndexerHisaUpdatePageRepsNvfp4(uint8_t const* kCache, float* pageReps
         slotMappingFp8, pageCounts, numTokens, cacheDim0, cacheDim1, cacheDim2, cacheDim3);
     TLLM_CUDA_CHECK(cudaGetLastError());
     indexerHisaRecomputePageRepsNvfp4Kernel<<<numTokens, kIndexerHeadDim, 0, stream>>>(kCache, pageReps, pageCounts,
-        slotMappingFp8, numTokens, cacheDim0, cacheDim1, cacheDim2, cacheDim3, cacheStride0, cacheStride1,
-        cacheStride2, cacheStride3);
+        slotMappingFp8, numTokens, cacheDim0, cacheDim1, cacheDim2, cacheDim3, cacheStride0, cacheStride1, cacheStride2,
+        cacheStride3);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -587,19 +592,17 @@ void invokeIndexerHisaBlockRepsFromPagesNvfp4(float const* pageReps, int32_t con
     TLLM_CHECK_WITH_INFO(kHisaBlockSize % pageSize == 0,
         "indexer_hisa_block_reps_from_pages_nvfp4 requires HISA block size to be divisible by page size");
     TLLM_CHECK_WITH_INFO(numPages > 0, "indexer_hisa_block_reps_from_pages_nvfp4 requires non-empty page reps");
-    TLLM_CHECK_WITH_INFO(pageTableStride > 0,
-        "indexer_hisa_block_reps_from_pages_nvfp4 requires a positive page-table stride");
+    TLLM_CHECK_WITH_INFO(
+        pageTableStride > 0, "indexer_hisa_block_reps_from_pages_nvfp4 requires a positive page-table stride");
 
     constexpr int kThreads = kIndexerHeadDim;
     int pagesPerHisaBlock = kHisaBlockSize / pageSize;
     int tasks = batchSize * maxBlocks;
     int blocks = min(tasks, 4096);
-    indexerHisaBlockRepsFromPagesKernel<<<blocks, kThreads, 0, stream>>>(pageReps, pageCounts, blockTable, kvLens,
-        reps, batchSize, maxBlocks, pageTableStride, numPages, pageSize, pagesPerHisaBlock);
+    indexerHisaBlockRepsFromPagesKernel<<<blocks, kThreads, 0, stream>>>(pageReps, pageCounts, blockTable, kvLens, reps,
+        batchSize, maxBlocks, pageTableStride, numPages, pageSize, pagesPerHisaBlock);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
-
-
 
 void invokeIndexerHisaQuantizeBlockRepsNvfp4(
     float const* blockReps, int8_t* packed, int32_t* scales, int32_t totalRows, cudaStream_t stream)
@@ -614,7 +617,6 @@ void invokeIndexerHisaQuantizeBlockRepsNvfp4(
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-
 void invokeIndexerHisaQuantizedBlockRepsFromPagesNvfp4(float const* pageReps, int32_t const* pageCounts,
     int32_t const* blockTable, int32_t const* kvLens, int8_t* packed, int32_t* scales, int32_t batchSize,
     int32_t maxBlocks, int32_t pageTableStride, int32_t numPages, int32_t pageSize, cudaStream_t stream)
@@ -623,10 +625,12 @@ void invokeIndexerHisaQuantizedBlockRepsFromPagesNvfp4(float const* pageReps, in
     {
         return;
     }
-    TLLM_CHECK_WITH_INFO(pageSize > 0, "indexer_hisa_quantized_block_reps_from_pages_nvfp4 requires a positive page size");
+    TLLM_CHECK_WITH_INFO(
+        pageSize > 0, "indexer_hisa_quantized_block_reps_from_pages_nvfp4 requires a positive page size");
     TLLM_CHECK_WITH_INFO(kHisaBlockSize % pageSize == 0,
         "indexer_hisa_quantized_block_reps_from_pages_nvfp4 requires HISA block size to be divisible by page size");
-    TLLM_CHECK_WITH_INFO(numPages > 0, "indexer_hisa_quantized_block_reps_from_pages_nvfp4 requires non-empty page reps");
+    TLLM_CHECK_WITH_INFO(
+        numPages > 0, "indexer_hisa_quantized_block_reps_from_pages_nvfp4 requires non-empty page reps");
     TLLM_CHECK_WITH_INFO(pageTableStride > 0,
         "indexer_hisa_quantized_block_reps_from_pages_nvfp4 requires a positive page-table stride");
 
@@ -638,7 +642,6 @@ void invokeIndexerHisaQuantizedBlockRepsFromPagesNvfp4(float const* pageReps, in
         kvLens, packed, scales, batchSize, maxBlocks, pageTableStride, numPages, pageSize, pagesPerHisaBlock);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
-
 
 void invokeIndexerHisaBlockScoresNvfp4(uint8_t const* qValues, int32_t const* qScales, float const* weights,
     float const* blockReps, int32_t const* prefixLens, float* blockScores, int32_t numRows, int32_t numHeads,
@@ -661,10 +664,9 @@ void invokeIndexerHisaBlockScoresNvfp4(uint8_t const* qValues, int32_t const* qS
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-
-void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* blockTable,
-    int32_t* candidatePageTable, int32_t numRows, int32_t blockTopK, int32_t pageTableStride, int32_t nextN,
-    int32_t pagesPerHisaBlock, cudaStream_t stream)
+void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* blockTable, int32_t* candidatePageTable,
+    int32_t numRows, int32_t blockTopK, int32_t pageTableStride, int32_t nextN, int32_t pagesPerHisaBlock,
+    cudaStream_t stream)
 {
     if (numRows == 0 || blockTopK == 0 || pagesPerHisaBlock == 0)
     {
@@ -675,6 +677,20 @@ void invokeIndexerHisaCandidatePages(int32_t const* topBlocks, int32_t const* bl
     constexpr int kThreads = 256;
     indexerHisaCandidatePagesKernel<<<numRows, kThreads, 0, stream>>>(
         topBlocks, blockTable, candidatePageTable, numRows, blockTopK, pageTableStride, nextN, pagesPerHisaBlock);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeIndexerHisaBlockCounts(
+    int32_t const* prefixLens, int32_t* blockCounts, int32_t numRows, int32_t blockSize, cudaStream_t stream)
+{
+    if (numRows == 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(blockSize > 0, "indexer_hisa_block_counts requires positive block_size");
+    constexpr int kThreads = 256;
+    int blocks = (numRows + kThreads - 1) / kThreads;
+    indexerHisaBlockCountsKernel<<<blocks, kThreads, 0, stream>>>(prefixLens, blockCounts, numRows, blockSize);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -699,8 +715,8 @@ void invokeIndexerHisaMaskScores(float* candidateScores, int32_t const* topBlock
 }
 
 void invokeIndexerHisaRemapSelected(int32_t const* selected, int32_t const* topBlocks, int32_t const* prefixLens,
-    int32_t* topkIndices, int32_t numRows, int32_t selectedTopK, int32_t indexTopK, int32_t blockTopK, int32_t blockSize,
-    cudaStream_t stream)
+    int32_t* topkIndices, int32_t numRows, int32_t selectedTopK, int32_t indexTopK, int32_t blockTopK,
+    int32_t blockSize, cudaStream_t stream)
 {
     if (numRows == 0 || indexTopK == 0)
     {
@@ -738,8 +754,8 @@ void invokeIndexerHisaMeanPoolNvfp4(uint8_t const* kCache, int32_t const* blockT
     int activeBlocksPerSm = 0;
     int smCount = 0;
     int device = 0;
-    TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &activeBlocksPerSm, indexerHisaMeanPoolNvfp4Kernel, block.x, 0));
+    TLLM_CUDA_CHECK(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&activeBlocksPerSm, indexerHisaMeanPoolNvfp4Kernel, block.x, 0));
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
     int residentBlocks = smCount * activeBlocksPerSm;

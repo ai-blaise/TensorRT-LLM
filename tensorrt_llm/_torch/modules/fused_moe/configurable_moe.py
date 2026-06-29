@@ -617,6 +617,48 @@ class ConfigurableMoE(MoE):
 
         return outputs
 
+    def forward_precomputed_route(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Forward entry point when routing was already computed upstream."""
+
+        if isinstance(x, Fp4QuantizedTensor):
+            assert output_dtype is not None
+        else:
+            output_dtype = x.dtype
+
+        forward_precomputed_route = getattr(self.scheduler,
+                                            "forward_precomputed_route", None)
+        if not callable(forward_precomputed_route):
+            raise NotImplementedError(
+                f"{self.scheduler.__class__.__name__} does not support "
+                "precomputed MoE routing")
+
+        outputs = forward_precomputed_route(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
+
+        if self.enable_dwdp:
+            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+
+        self.repeat_idx = (self.repeat_idx + 1) % self.repeat_count
+
+        return outputs
+
     # ========== Backend Validation ==========
 
     def validate_backend(self, backend: MoE):

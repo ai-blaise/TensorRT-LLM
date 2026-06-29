@@ -27,6 +27,29 @@ from tensorrt_llm._torch.attention_backend.sparse.kvarn_backend import (
     resolve_kvarn_config)
 
 
+def _optrt_dsa_kv_debug_enabled():
+    return os.environ.get("TRTLLM_OPTRT_DSA_KV_DEBUG", "0") == "1"
+
+
+def _optrt_dsa_debug_tensor(tensor, limit=32):
+    if tensor is None:
+        return None
+    try:
+        flat = tensor.detach().reshape(-1)
+        count = min(int(limit), int(flat.numel()))
+        head = flat[:count].to(device="cpu").tolist()
+        return {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "head": head,
+        }
+    except (RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        return {
+            "error": f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
+        }
+
+
 def _layersplit_compute_active_block_ids(metadata):
     """M5e: compute the unique block ids touched by THIS step's scatter.
 
@@ -2062,6 +2085,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._invalidate_pool_view_cache()
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
+            if _optrt_dsa_kv_debug_enabled():
+                logger.info("OPTRT_DSA_KV_LENS_DEBUG " + str({
+                    "num_tokens":
+                    self.num_tokens,
+                    "num_seqs":
+                    self.num_seqs,
+                    "num_contexts":
+                    self.num_contexts,
+                    "num_generations":
+                    self.num_generations,
+                    "seq_lens_cuda":
+                    _optrt_dsa_debug_tensor(
+                        getattr(self, "seq_lens_cuda", None), self.num_seqs),
+                    "kv_lens_cuda":
+                    _optrt_dsa_debug_tensor(
+                        getattr(self, "kv_lens_cuda", None), self.num_seqs),
+                    "req_idx_per_token":
+                    _optrt_dsa_debug_tensor(
+                        getattr(self, "req_idx_per_token", None),
+                        self.num_tokens),
+                    "indexer_k_cache_block_offsets":
+                    _optrt_dsa_debug_tensor(
+                        getattr(self, "indexer_k_cache_block_offsets", None),
+                        16),
+                }))
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
@@ -4817,15 +4865,15 @@ class Indexer(nn.Module):
             # top-k union equals the read set, so the dense KV (+ NVFP4
             # scale) broadcast does not need to wait for the TopK — issue
             # it NOW on the comm stream, hidden behind the indexer scoring
-            # below. sparse_attn_predict consumes the comm-stream event
-            # just before the dense read and skips the legacy union
-            # broadcast and its per-layer masked_select + unique host
-            # syncs. Generation steps keep the legacy path: at decode the
-            # top-k union is ~32 blocks/seq, far smaller than the read
-            # set, so the early superset broadcast would multiply wire
-            # bytes there. (Grafted from the forward()-site original to
-            # this unified entry point — same relative order.)
-            if (metadata.num_generations == 0
+            # below. The context sparse_attn_predict call consumes the
+            # comm-stream event just before the dense read and skips the legacy
+            # union broadcast and its per-layer masked_select + unique host
+            # syncs. Pure generation steps keep the legacy path: at decode the
+            # top-k union is ~32 blocks/seq, far smaller than the read set, so
+            # the early superset broadcast would multiply wire bytes there.
+            # (Grafted from the forward()-site original to this unified entry
+            # point — same relative order.)
+            if (metadata.num_contexts > 0
                     and _layersplit_prefill_overlap_enabled()):
                 try:
                     dense_kv_slot = kv_cache_manager.get_buffers(
@@ -5843,18 +5891,25 @@ class DSATrtllmAttention(TrtllmAttention):
             # unique host syncs).
             pass
         elif layersplit_state is not None and layersplit_state.enabled:
-            stride_factor = getattr(metadata, "_cached_stride_factor", None)
-            layersplit_topk_indices_global = topk_indices_global
-            if hisparse_mapping is not None:
-                # HiSparse remaps the attention read-set into hot-slot index
-                # space. LayerSplit still broadcasts dense normal-KV blocks,
-                # so its read-set must stay in global paged-KV index space.
-                layersplit_topk_indices_global, _ = (
-                    transform_local_topk_reuse_or_compute(
-                        forward_args.topk_indices, metadata, local_layer_idx,
-                        self.indexer.skip_topk, is_generation))
-            dense_block_ids = _layersplit_topk_global_block_ids(
-                layersplit_topk_indices_global, stride_factor)
+            if is_generation:
+                stride_factor = getattr(metadata, "_cached_stride_factor", None)
+                layersplit_topk_indices_global = topk_indices_global
+                if hisparse_mapping is not None:
+                    # HiSparse remaps the attention read-set into hot-slot index
+                    # space. LayerSplit still broadcasts dense normal-KV blocks,
+                    # so its read-set must stay in global paged-KV index space.
+                    layersplit_topk_indices_global, _ = (
+                        transform_local_topk_reuse_or_compute(
+                            forward_args.topk_indices, metadata, local_layer_idx,
+                            self.indexer.skip_topk, is_generation))
+                dense_block_ids = _layersplit_topk_global_block_ids(
+                    layersplit_topk_indices_global, stride_factor)
+            else:
+                # Context attention can only read the per-request prefix already
+                # represented by metadata. If the overlapped prefill broadcast
+                # event is missing, fall back to that bounded read set instead of
+                # scanning the full TopK tensor with masked_select + unique.
+                dense_block_ids = _layersplit_read_block_ids_step(metadata)
 
             # M5f dense KV broadcast. get_buffers may raise for layers outside
             # the current manager (PP-partitioned drafts etc.) — skip the dense

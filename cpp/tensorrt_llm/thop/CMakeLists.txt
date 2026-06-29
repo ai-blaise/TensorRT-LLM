@@ -68,6 +68,7 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekResidentDecodeOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
@@ -195,6 +196,23 @@ target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
 
+if(TARGET dsv3_min_latency_kernels)
+  target_sources(th_common PRIVATE $<TARGET_OBJECTS:dsv3_min_latency_kernels>)
+endif()
+
+if(BUILD_DEEP_GEMM)
+  set(TRTLLM_DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
+  target_compile_definitions(
+    th_common PRIVATE TRTLLM_OPTRT_ENABLE_DEEP_GEMM_RESIDENT_INDEXER=1)
+  target_include_directories(
+    th_common
+    PRIVATE ${TRTLLM_DEEP_GEMM_SOURCE_DIR}/csrc
+            ${TRTLLM_DEEP_GEMM_SOURCE_DIR}/deep_gemm/include
+            ${TRTLLM_DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include
+            ${TRTLLM_DEEP_GEMM_SOURCE_DIR}/third-party/fmt/include)
+  target_link_libraries(th_common PRIVATE CUDA::cuda_driver CUDA::cudart)
+endif()
+
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
@@ -226,7 +244,7 @@ endif()
 
 if(NOT WIN32)
   set_target_properties(
-    th_common PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../nvidia/nccl/lib")
+    th_common PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/..;$ORIGIN/../../nvidia/nccl/lib")
   set_target_properties(
     th_common PROPERTIES LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 else()

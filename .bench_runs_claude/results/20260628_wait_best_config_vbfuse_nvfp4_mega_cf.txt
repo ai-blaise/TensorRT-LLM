@@ -1,0 +1,199 @@
+[1]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-nxzjh 1/1 Running
+[2]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-prefill-nxzjh 1/1 Terminating
+[3]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-prefill-nxzjh 1/1 Terminating
+[4]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-prefill-nxzjh 1/1 Terminating
+[5]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-prefill-nxzjh 1/1 Terminating
+[6]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 SchedulingGated
+[7]
+topo-c1-dp2tp4-disagg-r20-0-decode-kn5f2 0/1 Terminating
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 SchedulingGated
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 SchedulingGated
+[8]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Init:0/1
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Init:0/1
+[9]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[10]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[11]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[12]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[13]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[14]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[15]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[16]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[17]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[18]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[19]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[20]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[21]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[22]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[23]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[24]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[25]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[26]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[27]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 0/1 Running
+[28]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[29]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[30]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[31]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[32]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[33]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[34]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[35]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[36]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[37]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[38]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[39]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[40]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[41]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[42]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[43]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[44]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[45]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[46]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 0/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+[47]
+topo-c1-dp2tp4-disagg-r20-0-decode-shbww 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-frontend-dcw2d 1/1 Running
+topo-c1-dp2tp4-disagg-r20-0-prefill-drswl 1/1 Running
+ready

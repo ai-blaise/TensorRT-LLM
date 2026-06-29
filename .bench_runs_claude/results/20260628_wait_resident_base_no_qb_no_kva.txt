@@ -1,0 +1,5 @@
+/bin/bash: line 16: .bench_runs_claude/wait_rollout.sh: Permission denied
+waiting for rollout to image substring 'cumsumfuse' (wall 1500s)
+[0 s] target-image pods=0 ready=0
+[15 s] target-image pods=0 ready=0
+[30 s] target-image pods=0 ready=0

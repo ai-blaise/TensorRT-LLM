@@ -44,6 +44,8 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.deepseek_stage_profiler import \
+    maybe_report_deepseek_stage_profile
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -67,6 +69,14 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .persistent_decode_planner import maybe_log_persistent_decode_plan
+from .persistent_decode_model_backend import (
+    PersistentDecodeModelForwardRequest,
+    PersistentDecodeModelWindowRequest,
+    PersistentDecodeModelWindowResult,
+    create_persistent_decode_model_backend)
+from .persistent_decode_profiler import PersistentDecodeProfiler
+from .persistent_decode_window import PersistentDecodeWindowTracker
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -393,6 +403,22 @@ class PyTorchModelEngine(ModelEngine):
         if mapping.has_pp():
             init_pp_comm(mapping)
         self.dist = dist
+        self._optrt_persistent_decode_profiler = PersistentDecodeProfiler(
+            self.dist)
+        self._optrt_persistent_decode_model_backend = (
+            create_persistent_decode_model_backend(self.dist))
+        self._optrt_persistent_decode_model_backend_state = {
+            "configured": self._optrt_persistent_decode_model_backend
+            is not None,
+            "attempted": False,
+            "executed": False,
+            "backend": None,
+            "reason": "not_attempted",
+        }
+        self._optrt_persistent_decode_last_plan = None
+        self._optrt_persistent_decode_last_model_forward_request = None
+        self._optrt_persistent_decode_window_tracker = (
+            PersistentDecodeWindowTracker(self.dist))
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
         self.llm_args = llm_args
@@ -758,6 +784,108 @@ class PyTorchModelEngine(ModelEngine):
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
+
+    def optrt_persistent_decode_model_backend_state(self) -> dict[str, Any]:
+        return dict(self._optrt_persistent_decode_model_backend_state)
+
+    def optrt_persistent_decode_model_graph_state(self) -> dict[str, Any]:
+        plan = self._optrt_persistent_decode_last_plan
+        if plan is None:
+            return {
+                "backend": "model_engine_cuda_graph_replay_v1",
+                "ready": False,
+                "reason": "cuda_graph_replay_plan_missing",
+            }
+        ready = bool(getattr(plan, "cuda_graph_replay", False))
+        return {
+            "backend": "model_engine_cuda_graph_replay_v1",
+            "ready": ready,
+            "reason":
+            "cuda_graph_replay_ready" if ready else
+            "cuda_graph_replay_not_available",
+            "metadata": {
+                "cuda_graph_padding":
+                bool(getattr(plan, "cuda_graph_padding", False)),
+                "input_tokens":
+                int(getattr(plan, "input_tokens", 0)),
+                "real_generation_requests":
+                int(getattr(plan, "real_generation_requests", 0)),
+                "padded_generation_requests":
+                int(getattr(plan, "padded_generation_requests", 0)),
+            },
+        }
+
+    def optrt_persistent_decode_model_window_backend_state(
+            self) -> dict[str, Any]:
+        backend = self._optrt_persistent_decode_model_backend
+        if backend is None:
+            return {
+                "backend": None,
+                "ready": False,
+                "reason": "resident_window_model_backend_not_configured",
+            }
+        state_fn = getattr(backend, "window_backend_state", None)
+        if not callable(state_fn):
+            return {
+                "backend": None,
+                "ready": False,
+                "reason": "resident_window_model_backend_state_missing",
+                "metadata": {
+                    "model_backend": getattr(backend, "name", None),
+                },
+            }
+        state = state_fn()
+        return dict(state) if isinstance(state, dict) else {
+            "backend": None,
+            "ready": False,
+            "reason": "resident_window_model_backend_state_invalid",
+            "metadata": {
+                "model_backend": getattr(backend, "name", None),
+            },
+        }
+
+    def optrt_try_execute_resident_decode_window(
+        self,
+        *,
+        sample_state: Any,
+        requested_window_steps: int,
+        make_sample_state: Any = None,
+    ) -> PersistentDecodeModelWindowResult | None:
+        backend = self._optrt_persistent_decode_model_backend
+        if backend is None:
+            return PersistentDecodeModelWindowResult(
+                sample_state=sample_state,
+                owned_steps=1,
+                requested_window_steps=requested_window_steps,
+                break_reason="resident_window_model_backend_not_configured",
+                executed=False,
+            )
+        forward_request = (
+            self._optrt_persistent_decode_last_model_forward_request)
+        if forward_request is None:
+            return PersistentDecodeModelWindowResult(
+                sample_state=sample_state,
+                owned_steps=1,
+                requested_window_steps=requested_window_steps,
+                break_reason="resident_window_missing_forward_request",
+                executed=False,
+            )
+        execute_window = getattr(backend, "try_execute_window", None)
+        if not callable(execute_window):
+            return PersistentDecodeModelWindowResult(
+                sample_state=sample_state,
+                owned_steps=1,
+                requested_window_steps=requested_window_steps,
+                break_reason="resident_window_model_backend_missing_execute",
+                executed=False,
+            )
+        return execute_window(
+            PersistentDecodeModelWindowRequest(
+                forward_request=forward_request,
+                sample_state=sample_state,
+                requested_window_steps=requested_window_steps,
+                make_sample_state=make_sample_state,
+            ))
 
     def _restore_kvarn_before_cuda_graph_replay(
             self, attn_metadata: AttentionMetadata) -> None:
@@ -4658,6 +4786,8 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        optrt_persistent_timing = (
+            self._optrt_persistent_decode_profiler.start_step())
         _optrt_me_debug(
             self.dist,
             "forward_enter",
@@ -4730,6 +4860,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_resource_manager = None
             spec_metadata = None
+        if optrt_persistent_timing is not None:
+            optrt_persistent_timing.mark("after_metadata_setup")
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
@@ -4777,6 +4909,8 @@ class PyTorchModelEngine(ModelEngine):
                 maybe_spec_metadata=_optrt_me_metadata_summary(
                     maybe_spec_metadata)
                 if maybe_spec_metadata is not None else None)
+            if optrt_persistent_timing is not None:
+                optrt_persistent_timing.mark("after_cuda_graph_lookup")
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -4812,62 +4946,169 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata=_optrt_me_metadata_summary(
                     inputs.get("spec_metadata"))
                 if inputs.get("spec_metadata") is not None else None)
+            if optrt_persistent_timing is not None:
+                optrt_persistent_timing.mark("after_prepare_inputs")
+            self._optrt_persistent_decode_last_plan = maybe_log_persistent_decode_plan(
+                real_requests=scheduled_requests,
+                padded_requests=padded_requests,
+                attn_metadata=attn_metadata,
+                inputs=inputs,
+                model=self.model,
+                kv_cache_manager=kv_cache_manager,
+                can_run_graph=can_run_graph,
+                enable_spec_decode=self.enable_spec_decode,
+                is_draft_model=self.is_draft_model,
+                force=(
+                    self._optrt_persistent_decode_model_backend is not None
+                    or os.environ.get(
+                        "TRTLLM_OPTRT_PERSISTENT_DECODE_ENGINE", "0") == "1"),
+            )
+            self._optrt_persistent_decode_window_tracker.record(
+                self._optrt_persistent_decode_last_plan)
+            if optrt_persistent_timing is not None:
+                optrt_persistent_timing.set_plan(
+                    self._optrt_persistent_decode_last_plan)
+                optrt_persistent_timing.mark("after_plan")
+                optrt_persistent_timing.mark("before_execute")
+                optrt_persistent_timing.begin_execute_cuda()
 
-            with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
-                if not can_run_graph:
-                    # Fallback to eager execution if graph was not used
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = self._forward_step(
-                            inputs,
-                            gather_ids=gather_ids,
-                            gather_context_logits=gather_context_logits)
-                else:
-                    if self.cuda_graph_runner.needs_capture(key):
+            resident_forward_request = None
+            self._optrt_persistent_decode_last_model_forward_request = None
+            self._optrt_persistent_decode_model_backend_state = {
+                "configured": self._optrt_persistent_decode_model_backend
+                is not None,
+                "attempted": False,
+                "executed": False,
+                "backend": None,
+                "reason": "not_attempted",
+                "metadata": None,
+            }
+            if self._optrt_persistent_decode_model_backend is not None:
+                resident_forward_request = PersistentDecodeModelForwardRequest(
+                    plan=self._optrt_persistent_decode_last_plan,
+                    real_requests=scheduled_requests,
+                    padded_requests=padded_requests,
+                    inputs=inputs,
+                    gather_ids=gather_ids,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    kv_cache_manager=kv_cache_manager,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                    resource_manager=resource_manager,
+                    model=self.model,
+                    cuda_graph_key=key,
+                    can_run_graph=can_run_graph,
+                    gather_context_logits=gather_context_logits,
+                    preprocess_inputs=self._preprocess_inputs,
+                    model_forward=self.model_forward,
+                    without_logits=self.without_logits,
+                )
+                self._optrt_persistent_decode_last_model_forward_request = (
+                    resident_forward_request)
 
-                        def capture_forward_fn(inputs: Dict[str, Any]):
+            try:
+                with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
+                    resident_forward_result = None
+                    if resident_forward_request is not None:
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            resident_forward_result = (
+                                self.
+                                _optrt_persistent_decode_model_backend.
+                                try_execute(resident_forward_request))
+                        backend = self._optrt_persistent_decode_model_backend
+                        self._optrt_persistent_decode_model_backend_state = {
+                            "configured": True,
+                            "attempted": True,
+                            "executed":
+                            resident_forward_result is not None,
+                            "backend":
+                            (resident_forward_result.backend
+                             if resident_forward_result is not None else
+                             getattr(backend, "name", None)),
+                            "reason":
+                            (resident_forward_result.reason
+                             if resident_forward_result is not None else
+                             getattr(backend, "last_reason", "declined")),
+                            "metadata":
+                            (resident_forward_result.metadata
+                             if resident_forward_result is not None else None),
+                        }
+
+                    if resident_forward_result is not None:
+                        outputs = resident_forward_result.outputs
+                    else:
+                        if not can_run_graph:
+                            # Fallback to eager execution if graph was not used
                             with MoeLoadBalancerIterContext(moe_load_balancer):
-                                return self._forward_step(
+                                outputs = self._forward_step(
                                     inputs,
                                     gather_ids=gather_ids,
                                     gather_context_logits=gather_context_logits)
+                        else:
+                            if self.cuda_graph_runner.needs_capture(key):
 
-                        def capture_postprocess_fn(inputs: Dict[str, Any]):
-                            self._postprocess_inputs(inputs)
+                                def capture_forward_fn(inputs: Dict[str, Any]):
+                                    with MoeLoadBalancerIterContext(
+                                            moe_load_balancer):
+                                        return self._forward_step(
+                                            inputs,
+                                            gather_ids=gather_ids,
+                                            gather_context_logits=
+                                            gather_context_logits)
 
-                        self.cuda_graph_runner.capture(
-                            key,
-                            capture_forward_fn,
-                            inputs,
-                            enable_spec_decode=self.enable_spec_decode,
-                            postprocess_fn=capture_postprocess_fn)
+                                def capture_postprocess_fn(inputs: Dict[
+                                        str, Any]):
+                                    self._postprocess_inputs(inputs)
 
-                        # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
-                        saved_draft = prepare_attn_metadata_for_draft_replay(
-                            attn_metadata, draft_kv_cache_manager)
-                        try:
-                            self._restore_kvarn_before_cuda_graph_replay(
-                                attn_metadata)
-                            outputs = self.cuda_graph_runner.replay(key, inputs)
-                        finally:
-                            restore_attn_metadata_after_draft_replay(
-                                attn_metadata, saved_draft)
-                    else:
-                        saved_draft = prepare_attn_metadata_for_draft_replay(
-                            attn_metadata, draft_kv_cache_manager)
-                        try:
-                            self._restore_kvarn_before_cuda_graph_replay(
-                                attn_metadata)
-                            with MoeLoadBalancerIterContext(moe_load_balancer):
-                                outputs = self.cuda_graph_runner.replay(
-                                    key, inputs)
-                        finally:
-                            restore_attn_metadata_after_draft_replay(
-                                attn_metadata, saved_draft)
+                                self.cuda_graph_runner.capture(
+                                    key,
+                                    capture_forward_fn,
+                                    inputs,
+                                    enable_spec_decode=self.enable_spec_decode,
+                                    postprocess_fn=capture_postprocess_fn)
+
+                                # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
+                                saved_draft = prepare_attn_metadata_for_draft_replay(
+                                    attn_metadata, draft_kv_cache_manager)
+                                try:
+                                    self._restore_kvarn_before_cuda_graph_replay(
+                                        attn_metadata)
+                                    outputs = self.cuda_graph_runner.replay(
+                                        key, inputs)
+                                finally:
+                                    restore_attn_metadata_after_draft_replay(
+                                        attn_metadata, saved_draft)
+                            else:
+                                saved_draft = prepare_attn_metadata_for_draft_replay(
+                                    attn_metadata, draft_kv_cache_manager)
+                                try:
+                                    self._restore_kvarn_before_cuda_graph_replay(
+                                        attn_metadata)
+                                    with MoeLoadBalancerIterContext(
+                                            moe_load_balancer):
+                                        outputs = self.cuda_graph_runner.replay(
+                                            key, inputs)
+                                finally:
+                                    restore_attn_metadata_after_draft_replay(
+                                        attn_metadata, saved_draft)
+            finally:
+                if optrt_persistent_timing is not None:
+                    optrt_persistent_timing.end_execute_cuda()
+                    optrt_persistent_timing.mark("after_execute")
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
+            if optrt_persistent_timing is not None:
+                optrt_persistent_timing.mark("after_forward_callback")
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
+            if optrt_persistent_timing is not None:
+                optrt_persistent_timing.mark("after_logit_postprocessors")
+                self._optrt_persistent_decode_profiler.record(
+                    optrt_persistent_timing)
+                plan = optrt_persistent_timing.plan
+                if plan is not None and getattr(plan, "eligible", False):
+                    maybe_report_deepseek_stage_profile()
 
             return outputs
 

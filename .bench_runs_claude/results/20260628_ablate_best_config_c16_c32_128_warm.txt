@@ -1,0 +1,4 @@
+# label=best_config_vbfuse_nvfp4_mega_cf_c16_c32_128_warm mode=stream url=http://10.42.0.165:8000/v1/completions osl=128 text_reps=160
+#   C reqs  ok    ISL TTFT_p50_ms TTFT_p95_ms user_tok_s_p50 agg_out_tok_s  wall_s
+   16   32  32   4161        2093        3581          39.88         359.8    11.4
+   32   32  32   4161        4489        6558          37.99         439.4     9.3

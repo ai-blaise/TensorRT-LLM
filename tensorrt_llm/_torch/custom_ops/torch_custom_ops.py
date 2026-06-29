@@ -1720,6 +1720,26 @@ def nvfp4_gemm(
          weight_scale.numel(), group is not None),
     )
 
+    if (os.environ.get("TRTLLM_OPTRT_DEEPSEEK_RESIDENT_NVFP4_CUDA_CORE_OUT",
+                       "0") == "1" and act_fp4.dim() == 2
+            and weight.dim() == 2
+            and act_fp4.shape[0] <= CudaCoreNVFP4Runner.MAX_M_DIMENSION
+            and get_sm_version() >= CudaCoreNVFP4Runner.MIN_SM_VERSION):
+        _log_nvfp4_gemm_debug(
+            f"NVFP4 GEMM resident small-M cuda_core M={act_fp4.shape[0]}, "
+            f"N={weight.shape[0]}, K={act_fp4.shape[1] * 2}, "
+            f"output_buffer_kind={output_buffer_kind}",
+            ("resident_cuda_core", act_fp4.shape[0], weight.shape[0],
+             act_fp4.shape[1] * 2, output_buffer_kind),
+        )
+        return CudaCoreNVFP4Runner(output_buffer_kind, output_dtype,
+                                   group=group)(
+                                       [
+                                           act_fp4, weight, act_sf,
+                                           weight_scale, alpha
+                                       ],
+                                       tactic=0)
+
     qb_cutedsl_result = _try_nvfp4_gemm_qb_cutedsl(
         act_fp4,
         weight,

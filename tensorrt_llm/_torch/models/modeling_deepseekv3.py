@@ -78,6 +78,7 @@ from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
+from .deepseek_stage_profiler import DeepseekStageTimer
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -1190,6 +1191,18 @@ class Deepseekv3MoE(nn.Module):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
+        self._optrt_stage_timer = DeepseekStageTimer(
+            rank=getattr(self.mapping, "rank", None),
+            layer_idx=layer_idx,
+            layer_kind="moe",
+            component="moe",
+            stages=(
+                "router_gate",
+                "experts_backend",
+                "shared_experts",
+                "combine",
+            ),
+        )
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1282,8 +1295,15 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
+        stage_timer = self._optrt_stage_timer
+        if stage_timer.enabled:
+            stage_timer.start("router_gate")
         router_logits = self.gate(hidden_states)
+        if stage_timer.enabled:
+            stage_timer.end("router_gate")
 
+        if stage_timer.enabled:
+            stage_timer.start("experts_backend")
         routed_output = self.experts(
             hidden_states_fp4
             if hidden_states_fp4 is not None else hidden_states,
@@ -1296,6 +1316,8 @@ class Deepseekv3MoE(nn.Module):
                 "alltoall_result_do_sum": False
             } if isinstance(self.experts, WideEPMoE) else {}),
         )
+        if stage_timer.enabled:
+            stage_timer.end("experts_backend")
 
         return routed_output
 
@@ -1309,10 +1331,13 @@ class Deepseekv3MoE(nn.Module):
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
+        stage_timer = self._optrt_stage_timer
 
         def _compute_shared_output():
             # Linear layers assume swizzled scale factors; a LINEAR-sf fp4
             # (pre-quantized MoE input) must not reach the shared experts.
+            if stage_timer.enabled:
+                stage_timer.start("shared_experts")
             shared_input = (hidden_states_fp4 if
                             (hidden_states_fp4 is not None
                              and self.shared_experts_use_fp4
@@ -1321,6 +1346,8 @@ class Deepseekv3MoE(nn.Module):
             shared_output = self.shared_experts(shared_input)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
+            if stage_timer.enabled:
+                stage_timer.end("shared_experts")
             return shared_output
 
         def _compute_routed_output():
@@ -1343,12 +1370,16 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if stage_timer.enabled:
+                stage_timer.start("combine")
             if not isinstance(shared_output, torch.Tensor):
                 final_hidden_states = shared_output + routed_output
                 if not self.use_dp and self.mapping.tp_size > 1:
                     final_hidden_states = self.allreduce(
                         final_hidden_states,
                         all_reduce_params=final_all_reduce_params)
+                if stage_timer.enabled:
+                    stage_timer.end("combine")
                 return final_hidden_states
             output_tensor = None
             if not self.use_dp and self.mapping.tp_size > 1:
@@ -1379,6 +1410,8 @@ class Deepseekv3MoE(nn.Module):
                     final_hidden_states,
                     all_reduce_params=final_all_reduce_params)
 
+            if stage_timer.enabled:
+                stage_timer.end("combine")
             return final_hidden_states
 
 
@@ -1462,6 +1495,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
+            layer_kind = "moe"
 
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
@@ -1479,6 +1513,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 aux_stream_dict=aux_stream_dict,
                 layer_idx=layer_idx)
         else:
+            layer_kind = "dense"
             block_size = 1
             if quant_config and quant_config.group_size is not None:
                 block_size = quant_config.group_size
@@ -1575,6 +1610,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        or self.fusion_config.PRE_MLP_FUSION
                                        or self.mapping.tp_size == 1
                                        or can_skip_for_attention_dp)
+        self._optrt_stage_timer = DeepseekStageTimer(
+            rank=getattr(mapping, "rank", None),
+            layer_idx=layer_idx,
+            layer_kind=layer_kind,
+        )
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -1795,12 +1835,20 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stage_timer = self._optrt_stage_timer
+        if stage_timer.enabled:
+            stage_timer.start("input_norm_gate")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         hidden_states, hidden_states_fp4 = self._apply_input_gated_norm_quant(
             hidden_states)
+        if stage_timer.enabled:
+            stage_timer.end("input_norm_gate")
+
         # Self Attention
+        if stage_timer.enabled:
+            stage_timer.start("attention")
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1813,6 +1861,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
+        if stage_timer.enabled:
+            stage_timer.end("attention")
+
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1841,6 +1892,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stage_timer = self._optrt_stage_timer
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             self.mlp.experts.warp_decode_is_decode_only = (
@@ -1858,6 +1910,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 do_finalize=do_finalize,
             )
 
+        if stage_timer.enabled:
+            stage_timer.start("post_norm_gate")
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
@@ -1876,6 +1930,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual)
         hidden_states, hidden_states_fp4 = (
             self._apply_post_attention_gated_norm_quant(hidden_states))
+        if stage_timer.enabled:
+            stage_timer.end("post_norm_gate")
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1884,10 +1940,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
+        if stage_timer.enabled:
+            stage_timer.start("ffn")
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=hidden_states_fp4,
                                  do_finalize=do_finalize)
+        if stage_timer.enabled:
+            stage_timer.end("ffn")
 
+        if stage_timer.enabled:
+            stage_timer.start("post_ffn")
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
                 hidden_states, residual = self.allreduce(
@@ -1927,6 +1989,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+        if stage_timer.enabled:
+            stage_timer.end("post_ffn")
 
         return hidden_states, residual
 
@@ -1936,7 +2000,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stage_timer = self._optrt_stage_timer
 
+        if stage_timer.enabled:
+            stage_timer.start("post_norm_gate")
         if self.fusion_config.PRE_MLP_FUSION:
             if self.has_gated_norm:
                 # The gated norm consumes the bf16 norm output, so the quant
@@ -1971,14 +2038,22 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual)
         hidden_states, hidden_states_fp4 = (
             self._apply_post_attention_gated_norm_quant_dense(hidden_states))
+        if stage_timer.enabled:
+            stage_timer.end("post_norm_gate")
 
+        if stage_timer.enabled:
+            stage_timer.start("ffn")
         hidden_states = self.mlp(
             hidden_states_fp4
             if hidden_states_fp4 is not None else hidden_states,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)),
         )
+        if stage_timer.enabled:
+            stage_timer.end("ffn")
 
+        if stage_timer.enabled:
+            stage_timer.start("post_ffn")
         if self.fusion_config.POST_MLP_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -1997,6 +2072,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+        if stage_timer.enabled:
+            stage_timer.end("post_ffn")
 
         return hidden_states, residual
 

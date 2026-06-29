@@ -1,0 +1,172 @@
+apiVersion: v1
+data:
+  decode.yaml: |
+    backend: pytorch
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    context_parallel_size: 1
+    enable_attention_dp: true
+    trust_remote_code: true
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: false
+    # DeepSeek decode should run attention-DP/local dense MLP ownership rather
+    # than exercising the dense MLP TP allreduce path during warmup.
+    allreduce_strategy: MNNVL
+    use_cute_dsl_blockscaling_bmm: true
+    use_cute_dsl_bf16_bmm: true
+    max_batch_size: 64
+    max_input_len: 131072
+    max_seq_len: 132096
+    max_num_tokens: 8192
+    print_iter_log: false
+    stream_interval: 50
+    num_postprocess_workers: 8
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.45
+      tokens_per_block: 64
+    cache_transceiver_config:
+      # NIXL is the pre-A/B KV-transfer gate.
+      # UCX remains available only as an A/B comparison candidate.
+      backend: NIXL
+      # Generation-first/write-mode handoff requires the V2 NIXL runtime; the
+      # legacy C++ transceiver only supports completed-prefill metadata.
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 131072
+    moe_config:
+      backend: WARPDECODE
+      use_low_precision_moe_combine: false
+      warp_decode:
+        enabled: true
+        tile_mode: decode_1cta
+        policy: force
+        allow_parallelism_fallback: false
+        max_batch_size: 64
+    nvfp4_gemm_config:
+      allowed_backends: [cutlass, cublaslt, cuda_core]
+    sparse_attention_config:
+      algorithm: dsa
+      indexer_mode: indexcache-hisa
+      index_n_heads: 64
+      index_head_dim: 128
+      index_topk: 1024
+      index_topk_pattern: FSSS
+      index_topk_freq: 4
+      indexer_k_dtype: fp4
+      # Dense MLA latent KV uses 2-bit KVarN. Indexer K remains fp4.
+      mla_latent_kv_dtype: kvarn_k2v2
+      mla_latent_kv_amortize: true
+      enable_nvfp4_hisa: true
+      hisa_block_size: 128
+      hisa_block_topk: 64
+      hisa_compression_ratio: 4.0
+      hisa_min_seq_len: 65536
+      hisa_execution_mode: optimized
+      use_cute_dsl_topk: true
+      use_cute_dsl_paged_mqa_logits: true
+      layersplit_enabled: false
+    # SMC two-model drafting is OPT-IN (per docs/blaise: 'pending A/B win',
+    # known regression): the GLM draft runs single-rank and EAGER, so every
+    # decode step serializes behind ~300ms of python-dispatched draft GEMMs
+    # (measured 2.8 vs 46 tok/s/user with/without on 2026-06-12). It was
+    # inert before smc-sd (2634a162d) wired it, which is why this block
+    # looked harmless. Re-enable deliberately for SMC A/Bs only.
+    # speculative_config:
+    #   decoding_type: SMC
+    #   speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
+    #   gamma: 6
+    #   n_particles: 4
+    #   resample_threshold: 0.5
+    #  draft_temperature: 0.7
+    #  target_temperature: 1.0
+    #  draft_attention_backend: triton
+    #  draft_kv_cache_dtype: bfloat16
+  prefill.yaml: |
+    backend: pytorch
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 4
+    context_parallel_size: 2
+    cp_config:
+      cp_type: LAYERSPLIT
+    enable_attention_dp: false
+    trust_remote_code: true
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: false
+    allreduce_strategy: AUTO
+    use_cute_dsl_blockscaling_bmm: true
+    use_cute_dsl_bf16_bmm: true
+    max_batch_size: 32
+    max_input_len: 131072
+    max_seq_len: 132096
+    max_num_tokens: 8192
+    print_iter_log: false
+    stream_interval: 50
+    num_postprocess_workers: 8
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.7
+      tokens_per_block: 64
+    cache_transceiver_config:
+      # NIXL is the pre-A/B KV-transfer gate.
+      # UCX remains available only as an A/B comparison candidate.
+      backend: NIXL
+      # Generation-first/write-mode handoff requires the V2 NIXL runtime; the
+      # legacy C++ transceiver only supports completed-prefill metadata.
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 131072
+    moe_config:
+      backend: WARPDECODE
+      use_low_precision_moe_combine: true
+      warp_decode:
+        enabled: false
+        tile_mode: autotune
+    nvfp4_gemm_config:
+      allowed_backends: [cutlass, cublaslt, cuda_core]
+    sparse_attention_config:
+      algorithm: dsa
+      indexer_mode: indexcache-hisa
+      index_n_heads: 64
+      index_head_dim: 128
+      index_topk: 1024
+      index_topk_pattern: FSSS
+      index_topk_freq: 4
+      indexer_k_dtype: fp4
+      # Dense MLA latent KV uses 2-bit KVarN. This is intentionally separate
+      # from Indexer K above; KVarN is dense compressed_kv+k_pe storage only.
+      mla_latent_kv_dtype: kvarn_k2v2
+      mla_latent_kv_amortize: true
+      enable_nvfp4_hisa: true
+      hisa_block_size: 128
+      hisa_block_topk: 64
+      hisa_compression_ratio: 4.0
+      hisa_min_seq_len: 65536
+      hisa_execution_mode: optimized
+      use_cute_dsl_topk: true
+      use_cute_dsl_paged_mqa_logits: true
+      # LayerSplit handoff over TRT-LLM NIXL transfer: prefill owns
+      # CP-sharded DSA KV/indexer-K cache, then the transceiver writes and
+      # reassembles it into decode's pre-allocated TP4/CP1 cache. Keep all CP
+      # ranks participating until a partial-rank protocol is implemented.
+      layersplit_enabled: true
+      layersplit_owner_assignment: contiguous
+      layersplit_transfer_backend: nixl
+      layersplit_all_cp_ranks_transfer: true
+      layersplit_owner_local_alloc: true
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"decode.yaml":"backend: pytorch\ntensor_parallel_size: 4\nmoe_expert_parallel_size: 4\ncontext_parallel_size: 1\nenable_attention_dp: true\ntrust_remote_code: true\nenable_chunked_prefill: true\ndisable_overlap_scheduler: false\n# DeepSeek decode should run attention-DP/local dense MLP ownership rather\n# than exercising the dense MLP TP allreduce path during warmup.\nallreduce_strategy: MNNVL\nuse_cute_dsl_blockscaling_bmm: true\nuse_cute_dsl_bf16_bmm: true\nmax_batch_size: 64\nmax_input_len: 131072\nmax_seq_len: 132096\nmax_num_tokens: 8192\nprint_iter_log: false\nstream_interval: 50\nnum_postprocess_workers: 8\ncuda_graph_config:\n  enable_padding: true\n  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]\nkv_cache_config:\n  dtype: fp8\n  enable_block_reuse: false\n  free_gpu_memory_fraction: 0.45\n  tokens_per_block: 64\ncache_transceiver_config:\n  # NIXL is the pre-A/B KV-transfer gate.\n  # UCX remains available only as an A/B comparison candidate.\n  backend: NIXL\n  # Generation-first/write-mode handoff requires the V2 NIXL runtime; the\n  # legacy C++ transceiver only supports completed-prefill metadata.\n  transceiver_runtime: PYTHON\n  max_tokens_in_buffer: 131072\nmoe_config:\n  backend: WARPDECODE\n  use_low_precision_moe_combine: false\n  warp_decode:\n    enabled: true\n    tile_mode: decode_1cta\n    policy: force\n    allow_parallelism_fallback: false\n    max_batch_size: 64\nnvfp4_gemm_config:\n  allowed_backends: [cutlass, cublaslt, cuda_core]\nsparse_attention_config:\n  algorithm: dsa\n  indexer_mode: indexcache-hisa\n  index_n_heads: 64\n  index_head_dim: 128\n  index_topk: 1024\n  index_topk_pattern: FSSS\n  index_topk_freq: 4\n  indexer_k_dtype: fp4\n  # Dense MLA latent KV uses 2-bit KVarN. Indexer K remains fp4.\n  mla_latent_kv_dtype: kvarn_k2v2\n  mla_latent_kv_amortize: true\n  enable_nvfp4_hisa: true\n  hisa_block_size: 128\n  hisa_block_topk: 64\n  hisa_compression_ratio: 4.0\n  hisa_min_seq_len: 65536\n  hisa_execution_mode: optimized\n  use_cute_dsl_topk: true\n  use_cute_dsl_paged_mqa_logits: true\n  layersplit_enabled: false\n# SMC two-model drafting is OPT-IN (per docs/blaise: 'pending A/B win',\n# known regression): the GLM draft runs single-rank and EAGER, so every\n# decode step serializes behind ~300ms of python-dispatched draft GEMMs\n# (measured 2.8 vs 46 tok/s/user with/without on 2026-06-12). It was\n# inert before smc-sd (2634a162d) wired it, which is why this block\n# looked harmless. Re-enable deliberately for SMC A/Bs only.\n# speculative_config:\n#   decoding_type: SMC\n#   speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP\n#   gamma: 6\n#   n_particles: 4\n#   resample_threshold: 0.5\n#  draft_temperature: 0.7\n#  target_temperature: 1.0\n#  draft_attention_backend: triton\n#  draft_kv_cache_dtype: bfloat16\n","prefill.yaml":"backend: pytorch\ntensor_parallel_size: 2\nmoe_expert_parallel_size: 4\ncontext_parallel_size: 2\ncp_config:\n  cp_type: LAYERSPLIT\nenable_attention_dp: false\ntrust_remote_code: true\nenable_chunked_prefill: true\ndisable_overlap_scheduler: false\nallreduce_strategy: AUTO\nuse_cute_dsl_blockscaling_bmm: true\nuse_cute_dsl_bf16_bmm: true\nmax_batch_size: 32\nmax_input_len: 131072\nmax_seq_len: 132096\nmax_num_tokens: 8192\nprint_iter_log: false\nstream_interval: 50\nnum_postprocess_workers: 8\ncuda_graph_config:\n  enable_padding: true\n  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64]\nkv_cache_config:\n  dtype: fp8\n  enable_block_reuse: true\n  free_gpu_memory_fraction: 0.7\n  tokens_per_block: 64\ncache_transceiver_config:\n  # NIXL is the pre-A/B KV-transfer gate.\n  # UCX remains available only as an A/B comparison candidate.\n  backend: NIXL\n  # Generation-first/write-mode handoff requires the V2 NIXL runtime; the\n  # legacy C++ transceiver only supports completed-prefill metadata.\n  transceiver_runtime: PYTHON\n  max_tokens_in_buffer: 131072\nmoe_config:\n  backend: WARPDECODE\n  use_low_precision_moe_combine: true\n  warp_decode:\n    enabled: false\n    tile_mode: autotune\nnvfp4_gemm_config:\n  allowed_backends: [cutlass, cublaslt, cuda_core]\nsparse_attention_config:\n  algorithm: dsa\n  indexer_mode: indexcache-hisa\n  index_n_heads: 64\n  index_head_dim: 128\n  index_topk: 1024\n  index_topk_pattern: FSSS\n  index_topk_freq: 4\n  indexer_k_dtype: fp4\n  # Dense MLA latent KV uses 2-bit KVarN. This is intentionally separate\n  # from Indexer K above; KVarN is dense compressed_kv+k_pe storage only.\n  mla_latent_kv_dtype: kvarn_k2v2\n  mla_latent_kv_amortize: true\n  enable_nvfp4_hisa: true\n  hisa_block_size: 128\n  hisa_block_topk: 64\n  hisa_compression_ratio: 4.0\n  hisa_min_seq_len: 65536\n  hisa_execution_mode: optimized\n  use_cute_dsl_topk: true\n  use_cute_dsl_paged_mqa_logits: true\n  # LayerSplit handoff over TRT-LLM NIXL transfer: prefill owns\n  # CP-sharded DSA KV/indexer-K cache, then the transceiver writes and\n  # reassembles it into decode's pre-allocated TP4/CP1 cache. Keep all CP\n  # ranks participating until a partial-rank protocol is implemented.\n  layersplit_enabled: true\n  layersplit_owner_assignment: contiguous\n  layersplit_transfer_backend: nixl\n  layersplit_all_cp_ranks_transfer: true\n  layersplit_owner_local_alloc: true\n"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"topo-c1-dp2tp4-disagg-r20-config","namespace":"dynamo-system"}}
+  creationTimestamp: "2026-06-05T12:02:32Z"
+  name: topo-c1-dp2tp4-disagg-r20-config
+  namespace: dynamo-system
+  resourceVersion: "8674647"
+  uid: 4072c9a8-6916-41b8-a0df-f79bb61c1d64

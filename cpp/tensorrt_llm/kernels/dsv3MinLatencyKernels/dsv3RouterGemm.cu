@@ -194,6 +194,34 @@ void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_
         &config, router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim>, output, mat_a, mat_b));
 }
 
+#define INSTANTIATE_ROUTER_GEMM(NUM_TOKENS, NUM_EXPERTS, HIDDEN_DIM)                                                \
+    template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, NUM_TOKENS,        \
+        NUM_EXPERTS, HIDDEN_DIM>(float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+#define INSTANTIATE_ROUTER_GEMM_ALL_TOKENS(NUM_EXPERTS, HIDDEN_DIM)                                                \
+    INSTANTIATE_ROUTER_GEMM(1, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(2, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(3, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(4, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(5, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(6, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(7, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(8, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(9, NUM_EXPERTS, HIDDEN_DIM)                                                            \
+    INSTANTIATE_ROUTER_GEMM(10, NUM_EXPERTS, HIDDEN_DIM)                                                           \
+    INSTANTIATE_ROUTER_GEMM(11, NUM_EXPERTS, HIDDEN_DIM)                                                           \
+    INSTANTIATE_ROUTER_GEMM(12, NUM_EXPERTS, HIDDEN_DIM)                                                           \
+    INSTANTIATE_ROUTER_GEMM(13, NUM_EXPERTS, HIDDEN_DIM)                                                           \
+    INSTANTIATE_ROUTER_GEMM(14, NUM_EXPERTS, HIDDEN_DIM)                                                           \
+    INSTANTIATE_ROUTER_GEMM(15, NUM_EXPERTS, HIDDEN_DIM)                                                           \
+    INSTANTIATE_ROUTER_GEMM(16, NUM_EXPERTS, HIDDEN_DIM)
+
+// Blaise / DeepSeek-V3.2 compressed checkpoint uses 128 routed experts.
+INSTANTIATE_ROUTER_GEMM_ALL_TOKENS(128, 7168)
+
+#undef INSTANTIATE_ROUTER_GEMM_ALL_TOKENS
+#undef INSTANTIATE_ROUTER_GEMM
+
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
