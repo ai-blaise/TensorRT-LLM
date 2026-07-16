@@ -50,7 +50,7 @@ RUN /opt/dynamo/venv/bin/python3 scripts/build_wheel.py \
 RUN cmake --build /workspace/TensorRT-LLM/cpp/build \
     --config Release \
     --parallel ${FULL_BUILD_JOBS} \
-    --target tensorrt_llm th_common bindings
+    --target tensorrt_llm th_common bindings deep_gemm
 
 FROM ${RUNTIME_BASE}
 USER root
@@ -63,8 +63,11 @@ COPY --from=build --chown=dynamo:0 /workspace/TensorRT-LLM/cpp/build/tensorrt_ll
 
 RUN set -eux; \
     mkdir -p "${SITE_PACKAGES}/tensorrt_llm/libs" /opt/ai-blaise; \
+    rm -rf "${SITE_PACKAGES}/tensorrt_llm/deep_gemm"; \
     find /tmp/tensorrt_llm_build_artifacts -maxdepth 1 -type f -name '*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
     find /tmp/tensorrt_llm_build_artifacts/nanobind -maxdepth 1 -type f -name 'bindings*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
+    find /tmp/tensorrt_llm_build_artifacts/deep_gemm -maxdepth 1 -type f -name 'deep_gemm_cpp_tllm*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
+    cp -a /tmp/tensorrt_llm_build_artifacts/deep_gemm/python/deep_gemm "${SITE_PACKAGES}/tensorrt_llm/deep_gemm"; \
     find /tmp/tensorrt_llm_build_artifacts/executor/cache_transmission/nixl_utils -maxdepth 1 -type f -name 'tensorrt_llm_transfer_agent_binding*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/" \;; \
     find /tmp/tensorrt_llm_build_artifacts/executor/cache_transmission/nixl_utils -maxdepth 1 -type f -name 'lib*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/" \;; \
     find /tmp/tensorrt_llm_build_artifacts/executor/cache_transmission/ucx_utils -maxdepth 1 -type f -name 'lib*.so' -exec cp -v {} "${SITE_PACKAGES}/tensorrt_llm/libs/" \;; \
