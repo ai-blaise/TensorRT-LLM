@@ -1,6 +1,5 @@
-# SMC-SD aggregated TP4 single-instance (smcsd-r12, 001 docker).
-# DeepSeek-V3.2-REAP-345B NVFP4 target + GLM-4-9B-0414-FP8 SMC draft.
-# Derived from the validated 002 decode_smc_on.yaml (smcsd-r10); aggregated (no disagg split).
+# Aggregated TP4 single-instance benchmark config for the Corsaire target.
+# This runs the target model as-is: no speculative decoding draft model.
 backend: pytorch
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
@@ -43,6 +42,9 @@ sparse_attention_config:
   index_topk_pattern: FSSS
   index_topk_freq: 4
   indexer_k_dtype: fp4
+  # Dense MLA latent KV uses 2-bit KVarN. Indexer K remains fp4.
+  mla_latent_kv_dtype: kvarn_k2v2
+  mla_latent_kv_amortize: true
   enable_nvfp4_hisa: true
   hisa_block_size: 128
   hisa_block_topk: 64
@@ -52,13 +54,3 @@ sparse_attention_config:
   use_cute_dsl_topk: true
   use_cute_dsl_paged_mqa_logits: true
   layersplit_enabled: false
-speculative_config:
-  decoding_type: SMC
-  speculative_model: /models/BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP
-  gamma: 6
-  n_particles: 4
-  resample_threshold: 0.5
-  draft_temperature: 0.7
-  target_temperature: 1.0
-  draft_attention_backend: triton
-  draft_kv_cache_dtype: bfloat16
