@@ -1,0 +1,161 @@
+# ============================================================================
+# CORSAIRE BOARD -- diagnostic knob board for the garbage-output bug.
+#
+# Every experimental feature is a numbered KNOB. Each knob line carries BOTH
+# states inline, so flipping one is a single-token edit -- no hunting, no
+# cross-referencing corsaire_tp4.yaml.
+#
+# HOW TO USE
+#   1. Edit a `KNOB Kn` line to the value you want.
+#   2. Update the BOARD table below so it still matches (it is the log of
+#      what you actually ran).
+#   3. Re-serve, re-curl, record the result in RUN LOG at the bottom.
+#   Change ONE knob per run, or you learn nothing.
+#
+# BOARD  (current state -- keep in sync by hand)
+#   ---- OFF: the variable set under test -------------------------------
+#   K1  WarpDecode MoE backend .................. OFF  (CUTLASS)
+#   K2  low-precision MoE combine ............... OFF
+#   K3  CuTe DSL blockscaling bmm ............... OFF
+#   K4  CuTe DSL bf16 bmm ....................... OFF
+#   K5  CuTe DSL indexer topk ................... OFF
+#   K6  CuTe DSL paged MQA logits ............... OFF
+#   K7  CUDA graph capture/replay ............... OFF
+#   K8  overlap scheduler ....................... OFF
+#   K9  fp8 KV cache ............................ OFF  (auto)
+#   ---- ON: held constant, NOT under test ------------------------------
+#   K10 KVarN 2-bit latent KV ................... ON   (kvarn_k2v2)
+#   K11 KVarN amortize .......................... ON
+#   K12 indexer mode ............................ ON   (indexcache-hisa)
+#   K13 fp4 indexer K ........................... ON
+#   K14 NVFP4 HISA .............................. ON
+#   K15 LayerSplit .............................. OFF  (off in orig too)
+#
+# NOT A KNOB: `algorithm: dsa` is required by the DeepSeek-V3.2-style
+# architecture. Removing it is not a valid configuration.
+#
+# READING A RESULT
+#   All-OFF clean  -> one of K1-K9 corrupts logits; turn them back ON one
+#                     at a time until it breaks again.
+#   All-OFF garbage-> cause is in the ON set (K10-K14) or upstream of
+#                     serving entirely: weights, tokenizer, loader, or TP4
+#                     sharding. Start by flipping K10 to kvarn_k4v4.
+#
+# Test with temperature 0. Greedy decode means any incoherence is a logits
+# bug, not sampling.
+#
+# Batch/length limits are reduced for fast startup. Not a benchmark config.
+# ============================================================================
+
+backend: pytorch
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: false
+trust_remote_code: true
+enable_chunked_prefill: true
+allreduce_strategy: AUTO
+
+# KNOB K8  overlap scheduler        ON: false   OFF: true
+disable_overlap_scheduler: true
+
+# KNOB K3  CuTe DSL blockscaling bmm    ON: true   OFF: false
+use_cute_dsl_blockscaling_bmm: false
+# KNOB K4  CuTe DSL bf16 bmm            ON: true   OFF: false
+use_cute_dsl_bf16_bmm: false
+
+# KNOB K7  CUDA graphs
+#   OFF: null
+#   ON:  {enable_padding: true, batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,
+#         13,14,15,16,24,32,48,64]}
+cuda_graph_config: null
+
+# --- scale: reduced for fast startup, not part of the variable set ---
+max_batch_size: 8
+max_input_len: 8192
+max_seq_len: 8448
+max_num_tokens: 2048
+print_iter_log: false
+stream_interval: 1
+num_postprocess_workers: 1
+
+kv_cache_config:
+  # KNOB K9  fp8 KV cache        ON: fp8   OFF: auto
+  dtype: auto
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.45
+  tokens_per_block: 64
+
+moe_config:
+  # KNOB K1  MoE backend         ON: WARPDECODE   OFF: CUTLASS
+  # NOTE: `warp_decode.enabled` is NOT this switch. moe backend=WARPDECODE
+  # selects the custom NVFP4 CuteDslFusedMoE path unconditionally
+  # (llm_args.py:L815-L822); warp_decode.enabled:false only makes
+  # validate_warp_decode_config early-return (L859-L861), i.e. it runs the
+  # custom kernel with its tiling config bypassed. Use backend to turn it off.
+  backend: CUTLASS
+  # KNOB K2  low-precision MoE combine    ON: true   OFF: false
+  use_low_precision_moe_combine: false
+
+# Not a knob: stock NVIDIA GEMM backends, pinned so selection is not left
+# to an unspecified default.
+nvfp4_gemm_config:
+  allowed_backends: [cutlass, cublaslt, cuda_core]
+
+sparse_attention_config:
+  # Not a knob -- architecturally required.
+  algorithm: dsa
+
+  # KNOB K12  indexer mode    ON: indexcache-hisa   OFF: vanilla
+  # CAUTION: "vanilla" may not stick. When the HF model config asks for
+  # indexcache/indexcache-hisa, model_config.py:L828-L835 promotes it back
+  # and drags indexer_k_dtype and enable_nvfp4_hisa along with it. Verify in
+  # the startup log before trusting an OFF result here.
+  indexer_mode: indexcache-hisa
+  index_n_heads: 64
+  index_head_dim: 128
+  index_topk: 1024
+  index_topk_pattern: FSSS
+  index_topk_freq: 4
+  # KNOB K13  indexer K dtype    ON: fp4   OFF: fp8
+  # fp4 requires index_head_dim=128 and SM>=100 (llm_args.py:L477-L489).
+  indexer_k_dtype: fp4
+
+  # KNOB K10  KVarN latent KV
+  #   ON:   kvarn_k2v2   (2-bit, current)
+  #   STEP: kvarn_k4v4   (4-bit, same code path -- try this first)
+  #   OFF:  fp16         (leaves the KVarN path entirely; UNVERIFIED
+  #                       downstream, may fail at load rather than serve)
+  # TRAP: `auto` does NOT disable KVarN. auto/None is the sentinel that
+  # re-selects the kvarn_k2v2 default (model_config.py:L814-L817 + L154);
+  # only a literal non-kvarn dtype reaches the else-branch at L819.
+  mla_latent_kv_dtype: kvarn_k2v2
+  # KNOB K11  KVarN amortize     ON: true   OFF: false
+  # Read-path staleness optimization layered on top of the 2-bit storage.
+  mla_latent_kv_amortize: true
+
+  # KNOB K14  NVFP4 HISA         ON: true   OFF: false
+  # Requires K12=indexcache-hisa and K13=fp4 (llm_args.py:L528-L535), so it
+  # cannot be ON alone. hisa_min_seq_len gates it to >=65536 tokens, so it
+  # is inert for short diagnostic prompts either way.
+  enable_nvfp4_hisa: true
+  hisa_block_size: 128
+  hisa_block_topk: 64
+  hisa_compression_ratio: 4.0
+  hisa_min_seq_len: 65536
+  hisa_execution_mode: optimized
+
+  # KNOB K5  CuTe DSL indexer topk         ON: true   OFF: false
+  use_cute_dsl_topk: false
+  # KNOB K6  CuTe DSL paged MQA logits     ON: true   OFF: false
+  use_cute_dsl_paged_mqa_logits: false
+
+  # KNOB K15  LayerSplit    ON: true   OFF: false   (off in orig too)
+  layersplit_enabled: false
+
+# ============================================================================
+# RUN LOG -- append one line per run.
+#
+#  date       | knobs changed from previous run | result
+#  -----------|---------------------------------|------------------------
+#  (baseline) | K1-K9 OFF                       | ?
+# ============================================================================
