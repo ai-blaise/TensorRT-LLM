@@ -24,7 +24,7 @@
 #   K8  overlap scheduler ....................... OFF
 #   K9  fp8 KV cache ............................ OFF  (auto)
 #   ---- ON: held constant, NOT under test -------------------------------
-#   K10 KVarN latent KV ......................... ON   (kvarn_k4v4)  <-- VAR
+#   K10 KVarN 2-bit latent KV ................... ON   (kvarn_k2v2)
 #   K11 KVarN amortize .......................... ON
 #   K12 indexer mode ............................ ON   (indexcache-hisa)
 #   K13 fp4 indexer K ........................... ON
@@ -35,16 +35,18 @@
 # the Blaise storage stack -- KVarN latent KV and the IndexCache/HISA
 # indexer -- plus the model, tokenizer, loader, and TP4 sharding.
 #
-#   clean here   -> the KVarN code path works and 2-bit was simply too lossy
-#                   for this model. Fix is a bit-width policy decision.
-#   garbage here -> KVarN bit width is not the cause. Either the KVarN path
-#                   itself is broken (next: K10 -> fp16, leaves the path
-#                   entirely) or the fault is upstream of every knob:
-#                   weights, tokenizer, loader, or TP4 sharding.
+# THIS IS THE WARPDECODE CONTROL. It is identical to the K1-ON run that
+# produced garbage except for K1 (WARPDECODE -> CUTLASS). One variable.
 #
-# COMPARABILITY: this run is single-variable against an all-kernels-off +
-# kvarn_k2v2 run. It differs from the last recorded run (K1 ON, k2v2) by TWO
-# knobs, so do not compare it to that one directly.
+#   clean here   -> WarpDecode IS the bug. The custom SGLang-ported MoE
+#                   kernel is corrupting logits. Done bisecting.
+#   garbage here -> WarpDecode is EXONERATED. No optional kernel is at
+#                   fault. The cause is KVarN, the checkpoint-forced
+#                   indexer, the weights, the tokenizer, the loader, or TP4
+#                   sharding. Next flip: K10 -> kvarn_k4v4, then fp16.
+#
+# It is also the missing baseline for the KVarN bit-width test: a later
+# kvarn_k4v4 run is single-variable only against THIS configuration.
 #
 # NOTE: the K1-ON run (WarpDecode isolated, everything else off) produced
 # garbage. That does NOT convict WarpDecode by itself -- if this run is also
@@ -157,8 +159,7 @@ sparse_attention_config:
   # only a literal non-kvarn dtype reaches the else-branch at L819.
   # NOTE: KVarN has no non-Blaise implementer -- there is no stock kernel
   # for 2-bit latent KV, so ON always means Blaise store/restore code runs.
-  # <<< VARIABLE UNDER TEST: 2-bit -> 4-bit, same KVarN code path >>>
-  mla_latent_kv_dtype: kvarn_k4v4
+  mla_latent_kv_dtype: kvarn_k2v2
   # KNOB K11  KVarN amortize     ON: true   OFF: false
   mla_latent_kv_amortize: true
 
@@ -188,6 +189,6 @@ sparse_attention_config:
 #  -----------|---------------------------------|------------------------
 #  2026-07-25 | K1-K9 OFF (all kernels off)     | ?
 #  2026-07-25 | K1 ON only (WarpDecode isolated)| GARBAGE
-#  2026-07-25 | K1 back OFF (all kernels off)   | not run
-#  2026-07-25 | kernels off + K10 kvarn_k4v4    | ?
+#  2026-07-25 | CUTLASS + all kernels off, k2v2 | ?   <-- WarpDecode control
+#             |   (pairs with the K1 ON row above; one variable = K1)
 # ============================================================================
