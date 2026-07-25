@@ -13,8 +13,9 @@
 #   Change ONE knob per run, or you learn nothing.
 #
 # BOARD  (current state -- keep in sync by hand)
-#   ---- OFF: the variable set under test -------------------------------
-#   K1  WarpDecode MoE backend .................. OFF  (CUTLASS)
+#   ---- THE VARIABLE: one custom kernel, on -----------------------------
+#   K1  WarpDecode MoE backend .................. ON   (WARPDECODE)
+#   ---- OFF: every other kernel -----------------------------------------
 #   K2  low-precision MoE combine ............... OFF
 #   K3  CuTe DSL blockscaling bmm ............... OFF
 #   K4  CuTe DSL bf16 bmm ....................... OFF
@@ -23,23 +24,40 @@
 #   K7  CUDA graph capture/replay ............... OFF
 #   K8  overlap scheduler ....................... OFF
 #   K9  fp8 KV cache ............................ OFF  (auto)
-#   ---- ON: held constant, NOT under test ------------------------------
+#   ---- ON: held constant, NOT under test -------------------------------
 #   K10 KVarN 2-bit latent KV ................... ON   (kvarn_k2v2)
 #   K11 KVarN amortize .......................... ON
 #   K12 indexer mode ............................ ON   (indexcache-hisa)
 #   K13 fp4 indexer K ........................... ON
 #   K14 NVFP4 HISA .............................. ON
-#   K15 LayerSplit .............................. OFF  (off in orig too)
+#   K15 LayerSplit .............................. OFF
+#
+# THIS RUN ISOLATES K1. It differs from the kernels-off run by exactly one
+# knob, so any change in output is attributable to WarpDecode alone.
+#
+#   garbage here + clean with K1 OFF -> WarpDecode is the bug. Done.
+#   clean here                       -> WarpDecode is fine; the fault is in
+#                                       K2-K9 (all upstream NVIDIA) or, if
+#                                       the kernels-off run was also
+#                                       garbage, in the held ON set / model.
+#
+# K1 is the highest-prior suspect: it is the only knob whose kernel was
+# ported in from the SGLang optimization-playground
+# (sgl-kernel/csrc/moe/warp_decode_cute.cu). Everything in K2-K9 is upstream
+# NVIDIA with a TRTLLM ticket.
 #
 # NOT A KNOB: `algorithm: dsa` is required by the DeepSeek-V3.2-style
 # architecture. Removing it is not a valid configuration.
 #
-# READING A RESULT
-#   All-OFF clean  -> one of K1-K9 corrupts logits; turn them back ON one
-#                     at a time until it breaks again.
-#   All-OFF garbage-> cause is in the ON set (K10-K14) or upstream of
-#                     serving entirely: weights, tokenizer, loader, or TP4
-#                     sharding. Start by flipping K10 to kvarn_k4v4.
+# PROVENANCE
+#   Blaise custom : K1 (SGLang playground port), K10, K11 (KVarN),
+#                   K12, K13, K14 (IndexCache/HISA)
+#   Upstream NVIDIA: K2 (#7898, TRTLLM-8827), K3 (TRTLLM-9457 #10130),
+#                   K4 (TRTLLM-11289 #12074), K5 (TRTLLM-10407 #12236),
+#                   K6 (TRTLLM-34871 #13219), K7, K8, K9
+#   Checkpoint-forced: K12, K13, K14 come from the model card's
+#                   quantization_config.indexer_quantization and cannot be
+#                   turned off from YAML (model_config.py:L828-L835).
 #
 # Test with temperature 0. Greedy decode means any incoherence is a logits
 # bug, not sampling.
@@ -87,14 +105,21 @@ kv_cache_config:
 
 moe_config:
   # KNOB K1  MoE backend         ON: WARPDECODE   OFF: CUTLASS
-  # NOTE: `warp_decode.enabled` is NOT this switch. moe backend=WARPDECODE
-  # selects the custom NVFP4 CuteDslFusedMoE path unconditionally
-  # (llm_args.py:L815-L822); warp_decode.enabled:false only makes
-  # validate_warp_decode_config early-return (L859-L861), i.e. it runs the
-  # custom kernel with its tiling config bypassed. Use backend to turn it off.
-  backend: CUTLASS
+  # <<< THIS IS THE VARIABLE UNDER TEST >>>
+  backend: WARPDECODE
   # KNOB K2  low-precision MoE combine    ON: true   OFF: false
+  # Kept OFF so K1 is the only MoE-path change vs the kernels-off run.
   use_low_precision_moe_combine: false
+  # WARNING: warp_decode.enabled is NOT the K1 switch. backend=WARPDECODE
+  # selects the custom NVFP4 CuteDslFusedMoE path unconditionally
+  # (llm_args.py:L815-L822); enabled:false only makes
+  # validate_warp_decode_config early-return (L859-L861), so the custom
+  # kernel runs with its tiling/policy config bypassed.
+  # Kept false to match how corsaire_tp4.yaml actually ran in production.
+  # Setting it true is a SEPARATE experiment.
+  warp_decode:
+    enabled: false
+    tile_mode: autotune
 
 # Not a knob: stock NVIDIA GEMM backends, pinned so selection is not left
 # to an unspecified default.
@@ -108,8 +133,7 @@ sparse_attention_config:
   # KNOB K12  indexer mode    ON: indexcache-hisa   OFF: vanilla
   # CAUTION: "vanilla" may not stick. When the HF model config asks for
   # indexcache/indexcache-hisa, model_config.py:L828-L835 promotes it back
-  # and drags indexer_k_dtype and enable_nvfp4_hisa along with it. Verify in
-  # the startup log before trusting an OFF result here.
+  # and drags indexer_k_dtype and enable_nvfp4_hisa along with it.
   indexer_mode: indexcache-hisa
   index_n_heads: 64
   index_head_dim: 128
@@ -122,21 +146,21 @@ sparse_attention_config:
 
   # KNOB K10  KVarN latent KV
   #   ON:   kvarn_k2v2   (2-bit, current)
-  #   STEP: kvarn_k4v4   (4-bit, same code path -- try this first)
-  #   OFF:  fp16         (leaves the KVarN path entirely; UNVERIFIED
-  #                       downstream, may fail at load rather than serve)
+  #   STEP: kvarn_k4v4   (4-bit, same code path)
+  #   OFF:  fp16         (leaves the KVarN path entirely)
   # TRAP: `auto` does NOT disable KVarN. auto/None is the sentinel that
   # re-selects the kvarn_k2v2 default (model_config.py:L814-L817 + L154);
   # only a literal non-kvarn dtype reaches the else-branch at L819.
+  # NOTE: KVarN has no non-Blaise implementer -- there is no stock kernel
+  # for 2-bit latent KV, so ON always means Blaise store/restore code runs.
   mla_latent_kv_dtype: kvarn_k2v2
   # KNOB K11  KVarN amortize     ON: true   OFF: false
-  # Read-path staleness optimization layered on top of the 2-bit storage.
   mla_latent_kv_amortize: true
 
   # KNOB K14  NVFP4 HISA         ON: true   OFF: false
-  # Requires K12=indexcache-hisa and K13=fp4 (llm_args.py:L528-L535), so it
-  # cannot be ON alone. hisa_min_seq_len gates it to >=65536 tokens, so it
-  # is inert for short diagnostic prompts either way.
+  # Requires K12=indexcache-hisa and K13=fp4 (llm_args.py:L528-L535).
+  # hisa_min_seq_len gates it to >=65536 tokens, so it is inert for short
+  # diagnostic prompts either way.
   enable_nvfp4_hisa: true
   hisa_block_size: 128
   hisa_block_topk: 64
@@ -149,7 +173,7 @@ sparse_attention_config:
   # KNOB K6  CuTe DSL paged MQA logits     ON: true   OFF: false
   use_cute_dsl_paged_mqa_logits: false
 
-  # KNOB K15  LayerSplit    ON: true   OFF: false   (off in orig too)
+  # KNOB K15  LayerSplit    ON: true   OFF: false
   layersplit_enabled: false
 
 # ============================================================================
@@ -157,5 +181,6 @@ sparse_attention_config:
 #
 #  date       | knobs changed from previous run | result
 #  -----------|---------------------------------|------------------------
-#  (baseline) | K1-K9 OFF                       | ?
+#  2026-07-25 | K1-K9 OFF (all kernels off)     | ?
+#  2026-07-25 | K1 ON only (WarpDecode isolated)| ?
 # ============================================================================
