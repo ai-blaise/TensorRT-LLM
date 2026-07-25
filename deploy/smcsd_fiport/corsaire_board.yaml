@@ -13,9 +13,8 @@
 #   Change ONE knob per run, or you learn nothing.
 #
 # BOARD  (current state -- keep in sync by hand)
-#   ---- THE VARIABLE: one custom kernel, on -----------------------------
-#   K1  WarpDecode MoE backend .................. ON   (WARPDECODE)
-#   ---- OFF: every other kernel -----------------------------------------
+#   ---- OFF: all custom/optional kernels --------------------------------
+#   K1  WarpDecode MoE backend .................. OFF  (CUTLASS)
 #   K2  low-precision MoE combine ............... OFF
 #   K3  CuTe DSL blockscaling bmm ............... OFF
 #   K4  CuTe DSL bf16 bmm ....................... OFF
@@ -25,26 +24,32 @@
 #   K8  overlap scheduler ....................... OFF
 #   K9  fp8 KV cache ............................ OFF  (auto)
 #   ---- ON: held constant, NOT under test -------------------------------
-#   K10 KVarN 2-bit latent KV ................... ON   (kvarn_k2v2)
+#   K10 KVarN latent KV ......................... ON   (kvarn_k4v4)  <-- VAR
 #   K11 KVarN amortize .......................... ON
 #   K12 indexer mode ............................ ON   (indexcache-hisa)
 #   K13 fp4 indexer K ........................... ON
 #   K14 NVFP4 HISA .............................. ON
 #   K15 LayerSplit .............................. OFF
 #
-# THIS RUN ISOLATES K1. It differs from the kernels-off run by exactly one
-# knob, so any change in output is attributable to WarpDecode alone.
+# STATE: every optional kernel is OFF. The only custom code still running is
+# the Blaise storage stack -- KVarN latent KV and the IndexCache/HISA
+# indexer -- plus the model, tokenizer, loader, and TP4 sharding.
 #
-#   garbage here + clean with K1 OFF -> WarpDecode is the bug. Done.
-#   clean here                       -> WarpDecode is fine; the fault is in
-#                                       K2-K9 (all upstream NVIDIA) or, if
-#                                       the kernels-off run was also
-#                                       garbage, in the held ON set / model.
+#   clean here   -> the KVarN code path works and 2-bit was simply too lossy
+#                   for this model. Fix is a bit-width policy decision.
+#   garbage here -> KVarN bit width is not the cause. Either the KVarN path
+#                   itself is broken (next: K10 -> fp16, leaves the path
+#                   entirely) or the fault is upstream of every knob:
+#                   weights, tokenizer, loader, or TP4 sharding.
 #
-# K1 is the highest-prior suspect: it is the only knob whose kernel was
-# ported in from the SGLang optimization-playground
-# (sgl-kernel/csrc/moe/warp_decode_cute.cu). Everything in K2-K9 is upstream
-# NVIDIA with a TRTLLM ticket.
+# COMPARABILITY: this run is single-variable against an all-kernels-off +
+# kvarn_k2v2 run. It differs from the last recorded run (K1 ON, k2v2) by TWO
+# knobs, so do not compare it to that one directly.
+#
+# NOTE: the K1-ON run (WarpDecode isolated, everything else off) produced
+# garbage. That does NOT convict WarpDecode by itself -- if this run is also
+# garbage, the fault is upstream of the MoE backend entirely and K1 is
+# exonerated. Compare the two before drawing a conclusion.
 #
 # NOT A KNOB: `algorithm: dsa` is required by the DeepSeek-V3.2-style
 # architecture. Removing it is not a valid configuration.
@@ -105,8 +110,7 @@ kv_cache_config:
 
 moe_config:
   # KNOB K1  MoE backend         ON: WARPDECODE   OFF: CUTLASS
-  # <<< THIS IS THE VARIABLE UNDER TEST >>>
-  backend: WARPDECODE
+  backend: CUTLASS
   # KNOB K2  low-precision MoE combine    ON: true   OFF: false
   # Kept OFF so K1 is the only MoE-path change vs the kernels-off run.
   use_low_precision_moe_combine: false
@@ -153,7 +157,8 @@ sparse_attention_config:
   # only a literal non-kvarn dtype reaches the else-branch at L819.
   # NOTE: KVarN has no non-Blaise implementer -- there is no stock kernel
   # for 2-bit latent KV, so ON always means Blaise store/restore code runs.
-  mla_latent_kv_dtype: kvarn_k2v2
+  # <<< VARIABLE UNDER TEST: 2-bit -> 4-bit, same KVarN code path >>>
+  mla_latent_kv_dtype: kvarn_k4v4
   # KNOB K11  KVarN amortize     ON: true   OFF: false
   mla_latent_kv_amortize: true
 
@@ -182,5 +187,7 @@ sparse_attention_config:
 #  date       | knobs changed from previous run | result
 #  -----------|---------------------------------|------------------------
 #  2026-07-25 | K1-K9 OFF (all kernels off)     | ?
-#  2026-07-25 | K1 ON only (WarpDecode isolated)| ?
+#  2026-07-25 | K1 ON only (WarpDecode isolated)| GARBAGE
+#  2026-07-25 | K1 back OFF (all kernels off)   | not run
+#  2026-07-25 | kernels off + K10 kvarn_k4v4    | ?
 # ============================================================================
