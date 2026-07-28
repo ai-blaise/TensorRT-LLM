@@ -14,7 +14,7 @@
 #
 # BOARD  (current state -- keep in sync by hand)
 #   ---- OFF: all custom/optional kernels --------------------------------
-#   K1  WarpDecode MoE backend .................. OFF  (CUTLASS)
+#   K1  WarpDecode MoE overlay .................. OFF  (CUTLASS)
 #   K2  low-precision MoE combine ............... OFF
 #   K3  CuTe DSL blockscaling bmm ............... OFF
 #   K4  CuTe DSL bf16 bmm ....................... OFF
@@ -31,34 +31,32 @@
 #   K14 NVFP4 HISA .............................. ON
 #   K15 LayerSplit .............................. OFF
 #
-# STATE: every optional kernel is OFF. The only custom code still running is
-# the Blaise storage stack -- KVarN latent KV and the IndexCache/HISA
-# indexer -- plus the model, tokenizer, loader, and TP4 sharding.
+# STATE: MODEL-AS-IS BASELINE. Every optional/experimental kernel is OFF,
+# including the WarpDecode overlay (K1). What still runs is the checkpoint's
+# own required configuration -- DSA sparse attention, the IndexCache/HISA
+# indexer at fp4 (K12/K13/K14), KVarN latent KV (K10/K11) -- plus the model,
+# tokenizer, loader, and TP4 sharding. No speculative decoding: there is no
+# speculative_config in this file and no draft model, so
+# BlaiseAI/corsaire-research-preview decodes every token itself.
 #
-# THIS IS THE WARPDECODE CONTROL. It is identical to the K1-ON run that
-# produced garbage except for K1 (WARPDECODE -> CUTLASS). One variable.
+# THIS IS THE CUTLASS CONTROL RUN. MoE dispatch goes to the stock NVIDIA
+# CUTLASS backend.
 #
-#   clean here   -> WarpDecode IS the bug. The custom SGLang-ported MoE
-#                   kernel is corrupting logits. Done bisecting.
-#   garbage here -> WarpDecode is EXONERATED. No optional kernel is at
-#                   fault. The cause is KVarN, the checkpoint-forced
-#                   indexer, the weights, the tokenizer, the loader, or TP4
-#                   sharding. Next flip: K10 -> kvarn_k4v4, then fp16.
+#   clean   -> the checkpoint is fine; the bug lives in one of the optional
+#              kernels. Turn them back on one at a time.
+#   garbage -> the fault is in the model, its weights, or the required
+#              DSA/indexer/KVarN path -- not in any optional kernel.
 #
-# It is also the missing baseline for the KVarN bit-width test: a later
-# kvarn_k4v4 run is single-variable only against THIS configuration.
-#
-# NOTE: the K1-ON run (WarpDecode isolated, everything else off) produced
-# garbage. That does NOT convict WarpDecode by itself -- if this run is also
-# garbage, the fault is upstream of the MoE backend entirely and K1 is
-# exonerated. Compare the two before drawing a conclusion.
+# To go back to the overlay test, set backend=TRTLLM and
+# warp_decode.enabled=true. For canonical CuteDSL WarpDecode, use
+# backend=WARPDECODE as a separate experiment.
 #
 # NOT A KNOB: `algorithm: dsa` is required by the DeepSeek-V3.2-style
 # architecture. Removing it is not a valid configuration.
 #
 # PROVENANCE
-#   Blaise custom : K1 (SGLang playground port), K10, K11 (KVarN),
-#                   K12, K13, K14 (IndexCache/HISA)
+#   Blaise custom : K1 (TensorRT-LLM overlay op trtllm::warp_decode_nvfp4_moe),
+#                   K10, K11 (KVarN), K12, K13, K14 (IndexCache/HISA)
 #   Upstream NVIDIA: K2 (#7898, TRTLLM-8827), K3 (TRTLLM-9457 #10130),
 #                   K4 (TRTLLM-11289 #12074), K5 (TRTLLM-10407 #12236),
 #                   K6 (TRTLLM-34871 #13219), K7, K8, K9
@@ -111,20 +109,20 @@ kv_cache_config:
   tokens_per_block: 64
 
 moe_config:
-  # KNOB K1  MoE backend         ON: WARPDECODE   OFF: CUTLASS
+  # KNOB K1  WarpDecode overlay
+  #   ON:  backend=TRTLLM + warp_decode.enabled=true
+  #   OFF: backend=CUTLASS + warp_decode.enabled=false
+  #   NOTE: backend=WARPDECODE is a separate canonical CuteDslFusedMoE path,
+  #   not this trtllm::warp_decode_nvfp4_moe overlay test.
   backend: CUTLASS
   # KNOB K2  low-precision MoE combine    ON: true   OFF: false
   # Kept OFF so K1 is the only MoE-path change vs the kernels-off run.
   use_low_precision_moe_combine: false
-  # WARNING: warp_decode.enabled is NOT the K1 switch. backend=WARPDECODE
-  # selects the custom NVFP4 CuteDslFusedMoE path unconditionally
-  # (llm_args.py:L815-L822); enabled:false only makes
-  # validate_warp_decode_config early-return (L859-L861), so the custom
-  # kernel runs with its tiling/policy config bypassed.
-  # Kept false to match how corsaire_tp4.yaml actually ran in production.
-  # Setting it true is a SEPARATE experiment.
   warp_decode:
     enabled: false
+    max_batch_size: 64
+    policy: force
+    allow_parallelism_fallback: false
     tile_mode: autotune
 
 # Not a knob: stock NVIDIA GEMM backends, pinned so selection is not left
@@ -189,6 +187,7 @@ sparse_attention_config:
 #  -----------|---------------------------------|------------------------
 #  2026-07-25 | K1-K9 OFF (all kernels off)     | ?
 #  2026-07-25 | K1 ON only (WarpDecode isolated)| GARBAGE
-#  2026-07-25 | CUTLASS + all kernels off, k2v2 | ?   <-- WarpDecode control
-#             |   (pairs with the K1 ON row above; one variable = K1)
+#  2026-07-25 | CUTLASS + all kernels off, k2v2 | ?   <-- CUTLASS control
+#  2026-07-26 | K1 ON: TRTLLM overlay force     | ?
+#  2026-07-28 | K1 OFF: CUTLASS, model as-is    | ?   <-- current board
 # ============================================================================
