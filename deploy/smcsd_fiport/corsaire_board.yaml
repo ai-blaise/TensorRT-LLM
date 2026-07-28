@@ -24,8 +24,8 @@
 #   K8  overlap scheduler ....................... OFF
 #   K9  fp8 KV cache ............................ OFF  (auto)
 #   ---- ON: held constant, NOT under test -------------------------------
-#   K10 KVarN 2-bit latent KV ................... ON   (kvarn_k2v2)
-#   K11 KVarN amortize .......................... ON
+#   K10 KVarN 2-bit latent KV ................... OFF  (fp16)
+#   K11 KVarN amortize .......................... OFF
 #   K12 indexer mode ............................ ON   (indexcache-hisa)
 #   K13 fp4 indexer K ........................... ON
 #   K14 NVFP4 HISA .............................. ON
@@ -157,9 +157,9 @@ sparse_attention_config:
   # only a literal non-kvarn dtype reaches the else-branch at L819.
   # NOTE: KVarN has no non-Blaise implementer -- there is no stock kernel
   # for 2-bit latent KV, so ON always means Blaise store/restore code runs.
-  mla_latent_kv_dtype: kvarn_k2v2
+  mla_latent_kv_dtype: fp16
   # KNOB K11  KVarN amortize     ON: true   OFF: false
-  mla_latent_kv_amortize: true
+  mla_latent_kv_amortize: false
 
   # KNOB K14  NVFP4 HISA         ON: true   OFF: false
   # Requires K12=indexcache-hisa and K13=fp4 (llm_args.py:L528-L535).
@@ -189,5 +189,10 @@ sparse_attention_config:
 #  2026-07-25 | K1 ON only (WarpDecode isolated)| GARBAGE
 #  2026-07-25 | CUTLASS + all kernels off, k2v2 | ?   <-- CUTLASS control
 #  2026-07-26 | K1 ON: TRTLLM overlay force     | ?
-#  2026-07-28 | K1 OFF: CUTLASS, model as-is    | ?   <-- current board
+#  2026-07-28 | K1 OFF: CUTLASS, all kernels off| GARBAGE  <-- exonerates K1-K9
+#             |   K14 HISA inert: min_seq_len   |
+#             |   65536 > max_seq_len 8448      |
+#  2026-07-28 | K10 kvarn_k2v2 -> fp16 (K11 off)| ?   <-- current board
+#             |   next if garbage: index_topk_  |
+#             |   pattern FSSS -> F, then TP4->1|
 # ============================================================================
